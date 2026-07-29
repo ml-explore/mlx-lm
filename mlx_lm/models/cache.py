@@ -610,6 +610,32 @@ def _try_schedule(*arrays):
         return False
 
 
+class _ArraysCacheFoldLock(type(threading.RLock())):
+    """An RLock that recreates itself across pickle/deepcopy.
+
+    A shallow cache copy keeps the same lock by normal object sharing.
+    Pickle and deepcopy create a new native lock; their memo preserves
+    sharing when an alias graph contains the same lock more than once.
+    """
+
+    def __reduce__(self):
+        return (type(self), ())
+
+
+class _ArraysCacheFieldState:
+    """Mutable bookkeeping shared by shallow aliases of one field.
+
+    ``promotion`` is separate from the pending counter because the two
+    metadata fields can reference the same bool array: stock promoted
+    both logical views together, while each field still applied its own
+    decrement.
+    """
+
+    def __init__(self, advance=0, promoted=False, promotion=None):
+        self.advance = advance
+        self.promotion = [promoted] if promotion is None else promotion
+
+
 class ArraysCache(_BaseCache):
     # ``left_padding`` and ``lengths`` are logically decremented by
     # ``advance()`` on every layer call during decode. Doing that decrement
@@ -683,37 +709,68 @@ class ArraysCache(_BaseCache):
     # machinery): the write lands before the deferred decrement -- the
     # alias-write window above -- where stock's eager decrement landed
     # first. Reads are serialized per cache: a reentrant lock guards the
-    # advance bookkeeping, folds, scheduling, and copies, because
-    # stock's pure attribute reads were trivially thread-safe while
-    # unserialized concurrent folds of one array deadlock on their
-    # thread-local streams. Cross-thread *mutation* (filter/extend/
-    # finalize racing anything) remains unsupported, as in stock.
+    # advance bookkeeping, folds, scheduling, copies, and metadata
+    # serialization, because stock's pure attribute reads were trivially
+    # thread-safe while unserialized concurrent folds of one array deadlock
+    # on their thread-local streams. Shallow aliases share that lock and
+    # their per-field bookkeeping for as long as they share the backing
+    # array; deepcopy preserves that topology within an alias graph.
+    # Cross-thread *mutation* (filter/extend/finalize racing anything)
+    # remains unsupported, as in stock.
 
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance._left_padding = None
         instance._lengths = None
-        instance._lp_advance = 0
-        instance._len_advance = 0
+        instance._lp_state = _ArraysCacheFieldState()
+        instance._len_state = _ArraysCacheFieldState()
         # bool-metadata promotion trackers: stock's eager subtraction
         # promoted a bool field to int32 on the FIRST advance() -- even a
         # zero or cancelling one -- so validation must remember that
         # independently of the pending total (see _logical_dtype)
-        instance._lp_promoted = False
-        instance._len_promoted = False
         # Serializes the deferred-decrement machinery (advance
-        # bookkeeping, folds, scheduling, copies). Stock's pure
-        # attribute reads were trivially thread-safe; deferred folding
-        # makes reads mutate, and two unserialized folds of the same
-        # array from different threads deadlock on their thread-local
-        # streams. Reentrant: mutators call _sync/_fold under it.
-        instance._fold_lock = threading.RLock()
+        # bookkeeping, folds, scheduling, copies, serialization). The
+        # native lock subclass is pickleable and deepcopy-aware without
+        # adding a wrapper on the per-token advance() hot path.
+        instance._fold_lock = _ArraysCacheFoldLock()
         return instance
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
         if left_padding:
             self.left_padding = mx.array(left_padding)
+
+    @property
+    def _lp_advance(self):
+        return self._lp_state.advance
+
+    @_lp_advance.setter
+    def _lp_advance(self, value):
+        self._lp_state.advance = value
+
+    @property
+    def _len_advance(self):
+        return self._len_state.advance
+
+    @_len_advance.setter
+    def _len_advance(self, value):
+        self._len_state.advance = value
+
+    @property
+    def _lp_promoted(self):
+        return self._lp_state.promotion[0]
+
+    @_lp_promoted.setter
+    def _lp_promoted(self, value):
+        self._lp_state.promotion[0] = value
+
+    @property
+    def _len_promoted(self):
+        return self._len_state.promotion[0]
+
+    @_len_promoted.setter
+    def _len_promoted(self, value):
+        self._len_state.promotion[0] = value
 
     # Integer metadata dtypes as (bits, signed): used to mirror stock's
     # eager per-call scalar range check in advance() and to wrap the
@@ -858,11 +915,17 @@ class ArraysCache(_BaseCache):
                 # Bound chains from repeatedly assigning lazy expressions
                 _try_schedule(v)
             self._left_padding = v
-            self._lp_advance = 0
             if not same:
                 # Only a genuinely new array resets the bool-promotion
                 # record; re-assigning the backing array is not a reset
-                self._lp_promoted = False
+                promotion = (
+                    self._len_state.promotion
+                    if v is not None and v is self._lengths
+                    else None
+                )
+                self._lp_state = _ArraysCacheFieldState(promotion=promotion)
+            else:
+                self._lp_advance = 0
 
     @property
     def lengths(self):
@@ -890,9 +953,15 @@ class ArraysCache(_BaseCache):
             if v is not None:
                 _try_schedule(v)
             self._lengths = v
-            self._len_advance = 0
             if not same:
-                self._len_promoted = False
+                promotion = (
+                    self._lp_state.promotion
+                    if v is not None and v is self._left_padding
+                    else None
+                )
+                self._len_state = _ArraysCacheFieldState(promotion=promotion)
+            else:
+                self._len_advance = 0
 
     def _sync(self):
         """Fold both pending integer decrements into the stored arrays."""
@@ -915,12 +984,12 @@ class ArraysCache(_BaseCache):
 
     def __copy__(self):
         # A shallow copy shares the backing arrays (as stock's did) --
-        # and the fold lock, so folds on the shared arrays stay
-        # serialized across both objects. Fold first: otherwise the
-        # copied pending counters would apply this cache's decrement
-        # once per object to the shared array. If the fold cannot land
-        # (captured tracer), a copy would escape the trace holding the
-        # transient tracer -- raise like the other guarded mutations.
+        # plus the fold lock and mutable per-field bookkeeping, so a
+        # pending total is folded only once across the alias graph.
+        # Fold first to preserve stock's copy-time visibility. If the
+        # fold cannot land (captured tracer), a copy would escape the
+        # trace holding the transient tracer -- raise like the other
+        # guarded mutations.
         with self._fold_lock:
             self._sync()
             self._require_folded("__copy__")
@@ -932,15 +1001,16 @@ class ArraysCache(_BaseCache):
         # Same guard as __copy__: python's default deepcopy would copy
         # __dict__ directly, letting a deep copy taken mid-trace escape
         # with the transient tracer and the pending counter. The copy
-        # gets its own fold lock (its arrays are independent).
+        # gets an independent lock for an independent array, while a
+        # shared deepcopy memo preserves lock/state sharing within a
+        # copied shallow-alias graph.
         with self._fold_lock:
             self._sync()
             self._require_folded("__deepcopy__")
             new = self.__class__.__new__(self.__class__)
             memo[id(self)] = new
             for k, v in self.__dict__.items():
-                if k != "_fold_lock":
-                    new.__dict__[k] = copy.deepcopy(v, memo)
+                new.__dict__[k] = copy.deepcopy(v, memo)
             return new
 
     def _materialize(self):
@@ -1005,10 +1075,6 @@ class ArraysCache(_BaseCache):
         # "" for an absent field, "<dtype>:<comma-joined values>"
         # otherwise (an empty array stays distinct from None and dtype
         # survives the round trip).
-        if self._left_padding is None and self._lengths is None:
-            return ""
-        self._sync()
-
         def encode(a):
             if a is None:
                 return ""
@@ -1027,7 +1093,11 @@ class ArraysCache(_BaseCache):
                 )
             return dtype + ":" + ",".join(str(x) for x in a.tolist())
 
-        return (encode(self._left_padding), encode(self._lengths))
+        with self._fold_lock:
+            if self._left_padding is None and self._lengths is None:
+                return ""
+            self._sync()
+            return (encode(self._left_padding), encode(self._lengths))
 
     @meta_state.setter
     def meta_state(self, v):
@@ -1059,9 +1129,13 @@ class ArraysCache(_BaseCache):
         self._sync()
         self._require_folded("filter")
         if self._left_padding is not None:
+            promoted = self._lp_promoted
             self._left_padding = self._left_padding[batch_indices]
+            self._lp_state = _ArraysCacheFieldState(promoted=promoted)
         if self._lengths is not None:
+            promoted = self._len_promoted
             self._lengths = self._lengths[batch_indices]
+            self._len_state = _ArraysCacheFieldState(promoted=promoted)
         self._materialize()
 
     def extend(self, other):
@@ -1091,15 +1165,32 @@ class ArraysCache(_BaseCache):
 
             return mx.concatenate([a, b])
 
+        def materialize_promoted_bool(a, promoted):
+            # Stock's first subtraction physically promoted bool metadata
+            # to int32. Preserve that logical dtype before mixed-dtype
+            # concatenation (bool + int8 would otherwise become int8).
+            if a is not None and promoted and a.dtype == mx.bool_:
+                return a.astype(mx.int32)
+            return a
+
         self._sync()
         other._sync()
         self._require_folded("extend")
         other._require_folded("extend")
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
-        self._left_padding = cat(self._left_padding, other._left_padding)
-        self._lengths = cat(self._lengths, other._lengths)
-        self._lp_promoted = self._lp_promoted or other._lp_promoted
-        self._len_promoted = self._len_promoted or other._len_promoted
+        self._left_padding = cat(
+            materialize_promoted_bool(self._left_padding, self._lp_promoted),
+            materialize_promoted_bool(other._left_padding, other._lp_promoted),
+        )
+        self._lengths = cat(
+            materialize_promoted_bool(self._lengths, self._len_promoted),
+            materialize_promoted_bool(other._lengths, other._len_promoted),
+        )
+        # Concatenation rebinds both fields. Any logical bool promotion
+        # was materialized above, so the new arrays start with fresh
+        # per-field state and no alias bookkeeping from either input.
+        self._lp_state = _ArraysCacheFieldState()
+        self._len_state = _ArraysCacheFieldState()
         self._materialize()
 
     def extract(self, idx):
@@ -1117,8 +1208,8 @@ class ArraysCache(_BaseCache):
         self._require_folded("finalize")
         self._lengths = None
         self._left_padding = None
-        self._lp_promoted = False
-        self._len_promoted = False
+        self._lp_state = _ArraysCacheFieldState()
+        self._len_state = _ArraysCacheFieldState()
 
     def advance(self, N):
         # Integer bookkeeping only: building this with mx.array arithmetic

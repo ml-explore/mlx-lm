@@ -2,6 +2,7 @@
 
 import copy
 import os
+import pickle
 import tempfile
 import threading
 import unittest
@@ -1035,15 +1036,17 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache.lengths.tolist(), [4])
         self.assertEqual(cloned.lengths.tolist(), [4])
         self.assertIs(cloned._lengths, cache._lengths)
-        # post-copy advances fold into the shared array at each object's
-        # own fold, so both eventually observe them (stock applied them
-        # eagerly to the same shared array)
+        self.assertIs(cloned._len_state, cache._len_state)
+        # post-copy advances accumulate in shared field state, so either
+        # alias folds the total exactly once into their shared array
         cloned.advance(2)
-        self.assertEqual(cloned.lengths.tolist(), [2])
-        self.assertEqual(cache.lengths.tolist(), [2])
+        cache.advance(1)
+        self.assertEqual(cloned._len_advance, 3)
+        self.assertEqual(cache.lengths.tolist(), [1])
+        self.assertEqual(cloned.lengths.tolist(), [1])
 
         # deepcopy also folds first; the copy is an independent object
-        # with its own counters
+        # with its own counters and lock
         cache = ArraysCache(size=1)
         cache.lengths = mx.array([5])
         cache.advance(1)
@@ -1051,6 +1054,7 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(deep.lengths.tolist(), [4])
         self.assertEqual(deep._len_advance, 0)
         self.assertIsNot(deep._lengths, cache._lengths)
+        self.assertIsNot(deep._fold_lock, cache._fold_lock)
         deep.advance(2)
         self.assertEqual(deep.lengths.tolist(), [2])
         self.assertEqual(cache.lengths.tolist(), [4])
@@ -1129,6 +1133,29 @@ class TestPromptCache(unittest.TestCase):
             cache.advance(2**31)
         self.assertEqual(cache._len_advance, 2**31)
         self.assertEqual(cache._lp_advance, 0)
+
+        # shallow aliases share the bool-promotion record as well as the
+        # backing array: once either alias has logically promoted bool to
+        # int32, all aliases validate future offsets against int32
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cloned = copy.copy(cache)
+        cache.advance(0)
+        with self.assertRaises(ValueError):
+            cloned.advance(2**31)
+
+        # extend must materialize a logical bool->int32 promotion before
+        # mixed-dtype concatenation. Stock concatenates int32 with int8,
+        # accepts 128, and produces this value.
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([True], dtype=mx.bool_)
+        cache.advance(0)
+        other = ArraysCache(size=1)
+        other.lengths = mx.array([1], dtype=mx.int8)
+        cache.extend(other)
+        self.assertEqual(cache.lengths.dtype, mx.int32)
+        cache.advance(128)
+        self.assertEqual(cache.lengths.tolist(), [-127, -127])
 
         # batch churn with the metadata never read must not accumulate
         # unevaluated gathers: filter/extend materialize the metadata.
@@ -1337,6 +1364,133 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(all(not t.is_alive() for t in threads))
         self.assertEqual(results, [[4], [4]])
         self.assertEqual(cache._len_advance, 0)
+
+    def test_arrays_cache_alias_copy_state(self):
+        """Shallow aliases share pending state and their fold lock. A
+        deepcopy of an alias graph recreates that topology with an
+        independent array/lock group."""
+
+        def concurrent_property_reads(caches):
+            gate = threading.Barrier(3)
+            arrays = []
+            errors = []
+
+            def read(cache):
+                try:
+                    gate.wait()
+                    arrays.append(cache.lengths)
+                except Exception as e:
+                    errors.append(e)
+
+            threads = [
+                threading.Thread(target=read, args=(cache,), daemon=True)
+                for cache in caches
+            ]
+            for thread in threads:
+                thread.start()
+            gate.wait()
+            for thread in threads:
+                thread.join(timeout=60)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            mx.eval(*arrays)
+            self.assertEqual([array.tolist() for array in arrays], [[3], [3]])
+
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        aliases = [cache, copy.copy(cache)]
+        self.assertIs(aliases[0]._lengths, aliases[1]._lengths)
+        self.assertIs(aliases[0]._len_state, aliases[1]._len_state)
+        self.assertIs(aliases[0]._fold_lock, aliases[1]._fold_lock)
+        for alias in aliases:
+            alias.advance(1)
+        self.assertEqual(aliases[0]._len_advance, 2)
+        concurrent_property_reads(aliases)
+        self.assertEqual(aliases[0]._len_advance, 0)
+        self.assertEqual(aliases[1]._len_advance, 0)
+
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        original = [cache, copy.copy(cache)]
+        aliases = copy.deepcopy(original)
+        self.assertIs(aliases[0]._lengths, aliases[1]._lengths)
+        self.assertIs(aliases[0]._len_state, aliases[1]._len_state)
+        self.assertIs(aliases[0]._fold_lock, aliases[1]._fold_lock)
+        self.assertIsNot(aliases[0]._lengths, original[0]._lengths)
+        self.assertIsNot(aliases[0]._fold_lock, original[0]._fold_lock)
+        for alias in aliases:
+            alias.advance(1)
+        concurrent_property_reads(aliases)
+
+    def test_arrays_cache_pickle(self):
+        """The deferred state round-trips without trying to pickle a
+        native RLock, including the sharing topology of alias graphs."""
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        cache.advance(2)
+        restored = pickle.loads(pickle.dumps(cache))
+        self.assertEqual(restored._len_advance, 2)
+        self.assertEqual(restored.lengths.tolist(), [3])
+
+        cache = ArraysCache(size=1)
+        cache.lengths = mx.array([5])
+        aliases = [cache, copy.copy(cache)]
+        cache.advance(1)
+        restored = pickle.loads(pickle.dumps(aliases))
+        self.assertIs(restored[0]._lengths, restored[1]._lengths)
+        self.assertIs(restored[0]._len_state, restored[1]._len_state)
+        self.assertIs(restored[0]._fold_lock, restored[1]._fold_lock)
+        self.assertEqual(restored[0].lengths.tolist(), [4])
+        self.assertEqual(restored[1].lengths.tolist(), [4])
+
+    def test_arrays_cache_metadata_serialization_is_atomic(self):
+        """advance() cannot interleave between the two encoded fields."""
+        cache = ArraysCache(size=1, left_padding=[10])
+        cache.lengths = mx.array([20])
+        cache.advance(1)
+        left_folded = threading.Event()
+        resume = threading.Event()
+        advance_started = threading.Event()
+        advance_done = threading.Event()
+        serialized = []
+        errors = []
+        real_fold_left = cache._fold_lp
+
+        def pause_after_left_fold():
+            real_fold_left()
+            left_folded.set()
+            if not resume.wait(timeout=60):
+                raise TimeoutError("serialization test did not resume")
+
+        def serialize():
+            try:
+                serialized.append(cache.meta_state)
+            except Exception as e:
+                errors.append(e)
+
+        def advance():
+            advance_started.set()
+            cache.advance(1)
+            advance_done.set()
+
+        cache._fold_lp = pause_after_left_fold
+        save_thread = threading.Thread(target=serialize, daemon=True)
+        save_thread.start()
+        self.assertTrue(left_folded.wait(timeout=60))
+        advance_thread = threading.Thread(target=advance, daemon=True)
+        advance_thread.start()
+        self.assertTrue(advance_started.wait(timeout=60))
+        advance_done.wait(timeout=0.1)
+        resume.set()
+        save_thread.join(timeout=60)
+        advance_thread.join(timeout=60)
+
+        self.assertFalse(save_thread.is_alive())
+        self.assertFalse(advance_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(serialized, [("int32:9", "int32:19")])
+        self.assertEqual(cache.left_padding.tolist(), [8])
+        self.assertEqual(cache.lengths.tolist(), [18])
 
     def test_arrays_cache_metadata_serialization(self):
         cache_file = os.path.join(self.test_dir, "arrays_cache_meta.safetensors")
