@@ -57,6 +57,11 @@ MODEL_REMAPPING = {
 
 MAX_FILE_SIZE_GB = 5
 
+# Number of arrays materialized per `mx.eval` call when writing a shard. Keeps
+# each Metal command buffer small enough to stay inside the GPU watchdog window;
+# see save_model.
+EVAL_BATCH_SIZE = 16
+
 
 def _parse_size(x):
     sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
@@ -795,6 +800,16 @@ def save_model(
         shards[i] = None
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
+
+        # Materialize the shard in batches before writing it. Freshly quantized
+        # weights are still lazy, so `save_safetensors` would otherwise be the
+        # first consumer and force a whole shard's graph into a single Metal
+        # command buffer, which can exceed the GPU watchdog window and abort the
+        # save. Evaluating in batches keeps each command buffer small.
+        shard_values = list(shard.values())
+        for start in range(0, len(shard_values), EVAL_BATCH_SIZE):
+            mx.eval(shard_values[start : start + EVAL_BATCH_SIZE])
+        del shard_values
 
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 

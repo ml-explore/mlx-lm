@@ -59,6 +59,52 @@ class TestUtils(unittest.TestCase):
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
 
+    def test_save_model_materializes_lazy_quantized_weights(self):
+        # Regression test: freshly quantized weights are lazy, and letting
+        # `save_safetensors` be their first consumer forces a whole shard's graph
+        # into one Metal command buffer, which can exceed the GPU watchdog window
+        # and abort the save (leaving a 0-byte shard behind). `save_model` should
+        # materialize each shard in batches before writing it.
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=1024,
+        )
+        model = llama.Model(args)
+        mx.eval(model.parameters())
+        nn.quantize(model, group_size=64, bits=4)
+
+        save_dir = os.path.join(self.test_dir, "save_model_lazy")
+        utils.save_model(save_dir, model)
+
+        # every shard written must be non-empty and readable
+        written = sorted(Path(save_dir).glob("*.safetensors"))
+        self.assertGreater(len(written), 0)
+        for shard_path in written:
+            self.assertGreater(shard_path.stat().st_size, 0)
+            mx.load(str(shard_path))
+
+        # the index must cover exactly the saved parameters
+        index_path = Path(save_dir) / "model.safetensors.index.json"
+        self.assertTrue(index_path.exists())
+        with open(index_path) as f:
+            weight_map = json.load(f)["weight_map"]
+        expected = {k for k, _ in tree_flatten(model.parameters())}
+        self.assertEqual(set(weight_map), expected)
+
+        # and the round trip must preserve values exactly
+        reloaded = {}
+        for shard_path in written:
+            reloaded.update(mx.load(str(shard_path)))
+        for name, value in tree_flatten(model.parameters()):
+            self.assertTrue(mx.array_equal(reloaded[name], value), msg=name)
+
     def test_quantize(self):
         from mlx_lm.models import llama
 
