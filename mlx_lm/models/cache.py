@@ -3,7 +3,9 @@
 import copy
 import operator
 import threading
+import weakref
 from collections import deque
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -611,15 +613,65 @@ def _try_schedule(*arrays):
 
 
 class _ArraysCacheFoldLock(type(threading.RLock())):
-    """An RLock that recreates itself across pickle/deepcopy.
+    """An RLock used by a cache alias group or a metadata-array alias group.
 
-    A shallow cache copy keeps the same lock by normal object sharing.
-    Pickle and deepcopy create a new native lock; their memo preserves
-    sharing when an alias graph contains the same lock more than once.
+    Normal object sharing keeps one lock across aliases. Pickle and deepcopy
+    create a new native lock; their memo preserves sharing when an alias graph
+    contains the same lock more than once.
     """
 
     def __reduce__(self):
         return (type(self), ())
+
+
+class _ArraysCacheArraySync:
+    """Synchronization and physical-promotion state for one backing array."""
+
+    def __init__(self, promotion=None, lock=None):
+        self.promotion = [False] if promotion is None else promotion
+        self.lock = _ArraysCacheFoldLock() if lock is None else lock
+
+
+# Public setters can attach one mx.array to independently constructed caches.
+# Keep synchronization by backing-array identity so their deferred reads cannot
+# concurrently mutate that array on different thread-local MLX streams. The
+# weak registry does not retain arrays after their last real owner is gone.
+_ARRAYS_CACHE_ARRAY_SYNCS = {}
+_ARRAYS_CACHE_ARRAY_SYNCS_LOCK = threading.Lock()
+
+
+def _register_arrays_cache_array(arr, state):
+    if arr is None:
+        return state
+    if not hasattr(state, "array_lock"):
+        # Compatibility with cache pickles produced before array-level locks.
+        state.array_lock = _ArraysCacheFoldLock()
+    key = id(arr)
+    with _ARRAYS_CACHE_ARRAY_SYNCS_LOCK:
+        item = _ARRAYS_CACHE_ARRAY_SYNCS.get(key)
+        if item is not None and item[0]() is arr:
+            sync = item[1]
+            state.promotion = sync.promotion
+            state.array_lock = sync.lock
+            return state
+
+        sync = _ArraysCacheArraySync(state.promotion, state.array_lock)
+
+        def remove(ref, key=key):
+            with _ARRAYS_CACHE_ARRAY_SYNCS_LOCK:
+                current = _ARRAYS_CACHE_ARRAY_SYNCS.get(key)
+                if current is not None and current[0] is ref:
+                    del _ARRAYS_CACHE_ARRAY_SYNCS[key]
+
+        ref = weakref.ref(arr, remove)
+        _ARRAYS_CACHE_ARRAY_SYNCS[key] = (ref, sync)
+        return state
+
+
+def _arrays_cache_field_state(arr=None, advance=0, promoted=False):
+    return _register_arrays_cache_array(
+        arr, _ArraysCacheFieldState(advance=advance, promoted=promoted)
+    )
 
 
 class _ArraysCacheFieldState:
@@ -631,9 +683,10 @@ class _ArraysCacheFieldState:
     decrement.
     """
 
-    def __init__(self, advance=0, promoted=False, promotion=None):
+    def __init__(self, advance=0, promoted=False, promotion=None, array_lock=None):
         self.advance = advance
         self.promotion = [promoted] if promotion is None else promotion
+        self.array_lock = _ArraysCacheFoldLock() if array_lock is None else array_lock
 
 
 class ArraysCache(_BaseCache):
@@ -684,10 +737,13 @@ class ArraysCache(_BaseCache):
     # bool metadata bool, numpy scalar offsets promoting the metadata
     # dtype) are not reproduced. bool metadata arithmetic is reproduced
     # at int32 precision (stock's promotion): the dtype stays bool
-    # through zero-net advance histories, and after the first advance()
-    # on the field -- even a zero or cancelling one, and through a bool
-    # array shared by both fields -- later offsets validate against
-    # int32 exactly as stock's already-promoted array would. A read that encounters a *tracer*
+    # through zero-net advance histories. Physical promotion and fold
+    # synchronization follow the backing array even when public setters
+    # attach it to independently constructed caches; shallow aliases
+    # additionally share their per-field pending counter. After the first
+    # advance() on a bool field -- even a zero or cancelling one -- later
+    # offsets through any of those aliases validate against int32 exactly
+    # as stock's already-promoted array would. A read that encounters a *tracer*
     # -- metadata swapped into a trace by
     # ``mx.compile(..., inputs=vars(cache))`` -- is pure: no fold, no
     # scheduling, like stock's attribute access, and the pending
@@ -711,10 +767,16 @@ class ArraysCache(_BaseCache):
     # first. Reads are serialized per cache: a reentrant lock guards the
     # advance bookkeeping, folds, scheduling, copies, and metadata
     # serialization, because stock's pure attribute reads were trivially
-    # thread-safe while unserialized concurrent folds of one array deadlock
-    # on their thread-local streams. Shallow aliases share that lock and
-    # their per-field bookkeeping for as long as they share the backing
-    # array; deepcopy preserves that topology within an alias graph.
+    # thread-safe while unserialized concurrent folds of one array
+    # deadlock on their thread-local streams. A second, array-identity
+    # lock serializes independently constructed caches that share a
+    # backing array. Shallow aliases share their cache lock and per-field
+    # bookkeeping; deepcopy preserves that topology within an alias
+    # graph. Quiescent generic pickle preserves the same topology, but
+    # pickle does not expose a lifecycle hook that can hold the source
+    # lock for the complete outer Pickler traversal: concurrent generic
+    # pickle is unsupported. ``meta_state`` and ``save_prompt_cache``
+    # remain linearizable complete metadata snapshots.
     # Cross-thread *mutation* (filter/extend/finalize racing anything)
     # remains unsupported, as in stock.
 
@@ -838,7 +900,7 @@ class ArraysCache(_BaseCache):
                 f"for {dtype} metadata"
             )
 
-    def _fold(self, arr_attr, adv_attr):
+    def _fold(self, arr_attr, state_attr):
         """Fold the pending decrement into the backing array -- in place,
         so aliases observe it -- and schedule the evaluation. A no-op on
         tracers (see _try_schedule): the fold stays pending, the counter
@@ -853,46 +915,49 @@ class ArraysCache(_BaseCache):
         in-flight chunk (an asynchronous interrupt or failed subtraction
         between the counter commit and the subtraction drops it)."""
         with self._fold_lock:
-            total = getattr(self, adv_attr)
-            if not total:
-                return
-            arr = getattr(self, arr_attr)
-            if not _try_schedule(arr):
-                return
-            total = self._wrap_advance(total, arr.dtype)
-            setattr(self, adv_attr, total)
-            lo, hi = -(1 << 63), (1 << 63) - 1
-            while True:
-                chunk = min(max(total, lo), hi)
-                total -= chunk
-                setattr(self, adv_attr, total)
-                arr -= chunk
-                setattr(self, arr_attr, arr)
+            state = getattr(self, state_attr)
+            with state.array_lock:
+                total = state.advance
                 if not total:
-                    break
+                    return
+                arr = getattr(self, arr_attr)
+                if not _try_schedule(arr):
+                    return
+                total = self._wrap_advance(total, arr.dtype)
+                state.advance = total
+                lo, hi = -(1 << 63), (1 << 63) - 1
+                while True:
+                    chunk = min(max(total, lo), hi)
+                    total -= chunk
+                    state.advance = total
+                    arr -= chunk
+                    setattr(self, arr_attr, arr)
+                    if not total:
+                        break
+                    mx.async_eval(arr)
                 mx.async_eval(arr)
-            mx.async_eval(arr)
 
     def _fold_lp(self):
-        self._fold("_left_padding", "_lp_advance")
+        self._fold("_left_padding", "_lp_state")
 
     def _fold_len(self):
-        self._fold("_lengths", "_len_advance")
+        self._fold("_lengths", "_len_state")
 
     @property
     def left_padding(self):
         if self._left_padding is None:
             return None
         with self._fold_lock:
-            if self._lp_advance:
-                self._fold_lp()
-            else:
-                # Schedule on every access: external in-place writes
-                # through the returned array are otherwise never
-                # evaluated for metadata nothing consumes (a property
-                # access is not an evaluation).
-                _try_schedule(self._left_padding)
-            return self._left_padding
+            with self._lp_state.array_lock:
+                if self._lp_advance:
+                    self._fold_lp()
+                else:
+                    # Schedule on every access: external in-place writes
+                    # through the returned array are otherwise never
+                    # evaluated for metadata nothing consumes (a property
+                    # access is not an evaluation).
+                    _try_schedule(self._left_padding)
+                return self._left_padding
 
     @left_padding.setter
     def left_padding(self, v):
@@ -911,19 +976,16 @@ class ArraysCache(_BaseCache):
                         "decrement is pending"
                     )
             same = v is self._left_padding
+            state = self._lp_state if same else _arrays_cache_field_state(v)
             if v is not None:
                 # Bound chains from repeatedly assigning lazy expressions
-                _try_schedule(v)
+                with state.array_lock:
+                    _try_schedule(v)
             self._left_padding = v
             if not same:
                 # Only a genuinely new array resets the bool-promotion
                 # record; re-assigning the backing array is not a reset
-                promotion = (
-                    self._len_state.promotion
-                    if v is not None and v is self._lengths
-                    else None
-                )
-                self._lp_state = _ArraysCacheFieldState(promotion=promotion)
+                self._lp_state = state
             else:
                 self._lp_advance = 0
 
@@ -932,11 +994,12 @@ class ArraysCache(_BaseCache):
         if self._lengths is None:
             return None
         with self._fold_lock:
-            if self._len_advance:
-                self._fold_len()
-            else:
-                _try_schedule(self._lengths)
-            return self._lengths
+            with self._len_state.array_lock:
+                if self._len_advance:
+                    self._fold_len()
+                else:
+                    _try_schedule(self._lengths)
+                return self._lengths
 
     @lengths.setter
     def lengths(self, v):
@@ -950,16 +1013,13 @@ class ArraysCache(_BaseCache):
                         "decrement is pending"
                     )
             same = v is self._lengths
+            state = self._len_state if same else _arrays_cache_field_state(v)
             if v is not None:
-                _try_schedule(v)
+                with state.array_lock:
+                    _try_schedule(v)
             self._lengths = v
             if not same:
-                promotion = (
-                    self._lp_state.promotion
-                    if v is not None and v is self._left_padding
-                    else None
-                )
-                self._len_state = _ArraysCacheFieldState(promotion=promotion)
+                self._len_state = state
             else:
                 self._len_advance = 0
 
@@ -967,6 +1027,42 @@ class ArraysCache(_BaseCache):
         """Fold both pending integer decrements into the stored arrays."""
         self._fold_lp()
         self._fold_len()
+
+    @contextmanager
+    def _metadata_locked(self):
+        """Lock this cache and every distinct backing metadata array."""
+        with self._fold_lock:
+            locks = {}
+            if self._left_padding is not None:
+                locks[id(self._lp_state.array_lock)] = self._lp_state.array_lock
+            if self._lengths is not None:
+                locks[id(self._len_state.array_lock)] = self._len_state.array_lock
+            with ExitStack() as stack:
+                for key in sorted(locks):
+                    stack.enter_context(locks[key])
+                yield
+
+    def _register_metadata_arrays(self):
+        if self._left_padding is not None:
+            self._lp_state = _register_arrays_cache_array(
+                self._left_padding, self._lp_state
+            )
+        if self._lengths is not None:
+            self._len_state = _register_arrays_cache_array(
+                self._lengths, self._len_state
+            )
+
+    def __setstate__(self, state):
+        if isinstance(state, tuple) and len(state) == 2:
+            state, slot_state = state
+        else:
+            slot_state = None
+        if state is not None:
+            self.__dict__.update(state)
+        if slot_state is not None:
+            for key, value in slot_state.items():
+                setattr(self, key, value)
+        self._register_metadata_arrays()
 
     def _require_folded(self, op):
         """Guard for mutators: a pending counter after _sync() means the
@@ -990,11 +1086,14 @@ class ArraysCache(_BaseCache):
         # fold cannot land (captured tracer), a copy would escape the
         # trace holding the transient tracer -- raise like the other
         # guarded mutations.
-        with self._fold_lock:
+        with self._metadata_locked():
             self._sync()
             self._require_folded("__copy__")
-            new = self.__class__.__new__(self.__class__)
-            new.__dict__.update(self.__dict__)
+            reducer = self.__reduce_ex__(4)
+            if isinstance(reducer, str):
+                return self
+            new = copy._reconstruct(self, None, *reducer)
+            new._register_metadata_arrays()
             return new
 
     def __deepcopy__(self, memo):
@@ -1004,13 +1103,14 @@ class ArraysCache(_BaseCache):
         # gets an independent lock for an independent array, while a
         # shared deepcopy memo preserves lock/state sharing within a
         # copied shallow-alias graph.
-        with self._fold_lock:
+        with self._metadata_locked():
             self._sync()
             self._require_folded("__deepcopy__")
-            new = self.__class__.__new__(self.__class__)
-            memo[id(self)] = new
-            for k, v in self.__dict__.items():
-                new.__dict__[k] = copy.deepcopy(v, memo)
+            reducer = self.__reduce_ex__(4)
+            if isinstance(reducer, str):
+                return self
+            new = copy._reconstruct(self, memo, *reducer)
+            new._register_metadata_arrays()
             return new
 
     def _materialize(self):
@@ -1093,7 +1193,7 @@ class ArraysCache(_BaseCache):
                 )
             return dtype + ":" + ",".join(str(x) for x in a.tolist())
 
-        with self._fold_lock:
+        with self._metadata_locked():
             if self._left_padding is None and self._lengths is None:
                 return ""
             self._sync()
@@ -1130,12 +1230,14 @@ class ArraysCache(_BaseCache):
         self._require_folded("filter")
         if self._left_padding is not None:
             promoted = self._lp_promoted
-            self._left_padding = self._left_padding[batch_indices]
-            self._lp_state = _ArraysCacheFieldState(promoted=promoted)
+            new = self._left_padding[batch_indices]
+            state = _arrays_cache_field_state(new, promoted=promoted)
+            self._left_padding, self._lp_state = new, state
         if self._lengths is not None:
             promoted = self._len_promoted
-            self._lengths = self._lengths[batch_indices]
-            self._len_state = _ArraysCacheFieldState(promoted=promoted)
+            new = self._lengths[batch_indices]
+            state = _arrays_cache_field_state(new, promoted=promoted)
+            self._lengths, self._len_state = new, state
         self._materialize()
 
     def extend(self, other):
@@ -1178,19 +1280,22 @@ class ArraysCache(_BaseCache):
         self._require_folded("extend")
         other._require_folded("extend")
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
-        self._left_padding = cat(
+        new = cat(
             materialize_promoted_bool(self._left_padding, self._lp_promoted),
             materialize_promoted_bool(other._left_padding, other._lp_promoted),
         )
-        self._lengths = cat(
+        state = _arrays_cache_field_state(new)
+        self._left_padding, self._lp_state = new, state
+        new = cat(
             materialize_promoted_bool(self._lengths, self._len_promoted),
             materialize_promoted_bool(other._lengths, other._len_promoted),
         )
-        # Concatenation rebinds both fields. Any logical bool promotion
-        # was materialized above, so the new arrays start with fresh
-        # per-field state and no alias bookkeeping from either input.
-        self._lp_state = _ArraysCacheFieldState()
-        self._len_state = _ArraysCacheFieldState()
+        state = _arrays_cache_field_state(new)
+        self._lengths, self._len_state = new, state
+        # Concatenation rebinds each field together with fresh bookkeeping as
+        # soon as that field succeeds. If the second concatenation raises, the
+        # first field therefore remains coherent and matches stock's partial
+        # mutation order without retaining a shallow alias's pending counter.
         self._materialize()
 
     def extract(self, idx):
@@ -1268,10 +1373,14 @@ class ArraysCache(_BaseCache):
             # field's counter is untouched. Scheduling matters even here:
             # a caller that discards the mask would otherwise leave the
             # fold unevaluated, one node per call.
-            self._fold_lp()
-            return pos >= self._left_padding[:, None]
-        self._fold_len()
-        return pos < self._lengths[:, None]
+            with self._fold_lock:
+                with self._lp_state.array_lock:
+                    self._fold_lp()
+                    return pos >= self._left_padding[:, None]
+        with self._fold_lock:
+            with self._len_state.array_lock:
+                self._fold_len()
+                return pos < self._lengths[:, None]
 
     @classmethod
     def merge(cls, caches):

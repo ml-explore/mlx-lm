@@ -1422,9 +1422,120 @@ class TestPromptCache(unittest.TestCase):
             alias.advance(1)
         concurrent_property_reads(aliases)
 
+    def test_arrays_cache_external_array_alias_state(self):
+        """Independent caches synchronize folds and logical bool promotion
+        when their public setters receive the same backing array."""
+        shared = mx.array([5])
+        mx.eval(shared)
+        aliases = [ArraysCache(size=1), ArraysCache(size=1)]
+        for alias in aliases:
+            alias.lengths = shared
+            alias.advance(1)
+
+        self.assertIsNot(aliases[0]._len_state, aliases[1]._len_state)
+        self.assertIsNot(aliases[0]._fold_lock, aliases[1]._fold_lock)
+        self.assertIs(
+            aliases[0]._len_state.array_lock,
+            aliases[1]._len_state.array_lock,
+        )
+        self.assertIs(
+            aliases[0]._len_state.promotion,
+            aliases[1]._len_state.promotion,
+        )
+
+        restored = pickle.loads(pickle.dumps(aliases))
+        self.assertIs(restored[0]._lengths, restored[1]._lengths)
+        self.assertIsNot(restored[0]._len_state, restored[1]._len_state)
+        self.assertIs(
+            restored[0]._len_state.array_lock,
+            restored[1]._len_state.array_lock,
+        )
+
+        gate = threading.Barrier(3)
+        arrays = []
+        errors = []
+
+        def read(cache):
+            try:
+                gate.wait()
+                arrays.append(cache.lengths)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [
+            threading.Thread(target=read, args=(cache,), daemon=True)
+            for cache in aliases
+        ]
+        for thread in threads:
+            thread.start()
+        gate.wait()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        mx.eval(*arrays)
+        self.assertEqual([array.tolist() for array in arrays], [[3], [3]])
+
+        shared = mx.array([True], dtype=mx.bool_)
+        aliases = [ArraysCache(size=1), ArraysCache(size=1)]
+        for alias in aliases:
+            alias.lengths = shared
+        aliases[0].advance(0)
+        self.assertTrue(aliases[1]._len_promoted)
+        with self.assertRaises(ValueError):
+            aliases[1].advance(2**31)
+
+        # left_padding uses the same array-identity synchronization.
+        shared = mx.array([5])
+        aliases = [ArraysCache(size=1), ArraysCache(size=1)]
+        for alias in aliases:
+            alias.left_padding = shared
+        self.assertIs(
+            aliases[0]._lp_state.array_lock,
+            aliases[1]._lp_state.array_lock,
+        )
+
+    def test_arrays_cache_subclass_slot_copy(self):
+        """Custom copy hooks preserve state stored in subclass slots."""
+
+        class Child(ArraysCache):
+            __slots__ = ("tag",)
+
+        cache = Child(size=1)
+        cache.lengths = mx.array([5])
+        cache.tag = {"items": [1]}
+
+        shallow = copy.copy(cache)
+        deep = copy.deepcopy(cache)
+        self.assertIs(shallow.tag, cache.tag)
+        self.assertEqual(deep.tag, cache.tag)
+        self.assertIsNot(deep.tag, cache.tag)
+        self.assertIs(shallow._lengths, cache._lengths)
+        self.assertIsNot(deep._lengths, cache._lengths)
+
+    def test_arrays_cache_failed_extend_detaches_state(self):
+        """A partial extend commit cannot retain an old alias counter."""
+        cache = ArraysCache(size=1, left_padding=[10])
+        cache.lengths = mx.array([30])
+        alias = copy.copy(cache)
+
+        other = ArraysCache(size=1, left_padding=[20])
+        other.lengths = mx.array([[40]])
+        with self.assertRaises(ValueError):
+            cache.extend(other)
+
+        self.assertEqual(cache._left_padding.tolist(), [10, 20])
+        self.assertEqual(alias._left_padding.tolist(), [10])
+        self.assertIsNot(cache._left_padding, alias._left_padding)
+        self.assertIsNot(cache._lp_state, alias._lp_state)
+        cache.advance(1)
+        self.assertEqual(alias.left_padding.tolist(), [10])
+        self.assertEqual(cache.left_padding.tolist(), [9, 19])
+
     def test_arrays_cache_pickle(self):
-        """The deferred state round-trips without trying to pickle a
-        native RLock, including the sharing topology of alias graphs."""
+        """A quiescent cache round-trips without trying to pickle a native
+        RLock, including the sharing topology of alias graphs. Concurrent
+        generic pickle is outside the supported synchronization contract."""
         cache = ArraysCache(size=1)
         cache.lengths = mx.array([5])
         cache.advance(2)
@@ -1436,12 +1547,13 @@ class TestPromptCache(unittest.TestCase):
         cache.lengths = mx.array([5])
         aliases = [cache, copy.copy(cache)]
         cache.advance(1)
-        restored = pickle.loads(pickle.dumps(aliases))
-        self.assertIs(restored[0]._lengths, restored[1]._lengths)
-        self.assertIs(restored[0]._len_state, restored[1]._len_state)
-        self.assertIs(restored[0]._fold_lock, restored[1]._fold_lock)
-        self.assertEqual(restored[0].lengths.tolist(), [4])
-        self.assertEqual(restored[1].lengths.tolist(), [4])
+        for protocol in range(2, pickle.HIGHEST_PROTOCOL + 1):
+            restored = pickle.loads(pickle.dumps(aliases, protocol=protocol))
+            self.assertIs(restored[0]._lengths, restored[1]._lengths)
+            self.assertIs(restored[0]._len_state, restored[1]._len_state)
+            self.assertIs(restored[0]._fold_lock, restored[1]._fold_lock)
+            self.assertEqual(restored[0].lengths.tolist(), [4])
+            self.assertEqual(restored[1].lengths.tolist(), [4])
 
     def test_arrays_cache_metadata_serialization_is_atomic(self):
         """advance() cannot interleave between the two encoded fields."""
