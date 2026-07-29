@@ -808,13 +808,40 @@ class KimiK3TextModel(nn.Module):
             )
             self._output_res_w_eff = None
 
-        kda_layers = args.linear_attn_config["kda_layers"]
-        self.ssm_idx = kda_layers[0] - 1 if kda_layers else None
+        self.pipeline_rank = 0
+        self.pipeline_size = 1
+        self.start_idx = 0
+        self.end_idx = len(self.layers)
+        self.num_layers = len(self.layers)
+        self.in_blocks = 0
+        self._set_cache_indices()
+
+    def _set_cache_indices(self):
+        self.ssm_idx = None
         self.attn_idx = None
-        for i in range(len(self.layers)):
-            if (i + 1) not in kda_layers:
+        for i, layer in enumerate(self.layers[self.start_idx : self.end_idx]):
+            if layer.is_linear:
+                if self.ssm_idx is None:
+                    self.ssm_idx = i
+            elif self.attn_idx is None:
                 self.attn_idx = i
+            if self.ssm_idx is not None and self.attn_idx is not None:
                 break
+
+    def pipeline(self, group):
+        self.pipeline_rank = group.rank()
+        self.pipeline_size = group.size()
+        base, extra = divmod(len(self.layers), self.pipeline_size)
+        seg = self.pipeline_size - self.pipeline_rank - 1
+        self.start_idx = seg * base + min(seg, extra)
+        self.end_idx = self.start_idx + base + (1 if seg < extra else 0)
+        self.num_layers = self.end_idx - self.start_idx
+        self.layers = self.layers[: self.end_idx]
+        self.layers[: self.start_idx] = [None] * self.start_idx
+        if self.use_attn_res:
+            block_size = self.args.attn_res_block_size
+            self.in_blocks = (self.start_idx + block_size - 1) // block_size
+        self._set_cache_indices()
 
     def __call__(
         self,
@@ -822,8 +849,9 @@ class KimiK3TextModel(nn.Module):
         cache: Optional[List[Any]] = None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
+        boundary_dtype = h.dtype
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * self.num_layers
 
         ssm_mask = (
             create_ssm_mask(h, cache[self.ssm_idx])
@@ -837,12 +865,45 @@ class KimiK3TextModel(nn.Module):
         else:
             attn_mask = None
 
-        blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
-        for layer, layer_cache in zip(self.layers, cache):
-            mask = ssm_mask if layer.is_linear else attn_mask
-            h, blocks = layer(h, mask=mask, cache=layer_cache, blocks=blocks)
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
 
-        if blocks is not None:
+        blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
+
+        if pipeline_rank < pipeline_size - 1:
+            src = pipeline_rank + 1
+            if blocks is not None:
+                packed = mx.distributed.recv(
+                    (self.in_blocks + 1, *h.shape), h.dtype, src
+                )
+                h = packed[-1]
+                blocks.raw = packed[:-1]
+                xf = blocks.raw.astype(mx.float32)
+                blocks.inv_rms = mx.rsqrt(
+                    (xf * xf).mean(axis=-1) + self.args.rms_norm_eps
+                )
+            else:
+                h = mx.distributed.recv_like(h, src)
+
+        for i in range(self.num_layers):
+            layer = self.layers[self.start_idx + i]
+            mask = ssm_mask if layer.is_linear else attn_mask
+            h, blocks = layer(h, mask=mask, cache=cache[i], blocks=blocks)
+
+        if pipeline_rank != 0:
+            dst = pipeline_rank - 1
+            if blocks is not None:
+                packed = mx.concatenate([blocks.raw, h[None]]).astype(boundary_dtype)
+                packed = mx.distributed.send(packed, dst)
+                h = packed[-1]
+            else:
+                h = mx.distributed.send(h.astype(boundary_dtype), dst)
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, h)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], h)
+        elif blocks is not None:
             if self.training or self._output_res_w_eff is None:
                 self._output_res_w_eff = self.output_attn_res_norm.weight.astype(
                     mx.float32
@@ -854,6 +915,10 @@ class KimiK3TextModel(nn.Module):
                 self.args.rms_norm_eps,
                 not self.training,
             )
+
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h.astype(boundary_dtype))[: h.shape[0]]
+
         return self.norm(h)
 
 
@@ -879,7 +944,7 @@ class LanguageModel(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.layers[self.model.start_idx : self.model.end_idx]
 
     def make_cache(self):
         caches: List[Any] = []
@@ -1201,7 +1266,9 @@ class Model(nn.Module):
                         group=group,
                     )
                     shard_inplace(
-                        layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
+                        layer.mlp.shared_experts.up_proj,
+                        "all-to-sharded",
+                        group=group,
                     )
                     shard_inplace(
                         layer.mlp.shared_experts.down_proj,
