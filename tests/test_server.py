@@ -368,6 +368,26 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
+    def test_handle_models_missing_cache(self):
+        # When no Hugging Face cache exists (e.g. air-gapped installs serving a
+        # local model path) scan_cache_dir raises CacheNotFound. The endpoint
+        # must still return a valid 200 response rather than committing the
+        # status before the failure and shipping a truncated body.
+        from unittest.mock import patch
+
+        from huggingface_hub.errors import CacheNotFound
+
+        url = f"http://localhost:{self.port}/v1/models"
+        with patch(
+            "mlx_lm.server.scan_cache_dir",
+            side_effect=CacheNotFound("no cache", cache_dir="/does/not/exist"),
+        ):
+            response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        response_body = json.loads(response.text)
+        self.assertEqual(response_body["object"], "list")
+        self.assertIsInstance(response_body["data"], list)
+
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
