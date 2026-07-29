@@ -12,7 +12,12 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import BatchGenerator, GenerationBatch, TextStateMachine
+from mlx_lm.generate import (
+    BatchGenerator,
+    GenerationBatch,
+    PromptProcessingBatch,
+    TextStateMachine,
+)
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
@@ -747,6 +752,113 @@ class TestResponseGeneratorResilience(unittest.TestCase):
                 # anything, the shared timestamp finally goes stale and
                 # the watchdog must fire for both in-flight requests.
                 keep_delivering_to_a.clear()
+
+                def drain_for_stall_error(q):
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        try:
+                            item = q.get(timeout=0.5)
+                        except Empty:
+                            continue
+                        if isinstance(item, Exception):
+                            return item
+                    return None
+
+                exc_b = drain_for_stall_error(queue_b)
+                self.assertIsInstance(exc_b, RuntimeError)
+                self.assertIn("generation stalled", str(exc_b))
+
+                exc_a = drain_for_stall_error(queue_a)
+                self.assertIsInstance(exc_a, RuntimeError)
+                self.assertIn("generation stalled", str(exc_a))
+
+            self.assertTrue(response_generator._generation_thread.is_alive())
+        finally:
+            response_generator.stop_and_join()
+
+    def test_stall_watchdog_prompt_progress_from_other_uid_can_mask_a_wedged_decode(
+        self,
+    ):
+        # Documents/locks in the exact masking shape from the archived
+        # #1493 incident (PR #1598 review, 2026-07-29): the July 17 server
+        # log shows one decode request (uid) wedged while *prompt-progress*
+        # for other, unrelated uids kept being delivered throughout the
+        # hang (06:55:15-06:57:47). Because last_delivery is refreshed by
+        # prompt-progress delivery too -- not just tokens -- that unrelated
+        # progress postpones detection of the wedged decode request.
+        #
+        # test_stall_watchdog_is_generator_wide_not_per_request already
+        # covers the shared-timestamp mechanism generically (token delivery
+        # to uid A masks a stalled uid B). This test drives the same
+        # mechanism with the specific signal from the archived incident --
+        # prompt-progress, not tokens -- for the request that keeps
+        # "generating," to lock in that the masking is not limited to the
+        # decode phase.
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        stall_timeout = 0.5
+        response_generator.model_provider.cli_args.generation_stall_timeout = (
+            stall_timeout
+        )
+        keep_progress_for_a = threading.Event()
+        keep_progress_for_a.set()
+
+        def fake_next(self):
+            time.sleep(0.02)
+            if keep_progress_for_a.is_set():
+                # uid 0 is request A (admitted first below); it is still
+                # in prefill and never finishes, so it keeps refreshing
+                # last_delivery every call via prompt-progress alone --
+                # request B never receives a token, an error, or a
+                # progress update of its own.
+                return (
+                    [
+                        PromptProcessingBatch.Response(
+                            uid=0,
+                            progress=(1, 2),
+                            end_of_segment=False,
+                            end_of_prompt=False,
+                        )
+                    ],
+                    [],
+                )
+            return [], []
+
+        try:
+            request_a, args_a = self._make_request()
+            request_b, args_b = self._make_request()
+
+            with mock.patch.object(BatchGenerator, "next", fake_next):
+                queue_a = Queue()
+                response_generator.requests.put((queue_a, request_a, args_a))
+                ctx_a = queue_a.get(timeout=30)
+                self.assertNotIsInstance(ctx_a, Exception)
+
+                queue_b = Queue()
+                response_generator.requests.put((queue_b, request_b, args_b))
+                ctx_b = queue_b.get(timeout=30)
+                self.assertNotIsInstance(ctx_b, Exception)
+
+                # Let A keep receiving prompt-progress for several
+                # multiples of the stall timeout. If the watchdog detected
+                # a per-request decode stall, B would already have been
+                # failed by now -- it never receives anything at all.
+                time.sleep(stall_timeout * 3)
+
+                self.assertTrue(response_generator._generation_thread.is_alive())
+                # A is receiving real prompt-progress deliveries.
+                self.assertGreater(queue_a.qsize(), 0)
+                # B has received nothing at all since admission -- no
+                # progress, no token, no error, no reset. This is the
+                # archived #1493 shape: a wedged request masked by
+                # unrelated prompt-progress, not detected within
+                # stall_timeout.
+                with self.assertRaises(Empty):
+                    queue_b.get_nowait()
+
+                # Now stop delivering progress for A too: with no uid
+                # delivering anything, the shared timestamp finally goes
+                # stale and the watchdog fires for both in-flight requests.
+                keep_progress_for_a.clear()
 
                 def drain_for_stall_error(q):
                     deadline = time.monotonic() + 5

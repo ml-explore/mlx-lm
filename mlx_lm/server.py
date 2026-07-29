@@ -640,10 +640,10 @@ class ResponseGenerator:
 
         # Wall-clock time a token, prompt-progress update, or admission ack
         # was last actually handed to a consumer queue. A batch loop can
-        # keep iterating (and burning real CPU/GPU) while never delivering
-        # anything to any request -- a livelock. Thread liveness and a
-        # naive per-iteration heartbeat both miss this; only delivery
-        # staleness catches it.
+        # keep iterating (and burning real CPU/GPU) while delivering
+        # nothing to *any* in-flight request -- a generator-wide delivery
+        # drought. Thread liveness and a naive per-iteration heartbeat both
+        # miss this; only delivery staleness catches it.
         #
         # Two deliberate scoping choices, worth calling out explicitly:
         #
@@ -651,11 +651,29 @@ class ResponseGenerator:
         #    request. It is refreshed by delivery to *any* uid, so ongoing
         #    admissions or progress on other requests postpone recovery for
         #    a single wedged request in the same batch. That is intentional:
-        #    the goal is to bound an engine-wide livelock (the batch loop
-        #    itself makes no forward progress for anyone -- the #1493
-        #    failure mode), not to guarantee a per-request delivery SLA. A
-        #    per-request stall inside an otherwise-healthy batch is a
-        #    different problem and is out of scope here.
+        #    the goal is to bound a generator-wide delivery drought (every
+        #    in-flight request goes silent for `stall_timeout` seconds), not
+        #    to guarantee a per-request delivery SLA. A per-request stall
+        #    inside an otherwise-healthy batch is a different problem and is
+        #    out of scope here.
+        #
+        #    This is narrower than the archived #1493 incident itself, not
+        #    an exact match for it. The July 17 capture (server log,
+        #    06:55:15-06:57:47) shows one decode request wedged while
+        #    prompt-progress for other, unrelated uids kept being delivered
+        #    throughout the hang -- and that unrelated progress refreshes
+        #    this same timestamp. On that captured incident, a 60s
+        #    `stall_timeout` would not have fired until roughly 3.5 minutes
+        #    after the wedge started, and there is no fixed upper bound on
+        #    the delay under regular long-prompt traffic. So: this watchdog
+        #    is a generator-wide-drought detector, and it is a real safety
+        #    net for the case where the whole batch genuinely stops
+        #    delivering; it is not a bounded-time detector for a single
+        #    wedged decode masked by unrelated admission/prefill progress,
+        #    which is the shape #1493 actually captured. See
+        #    `test_stall_watchdog_is_generator_wide_not_per_request` and
+        #    `test_stall_watchdog_prompt_progress_from_other_uid_can_mask_a_wedged_decode`,
+        #    which exercise this masking directly (PR #1598 review).
         #
         # 2. "Delivered" means put onto this process's internal per-request
         #    queue, i.e. handed off to the HTTP handler thread that owns
@@ -699,10 +717,13 @@ class ResponseGenerator:
                 # with no timeout -- which would turn "detected and reset
                 # the batch" into "the generation thread is now stuck in
                 # recovery instead." This has not been observed in
-                # practice (the reproduced #1493 failure is an *iterating*
-                # livelock, where the stream keeps completing steps, just
-                # without delivering output); it is a documented risk for
-                # a stream-level hang specifically, not a confirmed one.
+                # practice: the reproduced #1493 failure is an *iterating*
+                # livelock -- the stream keeps completing steps, and per
+                # the archived capture, other in-flight requests kept
+                # receiving prompt-progress throughout; only the one
+                # wedged decode request's queue went silent. It is a
+                # documented risk for a stream-level hang specifically,
+                # not a confirmed one.
                 batch_generator.close()
             except Exception:
                 logging.exception("Failed to close the batch generator.")
@@ -858,10 +879,13 @@ class ResponseGenerator:
                     # Detect a livelocked batch: the loop below can keep
                     # calling batch_generator.next() and doing real work
                     # (forward pass, eval sync) indefinitely without ever
-                    # putting anything on a request's queue -- reported as
-                    # a real-world failure mode in #1493. is_alive() and a
-                    # per-iteration heartbeat both stay green through this;
-                    # only "nothing delivered in N seconds" catches it.
+                    # putting anything on any request's queue -- a
+                    # generator-wide delivery drought (see the scope note
+                    # at `last_delivery`'s declaration above for how this
+                    # relates to, and differs from, the #1493 incident
+                    # itself). is_alive() and a per-iteration heartbeat
+                    # both stay green through this; only "nothing delivered
+                    # in N seconds" catches it.
                     #
                     # This check runs on the generation thread itself,
                     # between calls to batch_generator.next(), not
