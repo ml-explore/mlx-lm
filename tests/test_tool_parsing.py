@@ -197,6 +197,57 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_float_formatted_integer(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filePath": {"type": "string"},
+                            "limit": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # a float-formatted integer for an "integer" parameter is coerced, not rejected
+        test_case = (
+            "<function=read>\n"
+            "<parameter=filePath>\n/x/y.py\n</parameter>\n"
+            "<parameter=limit>\n140.0\n</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "read")
+        self.assertEqual(tool_call["arguments"]["filePath"], "/x/y.py")
+        self.assertEqual(tool_call["arguments"]["limit"], 140)
+        self.assertIsInstance(tool_call["arguments"]["limit"], int)
+
+        # a plain integer literal keeps working
+        test_case = (
+            "<function=read>\n"
+            "<parameter=filePath>\n/x/y.py\n</parameter>\n"
+            "<parameter=limit>\n140\n</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["limit"], 140)
+
+        # a genuinely non-integral value keeps its fractional part rather than
+        # being silently truncated
+        test_case = (
+            "<function=read>\n"
+            "<parameter=filePath>\n/x/y.py\n</parameter>\n"
+            "<parameter=limit>\n140.5\n</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["limit"], 140.5)
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
