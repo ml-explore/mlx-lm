@@ -329,6 +329,28 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
+    def test_mistral_json_array(self):
+        # Mistral Nemo, Mistral Small 2409, Ministral and Mixtral v0.3 emit a
+        # JSON array after "[TOOL_CALLS]" rather than the "name[ARGS]{...}"
+        # form used by Mistral 3 / Magistral / Devstral.
+        test_case = (
+            ' [{"name": "search", "arguments": {"query": "weather"}, "id": "abcdefghi"}, '
+            '{"name": "read_file", "arguments": {"path": "/tmp/test.txt"}}]'
+        )
+        expected = [
+            {"name": "search", "arguments": {"query": "weather"}, "id": "abcdefghi"},
+            {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+        ]
+        self.assertEqual(expected, mistral.parse_tool_call(test_case, None))
+
+    def test_mistral_rejects_unparseable(self):
+        for test_case in (
+            '[{"name": "read_file", "arguments": {"pa',  # truncated
+            "I will call the read_file tool.",  # plain prose
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(test_case, None)
+
 
 if __name__ == "__main__":
     unittest.main()
