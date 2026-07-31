@@ -42,6 +42,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool
     rope_scaling: Dict = None
     rope_theta: Optional[float] = None
+    indexer_rope_interleave: bool = True
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters

@@ -14,7 +14,7 @@ def make_sampler(
     min_tokens_to_keep: int = 1,
     top_k: int = 0,
     xtc_probability: float = 0.0,
-    xtc_threshold: float = 0.0,
+    xtc_threshold: float = 0.1,
     xtc_special_tokens: List[int] = [],
 ) -> Callable[[mx.array], mx.array]:
     """
@@ -263,7 +263,9 @@ def apply_xtc(
         )
 
     probs = mx.softmax(logits, -1)
-    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min()
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min(
+        axis=-1, keepdims=True
+    )
     if xtc_special_tokens:
         mask[..., xtc_special_tokens] = False
 
