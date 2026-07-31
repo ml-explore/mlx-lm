@@ -275,21 +275,30 @@ class TimeBudget:
 
 def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits, max_kv_size=None):
     """
-    Raise if any KV cache entry cannot honor a KV cache quantization request.
+    Validate a KV cache quantization request against a model's cache.
 
-    Converting an empty cache is free, so this probes the real conversion
-    rather than guessing from the cache class, and reports the reason the
-    cache itself gave rather than a guess about which flag caused it.
+    Raises when no entry can be quantized, since the request would then have no
+    effect at all, and warns when only some can. Partial quantization is worth
+    serving: on sliding-window architectures the layers that cannot convert hold
+    window-bounded state while the ones that can grow with the context, so they
+    hold the large majority of the bytes at long context lengths. Silence is the
+    thing to avoid, not partiality.
+
+    Converting an empty cache is free, so this probes the real conversion rather
+    than guessing from the cache class, and reports the reason the cache itself
+    gave rather than a guess about which flag caused it.
     """
+    quantizable = 0
     unsupported = Counter()
     for c in cache:
         if not hasattr(c, "to_quantized"):
             # Recurrent or otherwise non-KV state, e.g. the ArraysCache used
             # by Mamba and gated-delta-net layers, is not affected by
-            # --kv-bits and is not counted as a failure.
+            # --kv-bits and is not counted either way.
             continue
         try:
             c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+            quantizable += 1
         except NotImplementedError as e:
             unsupported[(type(c).__name__, str(e))] += 1
 
@@ -299,14 +308,23 @@ def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits, max_kv_size=None)
     summary = ", ".join(
         f"{n} x {name} ({reason})" for (name, reason), n in sorted(unsupported.items())
     )
+    skipped = sum(unsupported.values())
+
+    if quantizable:
+        logging.warning(
+            f"--kv-bits {kv_bits} applies to {quantizable} of {len(cache)} cache "
+            f"layers. {skipped} will stay unquantized: {summary}. On "
+            "sliding-window architectures these hold window-bounded state, while "
+            "the quantized layers grow with the context."
+        )
+        return
+
     hint = "Serve without --kv-bits"
     if max_kv_size is not None:
         hint += ", or without --max-kv-size, which builds a RotatingKVCache"
     raise ValueError(
-        f"--kv-bits {kv_bits} was requested but {sum(unsupported.values())} of "
-        f"{len(cache)} cache layers cannot be quantized: {summary}. Serving with "
-        "only the remaining layers quantized would ignore most of the request "
-        f"without reporting it. {hint}."
+        f"--kv-bits {kv_bits} cannot be applied to any of the {len(cache)} cache "
+        f"layers: {summary}. Serving would ignore the request entirely. {hint}."
     )
 
 
@@ -394,8 +412,8 @@ class ModelProvider:
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
-        # Fail before serving rather than part-way through a request, and
-        # rather than quantizing only the layers that happen to support it.
+        # Report what quantization will actually apply to before serving,
+        # rather than discovering it part-way through a request.
         if self.cli_args.kv_bits is not None:
             probe_cache = make_prompt_cache(
                 model, max_kv_size=self.cli_args.max_kv_size

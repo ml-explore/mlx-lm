@@ -528,13 +528,25 @@ class TestServerWithDraftModel(unittest.TestCase):
 
 
 class TestKVCacheQuantizable(unittest.TestCase):
-    def test_rejects_unquantizable_layers(self):
-        cache = [KVCache(), RotatingKVCache(max_size=8, keep=4)]
+    def test_warns_and_serves_hybrid_cache(self):
+        # A Gemma 4 / Laguna style layout: sliding-window layers cannot convert
+        # yet, but they are bounded by the window while the full-attention
+        # layers grow with the context, so quantizing those is still most of
+        # the saving. Warn, don't refuse.
+        cache = [KVCache()] + [RotatingKVCache(max_size=512) for _ in range(4)]
+        with self.assertLogs(level="WARNING") as logs:
+            _check_kv_cache_quantizable(cache, 64, 8)
+        message = "\n".join(logs.output)
+        self.assertIn("1 of 5", message)
+        self.assertIn("RotatingKVCache", message)
+
+    def test_rejects_when_nothing_can_be_quantized(self):
+        cache = [RotatingKVCache(max_size=8, keep=4) for _ in range(2)]
         with self.assertRaises(ValueError) as ctx:
             _check_kv_cache_quantizable(cache, 64, 8)
         message = str(ctx.exception)
         self.assertIn("RotatingKVCache", message)
-        self.assertIn("1 of 2", message)
+        self.assertIn("any of the 2 cache layers", message)
         # The reason comes from the cache, not from a guess about which flag
         # was responsible, so it stays accurate as cache support changes.
         self.assertNotIn("--max-kv-size", message)
@@ -543,11 +555,14 @@ class TestKVCacheQuantizable(unittest.TestCase):
         _check_kv_cache_quantizable([KVCache() for _ in range(4)], 64, 8)
 
     def test_ignores_non_kv_state(self):
-        _check_kv_cache_quantizable([KVCache(), ArraysCache(size=2)], 64, 8)
+        # Recurrent state is not a KV cache, so a model made only of quantizable
+        # attention layers plus recurrent state must not warn.
+        with self.assertNoLogs(level="WARNING"):
+            _check_kv_cache_quantizable([KVCache(), ArraysCache(size=2)], 64, 8)
 
     def test_rejects_max_kv_size_cache(self):
-        # make_prompt_cache builds RotatingKVCache(keep=4) for max_kv_size,
-        # and sink tokens have no quantized variant.
+        # make_prompt_cache builds RotatingKVCache(keep=4) for every layer with
+        # max_kv_size, so nothing is quantizable and the request is a no-op.
         model = types.SimpleNamespace(layers=[None] * 3)
         cache = make_prompt_cache(model, max_kv_size=32)
         with self.assertRaises(ValueError) as ctx:
