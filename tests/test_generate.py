@@ -502,6 +502,21 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].finish_reason, "stop")
         self.assertEqual(responses[uid2].finish_reason, "stop")
 
+    def test_batch_stats_zero_time_no_divide_by_zero(self):
+        # No time accrued should give 0.0 tps, not a ZeroDivisionError
+        gen = BatchGenerator(self.model)
+        with gen.stats() as stats:
+            pass
+        self.assertEqual(stats.prompt_tps, 0.0)
+        self.assertEqual(stats.generation_tps, 0.0)
+
+    def test_batch_stats_does_not_mask_exceptions(self):
+        # A body exception should propagate, not be masked by the stats finally-block
+        gen = BatchGenerator(self.model)
+        with self.assertRaises(ValueError):
+            with gen.stats():
+                raise ValueError("boom")
+
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:

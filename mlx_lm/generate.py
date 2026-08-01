@@ -1654,10 +1654,16 @@ class BatchGenerator:
             gen_time = total_time - self._prompt_time_counter
             stats.prompt_tokens += self._prompt_tokens_counter
             stats.prompt_time += self._prompt_time_counter
-            stats.prompt_tps = stats.prompt_tokens / stats.prompt_time
+            stats.prompt_tps = (
+                stats.prompt_tokens / stats.prompt_time if stats.prompt_time else 0.0
+            )
             stats.generation_tokens += self._gen_tokens_counter
             stats.generation_time += gen_time
-            stats.generation_tps = stats.generation_tokens / stats.generation_time
+            stats.generation_tps = (
+                stats.generation_tokens / stats.generation_time
+                if stats.generation_time
+                else 0.0
+            )
             stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
 
     def insert(
