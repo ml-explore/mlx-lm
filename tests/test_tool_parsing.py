@@ -329,6 +329,38 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
+    def test_minimax_m2_nullable_arguments(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                            "limit": {"type": ["integer", "null"]},
+                            "cursor": {"type": ["string", "null"]},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            '<invoke name="search">\n'
+            '<parameter name="query">weather</parameter>\n'
+            '<parameter name="limit">10</parameter>\n'
+            '<parameter name="cursor">null</parameter>\n'
+            "</invoke>"
+        )
+
+        tool_call = minimax_m2.parse_tool_call(test_case, tools)
+
+        self.assertEqual(
+            {"query": "weather", "limit": 10, "cursor": None},
+            tool_call["arguments"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
