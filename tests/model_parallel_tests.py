@@ -94,6 +94,26 @@ class TestModelParallel(unittest.TestCase):
                 "tie_word_embeddings": False,
                 "num_nextn_predict_layers": 1,
             },
+            {
+                "model_type": "qwen3_moe",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "mlp_only_layers": [0],
+                "norm_topk_prob": True,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 256,
+                "tie_word_embeddings": False,
+            },
         ]
         mx.random.seed(0)
         for config in test_configs:
