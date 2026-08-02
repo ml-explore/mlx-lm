@@ -715,8 +715,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -740,8 +739,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
@@ -814,6 +812,108 @@ def save_model(
         )
 
 
+Q4_0_GROUP_SIZE = 32
+Q4_0_BITS = 4
+# The grid spans [-8, 7]: the scale is extremum / -8 and the affine bias that recentres
+# it is -8 * scale.
+_Q4_0_NEGATIVE_EXTENT = 8
+
+
+def q4_0_quantize(w: mx.array):
+    """Reproduce the Q4_0 grid for one weight tensor.
+
+    Per 32-element group along the input axis the scale comes from the *signed* element of
+    largest magnitude, ``d = extremum / -8``. Using ``-abs(w).max() / 8`` instead flips the
+    sign on every group whose extremum is negative -- close to half of them -- which
+    silently yields a different grid rather than an error.
+
+    Returns MLX's affine triplet: packed 4-bit codes, ``scales = d`` and ``biases = -8 * d``.
+    """
+    if w.ndim != 2 or w.shape[-1] % Q4_0_GROUP_SIZE != 0:
+        raise ValueError(
+            "q4_0_quantize expects a 2-D weight whose last dimension is a multiple of "
+            f"{Q4_0_GROUP_SIZE}, got shape {w.shape}."
+        )
+    rows, cols = w.shape[0], w.shape[-1]
+    groups = cols // Q4_0_GROUP_SIZE
+    grouped = w.reshape(rows * groups, Q4_0_GROUP_SIZE).astype(mx.float32)
+
+    imax = mx.argmax(mx.abs(grouped), axis=-1, keepdims=True)
+    extremum = mx.take_along_axis(grouped, imax, axis=-1)
+    scales = extremum / -_Q4_0_NEGATIVE_EXTENT
+
+    is_zero = scales == 0
+    inverse = mx.where(
+        is_zero, mx.array(0.0), 1 / mx.where(is_zero, mx.array(1.0), scales)
+    )
+
+    # grouped * inverse lands in [-8, 8], so adding 8.5 is always positive and floor()
+    # equals the reference encoder's truncation. Rounding half-to-even would disagree on ties.
+    codes = mx.clip(mx.floor(grouped * inverse + 8.5), 0, 15).astype(mx.uint32)
+
+    # Pack 8 consecutive codes per uint32, low nibble first. The nibbles never overlap, so
+    # summing the shifted codes is exactly a bitwise or.
+    per_word = 32 // Q4_0_BITS
+    shifts = (mx.arange(per_word, dtype=mx.uint32) * Q4_0_BITS).reshape(1, 1, per_word)
+    packed = mx.sum(codes.reshape(rows, cols // per_word, per_word) << shifts, axis=2)
+
+    scale_grid = scales.reshape(rows, groups).astype(w.dtype)
+    return (
+        packed.astype(mx.uint32),
+        scale_grid,
+        (scale_grid * -_Q4_0_NEGATIVE_EXTENT).astype(w.dtype),
+    )
+
+
+def validate_calibration(calibration, group_size, bits, mode):
+    """Check a calibration request without loading anything.
+
+    A calibration fixes its own grid geometry, so a conflicting request is an error rather
+    than something to silently override. Callable early so large models fail fast.
+    """
+    if calibration not in ("standard", "q4_0"):
+        raise ValueError(f"Unknown calibration {calibration!r}.")
+    if calibration == "q4_0" and (
+        (bits or Q4_0_BITS) != Q4_0_BITS
+        or (group_size or Q4_0_GROUP_SIZE) != Q4_0_GROUP_SIZE
+        or mode != "affine"
+    ):
+        raise ValueError(
+            "q4_0 calibration requires bits 4, group size 32 and affine mode, got "
+            f"bits {bits}, group size {group_size}, mode {mode}."
+        )
+
+
+def _apply_q4_0_calibration(model, originals):
+    """Overwrite standard-derived grids with the Q4_0 grid on eligible linears.
+
+    Every captured path must have become a 4-bit/group-32 affine module. Anything else
+    means the conversion did not do what the calibration assumed, so raise rather than
+    write arrays into a module shaped for a different grid.
+    """
+    modules = dict(tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module))
+    for path, weight in originals.items():
+        module = modules.get(path)
+        if module is None or not hasattr(module, "scales"):
+            raise ValueError(
+                f"q4_0 calibration expected {path!r} to be quantized, but it was not."
+            )
+        geometry = (
+            getattr(module, "bits", None),
+            getattr(module, "group_size", None),
+            getattr(module, "mode", "affine"),
+        )
+        if geometry != (Q4_0_BITS, Q4_0_GROUP_SIZE, "affine"):
+            raise ValueError(
+                f"q4_0 calibration expected {path!r} to be 4-bit/group-32 affine, "
+                f"got bits/group_size/mode {geometry}."
+            )
+        packed, scales, biases = q4_0_quantize(weight)
+        module.weight = packed
+        module.scales = scales
+        module.biases = biases
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
@@ -821,6 +921,7 @@ def quantize_model(
     bits: Optional[int],
     mode: str = "affine",
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
+    calibration: str = "standard",
 ) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
@@ -835,10 +936,20 @@ def quantize_model(
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
           a dict of quantization parameters to pass to `to_quantized`.
+        calibration (str): How the quantization grid is derived. ``"standard"``
+          derives it from the weights as usual. ``"q4_0"`` instead reproduces the
+          Q4_0 grid, for checkpoints whose weights were already trained against it.
+          Requires 4 bits, group size 32 and affine mode. Only `nn.Linear` is
+          calibrated; other quantizable modules still land on the same 4-bit/group-32
+          affine grid but derive it the standard way. The output is ordinary affine
+          quantization either way, so this affects accuracy, not loadability.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
+    validate_calibration(calibration, group_size, bits, mode)
+    if calibration == "q4_0":
+        bits, group_size = Q4_0_BITS, Q4_0_GROUP_SIZE
 
     def defaults_for_mode(mode, group_size, bits):
         mode_defaults = {
@@ -863,6 +974,8 @@ def quantize_model(
         fine_grained_config = False
         quantized_config["quantization"] = quant_params
 
+    originals = {}
+
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
             return False
@@ -872,9 +985,29 @@ def quantize_model(
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
         if isinstance(bool_or_params, dict):
+            if calibration == "q4_0":
+                # A calibration fixes its own geometry, so a per-layer recipe asking for
+                # something else cannot be honoured. Rejecting beats silently installing
+                # 4-bit/group-32 arrays into, say, a 6-bit module.
+                incompatible = {
+                    k: v
+                    for k, v in bool_or_params.items()
+                    if (k == "bits" and v != Q4_0_BITS)
+                    or (k == "group_size" and v != Q4_0_GROUP_SIZE)
+                    or (k == "mode" and v != "affine")
+                }
+                if incompatible:
+                    raise ValueError(
+                        f"q4_0 calibration cannot honour per-layer parameters {incompatible} "
+                        f"for {path!r}; it requires bits 4, group size 32 and affine mode."
+                    )
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
             quantized_config["quantization"][path] = quant_params
+        # Capture here rather than in a separate traversal: predicates are not required to
+        # be pure, and evaluating one twice can disagree between the two passes.
+        if calibration == "q4_0" and bool_or_params and isinstance(module, nn.Linear):
+            originals[path] = module.weight
         return bool_or_params
 
     nn.quantize(
@@ -884,6 +1017,9 @@ def quantize_model(
         mode=mode,
         class_predicate=wrapped_predicate,
     )
+
+    if originals:
+        _apply_q4_0_calibration(model, originals)
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
 

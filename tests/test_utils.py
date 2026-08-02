@@ -265,5 +265,201 @@ class TestTrustRemoteCode(unittest.TestCase):
         self.assertEqual(loaded_config["model_type"], "llama")
 
 
+class TestQ4_0Calibration(unittest.TestCase):
+    """The q4_0 grid: scale from the *signed* element of largest magnitude."""
+
+    def _negative_extremum_group(self):
+        # extremum = -4 -> d = -4 / -8 = 0.5, code = floor(w / 0.5 + 8.5)
+        weights = [0.0] * 32
+        weights[0] = -4.0
+        weights[2] = 0.5
+        weights[3] = -0.5
+        weights[4] = 3.5
+        expected = [8] * 32  # w == 0 -> floor(8.5)
+        expected[0] = 0  # floor(-8 + 8.5)
+        expected[2] = 9  # floor(1 + 8.5)
+        expected[3] = 7  # floor(-1 + 8.5)
+        expected[4] = 15  # floor(7 + 8.5)
+        return weights, expected
+
+    def _unpack(self, packed):
+        words = packed.flatten().tolist()
+        return [(w >> (4 * i)) & 0xF for w in words for i in range(8)]
+
+    def test_hand_computable_codes_scales_and_biases(self):
+        weights, expected = self._negative_extremum_group()
+        w = mx.array(weights).reshape(1, 32)
+
+        packed, scales, biases = utils.q4_0_quantize(w)
+
+        self.assertEqual(self._unpack(packed), expected)
+        self.assertEqual(scales.tolist(), [[0.5]])
+        self.assertEqual(biases.tolist(), [[-4.0]])
+
+    def test_uses_signed_extremum_not_abs_max(self):
+        """The regression that matters: -abs(w).max()/8 flips the sign on nearly half
+        of all groups, silently producing a different grid."""
+        weights, _ = self._negative_extremum_group()
+        w = mx.array(weights).reshape(1, 32)
+
+        packed, scales, _ = utils.q4_0_quantize(w)
+
+        self.assertEqual(scales.tolist(), [[0.5]])
+        self.assertEqual(self._unpack(packed)[0], 0)
+
+        # -abs max would give d = -0.5, sending the same element to code 15.
+        wrong_scale = -max(abs(v) for v in weights) / 8
+        self.assertEqual(wrong_scale, -0.5)
+        self.assertEqual(min(15, int(weights[0] / wrong_scale + 8.5)), 15)
+
+    def test_positive_extremum_and_clipping(self):
+        weights = [0.0] * 32
+        weights[0] = 4.0
+        weights[1] = -3.5
+        w = mx.array(weights).reshape(1, 32)
+
+        packed, scales, biases = utils.q4_0_quantize(w)
+        codes = self._unpack(packed)
+
+        self.assertEqual(scales.tolist(), [[-0.5]])
+        self.assertEqual(biases.tolist(), [[4.0]])
+        self.assertEqual(codes[0], 0)
+        self.assertEqual(codes[1], 15)
+        self.assertTrue(all(0 <= c <= 15 for c in codes))
+
+    def test_all_zero_group_does_not_divide_by_zero(self):
+        w = mx.zeros((1, 32))
+
+        packed, scales, biases = utils.q4_0_quantize(w)
+
+        self.assertEqual(scales.tolist(), [[0.0]])
+        self.assertEqual(biases.tolist(), [[0.0]])
+        self.assertEqual(self._unpack(packed), [8] * 32)
+
+    def test_scales_are_per_group_across_rows(self):
+        values = [0.0] * 128
+        values[0] = -4.0  # row 0, group 0 -> 0.5
+        values[32] = 2.0  # row 0, group 1 -> -0.25
+        values[64] = 8.0  # row 1, group 0 -> -1.0
+        values[96] = -1.0  # row 1, group 1 -> 0.125
+        w = mx.array(values).reshape(2, 64)
+
+        _, scales, biases = utils.q4_0_quantize(w)
+
+        self.assertEqual(scales.tolist(), [[0.5, -0.25], [-1.0, 0.125]])
+        self.assertEqual(biases.tolist(), [[-4.0, 2.0], [8.0, -1.0]])
+
+    def test_dequantizes_onto_the_intended_lattice(self):
+        weights, expected = self._negative_extremum_group()
+        w = mx.array(weights).reshape(1, 32)
+
+        packed, scales, biases = utils.q4_0_quantize(w)
+        restored = mx.dequantize(
+            packed, scales=scales, biases=biases, group_size=32, bits=4, mode="affine"
+        )
+
+        scale = scales.tolist()[0][0]
+        want = [(c - 8) * scale for c in expected]
+        self.assertTrue(mx.allclose(restored.flatten(), mx.array(want)).item())
+
+    def test_rejects_incompatible_settings(self):
+        model = nn.Sequential(nn.Linear(32, 8))
+        for kwargs in (
+            {"bits": 8, "group_size": 32},
+            {"bits": 4, "group_size": 64},
+        ):
+            with self.assertRaises(ValueError):
+                utils.quantize_model(
+                    model, {}, calibration="q4_0", mode="affine", **kwargs
+                )
+
+    def test_accepts_omitted_settings(self):
+        model = nn.Sequential(nn.Linear(32, 8))
+        _, config = utils.quantize_model(
+            model, {}, group_size=None, bits=None, calibration="q4_0"
+        )
+        self.assertEqual(config["quantization"]["bits"], 4)
+        self.assertEqual(config["quantization"]["group_size"], 32)
+        self.assertEqual(config["quantization"]["mode"], "affine")
+
+    def test_calibrated_linear_matches_direct_derivation(self):
+        mx.random.seed(0)
+        linear = nn.Linear(64, 16, bias=True)
+        original = mx.array(linear.weight)
+        model = nn.Sequential(linear)
+
+        model, _ = utils.quantize_model(model, {}, None, None, calibration="q4_0")
+
+        want_w, want_s, want_b = utils.q4_0_quantize(original)
+        self.assertTrue(mx.array_equal(model.layers[0].weight, want_w).item())
+        self.assertTrue(mx.array_equal(model.layers[0].scales, want_s).item())
+        self.assertTrue(mx.array_equal(model.layers[0].biases, want_b).item())
+
+    def test_predicate_is_evaluated_once_per_module(self):
+        """A predicate is not required to be pure; evaluating it twice can disagree
+        between the capture and conversion passes and corrupt a module."""
+        calls = {}
+
+        def counting_predicate(path, module):
+            calls[path] = calls.get(path, 0) + 1
+            return True
+
+        model = nn.Sequential(nn.Linear(32, 8), nn.Linear(32, 8))
+        utils.quantize_model(
+            model,
+            {},
+            None,
+            None,
+            calibration="q4_0",
+            quant_predicate=counting_predicate,
+        )
+
+        self.assertTrue(calls)
+        self.assertTrue(all(n == 1 for n in calls.values()), calls)
+
+    def test_incompatible_per_layer_parameters_are_rejected(self):
+        def mixed_predicate(path, module):
+            return {"bits": 6, "group_size": 64}
+
+        model = nn.Sequential(nn.Linear(64, 8))
+        with self.assertRaises(ValueError):
+            utils.quantize_model(
+                model,
+                {},
+                None,
+                None,
+                calibration="q4_0",
+                quant_predicate=mixed_predicate,
+            )
+
+    def test_compatible_per_layer_parameters_are_allowed(self):
+        def matching_predicate(path, module):
+            return {"bits": 4, "group_size": 32}
+
+        model = nn.Sequential(nn.Linear(32, 8))
+        model, _ = utils.quantize_model(
+            model,
+            {},
+            None,
+            None,
+            calibration="q4_0",
+            quant_predicate=matching_predicate,
+        )
+        self.assertEqual(model.layers[0].bits, 4)
+        self.assertEqual(model.layers[0].group_size, 32)
+
+    def test_helper_rejects_unsupported_shapes(self):
+        with self.assertRaises(ValueError):
+            utils.q4_0_quantize(mx.zeros((1, 20)))
+        with self.assertRaises(ValueError):
+            utils.q4_0_quantize(mx.zeros((2, 2, 32)))
+
+    def test_unknown_calibration_is_rejected(self):
+        with self.assertRaises(ValueError):
+            utils.quantize_model(
+                nn.Sequential(nn.Linear(32, 8)), {}, None, None, calibration="nope"
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ from .utils import (
     quantize_model,
     save,
     upload_to_hub,
+    validate_calibration,
 )
 
 
@@ -97,6 +98,7 @@ def convert(
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
     trust_remote_code: bool = False,
+    q_calibration: str = "standard",
 ):
     # Check the save path is empty
     if isinstance(mlx_path, str):
@@ -107,6 +109,9 @@ def convert(
             f"Cannot save to the path {mlx_path} as it already exists."
             " Please delete the file/directory or specify a new path to save to."
         )
+
+    if quantize:
+        validate_calibration(q_calibration, q_group_size, q_bits, q_mode)
 
     print("[INFO] Loading")
     model, tokenizer, config = load(
@@ -156,6 +161,7 @@ def convert(
             q_bits,
             mode=q_mode,
             quant_predicate=quant_predicate,
+            calibration=q_calibration,
         )
 
     if dequantize:
@@ -204,6 +210,16 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Group size for quantization.",
         type=int,
         default=None,
+    )
+    parser.add_argument(
+        "--q-calibration",
+        choices=["standard", "q4_0"],
+        default="standard",
+        help=(
+            "How the quantization grid is derived. 'q4_0' reproduces the Q4_0 grid "
+            "for checkpoints already trained against it, instead of deriving a new "
+            "one. Requires --q-bits 4, --q-group-size 32 and affine mode."
+        ),
     )
     parser.add_argument(
         "--q-bits",
