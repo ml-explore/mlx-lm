@@ -845,5 +845,37 @@ class TestGenerate(unittest.TestCase):
         self.assertIsNone(response.token_ids)
 
 
+class TestQuantizedKVStartDefault(unittest.TestCase):
+    """The library defaults must not disagree with the CLI's own default."""
+
+    def _default(self, fn):
+        import inspect
+
+        return inspect.signature(fn).parameters["quantized_kv_start"].default
+
+    def test_generate_step_matches_cli_default(self):
+        from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START, generate_step
+
+        self.assertEqual(self._default(generate_step), DEFAULT_QUANTIZED_KV_START)
+
+    def test_speculative_generate_step_matches_cli_default(self):
+        from mlx_lm.generate import (
+            DEFAULT_QUANTIZED_KV_START,
+            speculative_generate_step,
+        )
+
+        self.assertEqual(
+            self._default(speculative_generate_step), DEFAULT_QUANTIZED_KV_START
+        )
+
+    def test_cache_prompt_shares_the_same_constant(self):
+        from mlx_lm.cache_prompt import (
+            DEFAULT_QUANTIZED_KV_START as CACHE_PROMPT_DEFAULT,
+        )
+        from mlx_lm.generate import DEFAULT_QUANTIZED_KV_START
+
+        self.assertEqual(CACHE_PROMPT_DEFAULT, DEFAULT_QUANTIZED_KV_START)
+
+
 if __name__ == "__main__":
     unittest.main()
