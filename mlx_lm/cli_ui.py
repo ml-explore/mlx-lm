@@ -1,10 +1,20 @@
 # Copyright © 2024 Apple Inc.
 
+import os
 import re
 import shutil
 import sys
 from contextlib import contextmanager
 from functools import lru_cache
+
+try:
+    # Importing readline is what makes input() honour the \x01/\x02
+    # non-printing markers corridor_input() emits, and what provides history
+    # and line editing. It is unavailable on some platforms (e.g. Windows
+    # without pyreadline), so the prompt must keep working without it.
+    import readline
+except ImportError:
+    readline = None
 
 import mlx.core as mx
 from rich.box import ROUNDED
@@ -249,6 +259,32 @@ class TrainUI:
         )
 
 
+CHAT_HISTORY_FILE = os.path.expanduser("~/.mlx_lm_chat_history")
+CHAT_HISTORY_LENGTH = 1000
+
+
+def load_chat_history(path: str = CHAT_HISTORY_FILE) -> None:
+    """Restore prompt history from a previous session, if there is one."""
+    if readline is None:
+        return
+    readline.set_history_length(CHAT_HISTORY_LENGTH)
+    try:
+        readline.read_history_file(path)
+    except (OSError, PermissionError):
+        # No history yet, or it is unreadable. Neither is worth failing over.
+        pass
+
+
+def save_chat_history(path: str = CHAT_HISTORY_FILE) -> None:
+    """Persist prompt history for the next session."""
+    if readline is None:
+        return
+    try:
+        readline.write_history_file(path)
+    except (OSError, PermissionError):
+        pass
+
+
 class ChatUI:
     """Helper class for rendering the chat UI and streaming responses."""
 
@@ -259,6 +295,7 @@ class ChatUI:
 
     def __enter__(self):
         if self._rank == 0:
+            load_chat_history()
             rows = [("model", str(self._args.model))]
             if self._args.adapter_path:
                 rows.append(("adapter", str(self._args.adapter_path)))
@@ -273,6 +310,8 @@ class ChatUI:
         return self
 
     def __exit__(self, *exc):
+        if self._rank == 0:
+            save_chat_history()
         return False
 
     def prompt(self) -> str:

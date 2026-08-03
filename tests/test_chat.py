@@ -1,7 +1,10 @@
 import argparse
+import os
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from mlx_lm import cli_ui
 from mlx_lm.chat import setup_arg_parser
 
 
@@ -169,6 +172,60 @@ class TestChat(unittest.TestCase):
         self.assertEqual(len(call_args), 1)
         self.assertEqual(call_args[0]["role"], "user")
         self.assertEqual(call_args[0]["content"], "What is the weather?")
+
+
+class TestChatHistory(unittest.TestCase):
+    """Prompt history is persisted across sessions, on rank 0 only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "history")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_round_trip(self):
+        if cli_ui.readline is None:
+            self.skipTest("readline unavailable on this platform")
+        cli_ui.readline.clear_history()
+        cli_ui.readline.add_history("hello there")
+        cli_ui.save_chat_history(self.path)
+
+        cli_ui.readline.clear_history()
+        self.assertEqual(cli_ui.readline.get_current_history_length(), 0)
+
+        cli_ui.load_chat_history(self.path)
+        self.assertEqual(cli_ui.readline.get_history_item(1), "hello there")
+
+    def test_missing_file_is_not_an_error(self):
+        cli_ui.load_chat_history(os.path.join(self.tmp.name, "does-not-exist"))
+
+    def test_unwritable_path_is_not_an_error(self):
+        cli_ui.save_chat_history(os.path.join(self.tmp.name, "no", "such", "dir"))
+
+    def test_history_is_skipped_without_readline(self):
+        with patch.object(cli_ui, "readline", None):
+            cli_ui.load_chat_history(self.path)
+            cli_ui.save_chat_history(self.path)
+        self.assertFalse(os.path.exists(self.path))
+
+    def test_only_rank_zero_touches_history(self):
+        args = MagicMock()
+        args.model, args.adapter_path = "m", None
+        args.max_tokens, args.system_prompt = 10, None
+
+        with patch.object(cli_ui, "load_chat_history") as load, patch.object(
+            cli_ui, "save_chat_history"
+        ) as save:
+            with cli_ui.ChatUI(args, rank=1):
+                pass
+            load.assert_not_called()
+            save.assert_not_called()
+
+            with cli_ui.ChatUI(args, rank=0):
+                pass
+            load.assert_called_once()
+            save.assert_called_once()
 
 
 if __name__ == "__main__":
