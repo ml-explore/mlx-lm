@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import mlx.core as mx
@@ -263,6 +264,45 @@ class TestTrustRemoteCode(unittest.TestCase):
         model, loaded_config = utils.load_model(self.model_path, strict=False)
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(loaded_config["model_type"], "llama")
+
+
+class TestDownloadLocalFirst(unittest.TestCase):
+    """_download should serve a cached repo without hitting the network."""
+
+    def test_cached_repo_skips_network(self):
+        calls = []
+
+        def fake_snapshot_download(repo, **kwargs):
+            calls.append(kwargs.get("local_files_only", False))
+            return "/tmp/cached"
+
+        with unittest.mock.patch.object(
+            utils, "snapshot_download", fake_snapshot_download
+        ):
+            path = utils._download("some/repo")
+
+        self.assertEqual(path, Path("/tmp/cached"))
+        # Exactly one call, and it asked for the cache only.
+        self.assertEqual(calls, [True])
+
+    def test_falls_back_to_network_when_not_cached(self):
+        calls = []
+
+        def fake_snapshot_download(repo, **kwargs):
+            local_only = kwargs.get("local_files_only", False)
+            calls.append(local_only)
+            if local_only:
+                raise utils.LocalEntryNotFoundError("not cached")
+            return "/tmp/downloaded"
+
+        with unittest.mock.patch.object(
+            utils, "snapshot_download", fake_snapshot_download
+        ):
+            path = utils._download("some/repo")
+
+        self.assertEqual(path, Path("/tmp/downloaded"))
+        # Tried the cache first, then fell back to the network.
+        self.assertEqual(calls, [True, False])
 
 
 if __name__ == "__main__":
