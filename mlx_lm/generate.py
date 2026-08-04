@@ -1425,7 +1425,7 @@ class GenerationBatch:
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
-                for processor in self.logits_processors[e]:
+                for processor in (self.logits_processors[e] or []):
                     sample_logits = processor(token_context[e], sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
