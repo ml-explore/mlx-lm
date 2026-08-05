@@ -72,6 +72,9 @@ CONFIG_DEFAULTS = {
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
     "clear_cache_threshold": 0,
+    "save_best": True,
+    "patience": None,
+    "min_delta": 0.0,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -150,6 +153,32 @@ def build_parser():
         "--grad-accumulation-steps",
         type=int,
         help="Number of steps to accumulate before each optimizer update.",
+    )
+    parser.add_argument(
+        "--no-save-best",
+        dest="save_best",
+        action="store_false",
+        default=None,
+        help=(
+            "Do not save the adapter with the lowest validation loss to "
+            "best_adapters.safetensors."
+        ),
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        help=(
+            "Stop training after this many validations without an improvement "
+            "in validation loss. Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--min-delta",
+        type=float,
+        help=(
+            "Minimum decrease in validation loss to count as an improvement "
+            "for --patience and for saving the best adapter."
+        ),
     )
     parser.add_argument(
         "--resume-adapter-file",
@@ -279,6 +308,9 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        save_best=args.save_best,
+        patience=args.patience,
+        min_delta=args.min_delta,
     )
 
     # Initialize the selected optimizer

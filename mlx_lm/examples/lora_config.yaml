@@ -50,6 +50,18 @@ steps_per_eval: 200
 # Number of micro-steps to accumulate before each optimizer update.
 grad_accumulation_steps: 1
 
+# Also save the adapter with the lowest validation loss to
+# best_adapters.safetensors. Needs a validation set.
+save_best: true
+
+# Stop after this many validations without an improvement in validation loss.
+# Null disables early stopping.
+patience: null
+
+# Minimum decrease in validation loss to count as an improvement, for both
+# patience and save_best.
+min_delta: 0.0
+
 # Load path to resume training with the given adapter weights.
 resume_adapter_file: null
 

@@ -22,6 +22,7 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
   - [Generate](#Generate)
 - [Fuse](#Fuse)
 - [Data](#Data)
+- [Choosing the Best Checkpoint](#Choosing-the-Best-Checkpoint)
 - [Memory Issues](#Memory-Issues)
 
 ## Run
@@ -361,6 +362,40 @@ How can I assistant you today.<|im_end|>
 If you are unsure of the format to use, the `chat` or `completions` are good to
 start with. For custom requirements on the format of the dataset, use the
 `text` format to assemble the content yourself.
+
+## Choosing the Best Checkpoint
+
+Training reports validation loss periodically but the weights saved in
+`adapters.safetensors` are the ones training *ended* on, which are not
+necessarily the best. If validation loss bottoms out partway through a long run,
+the final adapter is worse than one you already had.
+
+By default the adapter with the lowest validation loss is also written to
+`best_adapters.safetensors` alongside it, so you can pick whichever you want:
+
+```shell
+mlx_lm.generate --adapter-path adapters/best_adapters.safetensors ...
+```
+
+`adapters.safetensors` still always holds the final weights, so nothing changes
+for existing workflows. Pass `--no-save-best` to skip the extra file.
+
+To stop a run once it stops improving, use `--patience N`: training ends after
+`N` consecutive validations with no improvement. Since patience counts
+validations rather than iterations, its meaning depends on `--steps-per-eval`.
+`--min-delta` sets how much validation loss must drop to count as an
+improvement, which is useful when the loss is noisy or nearly flat:
+
+```shell
+mlx_lm.lora \
+    --model <path_to_model> \
+    --train \
+    --data <path_to_data> \
+    --patience 3 \
+    --min-delta 0.01
+```
+
+Early stopping is off unless `--patience` is given.
 
 ## Memory Issues
 

@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -79,6 +80,33 @@ class TrainingArgs:
         default=0,
         metadata={
             "help": "Clear the allocator cache between steps if it grows too large."
+        },
+    )
+    save_best: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Also save the adapter with the lowest validation loss to "
+                "best_adapters.safetensors. Requires a validation set."
+            )
+        },
+    )
+    patience: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Stop training after this many validations without an "
+                "improvement in validation loss. Disabled by default."
+            )
+        },
+    )
+    min_delta: float = field(
+        default=0.0,
+        metadata={
+            "help": (
+                "Minimum decrease in validation loss to count as an "
+                "improvement for patience and for saving the best adapter."
+            )
         },
     )
 
@@ -241,6 +269,14 @@ def train(
     if grad_accum_steps < 1:
         raise ValueError("grad_accumulation_steps must be at least 1")
 
+    if args.patience is not None:
+        if args.patience < 1:
+            raise ValueError("patience must be at least 1")
+        if val_dataset is None:
+            # Silently never stopping would be worse than saying so. save_best
+            # needs a validation loss too, but no-ops harmlessly without one.
+            raise ValueError("patience requires a validation set")
+
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
@@ -266,6 +302,11 @@ def train(
     trained_tokens = 0
     train_time = 0
     grad_accum = None
+    best_val_loss = float("inf")
+    best_it = None
+    n_no_improve = 0
+    stopped_early = False
+    best_adapter_file = Path(args.adapter_file).parent / "best_adapters.safetensors"
 
     ui = TrainUI(args.iters, rank=rank)
     with ui:
@@ -315,6 +356,29 @@ def train(
                             "val_time": val_time,
                         }
                     )
+
+                # Capture the best weights here rather than inferring them
+                # later from save timing: steps_per_eval and steps_per_save
+                # are independent, so the most recent periodic save is not
+                # necessarily the iteration that validated best.
+                if val_loss < best_val_loss - args.min_delta:
+                    best_val_loss = val_loss
+                    best_it = it
+                    n_no_improve = 0
+                    if args.save_best and rank == 0:
+                        best_weights = dict(tree_flatten(model.trainable_parameters()))
+                        mx.save_safetensors(str(best_adapter_file), best_weights)
+                        ui.report_save(best_adapter_file)
+                else:
+                    n_no_improve += 1
+                    if args.patience is not None and n_no_improve >= args.patience:
+                        rprint(
+                            f"[INFO] Stopping early at iter {it}: no improvement in "
+                            f"validation loss for {n_no_improve} validation(s). "
+                            f"Best was {best_val_loss:.3f} at iter {best_it}."
+                        )
+                        stopped_early = True
+                        break
 
                 tic = time.perf_counter()
 
@@ -373,7 +437,18 @@ def train(
                 mx.save_safetensors(str(checkpoint), adapter_weights)
                 ui.report_save(checkpoint)
 
-    # Save final weights
+    # Save final weights. This always writes the weights training ended on,
+    # even when it stopped early, so args.adapter_file keeps its meaning. The
+    # best checkpoint, if any, is a separate file.
     if rank == 0:
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
         mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        if best_it is not None and best_it != it:
+            msg = (
+                f"[INFO] Lowest validation loss was {best_val_loss:.3f} at iter "
+                f"{best_it}, while {args.adapter_file} holds the weights from "
+                f"iter {it}."
+            )
+            if args.save_best:
+                msg += f" The best weights are in {best_adapter_file}."
+            rprint(msg)
