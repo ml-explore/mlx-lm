@@ -6,6 +6,12 @@ from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
+#: Maps logprobs of shape ``(B, vocab_size)`` to sampled tokens of shape ``(B,)``.
+Sampler = Callable[[mx.array], mx.array]
+
+#: Maps ``(tokens, logits)`` to modified logits of the same shape as ``logits``.
+LogitsProcessor = Callable[[mx.array, mx.array], mx.array]
+
 
 def make_sampler(
     temp: float = 0.0,
@@ -16,7 +22,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.1,
     xtc_special_tokens: List[int] = [],
-) -> Callable[[mx.array], mx.array]:
+) -> Sampler:
     """
     Make a sampler function for use with ``generate_step``.
 
@@ -77,7 +83,7 @@ def make_logits_processors(
     presence_context_size: Optional[int] = 20,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = 20,
-):
+) -> List[LogitsProcessor]:
     """
     Make logits processors for use with ``generate_step``.
 
@@ -98,7 +104,7 @@ def make_logits_processors(
         logit_bias (dictionary, optional): Additive logit bias.
 
     Returns:
-        List[Callable[[mx.array, mx.array], mx.array]]:
+        List[LogitsProcessor]:
             A list of logits processors. Each processor in the list is a
             callable which takes an array of tokens and an array of logits
             and returns the updated logits.

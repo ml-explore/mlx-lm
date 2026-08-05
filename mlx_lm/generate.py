@@ -29,7 +29,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import LogitsProcessor, Sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -750,7 +750,7 @@ def generate(
     prompt: Union[str, List[int]],
     verbose: bool = False,
     **kwargs,
-) -> str:
+) -> Optional[str]:
     """
     Generate a complete response from the model.
 
@@ -777,7 +777,7 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return
+            return None
         print(
             f"Prompt: {response.prompt_tokens} tokens, "
             f"{response.prompt_tps:.3f} tokens-per-sec"
@@ -882,6 +882,25 @@ def _extend_cache(cache_a, cache_b):
     for ca, cb in zip(cache_a, cache_b):
         ca.extend(cb)
     return cache_a
+
+
+def _normalize_samplers(samplers, n: int):
+    if not samplers:
+        return [None] * n
+    return list(samplers)
+
+
+def _normalize_logits_processors(logits_processors, n: int):
+    """
+    Normalize per-sequence logits processors to a list of length ``n``.
+
+    Each entry is always a list of processors, empty if the sequence has none.
+    This is the only encoding of "no processors" that the batches use, so the
+    per-sequence step loop can iterate over an entry unconditionally.
+    """
+    if not logits_processors:
+        return [[] for _ in range(n)]
+    return [list(lp) if lp else [] for lp in logits_processors]
 
 
 def _build_trie(sequences):
@@ -1121,10 +1140,10 @@ class PromptProcessingBatch:
         self.tokens = tokens if tokens is not None else [[] for _ in uids]
 
         self.prefill_step_size = prefill_step_size
-        self.samplers = samplers if samplers is not None else []
+        self.samplers = _normalize_samplers(samplers, len(uids))
         self.fallback_sampler = fallback_sampler or (lambda x: mx.argmax(x, axis=-1))
-        self.logits_processors = (
-            logits_processors if logits_processors is not None else []
+        self.logits_processors = _normalize_logits_processors(
+            logits_processors, len(uids)
         )
         self.stop_matchers = (
             stop_matchers
@@ -1144,22 +1163,11 @@ class PromptProcessingBatch:
         return [c.extract(idx) for c in self.prompt_cache]
 
     def extend(self, batch):
-        if not any(self.samplers):
-            self.samplers = [None] * len(self.uids)
-        if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
-        samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
-        logits_processors = (
-            batch.logits_processors
-            if any(batch.logits_processors)
-            else [None] * len(batch.uids)
-        )
-
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
-        self.samplers.extend(samplers)
-        self.logits_processors.extend(logits_processors)
+        self.samplers.extend(batch.samplers)
+        self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.stop_matchers.extend(batch.stop_matchers)
 
@@ -1194,14 +1202,8 @@ class PromptProcessingBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
-            self.samplers = [self.samplers[idx] for idx in keep]
-        else:
-            self.samplers = [None] * len(keep)
-        if any(self.logits_processors):
-            self.logits_processors = [self.logits_processors[idx] for idx in keep]
-        else:
-            self.logits_processors = [[]] * len(keep)
+        self.samplers = [self.samplers[idx] for idx in keep]
+        self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
@@ -1347,15 +1349,17 @@ class GenerationBatch:
         self.prompt_cache = prompt_cache
         self.tokens = tokens
 
-        self.samplers = samplers
+        self.samplers = _normalize_samplers(samplers, len(uids))
         self.fallback_sampler = fallback_sampler
-        self.logits_processors = logits_processors
+        self.logits_processors = _normalize_logits_processors(
+            logits_processors, len(uids)
+        )
         self.stop_matchers = stop_matchers
         self.max_tokens = max_tokens
 
-        if self.samplers and len(self.samplers) != len(self.uids):
+        if len(self.samplers) != len(self.uids):
             raise ValueError("Insufficient number of samplers provided")
-        if self.logits_processors and len(self.logits_processors) != len(self.uids):
+        if len(self.logits_processors) != len(self.uids):
             raise ValueError("Insufficient number of logits_processors provided")
 
         self._current_tokens = None
@@ -1698,9 +1702,10 @@ class BatchGenerator:
 
         max_tokens = max_tokens or [self.max_tokens] * len(segments)
         all_tokens = all_tokens or [[] for _ in segments]
-        samplers = samplers or [None] * len(segments)
-        logits_processors = logits_processors or (
-            [self.logits_processors] * len(segments)
+        samplers = _normalize_samplers(samplers, len(segments))
+        logits_processors = _normalize_logits_processors(
+            logits_processors or [self.logits_processors] * len(segments),
+            len(segments),
         )
         stop_matchers = stop_matchers or ([self._default_stop_matcher] * len(segments))
 
