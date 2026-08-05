@@ -10,7 +10,22 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
+
+if TYPE_CHECKING:
+    # Self is only in typing from 3.11; the package supports >= 3.8, so it is
+    # imported for type checkers only and referenced as a string annotation.
+    from typing import Self
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -29,7 +44,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import LogitsProcessor, Sampler, make_sampler
+from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -300,8 +315,8 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    sampler: Optional[Sampler] = None,
+    logits_processors: Optional[List[LogitsProcessor]] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
@@ -319,9 +334,9 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+        sampler (Sampler, optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+        logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         max_kv_size (int, optional): Maximum size of the key-value cache. Old
@@ -374,7 +389,7 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or greedy_sampler
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -468,8 +483,8 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    sampler: Optional[Sampler] = None,
+    logits_processors: Optional[List[LogitsProcessor]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 512,
     kv_bits: Optional[int] = None,
@@ -487,9 +502,9 @@ def speculative_generate_step(
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[[mx.array], mx.array], optional): A sampler for sampling a
+        sampler (Sampler, optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+        logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
@@ -523,7 +538,7 @@ def speculative_generate_step(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or greedy_sampler
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -884,13 +899,17 @@ def _extend_cache(cache_a, cache_b):
     return cache_a
 
 
-def _normalize_samplers(samplers, n: int):
+def _normalize_samplers(
+    samplers: Optional[List[Optional[Sampler]]], n: int
+) -> List[Optional[Sampler]]:
     if not samplers:
         return [None] * n
     return list(samplers)
 
 
-def _normalize_logits_processors(logits_processors, n: int):
+def _normalize_logits_processors(
+    logits_processors: Optional[List[Optional[List[LogitsProcessor]]]], n: int
+) -> List[List[LogitsProcessor]]:
     """
     Normalize per-sequence logits processors to a list of length ``n``.
 
@@ -1126,11 +1145,9 @@ class PromptProcessingBatch:
         caches: List[List[Any]],
         tokens: Optional[List[List[int]]] = None,
         prefill_step_size: int = 2048,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        fallback_sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Optional[Sampler]]] = None,
+        fallback_sampler: Optional[Sampler] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
         max_tokens: Optional[List[int]] = None,
     ):
@@ -1141,7 +1158,7 @@ class PromptProcessingBatch:
 
         self.prefill_step_size = prefill_step_size
         self.samplers = _normalize_samplers(samplers, len(uids))
-        self.fallback_sampler = fallback_sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.fallback_sampler = fallback_sampler or greedy_sampler
         self.logits_processors = _normalize_logits_processors(
             logits_processors, len(uids)
         )
@@ -1162,7 +1179,7 @@ class PromptProcessingBatch:
     def extract_cache(self, idx: int) -> List[Any]:
         return [c.extract(idx) for c in self.prompt_cache]
 
-    def extend(self, batch):
+    def extend(self, batch: "Self") -> None:
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
@@ -1171,7 +1188,7 @@ class PromptProcessingBatch:
         self.max_tokens.extend(batch.max_tokens)
         self.stop_matchers.extend(batch.stop_matchers)
 
-    def _copy(self):
+    def _copy(self) -> "Self":
         new_batch = self.__class__.__new__(self.__class__)
         new_batch.model = self.model
         new_batch.uids = list(self.uids)
@@ -1185,7 +1202,7 @@ class PromptProcessingBatch:
         new_batch.max_tokens = list(self.max_tokens)
         return new_batch
 
-    def split(self, indices: List[int]):
+    def split(self, indices: List[int]) -> "Self":
         indices = sorted(indices)
         indices_left = sorted(set(range(len(self.uids))) - set(indices))
         new_batch = self._copy()
@@ -1194,7 +1211,7 @@ class PromptProcessingBatch:
 
         return new_batch
 
-    def filter(self, keep: List[int]):
+    def filter(self, keep: List[int]) -> None:
         self.uids = [self.uids[idx] for idx in keep]
         if not keep:
             self.prompt_cache.clear()
@@ -1207,7 +1224,7 @@ class PromptProcessingBatch:
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
-    def prompt(self, tokens: List[List[int]]):
+    def prompt(self, tokens: List[List[int]]) -> None:
         """
         Process prompt tokens through the model.
 
@@ -1255,7 +1272,7 @@ class PromptProcessingBatch:
             mx.eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
 
-    def generate(self, tokens: List[List[int]]):
+    def generate(self, tokens: List[List[int]]) -> "GenerationBatch":
         """
         Transition from prompt processing to generation.
 
@@ -1295,9 +1312,9 @@ class PromptProcessingBatch:
     def empty(
         cls,
         model: nn.Module,
-        fallback_sampler: Callable[[mx.array], mx.array],
+        fallback_sampler: Sampler,
         prefill_step_size: int = 2048,
-    ):
+    ) -> "Self":
         return cls(
             model=model,
             fallback_sampler=fallback_sampler,
@@ -1336,11 +1353,9 @@ class GenerationBatch:
         inputs: mx.array,
         prompt_cache: List[Any],
         tokens: List[List[int]],
-        samplers: Optional[List[Callable[[mx.array], mx.array]]],
-        fallback_sampler: Callable[[mx.array], mx.array],
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ],
+        samplers: Optional[List[Optional[Sampler]]],
+        fallback_sampler: Sampler,
+        logits_processors: Optional[List[List[LogitsProcessor]]],
         stop_matchers: List[StopSequenceMatcher],
         max_tokens: List[int],
     ):
@@ -1371,12 +1386,12 @@ class GenerationBatch:
         self._matcher_states = [m.make_state() for m in stop_matchers]
 
         if self.uids:
-            self._step()
+            _ = self._step()
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.uids)
 
-    def extend(self, batch):
+    def extend(self, batch: "Self") -> None:
         """Extend this batch with another generation batch."""
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
@@ -1466,7 +1481,7 @@ class GenerationBatch:
     def extract_cache(self, idx: int) -> List[Any]:
         return [c.extract(idx) for c in self.prompt_cache]
 
-    def filter(self, keep: List[int]):
+    def filter(self, keep: List[int]) -> None:
         """Filter the batch to keep only the specified indices."""
         self.uids = [self.uids[idx] for idx in keep]
         if not keep:
@@ -1550,8 +1565,8 @@ class GenerationBatch:
     def empty(
         cls,
         model: nn.Module,
-        fallback_sampler: Callable[[mx.array], mx.array],
-    ):
+        fallback_sampler: Sampler,
+    ) -> "Self":
         return cls(
             model=model,
             fallback_sampler=fallback_sampler,
@@ -1583,10 +1598,8 @@ class BatchGenerator:
         *,
         max_tokens: int = 128,
         stop_tokens: Optional[Sequence[Sequence[int]]] = None,
-        sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        logits_processors: Optional[
-            List[Callable[[mx.array, mx.array], mx.array]]
-        ] = None,
+        sampler: Optional[Sampler] = None,
+        logits_processors: Optional[List[LogitsProcessor]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
@@ -1595,8 +1608,8 @@ class BatchGenerator:
     ):
         self.model = model
         self.max_tokens = max_tokens
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
-        self.logits_processors = logits_processors or []
+        self.sampler = sampler or greedy_sampler
+        self.logits_processors: List[LogitsProcessor] = logits_processors or []
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
@@ -1634,13 +1647,13 @@ class BatchGenerator:
     def stream(self):
         return self._stream
 
-    def close(self):
+    def close(self) -> None:
         if self._old_wired_limit is not None:
             mx.synchronize(self._stream)
             mx.set_wired_limit(self._old_wired_limit)
             self._old_wired_limit = None
 
-    def __del__(self):
+    def __del__(self) -> None:
         self.close()
 
     @contextlib.contextmanager
@@ -1670,12 +1683,10 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Optional[Sampler]]] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
-    ):
+    ) -> List[int]:
         return self.insert_segments(
             [[p] for p in prompts],
             max_tokens,
@@ -1692,12 +1703,10 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Optional[Sampler]]] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
-    ):
+    ) -> List[int]:
         uids = []
 
         max_tokens = max_tokens or [self.max_tokens] * len(segments)
@@ -1807,13 +1816,13 @@ class BatchGenerator:
         return caches
 
     @property
-    def prompt_cache_nbytes(self):
+    def prompt_cache_nbytes(self) -> int:
         total = sum(c.nbytes for p in self._unprocessed_sequences for c in p[3])
         total += sum(c.nbytes for c in self._prompt_batch.prompt_cache)
         total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
         return total
 
-    def _make_batch(self, n: int):
+    def _make_batch(self, n: int) -> "PromptProcessingBatch":
         uids = []
         caches = []
         tokens = []
@@ -1935,7 +1944,7 @@ class BatchGenerator:
         with mx.stream(self._stream):
             return self._next()
 
-    def next_generated(self):
+    def next_generated(self) -> List["GenerationBatch.Response"]:
         """
         Return only generated tokens ignoring batch generation responses.
 
@@ -1983,7 +1992,7 @@ def batch_generate(
     return_prompt_caches: bool = False,
     return_token_ids: bool = False,
     return_logprobs: bool = False,
-    **kwargs,
+    **kwargs: Any,
 ) -> BatchResponse:
     """
     Generate responses for the given batch of prompts.

@@ -6,10 +6,7 @@ from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
-#: Maps logprobs of shape ``(B, vocab_size)`` to sampled tokens of shape ``(B,)``.
 Sampler = Callable[[mx.array], mx.array]
-
-#: Maps ``(tokens, logits)`` to modified logits of the same shape as ``logits``.
 LogitsProcessor = Callable[[mx.array, mx.array], mx.array]
 
 
@@ -46,15 +43,15 @@ def make_sampler(
 
 
     Returns:
-        Callable[mx.array, mx.array]:
+        Sampler:
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        return greedy_sampler
 
     # Create sampler chain
     sampling_methods = []
-    if top_p > 0 and top_p < 1.0:
+    if 0 < top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
@@ -66,7 +63,7 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_top_k(x, top_k))
 
     # Apply the sampling methods
-    def sampler(logprobs):
+    def sampler(logprobs: mx.array) -> mx.array:
         for method in sampling_methods:
             logprobs = method(logprobs)
         # Return the sampled token
@@ -130,6 +127,10 @@ def make_logits_processors(
             logits_processors.append(make_penalty(penalty, context_size))
 
     return logits_processors
+
+
+def greedy_sampler(logprobs: mx.array) -> mx.array:
+    return mx.argmax(logprobs, axis=-1)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
@@ -283,8 +284,8 @@ def apply_xtc(
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
-def categorical_sampling(logits, temp):
-    return mx.random.categorical(logits * (1 / temp))
+def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
+    return mx.random.categorical(logits * (1.0 / temp))
 
 
 def make_repetition_penalty(penalty: float, context_size: int = 20):
