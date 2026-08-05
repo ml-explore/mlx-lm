@@ -627,6 +627,50 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_kanana2_tiny(self):
+        from mlx_lm.models import kanana2_tiny
+
+        # Alternating pattern as shipped by the checkpoint: three sliding
+        # layers then one full-attention layer, each type with its own rope.
+        layer_types = ["sliding_attention"] * 3 + ["full_attention"]
+        args = kanana2_tiny.ModelArgs(
+            model_type="kanana2_tiny",
+            hidden_size=128,
+            num_hidden_layers=len(layer_types),
+            intermediate_size=256,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=10_000,
+            head_dim=32,
+            max_position_embeddings=4096,
+            layer_types=layer_types,
+            sliding_window=8,
+            rope_parameters={
+                "full_attention": {
+                    "rope_type": "yarn",
+                    "rope_theta": 10000,
+                    "factor": 40.0,
+                    "original_max_position_embeddings": 512,
+                },
+                "sliding_attention": {
+                    "rope_type": "default",
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = kanana2_tiny.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # The two attention types must not share a rope: the full-attention
+        # layers are yarn-scaled for long context, the sliding ones are not.
+        sliding_rope = model.layers[0].self_attn.rope
+        full_rope = model.layers[3].self_attn.rope
+        self.assertIsNot(sliding_rope, full_rope)
+        self.assertNotEqual(type(sliding_rope), type(full_rope))
+
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
             "hidden_size": 8,
