@@ -35,7 +35,10 @@ def _rstrip_until(s, untils):
     l = len(s)
     f = [s.find(u) for u in untils]
     f = [l if x < 0 else x for x in f]
-    return s[: min(f)]
+    # A task may legitimately specify no stop sequences -- ifeval sets
+    # `until: []` because the completion is meant to run to max_gen_toks --
+    # and there is then nothing to truncate at.
+    return s[: min(f, default=l)]
 
 
 def _lstrip(s, pattern):

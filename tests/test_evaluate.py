@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 
-from mlx_lm.evaluate import MLXLM
+from mlx_lm.evaluate import MLXLM, _rstrip_until
 
 
 class TestMLXLM(unittest.TestCase):
@@ -53,6 +53,26 @@ class TestMLXLM(unittest.TestCase):
         self.assertEqual(len(call_args_list[0][0][0]), 2)  # First batch: 2 items
         self.assertEqual(len(call_args_list[1][0][0]), 2)  # Second batch: 2 items
         self.assertEqual(len(call_args_list[2][0][0]), 1)  # Third batch: 1 item
+
+
+class TestRstripUntil(unittest.TestCase):
+    def test_truncates_at_first_stop_sequence(self):
+        self.assertEqual(_rstrip_until("abc<eos>def", ["<eos>"]), "abc")
+
+    def test_truncates_at_the_earliest_of_several(self):
+        self.assertEqual(_rstrip_until("abc\n\nQ:", ["Q:", "\n\n"]), "abc")
+
+    def test_returns_the_whole_string_when_nothing_matches(self):
+        self.assertEqual(_rstrip_until("abc", ["<eos>"]), "abc")
+
+    def test_no_stop_sequences(self):
+        # Tasks may legitimately specify none: lm-eval's ifeval (and every one
+        # of its multilingual variants) sets `until: []` so the completion runs
+        # to max_gen_toks. There is then nothing to truncate at.
+        self.assertEqual(_rstrip_until("abc", []), "abc")
+
+    def test_no_stop_sequences_on_empty_string(self):
+        self.assertEqual(_rstrip_until("", []), "")
 
 
 if __name__ == "__main__":
