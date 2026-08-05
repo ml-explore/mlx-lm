@@ -253,6 +253,9 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 def _infer_thinking(tokenizer):
     vocab = tokenizer.get_vocab()
     THINK_TOKENS = [
+        # Apertus has <think>/</think> in its vocabulary but never emits them,
+        # so its own markers must be checked first.
+        ("<|inner_prefix|>", "<|inner_suffix|>"),
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
     ]
@@ -566,6 +569,8 @@ def _infer_tool_parser(chat_template):
         return "qwen3_coder"
     elif "<|tool_calls_section_begin|>" in chat_template:
         return "kimi_k2"
+    elif "<|tools_prefix|>" in chat_template:
+        return "apertus"
     elif "[TOOL_CALLS]" in chat_template:
         return "mistral"
     elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
