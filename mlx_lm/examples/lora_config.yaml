@@ -50,6 +50,10 @@ steps_per_eval: 200
 # Number of micro-steps to accumulate before each optimizer update.
 grad_accumulation_steps: 1
 
+# Clip the global gradient norm to this value and skip the update when the norm
+# is not finite. Null disables both.
+grad_clip: null
+
 # Load path to resume training with the given adapter weights.
 resume_adapter_file: null
 

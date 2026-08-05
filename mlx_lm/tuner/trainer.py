@@ -5,11 +5,13 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
+from mlx.optimizers import clip_grad_norm
 from mlx.utils import tree_flatten, tree_map
 
 from ..cli_ui import TrainUI, rprint
@@ -73,6 +75,15 @@ class TrainingArgs:
         default=1,
         metadata={
             "help": "Number of steps to accumulate gradients before applying an optimizer update."
+        },
+    )
+    grad_clip: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Clip the global gradient norm to this value. Also skips the "
+                "optimizer update when the norm is not finite. Disabled by default."
+            )
         },
     )
     clear_cache_threshold: int = field(
@@ -241,6 +252,9 @@ def train(
     if grad_accum_steps < 1:
         raise ValueError("grad_accumulation_steps must be at least 1")
 
+    if args.grad_clip is not None and args.grad_clip <= 0:
+        raise ValueError("grad_clip must be positive")
+
     state = [model.state, optimizer.state, mx.random.state]
 
     @partial(mx.compile, inputs=state, outputs=state)
@@ -250,14 +264,29 @@ def train(
         if prev_grad is not None:
             grad = tree_map(lambda x, y: x + y, grad, prev_grad)
 
+        grad_norm = None
         if do_update:
             grad = average_gradients(grad)
             if grad_accum_steps > 1:
                 grad = tree_map(lambda x: x / grad_accum_steps, grad)
+            if args.grad_clip is not None:
+                # Clip the accumulated and averaged gradient, not each
+                # micro-batch, so accumulation stays equivalent to a large batch.
+                grad, grad_norm = clip_grad_norm(grad, args.grad_clip)
+                # A batch that overflows makes the norm inf or nan, and
+                # clip_grad_norm propagates that to every entry, so clipping
+                # alone would still poison the weights. Zero the gradient for
+                # that step instead. Note this is not a full no-op: a momentum
+                # optimizer still moves the weights by its existing state. It
+                # does keep the non-finite values out of them.
+                # mx.where keeps the check in the compiled graph; a Python
+                # branch on grad_norm would sync the device every step.
+                keep = mx.isfinite(grad_norm)
+                grad = tree_map(lambda g: mx.where(keep, g, 0), grad)
             optimizer.update(model, grad)
             grad = None
 
-        return lvalue, toks, grad
+        return lvalue, toks, grad, grad_norm
 
     model.train()
     losses = 0
@@ -266,6 +295,8 @@ def train(
     trained_tokens = 0
     train_time = 0
     grad_accum = None
+    max_grad_norm = mx.array(0.0)
+    n_nonfinite = mx.array(0, mx.int32)
 
     ui = TrainUI(args.iters, rank=rank)
     with ui:
@@ -318,7 +349,7 @@ def train(
 
                 tic = time.perf_counter()
 
-            lvalue, toks, grad_accum = step(
+            lvalue, toks, grad_accum, grad_norm = step(
                 batch,
                 grad_accum,
                 it % grad_accum_steps == 0,
@@ -327,7 +358,11 @@ def train(
             losses += lvalue
             n_tokens += toks
             steps += 1
-            mx.eval(state, losses, n_tokens, grad_accum)
+            if grad_norm is not None:
+                # Kept as arrays so tracking them adds no extra device sync.
+                max_grad_norm = mx.maximum(max_grad_norm, grad_norm)
+                n_nonfinite += mx.logical_not(mx.isfinite(grad_norm)).astype(mx.int32)
+            mx.eval(state, losses, n_tokens, grad_accum, max_grad_norm, n_nonfinite)
             _clear_cache(args.clear_cache_threshold)
             train_time += time.perf_counter() - tic
 
@@ -346,17 +381,29 @@ def train(
                 ui.report_train(it, train_loss, tokens_sec, trained_tokens)
 
                 if training_callback is not None:
-                    training_callback.on_train_loss_report(
-                        {
-                            "iteration": it,
-                            "train_loss": train_loss,
-                            "learning_rate": learning_rate,
-                            "iterations_per_second": it_sec,
-                            "tokens_per_second": tokens_sec,
-                            "trained_tokens": trained_tokens,
-                            "peak_memory": peak_mem,
-                        }
-                    )
+                    report = {
+                        "iteration": it,
+                        "train_loss": train_loss,
+                        "learning_rate": learning_rate,
+                        "iterations_per_second": it_sec,
+                        "tokens_per_second": tokens_sec,
+                        "trained_tokens": trained_tokens,
+                        "peak_memory": peak_mem,
+                    }
+                    if args.grad_clip is not None:
+                        report["max_grad_norm"] = max_grad_norm.item()
+                        report["non_finite_grad_steps"] = n_nonfinite.item()
+                    training_callback.on_train_loss_report(report)
+
+                if args.grad_clip is not None:
+                    skipped = n_nonfinite.item()
+                    if skipped > 0:
+                        rprint(
+                            f"[WARNING] Iter {it}: zeroed the gradient on {skipped} "
+                            "step(s) with a non-finite norm."
+                        )
+                    max_grad_norm = mx.array(0.0)
+                    n_nonfinite = mx.array(0, mx.int32)
 
                 losses = 0
                 n_tokens = 0

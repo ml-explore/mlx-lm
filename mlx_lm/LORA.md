@@ -362,6 +362,29 @@ If you are unsure of the format to use, the `chat` or `completions` are good to
 start with. For custom requirements on the format of the dataset, use the
 `text` format to assemble the content yourself.
 
+## NaN Loss
+
+By default there is no guard on the size of the gradient, so a single batch
+that overflows can put the weights in a state the run never recovers from and
+every later iteration reports `nan`.
+
+Use `--grad-clip <N>` to bound the global gradient norm to `N` (`1.0` is a
+common choice). This does two things:
+
+1. Gradients whose norm exceeds `N` are scaled down to `N`.
+2. If the norm comes out `inf` or `nan`, the gradient for that step is zeroed
+   so the non-finite values never reach the weights. Note that a momentum
+   optimizer such as Adam still moves the weights on that step using its
+   existing state; this bounds the damage of a bad batch rather than making the
+   step a complete no-op.
+
+Both are off unless you pass the flag, so the default behavior is unchanged.
+Steps with a non-finite norm are reported as a warning alongside the loss.
+
+If a run still diverges with clipping on, the usual next levers are a lower
+learning rate, adding warmup via `lr_schedule`, and lowering the LoRA `scale`
+in `lora_parameters`.
+
 ## Memory Issues
 
 Fine-tuning a large model with LoRA requires a machine with a decent amount

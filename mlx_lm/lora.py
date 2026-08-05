@@ -71,6 +71,7 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
+    "grad_clip": None,
     "clear_cache_threshold": 0,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
@@ -150,6 +151,14 @@ def build_parser():
         "--grad-accumulation-steps",
         type=int,
         help="Number of steps to accumulate before each optimizer update.",
+    )
+    parser.add_argument(
+        "--grad-clip",
+        type=float,
+        help=(
+            "Clip the global gradient norm to this value and skip the update "
+            "when the norm is not finite. Off by default."
+        ),
     )
     parser.add_argument(
         "--resume-adapter-file",
@@ -279,6 +288,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        grad_clip=args.grad_clip,
     )
 
     # Initialize the selected optimizer
