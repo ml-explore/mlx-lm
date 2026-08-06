@@ -40,7 +40,7 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import can_trim_prompt_cache, LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -48,6 +48,16 @@ from .utils import _parse_size, load, sharded_load
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+def _split_for_checkpoints(segments, segment_types, checkpoint_size):
+    checkpointed_segments = []
+    checkpointed_types = []
+    for segment, segment_type in zip(segments, segment_types):
+        for start in range(0, len(segment), checkpoint_size):
+            checkpointed_segments.append(segment[start : start + checkpoint_size])
+            checkpointed_types.append(segment_type)
+    return checkpointed_segments, checkpointed_types
 
 
 class ToolCallFormatter:
@@ -602,6 +612,16 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state
 
+    def _add_hybrid_checkpoints(self, segments, segment_types):
+        cache = make_prompt_cache(self.model_provider.model)
+        if self.model_provider.draft_model is not None:
+            cache += make_prompt_cache(self.model_provider.draft_model)
+        if can_trim_prompt_cache(cache):
+            return segments, segment_types
+        return _split_for_checkpoints(
+            segments, segment_types, self.cli_args.prefill_step_size
+        )
+
     def _make_state_machine(self, model_key, tokenizer, stop_words):
         """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
         cache_key = (model_key, tuple(stop_words))
@@ -673,6 +693,9 @@ class ResponseGenerator:
                     try:
                         prompt, segments, segment_types, initial_state = self._tokenize(
                             current_tokenizer, request, args
+                        )
+                        segments, segment_types = self._add_hybrid_checkpoints(
+                            segments, segment_types
                         )
                     except Exception as e:
                         rqueue.put(e)

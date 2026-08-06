@@ -17,6 +17,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     SamplingArguments,
+    _split_for_checkpoints,
     _make_sampler,
 )
 from mlx_lm.utils import load
@@ -566,6 +567,14 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_split_for_checkpoints(self):
+        segments, types = _split_for_checkpoints(
+            [[1, 2, 3, 4, 5], [6, 7]], ["system", "user"], 2
+        )
+
+        self.assertEqual(segments, [[1, 2], [3, 4], [5], [6, 7]])
+        self.assertEqual(types, ["system", "system", "system", "user"])
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
@@ -615,6 +624,20 @@ class TestLRUPromptCache(unittest.TestCase):
         c[0].update_and_fetch(*get_kv(8))
         cache.insert_cache(model, tokens, c)
         self.assertEqual(len(cache), 2)
+
+    def test_nontrimmable_cache_uses_saved_prefix_after_branch(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        # A recurrent state cannot be trimmed to the branch point. Keep a
+        # checkpoint before it and replay only the suffix after that checkpoint.
+        cache.insert_cache(model, [1, 2, 3], [MockCache("prefix", False)])
+        cache.insert_cache(model, [1, 2, 3, 4, 9], [MockCache("longer", False)])
+
+        cached, rest = cache.fetch_nearest_cache(model, [1, 2, 3, 4, 8])
+
+        self.assertEqual(cached, [MockCache("prefix", False)])
+        self.assertEqual(rest, [4, 8])
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
