@@ -2,6 +2,7 @@
 import copy
 import importlib
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1215,6 +1216,40 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_falcon_mamba_bcdt_normalization(self):
+        from mlx_lm.models import mamba
+
+        args = mamba.ModelArgs(
+            model_type="falcon_mamba",
+            vocab_size=32,
+            use_bias=False,
+            use_conv_bias=True,
+            conv_kernel=4,
+            hidden_size=4,
+            num_hidden_layers=1,
+            state_size=2,
+            intermediate_size=8,
+            time_step_rank=2,
+        )
+        block = mamba.MambaBlock(args)
+
+        x = mx.ones((1, args.intermediate_size))
+        A = -mx.ones((args.intermediate_size, args.state_size))
+
+        with (
+            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
+            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
+        ):
+            y, state = block.ssm_step(x, A)
+
+        mx.eval(y, state)
+        self.assertEqual(rms_norm.call_count, 3)
+        for call in rms_norm.call_args_list:
+            self.assertIsNone(call.kwargs["weight"])
+        self.assertEqual(ones.call_count, 0)
+        self.assertEqual(y.shape, (1, args.intermediate_size))
+        self.assertEqual(state.shape, (1, args.intermediate_size, args.state_size))
 
     def test_falcon_h1(self):
         from mlx_lm.models import falcon_h1
