@@ -1436,8 +1436,10 @@ class BatchRotatingKVCache(_BaseCache):
     def merge(cls, caches):
         if not all(c.max_size == caches[0].max_size for c in caches):
             raise ValueError(
-                "BatchRotatingKVCache can only merge caches with the same maximum size"
+                "BatchRotatingKVCache can only merge caches with the same maximum size."
             )
+        if any(c.keep > 0 for c in caches):
+            raise ValueError("BatchRotatingKVCache does not support keep tokens.")
 
         offsets = [c.offset for c in caches]
         lengths = [c.size() for c in caches]

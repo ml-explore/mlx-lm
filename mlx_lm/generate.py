@@ -36,10 +36,6 @@ from transformers import PreTrainedTokenizer
 from .generate_utils import BatchCounters, BatchReading, BatchStats
 from .models import cache
 from .models.cache import (
-    ArraysCache,
-    BatchKVCache,
-    BatchRotatingKVCache,
-    CacheList,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -817,38 +813,6 @@ def _right_pad_prompts(prompts, max_length=None):
     if max_length is None:
         max_length = max(len(p) for p in prompts)
     return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
-
-
-def _make_cache(model, left_padding, max_kv_size):
-    """
-    Convert a list of regular caches into their corresponding
-    batch-aware caches.
-    """
-
-    def to_batch_cache(c):
-        if type(c) is KVCache:
-            return BatchKVCache(left_padding)
-        elif isinstance(c, ArraysCache):
-            c.left_padding = mx.array(left_padding)
-            return c
-        elif isinstance(c, RotatingKVCache):
-            if c.keep > 0:
-                raise ValueError("RotatingKVCache with keep tokens is not supported.")
-            return BatchRotatingKVCache(c.max_size, left_padding)
-        elif isinstance(c, CacheList):
-            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        if max_kv_size is not None:
-            return [
-                BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
-            ]
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _merge_caches(caches):
