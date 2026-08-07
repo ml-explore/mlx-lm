@@ -1591,7 +1591,6 @@ class BatchGenerator:
         self.max_tokens = max_tokens
         self.sampler = sampler or greedy_sampler
         self.logits_processors: List[LogitsProcessor] = logits_processors or []
-        self.uid_count = 0
         self.prefill_step_size = prefill_step_size
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
