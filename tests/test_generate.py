@@ -20,6 +20,24 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
 
+class TestBatchGenerateValidation(unittest.TestCase):
+    def test_rejects_mismatched_max_tokens(self):
+        prompts = [[1], [2]]
+
+        for max_tokens in ([2], [2, 5, 8]):
+            with self.subTest(max_tokens=max_tokens):
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "max_tokens must have the same length as prompts",
+                ):
+                    batch_generate(
+                        object(),
+                        object(),
+                        prompts,
+                        max_tokens=max_tokens,
+                    )
+
+
 class TestGenerate(unittest.TestCase):
 
     @classmethod

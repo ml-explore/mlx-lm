@@ -1992,7 +1992,7 @@ def batch_generate(
           won't be updated in-place.
        verbose (bool): If ``True``, print tokens and timing information.
           Default: ``False``.
-       max_tokens (Union[int, List[int]): Maximum number of output tokens. This
+       max_tokens (Union[int, List[int]]): Maximum number of output tokens. This
           can be per prompt if a list is provided.
        return_prompt_caches (bool): Return the prompt caches in the batch
           responses. Default: ``False``.
@@ -2004,7 +2004,16 @@ def batch_generate(
           for importance weighting. Default: ``False``.
        kwargs: The remaining options get passed to :obj:`BatchGenerator`.
           See :obj:`BatchGenerator` for more details.
+
+    Raises:
+       ValueError: If a list of ``max_tokens`` values does not have the same
+          length as ``prompts``.
     """
+
+    if isinstance(max_tokens, int):
+        max_tokens = [max_tokens] * len(prompts)
+    elif len(max_tokens) != len(prompts):
+        raise ValueError("max_tokens must have the same length as prompts")
 
     gen = BatchGenerator(
         model,
@@ -2015,9 +2024,6 @@ def batch_generate(
     fin = 0
     if verbose:
         print(f"[batch_generate] Finished processing 0/{num_samples} ...", end="\r")
-
-    if isinstance(max_tokens, int):
-        max_tokens = [max_tokens] * len(prompts)
 
     uids = gen.insert(prompts, max_tokens, caches=prompt_caches)
     results = {uid: [] for uid in uids}
