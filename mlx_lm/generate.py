@@ -14,6 +14,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
     Generator,
     Iterator,
     List,
@@ -872,7 +873,12 @@ def _normalize_logits_processors(
     return [list(lp) if lp else [] for lp in logits_processors]
 
 
-def _build_trie(sequences):
+_TrieNode = Dict[Any, Any]
+
+
+def _build_trie(
+    sequences: Union[Sequence[Any], Sequence[Sequence[Any]]],
+) -> _TrieNode:
     """Build an Aho-Corasick trie from the provided sequences
 
     See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm .
@@ -910,15 +916,6 @@ def _build_trie(sequences):
     return trie
 
 
-def _step_trie(node, trie, x):
-    """One step in the Aho-Corasick trie."""
-    while x not in node and node is not trie:
-        node = node["__fail__"]
-    if x in node:
-        node = node[x]
-    return node
-
-
 class StopSequenceMatcher:
     """Detect stop sequences in a stream of tokens using an Aho-Corasick trie.
 
@@ -926,22 +923,38 @@ class StopSequenceMatcher:
     stop word detection.
     """
 
-    def __init__(self, stop_sequences=None):
-        self._trie = _build_trie(stop_sequences) if stop_sequences else {}
+    def __init__(self, stop_sequences: Optional[Sequence[Sequence[int]]] = None):
+        self._root: _TrieNode = _build_trie(stop_sequences) if stop_sequences else {}
+        self._node: _TrieNode = self._root
 
-    def __deepcopy__(self, memo):
-        new = object.__new__(StopSequenceMatcher)
-        new._trie = self._trie
+    def restart(self) -> "StopSequenceMatcher":
+        """A matcher over the same automaton, positioned at the start."""
+        new = StopSequenceMatcher.__new__(StopSequenceMatcher)
+        new._root = self._root
+        new._node = self._root
         return new
 
-    def make_state(self):
-        return self._trie
+    def __copy__(self) -> "StopSequenceMatcher":
+        """An independent matcher at the same position over the same automaton."""
+        new = StopSequenceMatcher.__new__(StopSequenceMatcher)
+        new._root = self._root
+        new._node = self._node
+        return new
 
-    @staticmethod
-    def match(state, trie, x):
-        """Advance by one token. Returns (new_state, matched)."""
-        node = _step_trie(state, trie, x)
-        return node, node.get("__match__") is not None
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "StopSequenceMatcher":
+        return self.__copy__()
+
+    def advance(self, token: int) -> bool:
+        """Consume one token. Returns whether a stop sequence just completed."""
+        node = self._node
+        # Fail back until the token continues a partial match, or we are at the
+        # root and there is nothing left to fall back to.
+        while token not in node and node is not self._root:
+            node = node["__fail__"]
+        if token in node:
+            node = node[token]
+        self._node = node
+        return node.get("__match__") is not None
 
 
 class TextStateMachine:
@@ -1311,10 +1324,10 @@ class GenerationBatch:
     tokens: List[List[int]]
     samplers: Optional[List[Optional[Sampler]]]
     logits_processors: Optional[List[List[LogitsProcessor]]]
-    stop_matchers: List[StopSequenceMatcher]
+    stop_matchers: InitVar[List[StopSequenceMatcher]]
     max_tokens: List[int]
 
-    def __post_init__(self, inputs: mx.array):
+    def __post_init__(self, inputs: mx.array, stop_matchers: List[StopSequenceMatcher]):
         self.samplers = _normalize_samplers(
             self.samplers, n=len(self.uids), fallback=greedy_sampler
         )
@@ -1333,7 +1346,9 @@ class GenerationBatch:
         self._next_logprobs = []
         self._token_context = [TokenBuffer(t) for t in self.tokens]
         self._num_tokens = [0] * len(self.uids)
-        self._matcher_states = [m.make_state() for m in self.stop_matchers]
+        # One matcher per sequence: the incoming ones may be shared, and a
+        # matcher tracks its own position.
+        self._stop_matchers = [m.restart() for m in stop_matchers]
 
         if self.uids:
             _ = self._step()
@@ -1349,7 +1364,6 @@ class GenerationBatch:
         self.samplers.extend(batch.samplers)
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
-        self.stop_matchers.extend(batch.stop_matchers)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1366,7 +1380,7 @@ class GenerationBatch:
             self._next_logprobs.extend(batch._next_logprobs)
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
-        self._matcher_states.extend(batch._matcher_states)
+        self._stop_matchers.extend(batch._stop_matchers)
 
     def _step(self) -> Tuple[List[int], List[mx.array]]:
         """
@@ -1442,13 +1456,12 @@ class GenerationBatch:
         self.samplers = [self.samplers[idx] for idx in keep]
         self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
-        self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
-        self._matcher_states = [self._matcher_states[idx] for idx in keep]
+        self._stop_matchers = [self._stop_matchers[idx] for idx in keep]
 
     def next(self) -> List[Response]:
         """
@@ -1471,12 +1484,7 @@ class GenerationBatch:
             if self._num_tokens[i] >= self.max_tokens[i]:
                 finish_reason = "length"
 
-            self._matcher_states[i], matched = StopSequenceMatcher.match(
-                self._matcher_states[i],
-                self.stop_matchers[i]._trie,
-                tokens[i],
-            )
-            if matched:
+            if self._stop_matchers[i].advance(tokens[i]):
                 finish_reason = "stop"
 
             if finish_reason is not None:

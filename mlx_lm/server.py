@@ -34,7 +34,6 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
-    StopSequenceMatcher,
     TextStateMachine,
     make_stop_matcher,
     make_text_state_machine,
@@ -918,7 +917,8 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
-            stop_state = stop_matcher.make_state()
+            # Own matcher: the cached one is shared between requests.
+            request_stop_matcher = stop_matcher.restart()
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -935,10 +935,7 @@ class ResponseGenerator:
                 finish_reason = gen.finish_reason
 
                 # Token-level stop word detection
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, gen.token
-                )
-                if matched:
+                if request_stop_matcher.advance(gen.token):
                     finish_reason = "stop"
 
                 rqueue.put(
