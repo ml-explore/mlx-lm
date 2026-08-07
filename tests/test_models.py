@@ -3119,6 +3119,57 @@ class TestModels(unittest.TestCase):
                     config["num_hidden_layers"],
                 )
 
+    def test_llama4_chunked_kv_cache(self):
+        # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
+        # the number of valid cached tokens, not on the padded buffer size.
+        # When the chunk size is smaller than the cache allocation step, the old
+        # logic dropped live tokens on the first decode step, so incremental
+        # generation diverged from a single full forward pass.
+        from mlx_lm.models import llama4
+
+        args = llama4.ModelArgs.from_dict(
+            {
+                "model_type": "llama4",
+                "vocab_size": 1000,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "attention_bias": False,
+                    "attention_chunk_size": 4,
+                    "head_dim": 32,
+                    "hidden_size": 128,
+                    "interleave_moe_layer_step": 2,
+                    "intermediate_size": 128,
+                    "intermediate_size_mlp": 128,
+                    "max_position_embeddings": 1000,
+                    "model_type": "llama4",
+                    "num_attention_heads": 4,
+                    "num_experts_per_tok": 1,
+                    "num_hidden_layers": 4,
+                    "num_key_value_heads": 2,
+                    "num_local_experts": 2,
+                    "rms_norm_eps": 1e-4,
+                    "rope_scaling": None,
+                    "rope_theta": 1000,
+                    "use_qk_norm": True,
+                    "vocab_size": 1000,
+                },
+            }
+        )
+        model = llama4.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        # A sequence several chunks long so the trim path runs repeatedly.
+        tokens = mx.array([list(range(1, 13))])
+        full = model(tokens)
+
+        cache = make_prompt_cache(model)
+        step = [model(tokens[:, :1], cache=cache)]
+        for i in range(1, tokens.shape[1]):
+            step.append(model(tokens[:, i : i + 1], cache=cache))
+        step = mx.concatenate(step, axis=1)
+
+        self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
+
     def test_ssm(self):
         for batch_size in [1, 2]:
             for n_group in [1, 4]:
