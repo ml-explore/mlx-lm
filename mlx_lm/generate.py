@@ -1655,9 +1655,7 @@ class BatchGenerator:
         stop_matchers = stop_matchers or ([self._default_stop_matcher] * len(segments))
 
         caches = caches or [None] * len(segments)
-        for i in range(len(segments)):
-            if caches[i] is None:
-                caches[i] = self._make_new_cache()
+        caches = [self._make_new_cache() if c is None else c for c in caches]
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
