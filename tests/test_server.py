@@ -351,9 +351,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(clean_text, "hellobody")
 
         # Verify EOS stops via the stop matcher
-        stop_state = stop_matcher.make_state()
-        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
-        self.assertTrue(matched)
+        self.assertTrue(stop_matcher.restart().advance(2))
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
