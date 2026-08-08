@@ -67,7 +67,7 @@ def _parse_size(x):
         split += 1
     digits = float(x[:split])
     size = (x[split:]).strip().upper()
-    return int(digits * sizes[size])
+    return int(round(digits * sizes[size]))
 
 
 def _unpack_awq_weights(qweight: mx.array) -> mx.array:
