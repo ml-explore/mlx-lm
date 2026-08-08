@@ -578,6 +578,33 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_switch_glu_fuse_gate_up(self):
+        from mlx_lm.models.switch_layers import SwitchGLU
+
+        mx.random.seed(0)
+        for quantize, bias in [(False, False), (False, True), (True, False)]:
+            with self.subTest(quantize=quantize, bias=bias):
+                glu = SwitchGLU(64, 128, 4, bias=bias)
+                if quantize:
+                    nn.quantize(glu, group_size=32, bits=8)
+
+                inputs = []
+                for n in (4, 48):  # below and above the sorted-path threshold
+                    x = mx.random.normal((1, n, 64))
+                    inds = mx.random.randint(0, 4, (1, n, 2)).astype(mx.uint32)
+                    inputs.append((x, inds, glu(x, inds)))
+
+                glu.fuse_gate_up()
+                glu.fuse_gate_up()  # idempotent
+                self.assertIn("gate_up_proj", glu)
+                self.assertNotIn("gate_proj", glu)
+                self.assertNotIn("up_proj", glu)
+
+                for x, inds, y_ref in inputs:
+                    self.assertTrue(
+                        mx.allclose(glu(x, inds), y_ref, atol=1e-5, rtol=1e-4)
+                    )
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 

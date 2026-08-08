@@ -488,6 +488,7 @@ def load(
     return_config: bool = False,
     revision: Optional[str] = None,
     trust_remote_code: bool = False,
+    fuse: bool = True,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -511,6 +512,9 @@ def load(
         trust_remote_code (bool): If ``True``, allow loading models that require
             executing a custom Python file specified in their config.
             Default: ``False``.
+        fuse (bool): If ``True``, fuse eligible projections (e.g. MoE
+            gate/up) after loading. Skipped when ``adapter_path`` is given.
+            Default: ``True``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -530,6 +534,10 @@ def load(
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
+    elif fuse:
+        fusible = [m for _, m in model.named_modules() if hasattr(m, "fuse_gate_up")]
+        for m in fusible:
+            m.fuse_gate_up()
     tokenizer = load_tokenizer(
         model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
     )

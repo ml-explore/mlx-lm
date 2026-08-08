@@ -173,6 +173,17 @@ class SwitchGLU(nn.Module):
         self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=bias)
         self.activation = activation
 
+    def fuse_gate_up(self):
+        if "gate_up_proj" in self:
+            return
+        gate, up = self.gate_proj, self.up_proj
+        for k in ("weight", "scales", "biases", "bias"):
+            if getattr(gate, k, None) is not None:
+                setattr(gate, k, mx.concatenate([gate[k], up[k]], axis=1))
+        del self.gate_proj, self.up_proj
+        self.gate_up_proj = gate
+        mx.eval(gate.parameters())
+
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
 
@@ -185,8 +196,12 @@ class SwitchGLU(nn.Module):
             x, idx, inv_order = _gather_sort(x, indices)
         if self.training:
             idx = mx.stop_gradient(idx)
-        x_up = self.up_proj(x, idx, sorted_indices=do_sort)
-        x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
+        if "gate_up_proj" in self:
+            x_gate_up = self.gate_up_proj(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+        else:
+            x_up = self.up_proj(x, idx, sorted_indices=do_sort)
+            x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
             self.activation(x_up, x_gate),
             idx,
