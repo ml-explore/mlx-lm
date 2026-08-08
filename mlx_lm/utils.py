@@ -513,8 +513,8 @@ def load(
             executing a custom Python file specified in their config.
             Default: ``False``.
         fuse (bool): If ``True``, fuse eligible projections (e.g. MoE
-            gate/up) after loading. Skipped when ``adapter_path`` is given.
-            Default: ``True``.
+            gate/up) after loading. Skipped when ``adapter_path`` is given
+            or ``lazy`` is ``True``. Default: ``True``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -534,7 +534,7 @@ def load(
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
-    elif fuse:
+    elif fuse and not lazy:
         fusible = [m for _, m in model.named_modules() if hasattr(m, "fuse_gate_up")]
         for m in fusible:
             m.fuse_gate_up()

@@ -178,7 +178,7 @@ class SwitchGLU(nn.Module):
             return
         gate, up = self.gate_proj, self.up_proj
         for k in ("weight", "scales", "biases", "bias"):
-            if getattr(gate, k, None) is not None:
+            if gate.get(k) is not None:
                 setattr(gate, k, mx.concatenate([gate[k], up[k]], axis=1))
         del self.gate_proj, self.up_proj
         self.gate_up_proj = gate
