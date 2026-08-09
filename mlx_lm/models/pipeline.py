@@ -20,11 +20,14 @@ class PipelineMixin:
         # rank=pipeline_size-1 gets the first
         self.pipeline_rank = group.rank()
         self.pipeline_size = group.size()
-        layers_per_rank = len(self.layers) // self.pipeline_size
-        extra = len(self.layers) - layers_per_rank * self.pipeline_size
-        if self.pipeline_rank < extra:
-            layers_per_rank += 1
-        self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
+        num_layers = len(self.layers)
+        layers_per_rank, extra = divmod(num_layers, self.pipeline_size)
+        # Convert the reverse pipeline rank to the corresponding forward
+        # partition, then use a prefix sum. Multiplying by a rank-local shard
+        # size creates gaps whenever the division has a remainder.
+        partition = self.pipeline_size - self.pipeline_rank - 1
+        self.start_idx = partition * layers_per_rank + min(partition, extra)
+        layers_per_rank += partition < extra
         self.end_idx = self.start_idx + layers_per_rank
         self.layers = self.layers[: self.end_idx]
         # Keep the layer numbers the same for model loading
