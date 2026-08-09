@@ -63,6 +63,19 @@ class TestGenerate(unittest.TestCase):
             tokens.append(response.token)
         self.assertEqual(len(tokens), 4)
 
+    def test_stream_generate_zero_max_tokens_is_empty(self):
+        self.assertEqual(
+            list(stream_generate(self.model, self.tokenizer, "hello", max_tokens=0)),
+            [],
+        )
+
+    def test_batch_insert_rejects_short_per_prompt_options(self):
+        batch_gen = BatchGenerator(self.model, max_tokens=1)
+        prompts = [[1], [2]]
+
+        with self.assertRaisesRegex(ValueError, "max_tokens.*expected 2, got 1"):
+            batch_gen.insert(prompts, max_tokens=[1])
+
     def test_generate_with_processor(self):
         init_toks = self.tokenizer.encode("hello")
 

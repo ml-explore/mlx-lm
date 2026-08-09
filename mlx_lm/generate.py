@@ -682,6 +682,11 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    if max_tokens < 0:
+        raise ValueError("max_tokens must be non-negative")
+    if max_tokens == 0:
+        return
+
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
@@ -1610,17 +1615,37 @@ class BatchGenerator:
     ):
         uids = []
 
-        max_tokens = max_tokens or [self.max_tokens] * len(segments)
-        all_tokens = all_tokens or [[] for _ in segments]
-        samplers = samplers or [None] * len(segments)
-        logits_processors = logits_processors or (
-            [self.logits_processors] * len(segments)
+        count = len(segments)
+        values = {
+            "max_tokens": max_tokens,
+            "caches": caches,
+            "all_tokens": all_tokens,
+            "samplers": samplers,
+            "logits_processors": logits_processors,
+            "state_machines": state_machines,
+        }
+        for name, value in values.items():
+            if value is not None and len(value) != count:
+                raise ValueError(
+                    f"{name} must have one entry per segment: "
+                    f"expected {count}, got {len(value)}"
+                )
+
+        max_tokens = max_tokens if max_tokens is not None else [self.max_tokens] * count
+        all_tokens = all_tokens if all_tokens is not None else [[] for _ in segments]
+        samplers = samplers if samplers is not None else [None] * count
+        logits_processors = (
+            logits_processors
+            if logits_processors is not None
+            else [self.logits_processors] * count
         )
-        state_machines = state_machines or (
-            [self._default_state_machine] * len(segments)
+        state_machines = (
+            state_machines
+            if state_machines is not None
+            else [self._default_state_machine] * count
         )
 
-        caches = caches or [None] * len(segments)
+        caches = caches if caches is not None else [None] * count
         for i in range(len(segments)):
             if caches[i] is None:
                 caches[i] = self._make_new_cache()
