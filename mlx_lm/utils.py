@@ -540,6 +540,12 @@ def load(
         return model, tokenizer
 
 
+def _sharded_tokenizer_config(tokenizer_config, trust_remote_code):
+    config = dict(tokenizer_config or {})
+    config.setdefault("trust_remote_code", trust_remote_code)
+    return config
+
+
 def sharded_load(
     repo,
     pipeline_group: Optional[mx.distributed.Group] = None,
@@ -614,7 +620,7 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        tokenizer_config or {"trust_remote_code": True},
+        _sharded_tokenizer_config(tokenizer_config, trust_remote_code),
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(

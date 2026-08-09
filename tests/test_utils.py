@@ -16,6 +16,20 @@ HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
 class TestUtils(unittest.TestCase):
+
+    def test_sharded_tokenizer_remote_code_requires_opt_in(self):
+        self.assertEqual(
+            utils._sharded_tokenizer_config(None, False),
+            {"trust_remote_code": False},
+        )
+        self.assertEqual(
+            utils._sharded_tokenizer_config({}, True),
+            {"trust_remote_code": True},
+        )
+        self.assertEqual(
+            utils._sharded_tokenizer_config({"trust_remote_code": False}, True),
+            {"trust_remote_code": False},
+        )
     @classmethod
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()
