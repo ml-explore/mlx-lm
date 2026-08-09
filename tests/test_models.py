@@ -517,6 +517,42 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_glm_partial_rotary(self):
+        from mlx_lm.models import glm
+
+        config = {
+            "model_type": "glm",
+            "hidden_size": 128,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 1000,
+            "head_dim": 32,
+            "num_key_value_heads": 2,
+        }
+
+        def rotary_split(args):
+            # Returns the parts of a head that RoPE does and does not touch, by
+            # rotating the same vector at two different positions.
+            attn = glm.Model(args).model.layers[0].self_attn
+            x = mx.random.normal((1, 1, 3, attn.head_dim))
+            here, later = attn.rope(x, offset=0), attn.rope(x, offset=7)
+            moved = mx.any(mx.abs(here - later) > 1e-6, axis=(0, 1, 2))
+            return moved.tolist()
+
+        # glm-4-9b omits partial_rotary_factor, so transformers supplies 0.5 and
+        # only the first half of each head is rotated.
+        moved = rotary_split(glm.ModelArgs.from_dict(config))
+        self.assertEqual(sum(moved), 16)
+        self.assertEqual(moved, [True] * 16 + [False] * 16)
+
+        # glm-edge sets it to 1.0 and every dimension is rotated.
+        moved = rotary_split(
+            glm.ModelArgs.from_dict({**config, "partial_rotary_factor": 1.0})
+        )
+        self.assertEqual(sum(moved), 32)
+
     def test_gemma(self):
         from mlx_lm.models import gemma
 

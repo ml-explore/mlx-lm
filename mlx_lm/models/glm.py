@@ -25,6 +25,7 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: Optional[int] = None
     attention_bias: bool = False
     rope_theta: float = 10000
+    partial_rotary_factor: float = 0.5
     tie_word_embeddings: bool = True
 
 
@@ -56,7 +57,11 @@ class GLMAttention(nn.Module):
             self.num_attention_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        self.rope = nn.RoPE(dims=self.head_dim, traditional=True, base=args.rope_theta)
+        self.rope = nn.RoPE(
+            dims=int(self.head_dim * args.partial_rotary_factor),
+            traditional=True,
+            base=args.rope_theta,
+        )
 
     def __call__(
         self,
