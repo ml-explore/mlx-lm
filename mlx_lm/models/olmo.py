@@ -1,6 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import sys
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -9,12 +8,6 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask
-
-try:
-    import hf_olmo
-except ImportError:
-    print("To run olmo install ai2-olmo: pip install ai2-olmo")
-    sys.exit(1)
 
 
 @dataclass
@@ -90,7 +83,15 @@ class TransformerBlock(nn.Module):
 
         scores = (queries * self.scale) @ keys.transpose(0, 1, 3, 2)
         if mask is not None:
-            scores += mask
+            if isinstance(mask, str):
+                query_length, key_length = scores.shape[-2:]
+                query_indices = mx.arange(key_length - query_length, key_length)
+                key_indices = mx.arange(key_length)
+                mask = query_indices[:, None] >= key_indices[None]
+            if mask.dtype == mx.bool_:
+                scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
+            else:
+                scores += mask
         scores = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
         output = (scores @ values).transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.attn_out(output)

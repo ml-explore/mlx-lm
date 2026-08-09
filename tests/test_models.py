@@ -525,7 +525,6 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-    @unittest.skip("requires ai2-olmo")
     def test_olmo(self):
         from mlx_lm.models import olmo
 
