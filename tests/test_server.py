@@ -248,6 +248,38 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
+    def test_generation_failure_is_internal_server_error(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        original_generate = self.response_generator.generate
+        self.response_generator.generate = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(RuntimeError("sensitive detail"))
+        try:
+            response = requests.post(
+                url, json={"model": "default_model", "prompt": "hello"}
+            )
+        finally:
+            self.response_generator.generate = original_generate
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), {"error": "Internal server error"})
+
+    def test_invalid_generation_request_is_bad_request(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        original_generate = self.response_generator.generate
+        self.response_generator.generate = lambda *args, **kwargs: (
+            _ for _ in ()
+        ).throw(ValueError("invalid generation option"))
+        try:
+            response = requests.post(
+                url, json={"model": "default_model", "prompt": "hello"}
+            )
+        finally:
+            self.response_generator.generate = original_generate
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"error": "invalid generation option"})
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {

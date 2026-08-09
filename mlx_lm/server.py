@@ -1370,10 +1370,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 args,
                 progress_callback=keepalive_callback,
             )
-        except Exception as e:
-            self._set_completion_headers(404)
+        except (AssertionError, ValueError) as error:
+            self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(json.dumps({"error": str(error)}).encode())
+            return
+        except Exception:
+            logging.exception("Generation request failed")
+            self._set_completion_headers(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Internal server error"}).encode())
             return
 
         # Prepare the headers

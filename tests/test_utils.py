@@ -2,6 +2,7 @@
 
 import json
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,16 @@ HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
 class TestUtils(unittest.TestCase):
+
+    def test_load_config_rejects_malformed_generation_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory)
+            (model_path / "config.json").write_text("{}")
+            (model_path / "generation_config.json").write_text("{invalid")
+
+            with self.assertRaises(json.JSONDecodeError):
+                utils.load_config(model_path)
+
     @classmethod
     def setUpClass(cls):
         cls.test_dir_fid = tempfile.TemporaryDirectory()

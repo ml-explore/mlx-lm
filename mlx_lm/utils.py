@@ -279,12 +279,8 @@ def load_config(model_path: Path) -> dict:
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
-        generation_config = {}
-        try:
-            with open(generation_config_file, "r") as f:
-                generation_config = json.load(f)
-        except json.JSONDecodeError:
-            pass
+        with open(generation_config_file, "r") as f:
+            generation_config = json.load(f)
 
         if eos_token_id := generation_config.get("eos_token_id", False):
             config["eos_token_id"] = eos_token_id
@@ -715,8 +711,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -740,8 +735,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
