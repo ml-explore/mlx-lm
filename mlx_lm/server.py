@@ -367,9 +367,34 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self._model_map.get(model_path, model_path)
-        adapter_path = self._adapter_map.get(model_path, adapter_path)
-        draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
+        # Request IDs are registered aliases (e.g. "default_model"), not free-form
+        # Hub/local paths. Falling through let clients force arbitrary downloads.
+        if model_path not in self._model_map:
+            raise ValueError(
+                f"Unknown model {model_path!r}. "
+                f"Available models: {sorted(self._model_map)}"
+            )
+        if draft_model_path is not None and draft_model_path not in self._draft_model_map:
+            raise ValueError(
+                f"Unknown draft_model {draft_model_path!r}. "
+                f"Available draft models: {sorted(self._draft_model_map)}"
+            )
+        if adapter_path is not None and adapter_path not in self._adapter_map:
+            raise ValueError(
+                f"Unknown adapters {adapter_path!r}. "
+                f"Available adapters: {sorted(self._adapter_map)}"
+            )
+
+        # Resolve adapter against the request model id before rewriting the path
+        # (so CLI --adapter-path registered under "default_model" is not dropped).
+        if adapter_path is None:
+            adapter_path = self._adapter_map.get(model_path)
+        else:
+            adapter_path = self._adapter_map[adapter_path]
+
+        model_path = self._model_map[model_path]
+        if draft_model_path is not None:
+            draft_model_path = self._draft_model_map[draft_model_path]
 
         model_key = (model_path, adapter_path, draft_model_path)
         if self.model_key != model_key:

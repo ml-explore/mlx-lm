@@ -14,6 +14,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    ModelProvider,
     Response,
     ResponseGenerator,
     SamplingArguments,
@@ -758,6 +759,70 @@ class TestMakeSampler(unittest.TestCase):
         token = sampler(logits)
         mx.eval(token)
         self.assertEqual(token.shape, (1,))
+
+
+class TestModelProviderFailClosed(unittest.TestCase):
+    """Request model/draft/adapter IDs must be registered aliases, not paths."""
+
+    def _provider(self, *, adapter_path=None, draft_model=None):
+        cli_args = type(
+            "obj",
+            (object,),
+            {
+                "model": "local/registered-model",
+                "adapter_path": adapter_path,
+                "draft_model": draft_model,
+                "pipeline": False,
+                "trust_remote_code": False,
+                "chat_template": None,
+                "use_default_chat_template": False,
+            },
+        )
+        return ModelProvider(cli_args)
+
+    def test_rejects_unregistered_model(self):
+        provider = self._provider()
+        loads = []
+
+        def fake_load(*args):
+            loads.append(args)
+
+        provider._load = fake_load
+        with self.assertRaisesRegex(ValueError, "Unknown model"):
+            provider.load("attacker/malicious-repo")
+        self.assertEqual(loads, [])
+
+    def test_rejects_unregistered_draft_model(self):
+        provider = self._provider(draft_model="local/draft")
+        loads = []
+        provider._load = lambda *args: loads.append(args)
+        with self.assertRaisesRegex(ValueError, "Unknown draft_model"):
+            provider.load("default_model", None, "attacker/draft")
+        self.assertEqual(loads, [])
+
+    def test_rejects_unregistered_adapters(self):
+        provider = self._provider(adapter_path="local/adapter")
+        loads = []
+        provider._load = lambda *args: loads.append(args)
+        with self.assertRaisesRegex(ValueError, "Unknown adapters"):
+            provider.load("default_model", "/tmp/evil-adapter", None)
+        self.assertEqual(loads, [])
+
+    def test_resolves_registered_default_and_cli_adapter(self):
+        provider = self._provider(adapter_path="local/adapter", draft_model=None)
+        loads = []
+
+        def fake_load(model_path, adapter_path=None, draft_model_path=None):
+            loads.append((model_path, adapter_path, draft_model_path))
+            provider.model_key = (model_path, adapter_path, draft_model_path)
+            provider.model = "model"
+            provider.tokenizer = "tok"
+
+        provider._load = fake_load
+        model, tokenizer = provider.load("default_model", None, "default_model")
+        self.assertEqual(model, "model")
+        self.assertEqual(tokenizer, "tok")
+        self.assertEqual(loads, [("local/registered-model", "local/adapter", None)])
 
 
 if __name__ == "__main__":
