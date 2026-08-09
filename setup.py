@@ -31,6 +31,9 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        "huggingface-hub",
+        "regex",
+        "tqdm",
     ],
     packages=[
         "mlx_lm",
@@ -40,7 +43,7 @@ setup(
         "mlx_lm.tool_parsers",
         "mlx_lm.chat_templates",
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     extras_require={
         "test": ["datasets", "lm-eval"],
         "train": ["datasets", "tqdm"],
