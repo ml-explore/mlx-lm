@@ -15,7 +15,7 @@ from mlx.utils import tree_flatten
 from mlx_lm import lora, tuner
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
-from mlx_lm.tuner.trainer import evaluate
+from mlx_lm.tuner.trainer import default_loss, evaluate, iterate_batches
 from mlx_lm.tuner.utils import build_schedule
 
 
@@ -445,6 +445,50 @@ class TestScheduleConfig(unittest.TestCase):
             comm_group=ANY,
         )
         self.assertEqual(mock_default_loss.call_count, 3)
+
+
+class TestDefaultLoss(unittest.TestCase):
+    vocab_size = 32
+
+    def setUp(self):
+        class Model(nn.Module):
+            def __init__(self, vocab_size):
+                super().__init__()
+                self.embed = nn.Embedding(vocab_size, 8)
+                self.out = nn.Linear(8, vocab_size)
+
+            def __call__(self, x):
+                return self.out(self.embed(x))
+
+        mx.random.seed(0)
+        self.model = Model(self.vocab_size)
+        mx.eval(self.model.parameters())
+
+    def make_batch(self):
+        # A four token prompt followed by a three token completion. The rows are
+        # shorter than pad_to, so iterate_batches right pads them with zeros.
+        dataset = [([3 + i, 4, 5, 6, 7, 8, 9], 4) for i in range(2)]
+        return next(iterate_batches(dataset=dataset, batch_size=2, max_seq_length=2048))
+
+    def test_padding_is_not_counted(self):
+        batch, lengths = self.make_batch()
+        _, ntoks = default_loss(self.model, batch, lengths)
+        expected = sum(
+            length - offset
+            for offset, length in zip(lengths[:, 0].tolist(), lengths[:, 1].tolist())
+        )
+        self.assertEqual(ntoks.item(), expected)
+
+    def test_loss_ignores_padding_values(self):
+        batch, lengths = self.make_batch()
+        repadded = mx.where(
+            mx.arange(batch.shape[1])[None, :] < lengths[:, 1:],
+            batch,
+            mx.array(self.vocab_size - 1, batch.dtype),
+        )
+        loss, _ = default_loss(self.model, batch, lengths)
+        other, _ = default_loss(self.model, repadded, lengths)
+        self.assertEqual(loss.item(), other.item())
 
 
 if __name__ == "__main__":
