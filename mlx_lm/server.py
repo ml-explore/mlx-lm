@@ -1,8 +1,11 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import hmac
+import ipaddress
 import json
 import logging
+import os
 import pickle
 import platform
 import socket
@@ -320,7 +323,10 @@ class ModelProvider:
             # TODO: Generalize distributed load
             if self.is_distributed:
                 model, tokenizer = sharded_load(
-                    self.cli_args.model, self.pipeline_group, self.tensor_group
+                    self.cli_args.model,
+                    self.pipeline_group,
+                    self.tensor_group,
+                    tokenizer_config=tokenizer_config,
                 )
             else:
                 model, tokenizer = load(
@@ -332,7 +338,10 @@ class ModelProvider:
             # TODO: Generalize distributed load
             if self.is_distributed:
                 model, tokenizer = sharded_load(
-                    model_path, self.pipeline_group, self.tensor_group
+                    model_path,
+                    self.pipeline_group,
+                    self.tensor_group,
+                    tokenizer_config=tokenizer_config,
                 )
             else:
                 model, tokenizer = load(
@@ -1081,6 +1090,19 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
 
+    def _authenticate(self) -> bool:
+        api_key = getattr(self.response_generator.cli_args, "api_key", None)
+        if not api_key:
+            return True
+        authorization = self.headers.get("Authorization", "")
+        if hmac.compare_digest(authorization, f"Bearer {api_key}"):
+            return True
+        self._set_completion_headers(401)
+        self.send_header("WWW-Authenticate", "Bearer")
+        self.end_headers()
+        self.wfile.write(json.dumps({"error": "Unauthorized"}).encode())
+        return False
+
     def do_OPTIONS(self):
         self._set_completion_headers(204)
         self.end_headers()
@@ -1089,6 +1111,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a POST request from a client.
         """
+        if not self._authenticate():
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -1408,10 +1433,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 args,
                 progress_callback=keepalive_callback,
             )
-        except Exception as e:
-            self._set_completion_headers(404)
+        except (AssertionError, ValueError) as error:
+            self._set_completion_headers(400)
             self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self.wfile.write(json.dumps({"error": str(error)}).encode())
+            return
+        except Exception:
+            logging.exception("Generation request failed")
+            self._set_completion_headers(500)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Internal server error"}).encode())
             return
 
         # Prepare the headers
@@ -1608,6 +1639,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
+        if not self._authenticate():
+            return
+
         if self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
@@ -1693,6 +1727,17 @@ def _run_http_server(
     server_class=ThreadingHTTPServer,
     handler_class=APIHandler,
 ):
+    api_key = getattr(response_generator.cli_args, "api_key", None)
+    try:
+        is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        is_loopback = host.lower() == "localhost"
+    if not is_loopback and not api_key:
+        raise ValueError(
+            "Binding mlx_lm.server to a non-loopback host requires --api-key "
+            "or MLX_LM_API_KEY"
+        )
+
     server_address = (host, port)
     infos = socket.getaddrinfo(
         *server_address, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
@@ -1764,6 +1809,11 @@ def main():
         type=lambda x: x.split(","),
         default="*",
         help="Allowed origins (default: *)",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("MLX_LM_API_KEY"),
+        help="Bearer token required for HTTP requests (or set MLX_LM_API_KEY)",
     )
     parser.add_argument(
         "--draft-model",

@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,15 @@ class TestUtils(unittest.TestCase):
         p1 = model.layers[0].mlp.up_proj.weight
         p2 = model_lazy.layers[0].mlp.up_proj.weight
         self.assertTrue(mx.allclose(p1, p2))
+
+    def test_load_config_rejects_malformed_generation_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory)
+            (model_path / "config.json").write_text("{}")
+            (model_path / "generation_config.json").write_text("{invalid")
+
+            with self.assertRaises(json.JSONDecodeError):
+                utils.load_config(model_path)
 
     def test_make_shards(self):
         from mlx_lm.models import llama

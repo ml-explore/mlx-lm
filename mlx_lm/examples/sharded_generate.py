@@ -49,6 +49,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -60,7 +65,14 @@ if __name__ == "__main__":
         if rank == 0:
             print(*args, **kwargs)
 
-    model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
+    model, tokenizer = sharded_load(
+        args.model,
+        pipeline_group,
+        tensor_group,
+        tokenizer_config={
+            "trust_remote_code": True if args.trust_remote_code else None
+        },
+    )
 
     messages = [{"role": "user", "content": args.prompt}]
     prompt = tokenizer.apply_chat_template(

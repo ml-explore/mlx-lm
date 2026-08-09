@@ -56,6 +56,11 @@ def setup_arg_parser():
         help="Use pipelining instead of tensor parallelism",
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
+    )
+    parser.add_argument(
         "--quantize-activations",
         "-qa",
         action="store_true",
@@ -94,13 +99,21 @@ def main():
 
     if group.size() > 1:
         model, tokenizer, config = sharded_load(
-            model_path, pipeline_group, tensor_group, return_config=True
+            model_path,
+            pipeline_group,
+            tensor_group,
+            return_config=True,
+            tokenizer_config={
+                "trust_remote_code": True if args.trust_remote_code else None
+            },
         )
     else:
         model, tokenizer, config = load(
             model_path,
             return_config=True,
-            tokenizer_config={"trust_remote_code": True},
+            tokenizer_config={
+                "trust_remote_code": True if args.trust_remote_code else None
+            },
             model_config={"quantize_activations": args.quantize_activations},
         )
 

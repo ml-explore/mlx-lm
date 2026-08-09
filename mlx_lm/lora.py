@@ -75,6 +75,7 @@ CONFIG_DEFAULTS = {
     "mask_prompt": False,
     "report_to": None,
     "project_name": None,
+    "trust_remote_code": False,
 }
 
 
@@ -84,6 +85,12 @@ def build_parser():
         "--model",
         type=str,
         help="The path to the local model directory or Hugging Face repo.",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=None,
+        help="Enable trusting remote code for tokenizer",
     )
 
     # Training args
@@ -326,7 +333,12 @@ def run(args, training_callback: TrainingCallback = None):
     )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+    model, tokenizer = load(
+        args.model,
+        tokenizer_config={
+            "trust_remote_code": True if args.trust_remote_code else None
+        },
+    )
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)

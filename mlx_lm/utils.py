@@ -266,12 +266,8 @@ def load_config(model_path: Path) -> dict:
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
-        generation_config = {}
-        try:
-            with open(generation_config_file, "r") as f:
-                generation_config = json.load(f)
-        except json.JSONDecodeError:
-            pass
+        with open(generation_config_file, "r") as f:
+            generation_config = json.load(f)
 
         if eos_token_id := generation_config.get("eos_token_id", False):
             config["eos_token_id"] = eos_token_id
@@ -507,6 +503,7 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -571,7 +568,7 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        {"trust_remote_code": True},
+        tokenizer_config or {},
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)
@@ -589,8 +586,14 @@ def sharded_load(
         return model, tokenizer
 
 
-def pipeline_load(repo, return_config=False):
-    return sharded_load(repo, mx.distributed.init(), None, return_config)
+def pipeline_load(repo, return_config=False, tokenizer_config=None):
+    return sharded_load(
+        repo,
+        mx.distributed.init(),
+        None,
+        return_config,
+        tokenizer_config=tokenizer_config,
+    )
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
@@ -670,8 +673,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -695,8 +697,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()

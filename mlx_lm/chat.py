@@ -105,7 +105,14 @@ def main():
     if group.size() > 1:
         if args.adapter_path:
             parser.error("Adapters not supported in distributed mode")
-        model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
+        model, tokenizer = sharded_load(
+            args.model,
+            pipeline_group,
+            tensor_group,
+            tokenizer_config={
+                "trust_remote_code": True if args.trust_remote_code else None
+            },
+        )
     else:
         model, tokenizer = load(
             args.model,
