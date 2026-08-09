@@ -88,6 +88,12 @@ class ModelArgs(BaseModelArgs):
         else:
             self._mtp_pattern = []
 
+        if self._mtp_pattern and self._mtp_pattern != ["*", "E"]:
+            raise ValueError(
+                "Nemotron-H MTP currently supports only the '*E' block pattern; "
+                f"got {''.join(self._mtp_pattern)!r}"
+            )
+
 
 class MambaRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float, group_size: int):
