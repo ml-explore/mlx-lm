@@ -18,6 +18,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
+    _run_http_server,
 )
 from mlx_lm.utils import load
 
@@ -248,6 +249,21 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
+    def test_api_key_protects_model_selection_endpoints(self):
+        url = f"http://localhost:{self.port}/v1/models"
+        cli_args = self.response_generator.cli_args
+        cli_args.api_key = "test-secret"
+        try:
+            unauthorized = requests.get(url)
+            authorized = requests.get(
+                url, headers={"Authorization": "Bearer test-secret"}
+            )
+        finally:
+            cli_args.api_key = None
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(authorized.status_code, 200)
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -367,6 +383,18 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+
+
+class TestRemoteBindingSecurity(unittest.TestCase):
+    def test_remote_binding_requires_api_key(self):
+        response_generator = type(
+            "ResponseGenerator",
+            (),
+            {"cli_args": type("Args", (), {"api_key": None})()},
+        )()
+
+        with self.assertRaisesRegex(ValueError, "non-loopback host requires"):
+            _run_http_server("0.0.0.0", 8080, response_generator)
 
 
 class TestServerWithDraftModel(unittest.TestCase):
