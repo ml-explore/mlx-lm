@@ -35,13 +35,13 @@ def load_data(
 
     perm = np.random.permutation(len(dataset)).tolist()
 
-    num_tokens = sequence_length * num_samples if num_samples > 0 else float("inf")
+    num_tokens = sequence_length * num_samples if num_samples > 0 else None
     data = []
-    i = 0
-    while len(data) < num_tokens:
-        tokens, _ = dataset.process(dataset[perm[i]])
-        i += 1
+    for index in perm:
+        tokens, _ = dataset.process(dataset[index])
         data.extend(tokens)
+        if num_tokens is not None and len(data) >= num_tokens:
+            break
 
     data = mx.array(data[: (len(data) // sequence_length) * sequence_length])
     data = data.reshape(-1, sequence_length)
