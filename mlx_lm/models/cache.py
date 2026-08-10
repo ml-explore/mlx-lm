@@ -672,7 +672,7 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        cache.cache = [mx.contiguous(c[idx : idx + 1]) for c in self.cache]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
