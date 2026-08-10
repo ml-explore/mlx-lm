@@ -168,11 +168,15 @@ class MoEGate(nn.Module):
         self.top_k = args.num_experts_per_tok
         self.num_experts = args.num_experts
         self.softcap = args.moe_router_logit_softcapping
-        self.weight = mx.zeros((args.num_experts, args.hidden_size))
+        # A Linear rather than a bare matrix so quantized checkpoints (which
+        # ship the router as a quantized layer, e.g. the public 8-bit repacks)
+        # can load it directly; sanitize() maps the bare `gate.weight` layout
+        # onto `gate.proj.weight`.
+        self.proj = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
 
     def __call__(self, x):
-        logits = (x @ self.weight.T).astype(mx.float32)
+        logits = self.proj(x).astype(mx.float32)
         if self.softcap > 0.0:
             logits = mx.tanh(logits / self.softcap) * self.softcap
 
@@ -318,3 +322,44 @@ class Model(nn.Module):
             )
             for layer in self.layers
         ]
+
+    def sanitize(self, weights):
+        # Public repacks (e.g. AtomicChat/Laguna-XS-2.1-MLX-8bit and
+        # mlx-community/Laguna-XS-2.1-bf16) wrap every tensor in a VLM-style
+        # `language_model.` prefix.
+        if any(k.startswith("language_model.") for k in weights):
+            prefix = "language_model."
+            weights = {
+                (k[len(prefix) :] if k.startswith(prefix) else k): v
+                for k, v in weights.items()
+            }
+
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp"
+
+            # The original poolside layout (e.g. poolside/Laguna-S-2.1-bf16)
+            # stores the router as a bare matrix and the correction bias
+            # under `experts.`.
+            gate_weight = weights.pop(f"{prefix}.gate.weight", None)
+            if gate_weight is not None:
+                weights[f"{prefix}.gate.proj.weight"] = gate_weight
+            bias = weights.pop(f"{prefix}.experts.e_score_correction_bias", None)
+            if bias is not None:
+                weights[f"{prefix}.gate.e_score_correction_bias"] = bias
+
+            # The original layout also stores experts individually; stack
+            # them into the SwitchGLU layout.
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                for suffix in ("weight", "scales", "biases"):
+                    if f"{prefix}.experts.0.{proj}.{suffix}" not in weights:
+                        continue
+                    weights[f"{prefix}.switch_mlp.{proj}.{suffix}"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.{proj}.{suffix}")
+                            for e in range(self.args.num_experts)
+                        ]
+                    )
+        return weights
