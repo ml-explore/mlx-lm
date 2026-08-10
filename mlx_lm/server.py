@@ -386,7 +386,7 @@ def _make_sampler(args, tokenizer):
     # settings share one sampler object. GenerationBatch groups rows by sampler
     # identity, letting a whole batch sample in a single vectorized call.
     xtc_special_tokens = (
-        tokenizer.eos_token_id,
+        tuple(tokenizer.eos_token_ids),
         tuple(tokenizer.encode("\n")),
     )
     key = (
