@@ -1727,6 +1727,72 @@ class TestModels(unittest.TestCase):
             mx.allclose(direct.astype(mx.float32), explicit.astype(mx.float32))
         )
 
+    def test_gemma3n_kv_sharing_is_cache_independent(self):
+        """KV-shared layers must reuse the source layer's keys/values and RoPE
+        offset whether or not a cache is present, so a no-cache forward (LoRA
+        training, evaluation) agrees with generation."""
+        from mlx_lm.models import gemma3n
+
+        def build(num_kv_shared_layers):
+            args = gemma3n.ModelArgs(
+                model_type="gemma3n",
+                text_config={
+                    "model_type": "gemma3n",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "head_dim": 32,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 1000,
+                    "num_key_value_heads": 2,
+                    "num_kv_shared_layers": num_kv_shared_layers,
+                    "vocab_size_per_layer_input": 1000,
+                    "sliding_window": 8,
+                    "max_position_embeddings": 1000,
+                    "rope_local_base_freq": 1.0,
+                    "rope_theta": 1000.0,
+                    "final_logit_softcapping": 1.0,
+                    "layer_types": [
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "full_attention",
+                    ],
+                    "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                    "hidden_size_per_layer_input": 256,
+                    "altup_num_inputs": 4,
+                    "altup_coef_clip": 1.0,
+                    "altup_correct_scale": True,
+                    "altup_active_idx": 0,
+                    "laurel_rank": 8,
+                },
+            )
+            return gemma3n.Model(args)
+
+        tokens = [1, 2, 3, 4, 5, 6]
+        inputs = mx.array([tokens])
+
+        # num_kv_shared_layers=0 turns sharing off and is the control: it agreed
+        # on both checks before this behavior was fixed.
+        for num_kv_shared_layers in (2, 0):
+            model = build(num_kv_shared_layers)
+
+            # A forward with no cache must match a forward with a fresh cache.
+            no_cache = model(inputs)
+            cached = model(inputs, cache=make_prompt_cache(model))
+            self.assertTrue(mx.allclose(no_cache, cached, atol=1e-4, rtol=1e-4))
+
+            # Prefilling the prompt in one step must match decoding it token by
+            # token, which pins the RoPE offset the shared layers query with.
+            cache = make_prompt_cache(model)
+            prefill = model(inputs, cache=cache)[:, -1, :]
+
+            cache = make_prompt_cache(model)
+            for token in tokens:
+                incremental = model(mx.array([[token]]), cache=cache)[:, -1, :]
+            self.assertTrue(mx.allclose(prefill, incremental, atol=1e-4, rtol=1e-4))
+
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 

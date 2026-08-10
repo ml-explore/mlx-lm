@@ -120,22 +120,21 @@ class Gemma3nAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
+    ):
         B, L, _ = x.shape
 
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
 
-        offset = 0
-        if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
-            offset = cache.offset
-
+        if shared_kv is not None:
+            # KV-shared layers reuse the keys/values and the RoPE offset of the
+            # designated source layer, whether or not a cache is present.
+            keys, values = shared_kv
         else:
-            if cache is not None:
-                offset = cache.offset
+            offset = cache.offset if cache is not None else 0
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
@@ -157,7 +156,7 @@ class Gemma3nAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output)
+        return self.o_proj(output), (keys, values), offset
 
 
 @partial(mx.compile, shapeless=True)
@@ -328,6 +327,8 @@ class Gemma3nDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
+        shared_kv: Optional[tuple] = None,
+        offset: Optional[Any] = None,
     ):
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -335,10 +336,12 @@ class Gemma3nDecoderLayer(nn.Module):
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
-        attn = self.self_attn(
+        attn, kvs, offset = self.self_attn(
             active_prediction_normed,
             mask,
             cache,
+            shared_kv=shared_kv,
+            offset=offset,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -366,7 +369,7 @@ class Gemma3nDecoderLayer(nn.Module):
 
         corrected_predictions[1:] = corrected_predictions[1:] + first_prediction
 
-        return corrected_predictions
+        return corrected_predictions, kvs, offset
 
 
 @partial(mx.compile, shapeless=True)
@@ -491,6 +494,9 @@ class LanguageModel(nn.Module):
         h = mx.stack(h_list, axis=0)
         mags = mx.mean(h[1:] ** 2, axis=-1, keepdims=True) ** 0.5
         h[1:] = h[1:] * (target_magnitude / mx.maximum(mags, mx.finfo(h0.dtype).min))
+        # Save each layer's keys/values and RoPE offset so the KV-shared layers
+        # can pick up the ones from their source layer.
+        intermediates = [(None, None)] * len(self.layers)
         for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
@@ -501,12 +507,18 @@ class LanguageModel(nn.Module):
             else:
                 mask = sliding_window_mask
 
-            h = layer(
+            shared_kv, offset = intermediates[self.layer_idx_to_cache_idx[i]]
+
+            h, kvs, offset = layer(
                 h,
                 mask,
                 cache[self.layer_idx_to_cache_idx[i]],
                 per_layer_input,
+                shared_kv=shared_kv,
+                offset=offset,
             )
+
+            intermediates[i] = (kvs, offset)
 
         # Per-layer inputs to single output
         target_magnitude = mx.mean(h[0] ** 2, axis=-1, keepdims=True) ** 0.5
