@@ -18,6 +18,7 @@ from mlx_lm.generate import (
     NativeMTPSparseBootstrap,
     attested_target_forward,
     mtp_generate_step,
+    stream_generate,
 )
 from mlx_lm.models.cache import (
     ArraysCache,
@@ -270,6 +271,24 @@ class _PositionContext:
             _ACTIVE_FORWARD.reset(token)
 
 
+class _StreamDetokenizer:
+    def __init__(self):
+        self.last_segment = ""
+        self.finalized = False
+
+    def add_token(self, token):
+        self.last_segment = str(token)
+
+    def finalize(self):
+        self.finalized = True
+
+
+class _StreamTokenizer:
+    def __init__(self):
+        self.detokenizer = _StreamDetokenizer()
+        self.eos_token_ids = frozenset()
+
+
 def _make_sparse_bootstrap(
     model,
     context,
@@ -306,6 +325,370 @@ def _make_sparse_bootstrap(
         target_cache=target_cache,
         next_logical_position=positions[-1] + 1,
     )
+
+
+def test_stream_generate_dispatches_attested_sparse_bootstrap_without_prompt_array(
+    monkeypatch,
+):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3, 7),
+        selected_token_ids=(0, 3, 5),
+        immediate_successor_token_ids=(1, 4),
+        chunk_sizes=(1, 2),
+    )
+    captured = {}
+    logprobs = mx.zeros((model.vocab_size,))
+
+    def fake_mtp_generate_step(prompt, actual_model, **kwargs):
+        captured["prompt"] = prompt
+        captured["model"] = actual_model
+        captured.update(kwargs)
+        kwargs["telemetry"].update(mtp_drafts=4, mtp_accepted=3)
+        yield 6, logprobs, True
+
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    monkeypatch.setattr(generate_module, "mtp_generate_step", fake_mtp_generate_step)
+    tokenizer = _StreamTokenizer()
+
+    responses = list(
+        stream_generate(
+            model,
+            tokenizer,
+            None,
+            mtp=True,
+            max_tokens=2,
+            sparse_bootstrap=bootstrap,
+            model_forward_context=context.context,
+        )
+    )
+
+    assert captured["prompt"] is None
+    assert captured["model"] is model
+    assert captured["sparse_bootstrap"] is bootstrap
+    assert captured["model_forward_context"] == context.context
+    assert [response.prompt_tokens for response in responses] == [8, 8]
+    assert [response.prompt_tps for response in responses] == [0.0, 0.0]
+    assert [response.mtp_drafts for response in responses] == [4, 4]
+    assert [response.mtp_accepted for response in responses] == [3, 3]
+    assert [response.text for response in responses] == ["6", "6"]
+    assert tokenizer.detokenizer.finalized
+    assert responses[-1].finish_reason == "length"
+
+
+def test_stream_generate_dense_native_mtp_omits_sparse_bootstrap_keyword(monkeypatch):
+    captured = {}
+    logprobs = mx.zeros((7,))
+
+    def fake_mtp_generate_step(prompt, actual_model, **kwargs):
+        captured["prompt"] = prompt
+        captured["model"] = actual_model
+        captured.update(kwargs)
+        yield 2, logprobs, False
+
+    model = _NativeMTPModel()
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    monkeypatch.setattr(generate_module, "mtp_generate_step", fake_mtp_generate_step)
+    responses = list(
+        stream_generate(
+            model,
+            _StreamTokenizer(),
+            [0, 1],
+            mtp=True,
+            max_tokens=2,
+        )
+    )
+
+    assert captured["prompt"].tolist() == [0, 1]
+    assert captured["model"] is model
+    assert "sparse_bootstrap" not in captured
+    assert [response.prompt_tokens for response in responses] == [2, 2]
+
+
+@pytest.mark.parametrize(
+    ("prompt", "mtp", "draft_model", "bootstrap", "kwargs", "message"),
+    (
+        (None, False, None, "valid", {}, "native_mtp_sparse_bootstrap_requires_mtp"),
+        (
+            None,
+            True,
+            object(),
+            "valid",
+            {},
+            "native_mtp_sparse_bootstrap_external_draft_unsupported",
+        ),
+        (None, True, None, None, {}, "stream_generate requires a prompt"),
+        (
+            (0,),
+            True,
+            None,
+            "valid",
+            {},
+            "native_mtp_sparse_bootstrap_owns_selected_tokens",
+        ),
+        (
+            None,
+            True,
+            None,
+            "valid",
+            {"prompt_logical_positions": (0,)},
+            "native_mtp_sparse_bootstrap_owns_logical_positions",
+        ),
+        (
+            None,
+            True,
+            None,
+            "valid",
+            {"prompt_cache": []},
+            "native_mtp_prefix_reuse_unsupported",
+        ),
+        (None, True, None, object(), {}, "native_mtp_sparse_bootstrap_invalid"),
+    ),
+)
+def test_stream_generate_rejects_invalid_sparse_none_combinations_before_prompt_mutation(
+    monkeypatch, prompt, mtp, draft_model, bootstrap, kwargs, message
+):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    valid_bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0,),
+        selected_token_ids=(0,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    if bootstrap == "valid":
+        bootstrap = valid_bootstrap
+
+    def prompt_conversion_forbidden(*_args, **_kwargs):
+        raise AssertionError("prompt conversion must not run before sparse validation")
+
+    monkeypatch.setattr(generate_module.mx, "array", prompt_conversion_forbidden)
+    with pytest.raises((TypeError, ValueError), match=message):
+        list(
+            stream_generate(
+                model,
+                _StreamTokenizer(),
+                prompt,
+                mtp=mtp,
+                draft_model=draft_model,
+                sparse_bootstrap=bootstrap,
+                model_forward_context=context.context,
+                **kwargs,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("model_capability", "context", "message"),
+    (
+        (None, None, "native_mtp_sparse_bootstrap_requires_position_context"),
+        (
+            _Capability(False, "native_mtp_weights_not_loaded"),
+            "context",
+            "native_mtp_weights_not_loaded",
+        ),
+    ),
+)
+def test_stream_generate_sparse_rejects_context_and_capability_before_mutation(
+    monkeypatch, model_capability, context, message
+):
+    model = _NativeMTPModel()
+    position_context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        position_context,
+        positions=(0,),
+        selected_token_ids=(0,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    if model_capability is not None:
+        model.mtp_capability = model_capability
+    if context == "context":
+        context = position_context.context
+
+    def prompt_conversion_forbidden(*_args, **_kwargs):
+        raise AssertionError("prompt conversion must not run before sparse validation")
+
+    monkeypatch.setattr(generate_module.mx, "array", prompt_conversion_forbidden)
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        list(
+            stream_generate(
+                model,
+                _StreamTokenizer(),
+                None,
+                mtp=True,
+                sparse_bootstrap=bootstrap,
+                model_forward_context=context,
+            )
+        )
+    assert model.requests == []
+
+
+def test_stream_generate_sparse_bootstrap_is_one_shot_and_closes_on_failure(
+    monkeypatch,
+):
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    adopted = []
+    original_adopt = NativeMTPRequestCache.adopt_sparse_target.__func__
+
+    def capture_adopt(cls, *args, **kwargs):
+        request = original_adopt(cls, *args, **kwargs)
+        adopted.append(request)
+        return request
+
+    monkeypatch.setattr(
+        NativeMTPRequestCache, "adopt_sparse_target", classmethod(capture_adopt)
+    )
+
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(2,),
+    )
+    iterator = stream_generate(
+        model,
+        _StreamTokenizer(),
+        None,
+        mtp=True,
+        max_tokens=4,
+        sparse_bootstrap=bootstrap,
+        model_forward_context=context.context,
+    )
+    assert next(iterator).token == 4
+    request = adopted[-1]
+    iterator.close()
+    assert request.closed
+    assert context.active == 0
+
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+        list(
+            stream_generate(
+                model,
+                _StreamTokenizer(),
+                None,
+                mtp=True,
+                sparse_bootstrap=bootstrap,
+                model_forward_context=context.context,
+            )
+        )
+
+    failing_model = _NativeMTPModel(fail_mtp_offsets={0})
+    failing_context = _PositionContext()
+    failing_bootstrap = _make_sparse_bootstrap(
+        failing_model,
+        failing_context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(2,),
+    )
+    with pytest.raises(RuntimeError, match="synthetic unexpected next draft"):
+        list(
+            stream_generate(
+                failing_model,
+                _StreamTokenizer(),
+                None,
+                mtp=True,
+                sparse_bootstrap=failing_bootstrap,
+                model_forward_context=failing_context.context,
+            )
+        )
+    assert adopted[-1].closed
+    assert failing_context.active == 0
+
+
+def test_stream_generate_sparse_zero_tokens_finalizes_with_terminal_telemetry(
+    monkeypatch,
+):
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    adopted = []
+    original_adopt = NativeMTPRequestCache.adopt_sparse_target.__func__
+
+    def capture_adopt(cls, *args, **kwargs):
+        request = original_adopt(cls, *args, **kwargs)
+        adopted.append(request)
+        return request
+
+    monkeypatch.setattr(
+        NativeMTPRequestCache, "adopt_sparse_target", classmethod(capture_adopt)
+    )
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(2,),
+    )
+    tokenizer = _StreamTokenizer()
+    responses = list(
+        stream_generate(
+            model,
+            tokenizer,
+            None,
+            mtp=True,
+            max_tokens=0,
+            sparse_bootstrap=bootstrap,
+            model_forward_context=context.context,
+        )
+    )
+
+    assert len(responses) == 1
+    terminal = responses[0]
+    assert tokenizer.detokenizer.finalized
+    assert terminal.text == ""
+    assert terminal.generation_tokens == 0
+    assert terminal.prompt_tokens == 4
+    assert terminal.prompt_tps == 0.0
+    assert terminal.finish_reason == "length"
+    assert terminal.mtp_drafts == 0
+    assert terminal.mtp_accepted == 0
+    assert terminal.mtp_bypass_reason is None
+    assert adopted[-1].closed
+    assert context.active == 0
+
+
+def test_stream_generate_ordinary_prompt_path_is_unchanged(monkeypatch):
+    captured = {}
+    logprobs = mx.zeros((7,))
+
+    def fake_generate_step(prompt, model, **kwargs):
+        captured["prompt"] = prompt
+        captured["model"] = model
+        captured.update(kwargs)
+        yield 2, logprobs
+
+    model = _NativeMTPModel()
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    monkeypatch.setattr(generate_module, "generate_step", fake_generate_step)
+    responses = list(
+        stream_generate(
+            model,
+            _StreamTokenizer(),
+            [0, 1],
+            max_tokens=2,
+        )
+    )
+
+    assert isinstance(captured["prompt"], mx.array)
+    assert captured["prompt"].tolist() == [0, 1]
+    assert captured["model"] is model
+    assert "sparse_bootstrap" not in captured
+    assert [response.prompt_tokens for response in responses] == [2, 2]
+    assert responses[-1].mtp_bypass_reason is None
 
 
 def _direct_positioned_target(model, cache, context, token_ids, positions):

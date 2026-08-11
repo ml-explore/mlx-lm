@@ -2255,12 +2255,13 @@ def mtp_generate_step(
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
-    prompt: Union[str, mx.array, List[int]],
+    prompt: Optional[Union[str, mx.array, List[int]]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
     mtp: bool = False,
     mtp_sampling_config: Optional[NativeMTPSamplingConfig] = None,
     model_forward_context: Optional[GenerationForwardContext] = None,
+    sparse_bootstrap: Optional[NativeMTPSparseBootstrap] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -2269,8 +2270,9 @@ def stream_generate(
     Args:
         model (nn.Module): The model to use for generation.
         tokenizer (PreTrainedTokenizer): The tokenizer.
-        prompt (Union[str, mx.array, List[int]]): The input prompt string or
-          integer tokens.
+        prompt (Union[str, mx.array, List[int]], optional): The input prompt
+          string or integer tokens. ``None`` is only valid with native MTP and
+          an attested ``sparse_bootstrap`` that owns the selected prompt state.
         max_tokens (int): The maximum number of tokens to generate.
           Default: ``256``.
         draft_model (Optional[nn.Module]): An optional draft model. If provided
@@ -2283,6 +2285,10 @@ def stream_generate(
         model_forward_context (Callable[[GenerationForward], ContextManager], optional):
           A request-local context factory forwarded to the selected generation
           implementation. The scope covers Python model-call graph construction.
+        sparse_bootstrap (NativeMTPSparseBootstrap, optional): Attested sparse
+          target state for native MTP. It owns the prompt tokens and logical
+          positions, and cannot be combined with ``prompt`` or an external
+          draft model.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -2290,10 +2296,41 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    sparse_prompt_tokens = None
+    if sparse_bootstrap is not None:
+        if not isinstance(sparse_bootstrap, NativeMTPSparseBootstrap):
+            raise TypeError("native_mtp_sparse_bootstrap_invalid")
+        if not mtp:
+            raise ValueError("native_mtp_sparse_bootstrap_requires_mtp")
+        if draft_model is not None:
+            raise ValueError("native_mtp_sparse_bootstrap_external_draft_unsupported")
+        if prompt is not None:
+            raise ValueError("native_mtp_sparse_bootstrap_owns_selected_tokens")
+        if model_forward_context is None:
+            raise ValueError("native_mtp_sparse_bootstrap_requires_position_context")
+        if kwargs.get("prompt_logical_positions") is not None:
+            raise ValueError("native_mtp_sparse_bootstrap_owns_logical_positions")
+        if kwargs.get("prompt_cache") is not None:
+            raise ValueError("native_mtp_prefix_reuse_unsupported")
+        capability = getattr(model, "mtp_capability", None)
+        if capability is None or not capability.supported:
+            reason = (
+                "native_mtp_model_capability_missing"
+                if capability is None
+                else capability.reason
+            )
+            raise RuntimeError(reason)
+        # Sparse prefill completed before this public stream starts. The next
+        # logical position is immutable host metadata and preserves original
+        # prompt-token usage without forcing device realization.
+        sparse_prompt_tokens = sparse_bootstrap.next_logical_position
+    elif prompt is None:
+        raise ValueError("stream_generate requires a prompt")
+
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
-    if not isinstance(prompt, mx.array):
+    if sparse_bootstrap is None and not isinstance(prompt, mx.array):
         if isinstance(prompt, str):
             # Try to infer if special tokens are needed
             add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
@@ -2301,6 +2338,8 @@ def stream_generate(
             )
             prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         prompt = mx.array(prompt)
+
+    prompt_tokens = prompt.size if sparse_prompt_tokens is None else sparse_prompt_tokens
 
     detokenizer = tokenizer.detokenizer
 
@@ -2319,12 +2358,17 @@ def stream_generate(
             kwargs.pop("max_kv_size", None)
             kwargs.pop("prompt_progress_callback", None)
             kwargs.pop("num_draft_tokens", None)
+            native_mtp_kwargs = {
+                "sampling_config": mtp_sampling_config,
+                "eos_token_ids": tokenizer.eos_token_ids,
+                "telemetry": mtp_telemetry,
+            }
+            if sparse_bootstrap is not None:
+                native_mtp_kwargs["sparse_bootstrap"] = sparse_bootstrap
             token_generator = mtp_generate_step(
                 prompt,
                 model,
-                sampling_config=mtp_sampling_config,
-                eos_token_ids=tokenizer.eos_token_ids,
-                telemetry=mtp_telemetry,
+                **native_mtp_kwargs,
                 **kwargs,
             )
         else:
@@ -2364,7 +2408,11 @@ def stream_generate(
             for n, (token, logprobs, from_draft) in enumerate(token_generator):
                 if n == 0:
                     prompt_time = time.perf_counter() - tic
-                    prompt_tps = prompt.size / prompt_time
+                    prompt_tps = (
+                        0.0
+                        if sparse_bootstrap is not None
+                        else prompt_tokens / prompt_time
+                    )
                     tic = time.perf_counter()
                 if token in tokenizer.eos_token_ids:
                     break
@@ -2378,7 +2426,7 @@ def stream_generate(
                     token=token,
                     logprobs=logprobs,
                     from_draft=from_draft,
-                    prompt_tokens=prompt.size,
+                    prompt_tokens=prompt_tokens,
                     prompt_tps=prompt_tps,
                     generation_tokens=n + 1,
                     generation_tps=(n + 1) / (time.perf_counter() - tic),
@@ -2399,7 +2447,7 @@ def stream_generate(
             token=token,
             logprobs=logprobs,
             from_draft=from_draft,
-            prompt_tokens=prompt.size,
+            prompt_tokens=prompt_tokens,
             prompt_tps=prompt_tps,
             generation_tokens=n + 1,
             generation_tps=(n + 1) / (time.perf_counter() - tic),
