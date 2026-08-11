@@ -3,11 +3,21 @@
 
 import importlib
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
+
+from mlx_lm.generate import (
+    GenerationForwardPhase,
+    NativeMTPSparseBootstrap,
+    attested_target_forward,
+    stream_generate,
+)
+from mlx_lm.models.cache import NativeMTPRequestCache
 
 HIDDEN = 32
 INTERMEDIATE = 64
@@ -17,6 +27,7 @@ NUM_KV_HEADS = 2
 NUM_EXPERTS = 2
 MOE_INTERMEDIATE = 32
 SHARED_INTERMEDIATE = 64
+_ACTIVE_FORWARD = ContextVar("qwen3_5_mtp_wrapper_forward", default=None)
 
 
 def _config(*, moe=False, mtp_layers=1, tie_word_embeddings=True):
@@ -58,10 +69,29 @@ def _config(*, moe=False, mtp_layers=1, tie_word_embeddings=True):
     return config
 
 
-def _model(*, moe=False, mtp_layers=1, tie_word_embeddings=True):
+def _model(*, moe=False, mtp_layers=1, tie_word_embeddings=True, acknowledge=False):
     module_name = "mlx_lm.models.qwen3_5_moe" if moe else "mlx_lm.models.qwen3_5"
     module = importlib.import_module(module_name)
-    model = module.Model(
+    model_type = module.Model
+    if acknowledge:
+
+        class _AcknowledgingModel(model_type):
+            @staticmethod
+            def _acknowledge_positions():
+                forward = _ACTIVE_FORWARD.get()
+                if forward is not None and forward.logical_position_ack is not None:
+                    forward.logical_position_ack.acknowledge(forward.logical_positions)
+
+            def __call__(self, *args, **kwargs):
+                self._acknowledge_positions()
+                return super().__call__(*args, **kwargs)
+
+            def mtp_forward(self, *args, **kwargs):
+                self._acknowledge_positions()
+                return super().mtp_forward(*args, **kwargs)
+
+        model_type = _AcknowledgingModel
+    model = model_type(
         module.ModelArgs.from_dict(
             _config(
                 moe=moe,
@@ -169,6 +199,54 @@ def _sanitize_and_load(model, weights):
     return sanitized
 
 
+@contextmanager
+def _acknowledging_forward_context(forward):
+    token = _ACTIVE_FORWARD.set(forward)
+    try:
+        yield
+    finally:
+        _ACTIVE_FORWARD.reset(token)
+
+
+class _StreamDetokenizer:
+    def __init__(self):
+        self.last_segment = ""
+        self.finalized = False
+
+    def add_token(self, token):
+        self.last_segment = str(token)
+
+    def finalize(self):
+        self.finalized = True
+
+
+class _StreamTokenizer:
+    def __init__(self):
+        self.detokenizer = _StreamDetokenizer()
+        self.eos_token_ids = frozenset()
+
+
+def _sparse_bootstrap(model):
+    target_cache = model.make_cache()
+    (_, _), receipt = attested_target_forward(
+        model,
+        (0, 1),
+        target_cache,
+        phase=GenerationForwardPhase.PREFILL,
+        logical_positions=(0, 1),
+        immediate_successor_token_ids=(1,),
+        model_forward_context=_acknowledging_forward_context,
+    )
+    return NativeMTPSparseBootstrap(
+        receipts=(receipt,),
+        selected_logical_positions=(0, 1),
+        selected_token_ids=(0, 1),
+        immediate_successor_token_ids=(1,),
+        target_cache=target_cache,
+        next_logical_position=2,
+    )
+
+
 def _convert_moe_layout(weights, layout):
     prefix = "language_model.mtp.layers.0.mlp"
     gate = weights.pop(f"{prefix}.switch_mlp.gate_proj.weight")
@@ -244,12 +322,90 @@ def test_dense_and_moe_models_expose_the_same_structured_mtp_cache_contract(moe)
     _sanitize_and_load(model, _checkpoint(model, moe=moe))
 
     request = model.make_mtp_request_cache()
+    assert model.mtp is model.language_model.mtp
+    assert request.model is model.language_model
+    assert not any(
+        key.startswith("mtp.") for key, _ in tree_flatten(model.parameters())
+    )
     assert request.backbone is not request.mtp
     assert request.state.backbone_tokens == 0
     assert request.state.mtp_tokens == 0
     request.assert_aligned(backbone_tokens=0, mtp_tokens=0)
     with pytest.raises(ValueError, match="native_mtp_prefix_reuse_unsupported"):
         model.make_mtp_request_cache(prompt_cache=model.make_cache())
+
+
+def test_outer_mtp_topology_view_preserves_unloaded_fail_closed_behavior():
+    model = _model()
+    target_cache = model.make_cache()
+
+    assert model.mtp is model.language_model.mtp
+    with pytest.raises(RuntimeError, match="native_mtp_weights_not_validated"):
+        NativeMTPRequestCache.adopt_sparse_target(
+            model,
+            target_cache=target_cache,
+            target_tokens=1,
+            next_logical_position=1,
+        )
+
+    assert target_cache[1].offset == 0
+
+
+@pytest.mark.parametrize("moe", (False, True))
+def test_outer_dense_and_moe_sparse_bootstrap_stream_adopts_outer_topology(
+    monkeypatch, moe
+):
+    model = _model(moe=moe, acknowledge=True)
+    _sanitize_and_load(model, _checkpoint(model, moe=moe))
+    bootstrap = _sparse_bootstrap(model)
+    adopted = []
+    sealed = []
+    original_adopt = NativeMTPRequestCache.adopt_sparse_target.__func__
+    original_seal = NativeMTPRequestCache.seal_verified
+
+    def capture_adopt(cls, *args, **kwargs):
+        request = original_adopt(cls, *args, **kwargs)
+        adopted.append(request)
+        return request
+
+    def capture_seal(self, *, backbone_tokens, mtp_tokens):
+        result = original_seal(
+            self, backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens
+        )
+        sealed.append((backbone_tokens, mtp_tokens, result))
+        return result
+
+    generate_module = importlib.import_module("mlx_lm.generate")
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    monkeypatch.setattr(
+        NativeMTPRequestCache, "adopt_sparse_target", classmethod(capture_adopt)
+    )
+    monkeypatch.setattr(NativeMTPRequestCache, "seal_verified", capture_seal)
+    tokenizer = _StreamTokenizer()
+
+    responses = list(
+        stream_generate(
+            model,
+            tokenizer,
+            None,
+            mtp=True,
+            max_tokens=1,
+            sparse_bootstrap=bootstrap,
+            model_forward_context=_acknowledging_forward_context,
+        )
+    )
+
+    request = adopted[0]
+    assert request.model is model
+    assert request.backbone is bootstrap.target_cache
+    assert (sealed[0][0], sealed[0][1]) == (2, 1)
+    assert sealed[0][2].backbone_tokens == 2
+    assert sealed[0][2].mtp_tokens == 1
+    assert request.closed
+    assert not request.checkpoint_active
+    assert tokenizer.detokenizer.finalized
+    assert responses[-1].prompt_tokens == 2
+    assert responses[-1].generation_tokens == 1
 
 
 def test_exact_sanitize_load_handshake_rejects_filtered_non_strict_load():

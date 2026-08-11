@@ -893,6 +893,12 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.pipeline_layers
 
+    @property
+    def mtp(self):
+        """Expose the exact owned MTP topology without registering an alias."""
+
+        return self.language_model.mtp
+
     def make_cache(self):
         return self.language_model.make_cache()
 
