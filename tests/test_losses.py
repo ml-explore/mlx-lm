@@ -63,6 +63,44 @@ class TestLosses(unittest.TestCase):
 
         self.assertTrue(mx.allclose(vjp_q, expected))
 
+    def test_kl_div_loss_vjp_large_vocab_deterministic(self):
+        self.assertTrue(can_run_metal())
+        mx.random.seed(0)
+
+        logits_q = mx.random.normal((64, 100003)) * 6.0
+        logits_p = mx.random.normal((64, 100003)) * 6.0
+        cotan = mx.ones((64,))
+
+        with mx.stream(mx.cpu):
+            expected = mx.vjp(kl_div_loss, [logits_q, logits_p], [cotan])[1][0]
+
+        runs = [mx.vjp(kl_div_loss, [logits_q, logits_p], [cotan])[1][0] for _ in range(5)]
+        mx.eval(runs, expected)
+
+        for g in runs:
+            self.assertTrue(mx.array_equal(g, runs[0]))
+            self.assertTrue(mx.allclose(g, expected, rtol=1e-4, atol=1e-5))
+            self.assertFalse(bool(mx.any(mx.abs(g) > 1e30)))
+
+    def test_js_div_loss_vjp_large_vocab_deterministic(self):
+        self.assertTrue(can_run_metal())
+        mx.random.seed(0)
+
+        logits_q = mx.random.normal((64, 100003)) * 6.0
+        logits_p = mx.random.normal((64, 100003)) * 6.0
+        cotan = mx.ones((64,))
+
+        with mx.stream(mx.cpu):
+            expected = mx.vjp(js_div_loss, [logits_q, logits_p], [cotan])[1][0]
+
+        runs = [mx.vjp(js_div_loss, [logits_q, logits_p], [cotan])[1][0] for _ in range(5)]
+        mx.eval(runs, expected)
+
+        for g in runs:
+            self.assertTrue(mx.array_equal(g, runs[0]))
+            self.assertTrue(mx.allclose(g, expected, rtol=1e-4, atol=1e-5))
+            self.assertFalse(bool(mx.any(mx.abs(g) > 1e30)))
+
 
 if __name__ == "__main__":
     unittest.main()
