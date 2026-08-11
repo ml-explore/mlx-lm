@@ -552,8 +552,12 @@ def _make_js_forward_kernel():
                 float logq_j = vals_q[j] - lse_q;
                 float p_j = metal::fast::exp(logp_j);
                 float q_j = metal::fast::exp(logq_j);
-                kl_p += p_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logq_j - logp_j)));
-                kl_q += q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)));
+                float d_qp = logq_j - logp_j;
+                float d_pq = logp_j - logq_j;
+                float sp_qp = (d_qp > 0) ? (d_qp + metal::fast::log(1 + metal::fast::exp(-d_qp))) : metal::fast::log(1 + metal::fast::exp(d_qp));
+                float sp_pq = (d_pq > 0) ? (d_pq + metal::fast::log(1 + metal::fast::exp(-d_pq))) : metal::fast::log(1 + metal::fast::exp(d_pq));
+                kl_p += p_j * (logtwo - sp_qp);
+                kl_q += q_j * (logtwo - sp_pq);
             }
 
             // Move to the next block
@@ -573,8 +577,12 @@ def _make_js_forward_kernel():
                     float logq_j = vals_q[j] - lse_q;
                     float p_j = metal::fast::exp(logp_j);
                     float q_j = metal::fast::exp(logq_j);
-                    kl_p += p_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logq_j - logp_j)));
-                    kl_q += q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)));
+                    float d_qp = logq_j - logp_j;
+                    float d_pq = logp_j - logq_j;
+                    float sp_qp = (d_qp > 0) ? (d_qp + metal::fast::log(1 + metal::fast::exp(-d_qp))) : metal::fast::log(1 + metal::fast::exp(d_qp));
+                    float sp_pq = (d_pq > 0) ? (d_pq + metal::fast::log(1 + metal::fast::exp(-d_pq))) : metal::fast::log(1 + metal::fast::exp(d_pq));
+                    kl_p += p_j * (logtwo - sp_qp);
+                    kl_q += q_j * (logtwo - sp_pq);
                 }
             }
         }
@@ -750,8 +758,10 @@ def _make_js_backward_kernel():
                 float logp_j = min(vals_p[j] - lse_p, 0.0f);
                 float logq_j = min(vals_q[j] - lse_q, 0.0f);
                 float q_j = metal::fast::exp(logq_j);
+                float d_pq = logp_j - logq_j;
+                float sp_pq = (d_pq > 0) ? (d_pq + metal::fast::log(1 + metal::fast::exp(-d_pq))) : metal::fast::log(1 + metal::fast::exp(d_pq));
                 out_q[offset + j] = static_cast<T>(
-                    c * 0.5 * q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)) - kl_q)
+                    c * 0.5 * q_j * (logtwo - sp_pq - kl_q)
                 );
             }
 
@@ -771,8 +781,10 @@ def _make_js_backward_kernel():
                     float logp_j = min(vals_p[j] - lse_p, 0.0f);
                     float logq_j = min(vals_q[j] - lse_q, 0.0f);
                     float q_j = metal::fast::exp(logq_j);
+                    float d_pq = logp_j - logq_j;
+                    float sp_pq = (d_pq > 0) ? (d_pq + metal::fast::log(1 + metal::fast::exp(-d_pq))) : metal::fast::log(1 + metal::fast::exp(d_pq));
                     out_q[offset + j] = static_cast<T>(
-                        c * 0.5 * q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)) - kl_q)
+                        c * 0.5 * q_j * (logtwo - sp_pq - kl_q)
                     );
                 }
             }
