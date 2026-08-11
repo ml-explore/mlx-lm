@@ -2,6 +2,7 @@
 """Synthetic streaming coverage for the native Qwen MTP generator."""
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -13,6 +14,8 @@ from mlx_lm.generate import (
     mtp_generate_step,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache, NativeMTPRequestCache
+
+_ACTIVE_FORWARD = ContextVar("native_mtp_test_forward", default=None)
 
 
 @dataclass(frozen=True)
@@ -27,9 +30,20 @@ class _NativeMTPModel:
     mtp_capability = _Capability()
     vocab_size = 7
 
-    def __init__(self, *, wrong_draft=False, fail_mtp_offsets=()):
+    def __init__(
+        self,
+        *,
+        wrong_draft=False,
+        fail_mtp_offsets=(),
+        acknowledge_positions=True,
+        tamper_ack=False,
+        reuse_ack=False,
+    ):
         self.wrong_draft = wrong_draft
         self.fail_mtp_offsets = frozenset(fail_mtp_offsets)
+        self.acknowledge_positions = acknowledge_positions
+        self.tamper_ack = tamper_ack
+        self.reuse_ack = reuse_ack
         self.layers = [
             type("_Linear", (), {"is_linear": True})(),
             type("_Attention", (), {"is_linear": False})(),
@@ -40,6 +54,19 @@ class _NativeMTPModel:
         self.target_offsets = []
         self.mtp_offsets = []
         self.mtp_attempt_offsets = []
+
+    def _acknowledge_forward_positions(self):
+        forward = _ACTIVE_FORWARD.get()
+        if forward is None or forward.logical_position_ack is None:
+            return
+        if not self.acknowledge_positions:
+            return
+        positions = forward.logical_positions
+        if self.tamper_ack:
+            positions = positions[:-1] + (positions[-1] + 1,)
+        forward.logical_position_ack.acknowledge(positions)
+        if self.reuse_ack:
+            forward.logical_position_ack.acknowledge(positions)
 
     def make_cache(self):
         recurrent = ArraysCache(2)
@@ -68,6 +95,7 @@ class _NativeMTPModel:
         return logits
 
     def __call__(self, inputs, *, cache, return_hidden=False):
+        self._acknowledge_forward_positions()
         count = inputs.shape[1]
         cache[0][0] = cache[0][0] + count
         cache[0][1] = cache[0][1] + count
@@ -80,6 +108,7 @@ class _NativeMTPModel:
         return (logits, hidden) if return_hidden else logits
 
     def mtp_forward(self, hidden, next_token_ids, cache):
+        self._acknowledge_forward_positions()
         self.mtp_attempt_offsets.append(cache[0].offset)
         if cache[0].offset in self.fail_mtp_offsets:
             raise RuntimeError("synthetic unexpected next draft")
@@ -150,6 +179,244 @@ def test_forward_context_labels_target_prefill_verify_decode_and_mtp_draft():
     assert GenerationForwardPhase.MTP_DRAFT in phases
     assert GenerationForwardPhase.VERIFY in phases
     assert GenerationForwardPhase.DECODE in phases
+
+
+class _PositionContext:
+    def __init__(self):
+        self.events = []
+        self.active = 0
+
+    @contextmanager
+    def context(self, forward):
+        self.events.append(forward)
+        token = _ACTIVE_FORWARD.set(forward)
+        self.active += 1
+        try:
+            yield
+        finally:
+            self.active -= 1
+            _ACTIVE_FORWARD.reset(token)
+
+
+def _event_contract(events):
+    return [(event.phase, event.logical_positions) for event in events]
+
+
+def test_sparse_positions_cover_exact_native_phase_order_and_shared_cursor():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+
+    output, _ = _run(
+        model,
+        max_tokens=4,
+        prompt_logical_positions=(0, 3),
+        model_forward_context=context.context,
+    )
+
+    assert [token for token, _, _ in output] == [2, 3, 4, 5]
+    assert _event_contract(context.events) == [
+        (GenerationForwardPhase.PREFILL, (0,)),
+        (GenerationForwardPhase.MTP_DRAFT, (0,)),
+        (GenerationForwardPhase.PREFILL, (3,)),
+        (GenerationForwardPhase.MTP_DRAFT, (3,)),
+        (GenerationForwardPhase.VERIFY, (4, 5)),
+        (GenerationForwardPhase.MTP_DRAFT, (4, 5)),
+        (GenerationForwardPhase.VERIFY, (6, 7)),
+    ]
+    request = model.requests[-1]
+    assert request.backbone[1].offset == 6
+    assert request.mtp[0].offset == 4
+    assert request.state.next_logical_position == 8
+    assert context.active == 0
+
+
+def test_sparse_rejection_replays_exact_positions_without_cursor_rewind():
+    model = _NativeMTPModel(wrong_draft=True)
+    context = _PositionContext()
+
+    output, _ = _run(
+        model,
+        max_tokens=3,
+        prompt_logical_positions=(0, 3),
+        model_forward_context=context.context,
+    )
+
+    assert [token for token, _, _ in output] == [2, 3, 4]
+    assert _event_contract(context.events) == [
+        (GenerationForwardPhase.PREFILL, (0,)),
+        (GenerationForwardPhase.MTP_DRAFT, (0,)),
+        (GenerationForwardPhase.PREFILL, (3,)),
+        (GenerationForwardPhase.MTP_DRAFT, (3,)),
+        (GenerationForwardPhase.VERIFY, (4, 5)),
+        (GenerationForwardPhase.DECODE, (4,)),
+        (GenerationForwardPhase.MTP_DRAFT, (4,)),
+        (GenerationForwardPhase.VERIFY, (5, 6)),
+        (GenerationForwardPhase.DECODE, (5,)),
+    ]
+    request = model.requests[-1]
+    assert request.backbone[1].offset == 4
+    assert request.mtp[0].offset == 3
+    assert request.state.next_logical_position == 7
+    assert context.active == 0
+
+
+def test_sparse_cursor_advances_before_terminal_yield_and_cancel_cleanup():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    iterator = mtp_generate_step(
+        mx.array([0, 1], dtype=mx.uint32),
+        model,
+        max_tokens=4,
+        prompt_logical_positions=(0, 3),
+        model_forward_context=context.context,
+    )
+
+    assert next(iterator)[0] == 2
+    request = model.requests[-1]
+    assert request.state.next_logical_position == 5
+    assert context.active == 0
+    iterator.close()
+    assert request.closed
+    assert request.state.next_logical_position == 5
+    assert context.active == 0
+
+    terminal_model = _NativeMTPModel()
+    terminal_context = _PositionContext()
+    terminal, _ = _run(
+        terminal_model,
+        max_tokens=1,
+        prompt_logical_positions=(0, 3),
+        model_forward_context=terminal_context.context,
+    )
+    assert [token for token, _, _ in terminal] == [2]
+    assert terminal_model.requests[-1].closed
+    assert terminal_model.requests[-1].state.next_logical_position == 5
+    assert terminal_context.active == 0
+
+
+@pytest.mark.parametrize("wrong_draft", (False, True))
+def test_sparse_position_context_is_inactive_across_every_yield(wrong_draft):
+    model = _NativeMTPModel(wrong_draft=wrong_draft)
+    context = _PositionContext()
+    iterator = mtp_generate_step(
+        mx.array([0, 1], dtype=mx.uint32),
+        model,
+        max_tokens=4,
+        prompt_logical_positions=(0, 3),
+        model_forward_context=context.context,
+    )
+
+    observed = []
+    for item in iterator:
+        observed.append(item[0])
+        assert context.active == 0
+        assert _ACTIVE_FORWARD.get() is None
+    assert observed == [2, 3, 4, 5]
+    assert context.active == 0
+
+
+@pytest.mark.parametrize(
+    ("model", "message"),
+    (
+        (
+            _NativeMTPModel(acknowledge_positions=False),
+            "generation_logical_positions_not_acknowledged",
+        ),
+        (
+            _NativeMTPModel(tamper_ack=True),
+            "generation_logical_position_ack_mismatch",
+        ),
+        (
+            _NativeMTPModel(reuse_ack=True),
+            "generation_logical_position_ack_reused",
+        ),
+    ),
+)
+def test_sparse_position_ack_missing_tampered_or_reused_fails_closed(model, message):
+    context = _PositionContext()
+    with pytest.raises(RuntimeError, match=message):
+        _run(
+            model,
+            max_tokens=1,
+            prompt_logical_positions=(0, 3),
+            model_forward_context=context.context,
+        )
+    assert model.requests[-1].closed
+    assert context.active == 0
+
+
+def test_sparse_position_ack_rejects_context_entry_pre_ack():
+    model = _NativeMTPModel()
+
+    @contextmanager
+    def pre_ack_context(forward):
+        forward.logical_position_ack.acknowledge(forward.logical_positions)
+        yield
+
+    with pytest.raises(
+        RuntimeError, match="generation_logical_position_ack_outside_forward"
+    ):
+        _run(
+            model,
+            max_tokens=1,
+            prompt_logical_positions=(0, 3),
+            model_forward_context=pre_ack_context,
+        )
+    assert model.requests[-1].closed
+
+
+def test_dense_native_path_has_no_logical_metadata_or_cursor():
+    model = _NativeMTPModel(wrong_draft=True)
+    events = []
+
+    @contextmanager
+    def context(forward):
+        events.append(forward)
+        yield
+
+    output, _ = _run(model, max_tokens=3, model_forward_context=context)
+    assert [token for token, _, _ in output] == [2, 3, 4]
+    assert events
+    assert all(event.logical_positions is None for event in events)
+    assert all(event.logical_position_ack is None for event in events)
+    assert model.requests[-1].state.next_logical_position is None
+
+
+@pytest.mark.parametrize(
+    ("positions", "error", "message"),
+    (
+        ((0,), ValueError, "must match prompt"),
+        ((0, 0), ValueError, "strictly increasing"),
+        ((0, -1), ValueError, "non-negative integers"),
+        ((0, True), ValueError, "non-negative integers"),
+    ),
+)
+def test_sparse_prompt_positions_fail_before_cache_construction(
+    positions, error, message
+):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    with pytest.raises(error, match=message):
+        _run(
+            model,
+            max_tokens=1,
+            prompt_logical_positions=positions,
+            model_forward_context=context.context,
+        )
+    assert model.requests == []
+
+
+def test_sparse_prompt_positions_reject_device_sequence_before_iteration():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    with pytest.raises(TypeError, match="host sequence"):
+        _run(
+            model,
+            max_tokens=1,
+            prompt_logical_positions=mx.array([0, 3]),
+            model_forward_context=context.context,
+        )
+    assert model.requests == []
 
 
 @pytest.mark.parametrize(

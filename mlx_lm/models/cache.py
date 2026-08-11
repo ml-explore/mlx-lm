@@ -745,11 +745,12 @@ class NativeMTPCacheIdentity:
 
 @dataclass(frozen=True)
 class NativeMTPCacheState:
-    """Logical positions attached to a request-local native MTP cache."""
+    """Physical occupancies and the shared request-local logical cursor."""
 
     identity: NativeMTPCacheIdentity
     backbone_tokens: int
     mtp_tokens: int
+    next_logical_position: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -1022,7 +1023,12 @@ class NativeMTPRequestCache:
         ):
             raise ValueError("native MTP sealed positions cannot move backwards")
         self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
-        self._sealed = NativeMTPCacheState(self.identity, backbone_tokens, mtp_tokens)
+        self._sealed = NativeMTPCacheState(
+            self.identity,
+            backbone_tokens,
+            mtp_tokens,
+            previous.next_logical_position,
+        )
         return self._sealed
 
     @staticmethod
@@ -1124,7 +1130,62 @@ class NativeMTPRequestCache:
         ):
             raise ValueError("native MTP retained positions cannot move backwards")
         self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
-        self._state = NativeMTPCacheState(self.identity, backbone_tokens, mtp_tokens)
+        self._state = NativeMTPCacheState(
+            self.identity,
+            backbone_tokens,
+            mtp_tokens,
+            self._state.next_logical_position,
+        )
+        return self._state
+
+    def retain_logical_position(
+        self, *, backbone_tokens: int, mtp_tokens: int, next_logical_position: int
+    ) -> NativeMTPCacheState:
+        """Record physical retention plus an independently advancing cursor.
+
+        Sparse prompt positions may contain gaps, so prompt retention can move
+        the cursor forward by more than one.  Generated tokens use
+        :meth:`advance_logical_position`, whose contract is exactly one step.
+        """
+
+        current = self._state.next_logical_position
+        if (
+            isinstance(next_logical_position, bool)
+            or not isinstance(next_logical_position, int)
+            or next_logical_position < 0
+            or (current is not None and next_logical_position < current)
+        ):
+            raise ValueError("native MTP logical cursor cannot move backwards")
+        state = self.retain(
+            backbone_tokens=backbone_tokens,
+            mtp_tokens=mtp_tokens,
+        )
+        self._state = NativeMTPCacheState(
+            self.identity,
+            state.backbone_tokens,
+            state.mtp_tokens,
+            next_logical_position,
+        )
+        return self._state
+
+    def advance_logical_position(self) -> NativeMTPCacheState:
+        """Advance the shared generated-token cursor exactly once."""
+
+        if self._closed:
+            raise RuntimeError("native_mtp_cache_closed")
+        if self._replay_required is not None:
+            raise RuntimeError("native_mtp_cache_replay_required")
+        if self._checkpoint is not None:
+            raise RuntimeError("native_mtp_cache_checkpoint_active")
+        state = self._state
+        if state.next_logical_position is None:
+            raise RuntimeError("native_mtp_logical_cursor_uninitialized")
+        self._state = NativeMTPCacheState(
+            self.identity,
+            state.backbone_tokens,
+            state.mtp_tokens,
+            state.next_logical_position + 1,
+        )
         return self._state
 
     def replay_retained(
@@ -1152,7 +1213,12 @@ class NativeMTPRequestCache:
         ):
             raise ValueError("native MTP replay must advance one retained token step")
         self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
-        self._state = NativeMTPCacheState(self.identity, backbone_tokens, mtp_tokens)
+        self._state = NativeMTPCacheState(
+            self.identity,
+            backbone_tokens,
+            mtp_tokens,
+            self._state.next_logical_position,
+        )
         if (backbone_tokens, mtp_tokens) == (
             replay.replay_to_backbone_tokens,
             replay.replay_to_mtp_tokens,

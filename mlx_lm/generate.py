@@ -90,6 +90,49 @@ class GenerationForward:
     cache: Any
     phase: GenerationForwardPhase
     input_embeddings: Optional[mx.array] = None
+    logical_positions: Optional[Tuple[int, ...]] = None
+    logical_position_ack: Optional["GenerationForwardPositionAck"] = None
+
+
+class GenerationForwardPositionAck:
+    """One-shot proof that a context consumer used exact logical positions.
+
+    The generation wrapper activates the acknowledgement only for the model
+    call itself.  A request-local position hook must acknowledge the immutable
+    host positions while that call is in progress; acknowledging on context
+    entry/exit, acknowledging twice, or acknowledging different positions is
+    rejected.
+    """
+
+    def __init__(self, logical_positions: Tuple[int, ...]):
+        self._logical_positions = logical_positions
+        self._active = False
+        self._acknowledged = False
+        self._finished = False
+
+    def acknowledge(self, logical_positions: Tuple[int, ...]) -> None:
+        if not self._active or self._finished:
+            raise RuntimeError("generation_logical_position_ack_outside_forward")
+        if self._acknowledged:
+            raise RuntimeError("generation_logical_position_ack_reused")
+        if not isinstance(logical_positions, tuple) or (
+            logical_positions != self._logical_positions
+        ):
+            raise RuntimeError("generation_logical_position_ack_mismatch")
+        self._acknowledged = True
+
+    def _activate(self) -> None:
+        if self._active or self._finished:
+            raise RuntimeError("generation_logical_position_ack_reused")
+        self._active = True
+
+    def _require_acknowledged(self) -> None:
+        if not self._active or not self._acknowledged:
+            raise RuntimeError("generation_logical_positions_not_acknowledged")
+
+    def _finish(self) -> None:
+        self._active = False
+        self._finished = True
 
 
 GenerationForwardContext = Callable[[GenerationForward], ContextManager[None]]
@@ -867,6 +910,7 @@ def mtp_generate_step(
     sampling_config: Optional[NativeMTPSamplingConfig] = None,
     eos_token_ids: Optional[Sequence[int]] = None,
     telemetry: Optional[Dict[str, Any]] = None,
+    prompt_logical_positions: Optional[Sequence[int]] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Stream native-Qwen MTP with request-local transactional cache state.
 
@@ -878,7 +922,9 @@ def mtp_generate_step(
     Stochastic sampling is described by :class:`NativeMTPSamplingConfig` and
     uses an explicit per-request MLX key.  Opaque filters and stateful logits
     processors fail before cache construction because they cannot be replayed
-    exactly after a rejected recurrent verification.
+    exactly after a rejected recurrent verification.  Optional sparse prompt
+    coordinates are immutable host metadata only: every forward must be
+    acknowledged by the request-local context consumer that applies them.
     """
 
     if prompt_cache is not None:
@@ -917,6 +963,35 @@ def mtp_generate_step(
         for processor in logits_processors
     ):
         raise ValueError("native_mtp_non_replay_safe_logits_processor")
+
+    logical_prompt = None
+    if prompt_logical_positions is not None:
+        if model_forward_context is None:
+            raise ValueError("native_mtp_logical_positions_require_forward_context")
+        if isinstance(prompt_logical_positions, mx.array) or not isinstance(
+            prompt_logical_positions, Sequence
+        ):
+            raise TypeError(
+                "native MTP prompt logical positions must be a host sequence"
+            )
+        logical_prompt = tuple(prompt_logical_positions)
+        if len(logical_prompt) != prompt.size:
+            raise ValueError("native MTP prompt logical positions must match prompt")
+        previous_position = -1
+        for position in logical_prompt:
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position < 0
+            ):
+                raise ValueError(
+                    "native MTP prompt logical positions must be non-negative integers"
+                )
+            if position <= previous_position:
+                raise ValueError(
+                    "native MTP prompt logical positions must be strictly increasing"
+                )
+            previous_position = position
 
     request = model.make_mtp_request_cache()
     if telemetry is not None:
@@ -989,31 +1064,67 @@ def mtp_generate_step(
             logprobs = logprobs / sampling_config.temperature
         return (logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)).squeeze(0)
 
-    def _target_call(input_tokens, phase, *, return_hidden=False):
+    def _target_call(
+        input_tokens, phase, *, return_hidden=False, logical_positions=None
+    ):
         batched = input_tokens[None]
         if model_forward_context is None:
             return model(batched, cache=request.backbone, return_hidden=return_hidden)
+        position_ack = (
+            GenerationForwardPositionAck(logical_positions)
+            if logical_positions is not None
+            else None
+        )
         forward = GenerationForward(
             model=model,
             input_tokens=batched,
             cache=request.backbone,
             phase=phase,
+            logical_positions=logical_positions,
+            logical_position_ack=position_ack,
         )
         with model_forward_context(forward):
-            return model(batched, cache=request.backbone, return_hidden=return_hidden)
+            if position_ack is None:
+                return model(
+                    batched, cache=request.backbone, return_hidden=return_hidden
+                )
+            position_ack._activate()
+            try:
+                result = model(
+                    batched, cache=request.backbone, return_hidden=return_hidden
+                )
+                position_ack._require_acknowledged()
+                return result
+            finally:
+                position_ack._finish()
 
-    def _mtp_call(hidden, next_tokens):
+    def _mtp_call(hidden, next_tokens, *, logical_positions=None):
         next_ids = next_tokens.reshape(1, -1)
         if model_forward_context is None:
             return model.mtp_forward(hidden, next_ids, request.mtp)
+        position_ack = (
+            GenerationForwardPositionAck(logical_positions)
+            if logical_positions is not None
+            else None
+        )
         forward = GenerationForward(
             model=model,
             input_tokens=next_ids,
             cache=request.mtp,
             phase=GenerationForwardPhase.MTP_DRAFT,
+            logical_positions=logical_positions,
+            logical_position_ack=position_ack,
         )
         with model_forward_context(forward):
-            return model.mtp_forward(hidden, next_ids, request.mtp)
+            if position_ack is None:
+                return model.mtp_forward(hidden, next_ids, request.mtp)
+            position_ack._activate()
+            try:
+                result = model.mtp_forward(hidden, next_ids, request.mtp)
+                position_ack._require_acknowledged()
+                return result
+            finally:
+                position_ack._finish()
 
     def _quantize():
         request.quantize(
@@ -1031,9 +1142,11 @@ def mtp_generate_step(
             mtp_tokens=state.mtp_tokens,
         )
 
-    def _draft(hidden, next_tokens, token_history):
+    def _draft(hidden, next_tokens, token_history, logical_positions=None):
         with mx.stream(generation_stream):
-            logits = _mtp_call(hidden, next_tokens)[:, -1, :]
+            logits = _mtp_call(
+                hidden, next_tokens, logical_positions=logical_positions
+            )[:, -1, :]
             _quantize()
             request.retain(
                 backbone_tokens=request.state.backbone_tokens,
@@ -1072,36 +1185,73 @@ def mtp_generate_step(
         # Shifted hidden/token pairs prefill the MTP head to the same physical
         # and logical position as the target before decode begins.
         remaining = prompt.astype(mx.uint32)
+        prompt_position_index = 0 if logical_prompt is not None else None
         with mx.stream(generation_stream):
             while remaining.size > 1:
                 count = min(prefill_step_size, remaining.size - 1)
+                forward_positions = (
+                    logical_prompt[
+                        prompt_position_index : prompt_position_index + count
+                    ]
+                    if logical_prompt is not None
+                    else None
+                )
                 _, hidden = _target_call(
                     remaining[:count],
                     GenerationForwardPhase.PREFILL,
                     return_hidden=True,
+                    logical_positions=forward_positions,
                 )
-                _mtp_call(hidden, remaining[1 : count + 1])
+                _mtp_call(
+                    hidden,
+                    remaining[1 : count + 1],
+                    logical_positions=forward_positions,
+                )
                 _quantize()
                 mx.eval(
                     [entry.state for entry in request.backbone],
                     [entry.state for entry in request.mtp],
                 )
-                request.retain(
-                    backbone_tokens=request.state.backbone_tokens + count,
-                    mtp_tokens=request.state.mtp_tokens + count,
-                )
+                if forward_positions is None:
+                    request.retain(
+                        backbone_tokens=request.state.backbone_tokens + count,
+                        mtp_tokens=request.state.mtp_tokens + count,
+                    )
+                else:
+                    request.retain_logical_position(
+                        backbone_tokens=request.state.backbone_tokens + count,
+                        mtp_tokens=request.state.mtp_tokens + count,
+                        next_logical_position=forward_positions[-1] + 1,
+                    )
                 _assert_target_mtp_alignment()
                 remaining = remaining[count:]
+                if logical_prompt is not None:
+                    prompt_position_index += count
                 mx.clear_cache()
 
+            final_prompt_positions = (
+                (logical_prompt[prompt_position_index],)
+                if logical_prompt is not None
+                else None
+            )
             initial_logits, initial_hidden = _target_call(
-                remaining, GenerationForwardPhase.PREFILL, return_hidden=True
+                remaining,
+                GenerationForwardPhase.PREFILL,
+                return_hidden=True,
+                logical_positions=final_prompt_positions,
             )
             _quantize()
-            request.retain(
-                backbone_tokens=request.state.backbone_tokens + 1,
-                mtp_tokens=request.state.mtp_tokens,
-            )
+            if final_prompt_positions is None:
+                request.retain(
+                    backbone_tokens=request.state.backbone_tokens + 1,
+                    mtp_tokens=request.state.mtp_tokens,
+                )
+            else:
+                request.retain_logical_position(
+                    backbone_tokens=request.state.backbone_tokens + 1,
+                    mtp_tokens=request.state.mtp_tokens,
+                    next_logical_position=final_prompt_positions[0] + 1,
+                )
             # Match generate_step: processors see only the input tokens passed
             # to its final prefill/decode step, not chunks consumed by _step.
             history = remaining.astype(mx.uint32)
@@ -1115,6 +1265,8 @@ def mtp_generate_step(
         history = mx.concatenate([history, current_token])
 
         generated = 1
+        if logical_prompt is not None:
+            request.advance_logical_position()
         current_id = current_token.item()
         terminal = current_id in eos_token_ids or generated >= max_tokens
         if terminal:
@@ -1123,17 +1275,31 @@ def mtp_generate_step(
         yield current_id, current_logprobs, False
         if terminal:
             return
-        draft_token, draft_logprobs = _draft(current_hidden, current_token, history)
+        draft_token, draft_logprobs = _draft(
+            current_hidden,
+            current_token,
+            history,
+            logical_positions=final_prompt_positions,
+        )
 
         while True:
 
             request.checkpoint()
             verify_inputs = mx.concatenate([current_token, draft_token])
+            verify_positions = (
+                (
+                    request.state.next_logical_position - 1,
+                    request.state.next_logical_position,
+                )
+                if logical_prompt is not None
+                else None
+            )
             with mx.stream(generation_stream):
                 verify_logits, verify_hidden = _target_call(
                     verify_inputs,
                     GenerationForwardPhase.VERIFY,
                     return_hidden=True,
+                    logical_positions=verify_positions,
                 )
                 _quantize()
                 request.seal_verified(
@@ -1177,6 +1343,8 @@ def mtp_generate_step(
                 if telemetry is not None:
                     telemetry["mtp_accepted"] += 1
                 generated += 1
+                if logical_prompt is not None:
+                    request.advance_logical_position()
                 draft_id = draft_token.item()
                 draft_terminal = draft_id in eos_token_ids or generated >= max_tokens
                 if draft_terminal:
@@ -1197,6 +1365,8 @@ def mtp_generate_step(
                 mx.eval(bonus_token, bonus_logprobs)
                 next_history = mx.concatenate([bonus_history, bonus_token])
                 generated += 1
+                if logical_prompt is not None:
+                    request.advance_logical_position()
                 bonus_id = bonus_token.item()
                 bonus_terminal = bonus_id in eos_token_ids or generated >= max_tokens
                 if bonus_terminal:
@@ -1213,7 +1383,10 @@ def mtp_generate_step(
                 )
                 mtp_tokens = mx.concatenate([draft_token, bonus_token])
                 next_draft, next_draft_logprobs = _draft(
-                    mtp_hidden, mtp_tokens, next_history
+                    mtp_hidden,
+                    mtp_tokens,
+                    next_history,
+                    logical_positions=verify_positions,
                 )
                 history = next_history
                 current_token = bonus_token
@@ -1227,11 +1400,17 @@ def mtp_generate_step(
             # recurrent state cannot retain a prefix of that forward.  Restore
             # then replay exactly that token before drafting from the residual.
             request.reject_partial(accepted_backbone_tokens=1, accepted_mtp_tokens=0)
+            replay_positions = (
+                (request.state.next_logical_position - 1,)
+                if logical_prompt is not None
+                else None
+            )
             with mx.stream(generation_stream):
                 _, replay_hidden = _target_call(
                     current_token,
                     GenerationForwardPhase.DECODE,
                     return_hidden=True,
+                    logical_positions=replay_positions,
                 )
                 _quantize()
                 request.replay_retained(
@@ -1240,6 +1419,8 @@ def mtp_generate_step(
                 )
             next_history = mx.concatenate([history, replacement_token])
             generated += 1
+            if logical_prompt is not None:
+                request.advance_logical_position()
             replacement_id = replacement_token.item()
             replacement_terminal = (
                 replacement_id in eos_token_ids or generated >= max_tokens
@@ -1252,7 +1433,10 @@ def mtp_generate_step(
                 return
 
             next_draft, next_draft_logprobs = _draft(
-                replay_hidden[:, -1:, :], replacement_token, next_history
+                replay_hidden[:, -1:, :],
+                replacement_token,
+                next_history,
+                logical_positions=replay_positions,
             )
             history = next_history
             current_token = replacement_token
