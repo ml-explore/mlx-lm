@@ -144,6 +144,72 @@ def test_rollback_restores_pre_quantization_entry_objects_and_positions():
     assert mtp[0].offset == 2
 
 
+def test_sparse_target_adoption_checkpoints_fresh_mtp_before_any_write():
+    backbone, mtp = _cache_pair()
+    _advance(backbone[1], 3)
+    request = NativeMTPRequestCache.adopt_sparse_target(
+        _Model(backbone, mtp),
+        target_cache=backbone,
+        target_tokens=3,
+        next_logical_position=8,
+    )
+
+    assert request.state.backbone_tokens == 3
+    assert request.state.mtp_tokens == 0
+    assert request.state.next_logical_position == 8
+    assert request.checkpoint_active
+    assert request.mtp[0].offset == 0
+
+    _advance(request.mtp[0], 2)
+    request.seal_verified(backbone_tokens=3, mtp_tokens=2)
+    request.commit(backbone_tokens=3, mtp_tokens=2)
+    assert not request.checkpoint_active
+    assert request.state.mtp_tokens == 2
+
+
+def test_sparse_target_adoption_rolls_back_bootstrap_suffix_on_close():
+    backbone, mtp = _cache_pair()
+    _advance(backbone[1], 2)
+    request = NativeMTPRequestCache.adopt_sparse_target(
+        _Model(backbone, mtp),
+        target_cache=backbone,
+        target_tokens=2,
+        next_logical_position=4,
+    )
+    _advance(request.mtp[0], 1)
+
+    request.finish("cancelled")
+
+    assert request.closed
+    assert not request.checkpoint_active
+    assert request.backbone[1].offset == 2
+    assert request.mtp[0].offset == 0
+
+
+def test_sparse_target_adoption_failure_closes_constructed_request(monkeypatch):
+    backbone, mtp = _cache_pair()
+    _advance(backbone[1], 2)
+    constructed = []
+
+    def fail_checkpoint(self):
+        constructed.append(self)
+        raise RuntimeError("synthetic adoption checkpoint failure")
+
+    monkeypatch.setattr(NativeMTPRequestCache, "checkpoint", fail_checkpoint)
+    with pytest.raises(RuntimeError, match="adoption checkpoint failure"):
+        NativeMTPRequestCache.adopt_sparse_target(
+            _Model(backbone, mtp),
+            target_cache=backbone,
+            target_tokens=2,
+            next_logical_position=4,
+        )
+    request = constructed[0]
+    assert request.closed
+    assert not request.checkpoint_active
+    assert request.backbone[1].offset == 2
+    assert request.mtp[0].offset == 0
+
+
 def test_prefix_reuse_batch_and_external_replacement_fail_closed():
     backbone, mtp = _cache_pair()
     model = _Model(backbone, mtp)

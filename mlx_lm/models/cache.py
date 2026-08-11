@@ -956,6 +956,49 @@ class NativeMTPRequestCache:
             raise RuntimeError(capability.reason)
         return cls(model, model.make_cache(), model.make_mtp_cache())
 
+    @classmethod
+    def adopt_sparse_target(
+        cls,
+        model: Any,
+        *,
+        target_cache: List[Any],
+        target_tokens: int,
+        next_logical_position: int,
+    ):
+        """Adopt an attested target cache and checkpoint before MTP writes.
+
+        Receipt validation belongs to the generation layer that owns the
+        evidence objects.  This cache-owned boundary independently validates
+        the exact target topology/physical occupancy, creates a fresh MTP
+        cache, initializes the shared cursor, and opens the rollback boundary
+        before returning control to any MTP forward.
+        """
+
+        if isinstance(target_tokens, bool) or not isinstance(target_tokens, int):
+            raise TypeError("native MTP sparse target token count must be an integer")
+        if target_tokens < 1:
+            raise ValueError("native MTP sparse target cache must be non-empty")
+        if (
+            isinstance(next_logical_position, bool)
+            or not isinstance(next_logical_position, int)
+            or next_logical_position < 1
+        ):
+            raise ValueError("native MTP sparse logical cursor is invalid")
+        request = None
+        try:
+            request = cls(model, target_cache, model.make_mtp_cache())
+            request.retain_logical_position(
+                backbone_tokens=target_tokens,
+                mtp_tokens=0,
+                next_logical_position=next_logical_position,
+            )
+            request.checkpoint()
+            return request
+        except BaseException:
+            if request is not None and not request.closed:
+                request.finish("cancelled")
+            raise
+
     def assert_aligned(self, *, backbone_tokens: int, mtp_tokens: int) -> None:
         """Assert exact logical/cache alignment before output may be emitted."""
 

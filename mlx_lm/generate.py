@@ -7,11 +7,12 @@ import functools
 import json
 import math
 import sys
+import threading
 import time
+import weakref
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
 from typing import (
     Any,
     Callable,
@@ -94,6 +95,242 @@ class GenerationForward:
     logical_position_ack: Optional["GenerationForwardPositionAck"] = None
 
 
+@dataclass(frozen=True)
+class NativeMTPCapabilityFingerprint:
+    """Stable value identity for a model's native-MTP capability snapshot."""
+
+    type_module: str
+    type_name: str
+    supported: bool
+    reason: str
+    num_layers: Optional[int]
+
+    @classmethod
+    def from_model(cls, model: nn.Module) -> "NativeMTPCapabilityFingerprint":
+        capability = getattr(model, "mtp_capability", None)
+        if capability is None:
+            raise RuntimeError("native_mtp_model_capability_missing")
+        capability_type = type(capability)
+        return cls(
+            capability_type.__module__,
+            capability_type.__qualname__,
+            capability.supported,
+            capability.reason,
+            getattr(capability, "num_layers", None),
+        )
+
+
+_GENERATION_FORWARD_RECEIPT_ISSUER = object()
+_GENERATION_FORWARD_RECEIPT_LOCK = threading.Lock()
+
+
+class _GenerationForwardReceiptToken:
+    __slots__ = ("__weakref__",)
+
+
+_GENERATION_FORWARD_RECEIPTS = weakref.WeakKeyDictionary()
+
+
+def _array_identity_evidence(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        return type(value), tuple(_array_identity_evidence(item) for item in value)
+    return id(value), tuple(value.shape), value.dtype
+
+
+def _cache_state_identity_evidence(entries):
+    evidence = []
+    for entry in entries:
+        if isinstance(entry, ArraysCache):
+            state = tuple(_array_identity_evidence(value) for value in entry.cache)
+            evidence.append(
+                (
+                    type(entry),
+                    state,
+                    _array_identity_evidence(entry.left_padding),
+                    _array_identity_evidence(entry.lengths),
+                )
+            )
+        else:
+            evidence.append(
+                (
+                    type(entry),
+                    entry.offset,
+                    _array_identity_evidence(entry.keys),
+                    _array_identity_evidence(entry.values),
+                )
+            )
+    return tuple(evidence)
+
+
+def _uint64_hash_constant(value):
+    """Construct exact uint64 bits without MLX's unsigned Python-int cast."""
+
+    value &= (1 << 64) - 1
+    if value >= 1 << 63:
+        value -= 1 << 64
+    return mx.array(value, dtype=mx.int64).view(mx.uint64)
+
+
+def _active_array_payload_hash(array):
+    """Hash exact payload bits to two words; this is not cryptographic."""
+
+    payload = array.view(mx.uint8)
+    if payload.ndim == 0:
+        payload = payload.reshape(1)
+    words = payload.astype(mx.uint64)
+    position = _uint64_hash_constant(0)
+    position_constant = 0x517CC1B727220A95
+    position_step = 0x6C8E9CF570932BD5
+    mask = (1 << 64) - 1
+    for axis, size in enumerate(payload.shape):
+        coordinate_shape = [1] * payload.ndim
+        coordinate_shape[axis] = size
+        coordinates = mx.arange(size, dtype=mx.uint64).reshape(coordinate_shape)
+        axis_constant = _uint64_hash_constant(
+            (position_constant + axis * position_step) & mask
+        )
+        position = position + coordinates * axis_constant
+
+    initial = mx.bitwise_xor(
+        words + _uint64_hash_constant(0x243F6A8885A308D3),
+        position + _uint64_hash_constant(0x13198A2E03707344),
+    )
+    mixed = initial * _uint64_hash_constant(0x9E3779B185EBCA87)
+    mixed = mx.bitwise_xor(mixed, mx.right_shift(mixed, 29))
+    mixed = mixed * _uint64_hash_constant(0xC2B2AE3D27D4EB4F)
+    second = mx.bitwise_xor(
+        mixed,
+        position * _uint64_hash_constant(0x165667B19E3779F9)
+        + _uint64_hash_constant(0x85EBCA77C2B2AE63),
+    )
+    lanes = mx.stack((mixed, second), axis=-1)
+    return mx.sum(lanes, axis=tuple(range(payload.ndim)))
+
+
+def _array_content_digest(value):
+    """Return compact dtype-preserving hashes for a nested array payload."""
+
+    flattened = []
+
+    def append_arrays(item):
+        if item is None:
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                append_arrays(child)
+            return
+        flattened.append(item)
+
+    append_arrays(value)
+    parts = [_active_array_payload_hash(array) for array in flattened]
+    if not parts:
+        return mx.zeros((0,), dtype=mx.uint64)
+    return mx.concatenate(parts)
+
+
+def _cache_content_digest(entries):
+    active = []
+    for entry in entries:
+        if isinstance(entry, ArraysCache):
+            active.extend(entry.cache)
+            active.extend((entry.left_padding, entry.lengths))
+            continue
+
+        def active_prefix(value):
+            if value is None:
+                return None
+            if isinstance(value, (list, tuple)):
+                return type(value)(active_prefix(item) for item in value)
+            return value[..., : entry.offset, :]
+
+        active.extend((active_prefix(entry.keys), active_prefix(entry.values)))
+    return _array_content_digest(active)
+
+
+@dataclass(frozen=True)
+class _GenerationForwardCanonicalRecord:
+    receipt_id: int
+    model_id: int
+    cache: List[Any]
+    cache_container_id: int
+    cache_entry_ids: Tuple[int, ...]
+    cache_state_evidence: tuple
+    cache_content_digest: Optional[mx.array]
+    capability: NativeMTPCapabilityFingerprint
+    phase: GenerationForwardPhase
+    logical_positions: Tuple[int, ...]
+    token_ids: Tuple[int, ...]
+    immediate_successor_token_ids: Tuple[int, ...]
+    logits: mx.array
+    logits_evidence: tuple
+    canonical_final_logits: Optional[mx.array]
+    hidden_rows: mx.array
+    hidden_evidence: tuple
+    canonical_hidden_rows: mx.array
+
+
+@dataclass
+class _GenerationForwardAuthority:
+    record: _GenerationForwardCanonicalRecord
+    reservation: Optional[Any] = None
+
+
+@dataclass(frozen=True, init=False)
+class GenerationForwardPositionReceipt:
+    """Unforgeable immutable evidence from one acknowledged target call."""
+
+    model_id: int
+    cache_container_id: int
+    cache_entry_ids: Tuple[int, ...]
+    capability: NativeMTPCapabilityFingerprint
+    phase: GenerationForwardPhase
+    logical_positions: Tuple[int, ...]
+    token_ids: Tuple[int, ...]
+    immediate_successor_token_ids: Tuple[int, ...]
+    logits: mx.array
+    hidden_rows: mx.array
+    _issuer_seal: Any
+    _record_token: Any
+
+    def __init__(
+        self,
+        *,
+        _issuer,
+        model_id,
+        cache_container_id,
+        cache_entry_ids,
+        capability,
+        phase,
+        logical_positions,
+        token_ids,
+        immediate_successor_token_ids,
+        logits,
+        hidden_rows,
+        record_token,
+    ):
+        if _issuer is not _GENERATION_FORWARD_RECEIPT_ISSUER:
+            raise TypeError(
+                "generation forward receipts are issued by an acknowledged call"
+            )
+        for name, value in (
+            ("model_id", model_id),
+            ("cache_container_id", cache_container_id),
+            ("cache_entry_ids", cache_entry_ids),
+            ("capability", capability),
+            ("phase", phase),
+            ("logical_positions", logical_positions),
+            ("token_ids", token_ids),
+            ("immediate_successor_token_ids", immediate_successor_token_ids),
+            ("logits", logits),
+            ("hidden_rows", hidden_rows),
+            ("_issuer_seal", _issuer),
+            ("_record_token", record_token),
+        ):
+            object.__setattr__(self, name, value)
+
+
 class GenerationForwardPositionAck:
     """One-shot proof that a context consumer used exact logical positions.
 
@@ -104,11 +341,32 @@ class GenerationForwardPositionAck:
     rejected.
     """
 
-    def __init__(self, logical_positions: Tuple[int, ...]):
+    def __init__(
+        self,
+        logical_positions: Tuple[int, ...],
+        *,
+        model: Optional[nn.Module] = None,
+        cache: Optional[Any] = None,
+        token_ids: Optional[Tuple[int, ...]] = None,
+        immediate_successor_token_ids: Tuple[int, ...] = (),
+        phase: Optional[GenerationForwardPhase] = None,
+        _receipt_issuer=None,
+    ):
         self._logical_positions = logical_positions
+        self._model = model
+        self._cache = cache
+        self._token_ids = token_ids
+        self._immediate_successor_token_ids = immediate_successor_token_ids
+        self._phase = phase
+        self._receipt_issuer = _receipt_issuer
         self._active = False
         self._acknowledged = False
         self._finished = False
+        self._receipt = None
+
+    @property
+    def receipt(self) -> Optional[GenerationForwardPositionReceipt]:
+        return self._receipt
 
     def acknowledge(self, logical_positions: Tuple[int, ...]) -> None:
         if not self._active or self._finished:
@@ -134,8 +392,147 @@ class GenerationForwardPositionAck:
         self._active = False
         self._finished = True
 
+    def _issue_receipt(self, result) -> GenerationForwardPositionReceipt:
+        if not self._finished or not self._acknowledged or self._receipt is not None:
+            raise RuntimeError("generation_logical_position_receipt_not_ready")
+        if self._receipt_issuer is not _GENERATION_FORWARD_RECEIPT_ISSUER:
+            raise RuntimeError("generation_logical_position_receipt_untrusted")
+        if (
+            self._model is None
+            or not isinstance(self._cache, list)
+            or self._token_ids is None
+            or self._phase is None
+        ):
+            raise RuntimeError("generation_logical_position_receipt_unbound")
+        if not isinstance(result, tuple) or len(result) != 2:
+            raise RuntimeError("generation_logical_position_receipt_missing_hidden")
+        logits, hidden_rows = result
+        canonical_hidden_rows = hidden_rows + mx.zeros(
+            hidden_rows.shape, dtype=hidden_rows.dtype
+        )
+        canonical_final_logits = None
+        cache_content_digest = None
+        if len(self._immediate_successor_token_ids) == len(self._logical_positions) - 1:
+            final_logits = logits[:, -1:, :]
+            canonical_final_logits = final_logits + mx.zeros(
+                final_logits.shape, dtype=final_logits.dtype
+            )
+            cache_content_digest = _cache_content_digest(self._cache)
+        canonical_values = [canonical_hidden_rows]
+        if canonical_final_logits is not None:
+            canonical_values.append(canonical_final_logits)
+            canonical_values.append(cache_content_digest)
+        mx.eval(canonical_values)
+        record_token = _GenerationForwardReceiptToken()
+        self._receipt = GenerationForwardPositionReceipt(
+            _issuer=_GENERATION_FORWARD_RECEIPT_ISSUER,
+            model_id=id(self._model),
+            cache_container_id=id(self._cache),
+            cache_entry_ids=tuple(id(entry) for entry in self._cache),
+            capability=NativeMTPCapabilityFingerprint.from_model(self._model),
+            phase=self._phase,
+            logical_positions=self._logical_positions,
+            token_ids=self._token_ids,
+            immediate_successor_token_ids=self._immediate_successor_token_ids,
+            logits=logits,
+            hidden_rows=hidden_rows,
+            record_token=record_token,
+        )
+        record = _GenerationForwardCanonicalRecord(
+            receipt_id=id(self._receipt),
+            model_id=id(self._model),
+            cache=self._cache,
+            cache_container_id=id(self._cache),
+            cache_entry_ids=tuple(id(entry) for entry in self._cache),
+            cache_state_evidence=_cache_state_identity_evidence(self._cache),
+            cache_content_digest=cache_content_digest,
+            capability=NativeMTPCapabilityFingerprint.from_model(self._model),
+            phase=self._phase,
+            logical_positions=self._logical_positions,
+            token_ids=self._token_ids,
+            immediate_successor_token_ids=self._immediate_successor_token_ids,
+            logits=logits,
+            logits_evidence=_array_identity_evidence(logits),
+            canonical_final_logits=canonical_final_logits,
+            hidden_rows=hidden_rows,
+            hidden_evidence=_array_identity_evidence(hidden_rows),
+            canonical_hidden_rows=canonical_hidden_rows,
+        )
+        with _GENERATION_FORWARD_RECEIPT_LOCK:
+            _GENERATION_FORWARD_RECEIPTS[record_token] = _GenerationForwardAuthority(
+                record
+            )
+        return self._receipt
+
 
 GenerationForwardContext = Callable[[GenerationForward], ContextManager[None]]
+
+
+def attested_target_forward(
+    model: nn.Module,
+    token_ids: Tuple[int, ...],
+    target_cache: List[Any],
+    *,
+    phase: GenerationForwardPhase,
+    logical_positions: Tuple[int, ...],
+    immediate_successor_token_ids: Tuple[int, ...],
+    model_forward_context: GenerationForwardContext,
+) -> Tuple[Tuple[mx.array, mx.array], GenerationForwardPositionReceipt]:
+    """Run and attest one exact hidden-returning target forward.
+
+    This is the only public receipt producer.  It owns the entire call rather
+    than accepting caller-provided outputs, so a receipt can only be issued
+    after the model itself returned hidden rows under an acknowledged position
+    context and those lazy outputs realized successfully.
+    """
+
+    if not isinstance(target_cache, list):
+        raise TypeError("attested target cache must be a caller-owned list")
+    if not isinstance(token_ids, tuple) or not token_ids:
+        raise ValueError("attested target forward requires non-empty host tokens")
+    if any(
+        isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
+        for token_id in token_ids
+    ):
+        raise ValueError("attested target token IDs must be non-negative integers")
+    if not isinstance(logical_positions, tuple) or len(logical_positions) != len(
+        token_ids
+    ):
+        raise ValueError("attested target positions must match input tokens")
+    if not isinstance(immediate_successor_token_ids, tuple) or len(
+        immediate_successor_token_ids
+    ) not in (len(logical_positions), len(logical_positions) - 1):
+        raise ValueError("attested target successor count is invalid")
+    input_tokens = mx.array(token_ids, dtype=mx.uint32)
+    ack = GenerationForwardPositionAck(
+        logical_positions,
+        model=model,
+        cache=target_cache,
+        token_ids=token_ids,
+        immediate_successor_token_ids=immediate_successor_token_ids,
+        phase=phase,
+        _receipt_issuer=_GENERATION_FORWARD_RECEIPT_ISSUER,
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=input_tokens[None],
+        cache=target_cache,
+        phase=phase,
+        logical_positions=logical_positions,
+        logical_position_ack=ack,
+    )
+    with model_forward_context(forward):
+        ack._activate()
+        try:
+            result = model(input_tokens[None], cache=target_cache, return_hidden=True)
+            ack._require_acknowledged()
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise RuntimeError("attested target forward did not return hidden rows")
+            mx.eval(result)
+        finally:
+            ack._finish()
+    receipt = ack._issue_receipt(result)
+    return result, receipt
 
 
 @dataclass(frozen=True)
@@ -184,6 +581,318 @@ class NativeMTPSamplingConfig:
     @property
     def stochastic(self) -> bool:
         return self.temperature > 0
+
+
+def _validate_receipt_against_record(receipt, record):
+    if (
+        not isinstance(receipt, GenerationForwardPositionReceipt)
+        or getattr(receipt, "_issuer_seal", None)
+        is not _GENERATION_FORWARD_RECEIPT_ISSUER
+        or id(receipt) != record.receipt_id
+        or receipt.model_id != record.model_id
+        or receipt.cache_container_id != record.cache_container_id
+        or receipt.cache_entry_ids != record.cache_entry_ids
+        or receipt.capability != record.capability
+        or receipt.phase is not record.phase
+        or receipt.logical_positions != record.logical_positions
+        or receipt.token_ids != record.token_ids
+        or receipt.immediate_successor_token_ids != record.immediate_successor_token_ids
+        or receipt.logits is not record.logits
+        or receipt.hidden_rows is not record.hidden_rows
+        or _array_identity_evidence(receipt.logits) != record.logits_evidence
+        or _array_identity_evidence(receipt.hidden_rows) != record.hidden_evidence
+    ):
+        raise RuntimeError("native_mtp_sparse_receipt_canonical_mismatch")
+
+
+def _sparse_attestation_host_decision(decision):
+    mx.eval(decision)
+    return bool(decision.item())
+
+
+def _verify_sparse_canonical_content(records):
+    """Realize all mutable evidence checks with one aggregate host decision."""
+
+    checks = [
+        mx.array_equal(record.hidden_rows, record.canonical_hidden_rows)
+        for record in records
+    ]
+    final = records[-1]
+    checks.extend(
+        (
+            mx.array_equal(final.logits[:, -1:, :], final.canonical_final_logits),
+            mx.array_equal(
+                _cache_content_digest(final.cache), final.cache_content_digest
+            ),
+        )
+    )
+    decision = mx.all(mx.stack(checks))
+    if not _sparse_attestation_host_decision(decision):
+        raise RuntimeError("native_mtp_sparse_evidence_content_mismatch")
+
+
+@dataclass(frozen=True)
+class _NativeMTPSparseClaim:
+    records: Tuple[_GenerationForwardCanonicalRecord, ...]
+    selected_logical_positions: Tuple[int, ...]
+    selected_token_ids: Tuple[int, ...]
+    immediate_successor_token_ids: Tuple[int, ...]
+    target_cache: List[Any]
+    next_logical_position: int
+
+    @property
+    def final_target_hidden(self):
+        return self.records[-1].canonical_hidden_rows[:, -1:, :]
+
+    @property
+    def final_target_logits(self):
+        return self.records[-1].canonical_final_logits
+
+
+@dataclass(frozen=True)
+class NativeMTPSparseBootstrap:
+    """Attested sparse target state from which native MTP may start.
+
+    The receipts retain the exact target outputs.  The explicit host tuples
+    make the caller contract inspectable, but never act as a second authority:
+    validation requires them to equal the ordered receipt contents exactly.
+    """
+
+    receipts: Tuple[GenerationForwardPositionReceipt, ...]
+    selected_logical_positions: Tuple[int, ...]
+    selected_token_ids: Tuple[int, ...]
+    immediate_successor_token_ids: Tuple[int, ...]
+    target_cache: List[Any]
+    next_logical_position: int
+
+    @property
+    def final_target_hidden(self) -> mx.array:
+        return self.receipts[-1].hidden_rows[:, -1:, :]
+
+    @property
+    def final_target_logits(self) -> mx.array:
+        return self.receipts[-1].logits
+
+    def _canonical_records_locked(self, reservation=None):
+        records = []
+        tokens = []
+        authorities = []
+        for receipt in self.receipts:
+            record_token = getattr(receipt, "_record_token", None)
+            if not isinstance(record_token, _GenerationForwardReceiptToken):
+                raise RuntimeError("native_mtp_sparse_receipt_canonical_mismatch")
+            authority = _GENERATION_FORWARD_RECEIPTS.get(record_token)
+            if authority is None or authority.reservation is not None:
+                raise RuntimeError("native_mtp_sparse_bootstrap_already_claimed")
+            record = authority.record
+            _validate_receipt_against_record(receipt, record)
+            records.append(record)
+            tokens.append(record_token)
+            authorities.append(authority)
+        if len(tokens) != len(set(tokens)):
+            raise RuntimeError("native_mtp_sparse_receipt_reused")
+        if reservation is not None:
+            for authority in authorities:
+                authority.reservation = reservation
+        return tuple(records), tuple(tokens)
+
+    def _validate_records(self, model: nn.Module, canonical_records) -> None:
+        """Validate provenance, values, topology-facing shapes, and cursor."""
+
+        if not isinstance(self.receipts, tuple) or not self.receipts:
+            raise ValueError("native_mtp_sparse_receipts_required")
+        if not isinstance(self.target_cache, list) or not self.target_cache:
+            raise TypeError("native_mtp_sparse_target_cache_must_be_list")
+        for name, values in (
+            ("positions", self.selected_logical_positions),
+            ("tokens", self.selected_token_ids),
+            ("successors", self.immediate_successor_token_ids),
+        ):
+            if not isinstance(values, tuple):
+                raise TypeError(f"native MTP sparse {name} must be a host tuple")
+
+        positions = self.selected_logical_positions
+        token_ids = self.selected_token_ids
+        successors = self.immediate_successor_token_ids
+        if not positions or len(token_ids) != len(positions):
+            raise ValueError("native_mtp_sparse_selected_length_mismatch")
+        if len(successors) != len(positions) - 1:
+            raise ValueError("native_mtp_sparse_successor_length_mismatch")
+
+        previous = -1
+        for position in positions:
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position <= previous
+            ):
+                raise ValueError("native_mtp_sparse_positions_not_strict")
+            previous = position
+        if (
+            isinstance(self.next_logical_position, bool)
+            or not isinstance(self.next_logical_position, int)
+            or self.next_logical_position != positions[-1] + 1
+        ):
+            raise ValueError("native_mtp_sparse_cursor_mismatch")
+
+        vocab_size = getattr(model, "vocab_size", None)
+        if vocab_size is None:
+            vocab_size = getattr(getattr(model, "args", None), "vocab_size", None)
+        for token_id in (*token_ids, *successors):
+            if (
+                isinstance(token_id, bool)
+                or not isinstance(token_id, int)
+                or token_id < 0
+                or (vocab_size is not None and token_id >= vocab_size)
+            ):
+                raise ValueError("native_mtp_sparse_token_id_invalid")
+
+        capability = NativeMTPCapabilityFingerprint.from_model(model)
+        expected_cache_id = id(self.target_cache)
+        expected_entry_ids = tuple(id(entry) for entry in self.target_cache)
+        model_args = getattr(model, "args", None)
+        if getattr(model_args, "hidden_size", None) is None:
+            model_args = getattr(getattr(model, "language_model", None), "args", None)
+        expected_hidden_width = getattr(model_args, "hidden_size", None)
+        if canonical_records[-1].canonical_final_logits is None:
+            raise RuntimeError("native_mtp_sparse_final_logits_evidence_missing")
+        if canonical_records[-1].cache_content_digest is None:
+            raise RuntimeError("native_mtp_sparse_final_cache_evidence_missing")
+        if any(
+            record.canonical_final_logits is not None
+            for record in canonical_records[:-1]
+        ):
+            raise RuntimeError("native_mtp_sparse_final_logits_evidence_order_mismatch")
+        receipt_positions = []
+        receipt_tokens = []
+        receipt_successors = []
+        hidden_width = None
+        floating_dtypes = (mx.float16, mx.float32, mx.bfloat16)
+        for index, (receipt, record) in enumerate(
+            zip(self.receipts, canonical_records)
+        ):
+            if not isinstance(receipt, GenerationForwardPositionReceipt):
+                raise TypeError("native_mtp_sparse_receipt_invalid")
+            if (
+                getattr(receipt, "_issuer_seal", None)
+                is not _GENERATION_FORWARD_RECEIPT_ISSUER
+            ):
+                raise TypeError("native_mtp_sparse_receipt_not_issued")
+            if receipt.phase is not GenerationForwardPhase.PREFILL:
+                raise ValueError("native_mtp_sparse_receipt_phase_mismatch")
+            if (
+                receipt.model_id != id(model)
+                or receipt.cache_container_id != expected_cache_id
+                or receipt.cache_entry_ids != expected_entry_ids
+                or receipt.capability != capability
+            ):
+                raise RuntimeError("native_mtp_sparse_receipt_provenance_mismatch")
+            if record.cache is not self.target_cache:
+                raise RuntimeError("native_mtp_sparse_target_cache_identity_mismatch")
+            if not receipt.logical_positions or len(receipt.token_ids) != len(
+                receipt.logical_positions
+            ):
+                raise ValueError("native_mtp_sparse_receipt_length_mismatch")
+            expected_successors = len(receipt.token_ids)
+            if index == len(self.receipts) - 1:
+                expected_successors -= 1
+            if len(receipt.immediate_successor_token_ids) != expected_successors:
+                raise ValueError("native_mtp_sparse_receipt_successor_mismatch")
+
+            hidden = receipt.hidden_rows
+            logits = receipt.logits
+            chunk_size = len(receipt.token_ids)
+            if (
+                not isinstance(hidden, mx.array)
+                or hidden.ndim != 3
+                or hidden.shape[0] != 1
+                or hidden.shape[1] != chunk_size
+                or hidden.dtype not in floating_dtypes
+            ):
+                raise ValueError("native_mtp_sparse_hidden_shape_or_dtype_mismatch")
+            if hidden_width is None:
+                hidden_width = hidden.shape[2]
+            elif hidden.shape[2] != hidden_width:
+                raise ValueError("native_mtp_sparse_hidden_width_mismatch")
+            if (
+                expected_hidden_width is not None
+                and hidden.shape[2] != expected_hidden_width
+            ):
+                raise ValueError("native_mtp_sparse_hidden_model_width_mismatch")
+            if (
+                not isinstance(logits, mx.array)
+                or logits.ndim != 3
+                or logits.shape[0] != 1
+                or logits.shape[1] != chunk_size
+                or logits.dtype not in floating_dtypes
+                or (vocab_size is not None and logits.shape[2] != vocab_size)
+            ):
+                raise ValueError("native_mtp_sparse_logits_shape_or_dtype_mismatch")
+
+            receipt_positions.extend(receipt.logical_positions)
+            receipt_tokens.extend(receipt.token_ids)
+            receipt_successors.extend(receipt.immediate_successor_token_ids)
+
+        if tuple(receipt_positions) != positions:
+            raise ValueError("native_mtp_sparse_receipt_positions_mismatch")
+        if tuple(receipt_tokens) != token_ids:
+            raise ValueError("native_mtp_sparse_receipt_tokens_mismatch")
+        if tuple(receipt_successors) != successors:
+            raise ValueError("native_mtp_sparse_receipt_successors_mismatch")
+        if (
+            _cache_state_identity_evidence(self.target_cache)
+            != canonical_records[-1].cache_state_evidence
+        ):
+            raise RuntimeError("native_mtp_sparse_target_cache_state_mismatch")
+
+    def validate(self, model: nn.Module) -> None:
+        """Validate currently issued authority without consuming it."""
+
+        if not isinstance(self.receipts, tuple) or not self.receipts:
+            raise ValueError("native_mtp_sparse_receipts_required")
+        with _GENERATION_FORWARD_RECEIPT_LOCK:
+            records, _ = self._canonical_records_locked()
+        self._validate_records(model, records)
+        _verify_sparse_canonical_content(records)
+
+    def claim(self, model: nn.Module) -> _NativeMTPSparseClaim:
+        """Reserve, verify off-lock, and permanently consume receipt authority."""
+
+        if not isinstance(self.receipts, tuple) or not self.receipts:
+            raise ValueError("native_mtp_sparse_receipts_required")
+        reservation = object()
+        with _GENERATION_FORWARD_RECEIPT_LOCK:
+            records, record_tokens = self._canonical_records_locked(reservation)
+        try:
+            self._validate_records(model, records)
+            _verify_sparse_canonical_content(records)
+        finally:
+            with _GENERATION_FORWARD_RECEIPT_LOCK:
+                for record_token in record_tokens:
+                    authority = _GENERATION_FORWARD_RECEIPTS.get(record_token)
+                    if authority is not None and authority.reservation is reservation:
+                        del _GENERATION_FORWARD_RECEIPTS[record_token]
+
+        positions = tuple(
+            position for record in records for position in record.logical_positions
+        )
+        token_ids = tuple(
+            token_id for record in records for token_id in record.token_ids
+        )
+        successors = tuple(
+            token_id
+            for record in records
+            for token_id in record.immediate_successor_token_ids
+        )
+        final = records[-1]
+        return _NativeMTPSparseClaim(
+            records=records,
+            selected_logical_positions=positions,
+            selected_token_ids=token_ids,
+            immediate_successor_token_ids=successors,
+            target_cache=final.cache,
+            next_logical_position=positions[-1] + 1,
+        )
 
 
 def str2bool(string):
@@ -895,7 +1604,7 @@ def speculative_generate_step(
 
 
 def mtp_generate_step(
-    prompt: mx.array,
+    prompt: Optional[mx.array],
     model: nn.Module,
     *,
     max_tokens: int = 256,
@@ -911,6 +1620,7 @@ def mtp_generate_step(
     eos_token_ids: Optional[Sequence[int]] = None,
     telemetry: Optional[Dict[str, Any]] = None,
     prompt_logical_positions: Optional[Sequence[int]] = None,
+    sparse_bootstrap: Optional[NativeMTPSparseBootstrap] = None,
 ) -> Generator[Tuple[int, mx.array, bool], None, None]:
     """Stream native-Qwen MTP with request-local transactional cache state.
 
@@ -939,10 +1649,24 @@ def mtp_generate_step(
         if telemetry is not None:
             telemetry["mtp_bypass_reason"] = reason
         raise RuntimeError(reason)
-    if prompt.ndim != 1 or prompt.size == 0:
-        raise ValueError("native MTP requires one non-empty unbatched prompt")
+    if sparse_bootstrap is None:
+        if prompt is None or prompt.ndim != 1 or prompt.size == 0:
+            raise ValueError("native MTP requires one non-empty unbatched prompt")
+    else:
+        if prompt is not None:
+            raise ValueError("native_mtp_sparse_bootstrap_owns_selected_tokens")
+        if prompt_logical_positions is not None:
+            raise ValueError("native_mtp_sparse_bootstrap_owns_logical_positions")
+        if model_forward_context is None:
+            raise ValueError("native_mtp_sparse_bootstrap_requires_position_context")
     if max_tokens < 0:
         raise ValueError("native MTP requires a finite non-negative max_tokens")
+    if (
+        isinstance(prefill_step_size, bool)
+        or not isinstance(prefill_step_size, int)
+        or prefill_step_size < 1
+    ):
+        raise ValueError("native MTP prefill_step_size must be a positive integer")
     sampling_config = sampling_config or NativeMTPSamplingConfig()
     model_vocab_size = getattr(model, "vocab_size", None)
     if model_vocab_size is None:
@@ -993,19 +1717,12 @@ def mtp_generate_step(
                 )
             previous_position = position
 
-    request = model.make_mtp_request_cache()
-    if telemetry is not None:
-        telemetry.update(
-            mtp_drafts=0,
-            mtp_accepted=0,
-            mtp_bypass_reason=None,
-        )
-    eos_token_ids = frozenset(eos_token_ids or ())
-    rng_key = mx.random.key(
-        sampling_config.seed
-        if sampling_config.seed is not None
-        else (time.time_ns() & ((1 << 63) - 1))
+    logical_positions_active = (
+        logical_prompt is not None or sparse_bootstrap is not None
     )
+
+    request = None
+    sparse_claim = None
 
     def _next_rng_key():
         nonlocal rng_key
@@ -1065,7 +1782,12 @@ def mtp_generate_step(
         return (logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)).squeeze(0)
 
     def _target_call(
-        input_tokens, phase, *, return_hidden=False, logical_positions=None
+        input_tokens,
+        phase,
+        *,
+        return_hidden=False,
+        logical_positions=None,
+        immediate_successor_token_ids=(),
     ):
         batched = input_tokens[None]
         if model_forward_context is None:
@@ -1094,9 +1816,9 @@ def mtp_generate_step(
                     batched, cache=request.backbone, return_hidden=return_hidden
                 )
                 position_ack._require_acknowledged()
-                return result
             finally:
                 position_ack._finish()
+        return result
 
     def _mtp_call(hidden, next_tokens, *, logical_positions=None):
         next_ids = next_tokens.reshape(1, -1)
@@ -1178,94 +1900,169 @@ def mtp_generate_step(
     finish_reason = "generator_closed"
     generated = 0
     try:
+        if sparse_bootstrap is None:
+            request = model.make_mtp_request_cache()
+        else:
+            sparse_claim = sparse_bootstrap.claim(model)
+            request = cache.NativeMTPRequestCache.adopt_sparse_target(
+                model,
+                target_cache=sparse_claim.target_cache,
+                target_tokens=len(sparse_claim.selected_token_ids),
+                next_logical_position=sparse_claim.next_logical_position,
+            )
+        if telemetry is not None:
+            telemetry.update(
+                mtp_drafts=0,
+                mtp_accepted=0,
+                mtp_bypass_reason=None,
+            )
+        eos_token_ids = frozenset(eos_token_ids or ())
+        rng_key = mx.random.key(
+            sampling_config.seed
+            if sampling_config.seed is not None
+            else (time.time_ns() & ((1 << 63) - 1))
+        )
         if max_tokens == 0:
             finish_reason = "length"
             return
 
-        # Shifted hidden/token pairs prefill the MTP head to the same physical
-        # and logical position as the target before decode begins.
-        remaining = prompt.astype(mx.uint32)
-        prompt_position_index = 0 if logical_prompt is not None else None
-        with mx.stream(generation_stream):
-            while remaining.size > 1:
-                count = min(prefill_step_size, remaining.size - 1)
-                forward_positions = (
-                    logical_prompt[
-                        prompt_position_index : prompt_position_index + count
-                    ]
+        if sparse_bootstrap is None:
+            # Shifted hidden/token pairs prefill the MTP head to the same
+            # physical and logical position as the target before decode.
+            remaining = prompt.astype(mx.uint32)
+            prompt_position_index = 0 if logical_prompt is not None else None
+            with mx.stream(generation_stream):
+                while remaining.size > 1:
+                    count = min(prefill_step_size, remaining.size - 1)
+                    forward_positions = (
+                        logical_prompt[
+                            prompt_position_index : prompt_position_index + count
+                        ]
+                        if logical_prompt is not None
+                        else None
+                    )
+                    _, hidden = _target_call(
+                        remaining[:count],
+                        GenerationForwardPhase.PREFILL,
+                        return_hidden=True,
+                        logical_positions=forward_positions,
+                        immediate_successor_token_ids=remaining[1 : count + 1].tolist(),
+                    )
+                    _mtp_call(
+                        hidden,
+                        remaining[1 : count + 1],
+                        logical_positions=forward_positions,
+                    )
+                    _quantize()
+                    mx.eval(
+                        [entry.state for entry in request.backbone],
+                        [entry.state for entry in request.mtp],
+                    )
+                    if forward_positions is None:
+                        request.retain(
+                            backbone_tokens=request.state.backbone_tokens + count,
+                            mtp_tokens=request.state.mtp_tokens + count,
+                        )
+                    else:
+                        request.retain_logical_position(
+                            backbone_tokens=request.state.backbone_tokens + count,
+                            mtp_tokens=request.state.mtp_tokens + count,
+                            next_logical_position=forward_positions[-1] + 1,
+                        )
+                    _assert_target_mtp_alignment()
+                    remaining = remaining[count:]
+                    if logical_prompt is not None:
+                        prompt_position_index += count
+                    mx.clear_cache()
+
+                final_prompt_positions = (
+                    (logical_prompt[prompt_position_index],)
                     if logical_prompt is not None
                     else None
                 )
-                _, hidden = _target_call(
-                    remaining[:count],
+                initial_logits, initial_hidden = _target_call(
+                    remaining,
                     GenerationForwardPhase.PREFILL,
                     return_hidden=True,
-                    logical_positions=forward_positions,
-                )
-                _mtp_call(
-                    hidden,
-                    remaining[1 : count + 1],
-                    logical_positions=forward_positions,
+                    logical_positions=final_prompt_positions,
                 )
                 _quantize()
-                mx.eval(
-                    [entry.state for entry in request.backbone],
-                    [entry.state for entry in request.mtp],
-                )
-                if forward_positions is None:
+                if final_prompt_positions is None:
                     request.retain(
-                        backbone_tokens=request.state.backbone_tokens + count,
-                        mtp_tokens=request.state.mtp_tokens + count,
+                        backbone_tokens=request.state.backbone_tokens + 1,
+                        mtp_tokens=request.state.mtp_tokens,
                     )
                 else:
                     request.retain_logical_position(
-                        backbone_tokens=request.state.backbone_tokens + count,
-                        mtp_tokens=request.state.mtp_tokens + count,
-                        next_logical_position=forward_positions[-1] + 1,
+                        backbone_tokens=request.state.backbone_tokens + 1,
+                        mtp_tokens=request.state.mtp_tokens,
+                        next_logical_position=final_prompt_positions[0] + 1,
                     )
-                _assert_target_mtp_alignment()
-                remaining = remaining[count:]
-                if logical_prompt is not None:
-                    prompt_position_index += count
-                mx.clear_cache()
-
-            final_prompt_positions = (
-                (logical_prompt[prompt_position_index],)
-                if logical_prompt is not None
-                else None
-            )
-            initial_logits, initial_hidden = _target_call(
-                remaining,
-                GenerationForwardPhase.PREFILL,
-                return_hidden=True,
-                logical_positions=final_prompt_positions,
-            )
-            _quantize()
-            if final_prompt_positions is None:
-                request.retain(
-                    backbone_tokens=request.state.backbone_tokens + 1,
-                    mtp_tokens=request.state.mtp_tokens,
+                # Match generate_step: processors see only the final step.
+                history = remaining.astype(mx.uint32)
+                current_logprobs = _reported_logprobs(
+                    initial_logits[:, -1, :].squeeze(0), history
                 )
-            else:
-                request.retain_logical_position(
-                    backbone_tokens=request.state.backbone_tokens + 1,
-                    mtp_tokens=request.state.mtp_tokens,
-                    next_logical_position=final_prompt_positions[0] + 1,
+                current_sampling_logprobs = _sampling_distribution(current_logprobs)
+                current_token = _sample(current_sampling_logprobs).reshape(-1)
+            current_hidden = initial_hidden[:, -1:, :]
+        else:
+            selected_count = len(sparse_claim.selected_token_ids)
+            final_prompt_positions = (sparse_claim.selected_logical_positions[-1],)
+            with mx.stream(generation_stream):
+                for record in sparse_claim.records:
+                    pair_count = len(record.immediate_successor_token_ids)
+                    pair_start = 0
+                    while pair_start < pair_count:
+                        pair_end = min(pair_start + prefill_step_size, pair_count)
+                        _mtp_call(
+                            record.canonical_hidden_rows[:, pair_start:pair_end, :],
+                            mx.array(
+                                record.immediate_successor_token_ids[
+                                    pair_start:pair_end
+                                ],
+                                dtype=mx.uint32,
+                            ),
+                            logical_positions=record.logical_positions[
+                                pair_start:pair_end
+                            ],
+                        )
+                        _quantize()
+                        mx.eval([entry.state for entry in request.mtp])
+                        pair_start = pair_end
+                        mx.clear_cache()
+                mx.eval(
+                    tuple(
+                        record.canonical_hidden_rows for record in sparse_claim.records
+                    ),
+                    sparse_claim.final_target_logits,
+                    [entry.state for entry in request.backbone],
+                    [entry.state for entry in request.mtp],
                 )
-            # Match generate_step: processors see only the input tokens passed
-            # to its final prefill/decode step, not chunks consumed by _step.
-            history = remaining.astype(mx.uint32)
-            current_logprobs = _reported_logprobs(
-                initial_logits[:, -1, :].squeeze(0), history
-            )
-            current_sampling_logprobs = _sampling_distribution(current_logprobs)
-            current_token = _sample(current_sampling_logprobs).reshape(-1)
+                history = mx.array(
+                    [sparse_claim.selected_token_ids[-1]], dtype=mx.uint32
+                )
+                current_logprobs = _reported_logprobs(
+                    sparse_claim.final_target_logits[:, -1, :].squeeze(0),
+                    history,
+                )
+                current_sampling_logprobs = _sampling_distribution(current_logprobs)
+                current_token = _sample(current_sampling_logprobs).reshape(-1)
+            current_hidden = sparse_claim.final_target_hidden
         mx.eval(current_token, current_logprobs)
-        current_hidden = initial_hidden[:, -1:, :]
+        if sparse_bootstrap is not None:
+            request.seal_verified(
+                backbone_tokens=selected_count,
+                mtp_tokens=selected_count - 1,
+            )
+            request.commit(
+                backbone_tokens=selected_count,
+                mtp_tokens=selected_count - 1,
+            )
         history = mx.concatenate([history, current_token])
 
         generated = 1
-        if logical_prompt is not None:
+        if logical_positions_active:
             request.advance_logical_position()
         current_id = current_token.item()
         terminal = current_id in eos_token_ids or generated >= max_tokens
@@ -1291,7 +2088,7 @@ def mtp_generate_step(
                     request.state.next_logical_position - 1,
                     request.state.next_logical_position,
                 )
-                if logical_prompt is not None
+                if logical_positions_active
                 else None
             )
             with mx.stream(generation_stream):
@@ -1343,7 +2140,7 @@ def mtp_generate_step(
                 if telemetry is not None:
                     telemetry["mtp_accepted"] += 1
                 generated += 1
-                if logical_prompt is not None:
+                if logical_positions_active:
                     request.advance_logical_position()
                 draft_id = draft_token.item()
                 draft_terminal = draft_id in eos_token_ids or generated >= max_tokens
@@ -1365,7 +2162,7 @@ def mtp_generate_step(
                 mx.eval(bonus_token, bonus_logprobs)
                 next_history = mx.concatenate([bonus_history, bonus_token])
                 generated += 1
-                if logical_prompt is not None:
+                if logical_positions_active:
                     request.advance_logical_position()
                 bonus_id = bonus_token.item()
                 bonus_terminal = bonus_id in eos_token_ids or generated >= max_tokens
@@ -1402,7 +2199,7 @@ def mtp_generate_step(
             request.reject_partial(accepted_backbone_tokens=1, accepted_mtp_tokens=0)
             replay_positions = (
                 (request.state.next_logical_position - 1,)
-                if logical_prompt is not None
+                if logical_positions_active
                 else None
             )
             with mx.stream(generation_stream):
@@ -1419,7 +2216,7 @@ def mtp_generate_step(
                 )
             next_history = mx.concatenate([history, replacement_token])
             generated += 1
-            if logical_prompt is not None:
+            if logical_positions_active:
                 request.advance_logical_position()
             replacement_id = replacement_token.item()
             replacement_terminal = (
@@ -1451,7 +2248,7 @@ def mtp_generate_step(
         finish_reason = "cancelled"
         raise
     finally:
-        if not request.closed:
+        if request is not None and not request.closed:
             request.finish(finish_reason)
 
 
