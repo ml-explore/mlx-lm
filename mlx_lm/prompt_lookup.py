@@ -99,11 +99,20 @@ class NgramProposer:
     earlier occurrence of the tail n-gram (largest n first)."""
 
     def __init__(
-        self, ngram_max: int = 3, ngram_min: int = 1, prompt_only: bool = False
+        self,
+        ngram_max: int = 3,
+        ngram_min: int = 1,
+        prompt_only: bool = False,
+        max_lookback: int = 4096,
     ):
         self.ngram_max = ngram_max
         self.ngram_min = ngram_min
         self.prompt_only = prompt_only
+        # Bound the backward scan: on novel text the miss case otherwise
+        # walks the FULL sequence per verify cycle for every g — quadratic
+        # over a long generation. Proposals are verified anyway, so a bounded
+        # window is lossless (worst case: fewer proposals). 0 = unbounded.
+        self.max_lookback = max_lookback
 
     def observe(self, token: int) -> None:  # stateless
         pass
@@ -117,7 +126,9 @@ class NgramProposer:
                 continue
             key = seq[-g:]
             start = (limit - g) if search_len is not None else (n - g - 1)
-            for i in range(min(start, n - g - 1), -1, -1):
+            begin = min(start, n - g - 1)
+            floor = -1 if not self.max_lookback else max(-1, begin - self.max_lookback)
+            for i in range(begin, floor, -1):
                 if seq[i : i + g] == key:
                     cont = seq[i + g : i + g + max_span]
                     if cont:

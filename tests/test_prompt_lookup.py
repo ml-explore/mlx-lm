@@ -32,6 +32,19 @@ GREEDY = make_sampler(temp=0.0)
 
 
 class TestProposers(unittest.TestCase):
+    def test_ngram_lookback_bound(self):
+        # A match beyond max_lookback is not scanned (bounds the per-cycle
+        # cost on novel text)...
+        seq = [1, 2, 7, 8] + [3] * 64 + [1, 2]
+        bounded = NgramProposer(ngram_max=2, ngram_min=2, max_lookback=16)
+        self.assertEqual(bounded.propose(seq, 2, 0), [])
+        # ...while the default window still finds it, and the same proposer
+        # still finds an in-window match.
+        full = NgramProposer(ngram_max=2, ngram_min=2)
+        self.assertEqual(full.propose(seq, 2, 0), [7, 8])
+        near = [9, 9, 1, 2, 7, 8, 1, 2]
+        self.assertEqual(bounded.propose(near, 2, 0), [7, 8])
+
     def test_ngram_finds_earlier_continuation(self):
         # "a b c ... a b" -> proposes the continuation after the earlier "a b".
         seq = [1, 2, 3, 9, 9, 1, 2]
@@ -215,8 +228,6 @@ class TestPromptLookupGenerate(unittest.TestCase):
         ]
         self.assertEqual(len(out), 80)
         self.assertEqual(_pld_offset(cache[0]), prompt.size + len(out))
-
-
 
 
 class _LifecycleCache:
