@@ -728,6 +728,485 @@ class ArraysCache(_BaseCache):
         return sum(c.nbytes for c in self.cache if c is not None)
 
 
+@dataclass(frozen=True)
+class NativeMTPCacheIdentity:
+    """Identity of the caller-owned cache containers for one native MTP request.
+
+    Native MTP has two independent state machines: the backbone cache and the
+    MTP-head cache.  The container identities, rather than a concatenated list
+    layout, are the public ownership boundary.  This deliberately makes a
+    legacy ``backbone + mtp`` cache impossible to pass by accident.
+    """
+
+    model_id: int
+    backbone_container_id: int
+    mtp_container_id: int
+
+
+@dataclass(frozen=True)
+class NativeMTPCacheState:
+    """Logical positions attached to a request-local native MTP cache."""
+
+    identity: NativeMTPCacheIdentity
+    backbone_tokens: int
+    mtp_tokens: int
+
+
+@dataclass(frozen=True)
+class _NativeMTPEntryCheckpoint:
+    """Rollback state for one cache entry.
+
+    Attention cache writes append after ``offset``; retaining the prior offset
+    is therefore enough to discard an unaccepted suffix without copying the
+    potentially very large KV tensors.  ArraysCache is recurrent state and has
+    no logical offset, so its small state vectors are copied at the transaction
+    boundary.
+    """
+
+    index: int
+    cache: Any
+    offset: Optional[int]
+    array_state: Optional[tuple]
+    left_padding: Optional[mx.array]
+    lengths: Optional[mx.array]
+
+
+@dataclass(frozen=True)
+class NativeMTPCacheCheckpoint:
+    state: NativeMTPCacheState
+    backbone: tuple[_NativeMTPEntryCheckpoint, ...]
+    mtp: tuple[_NativeMTPEntryCheckpoint, ...]
+
+
+@dataclass(frozen=True)
+class NativeMTPReplayRequired:
+    """The only legal result of retaining a strict prefix of a verified draft.
+
+    Recurrent backbone state cannot be trimmed to retain a prefix of a
+    multi-token verification forward.  The caller must restore the checkpoint
+    and replay every accepted token through the ordinary single-token path.
+    """
+
+    state: NativeMTPCacheState
+    replay_to_backbone_tokens: int
+    replay_to_mtp_tokens: int
+
+
+def _mtp_copy_array(value):
+    """Make a value snapshot without retaining a mutable MLX backing buffer."""
+
+    if value is None:
+        return None
+    # ``mx.array`` may preserve an existing array object.  Adding zero makes a
+    # distinct lazy graph value and is evaluated only with the caller's normal
+    # generation graph; ArraysCache state is intentionally small.
+    return value + mx.zeros(value.shape, dtype=value.dtype)
+
+
+class NativeMTPRequestCache:
+    """B=1 transactional cache owner for native Qwen MTP.
+
+    This is intentionally an unused engine-neutral foundation.  No generation
+    lifecycle consumes it yet, so it cannot certify native MTP by itself.  A
+    future generation loop must record every retained backbone/MTP token
+    through :meth:`commit`, and use a checkpoint around each proposed draft.
+    Cache replacement caused by KV quantization is performed through these
+    caller-owned containers, so a rollback restores the exact pre-draft entry
+    object when necessary.
+
+    Prefix reuse is deliberately not supported: a generic prompt cache cannot
+    prove that its MTP-head position and recurrent state are aligned with the
+    backbone.  It must remain disabled until that separate proof exists.
+    """
+
+    def __init__(self, model: Any, backbone: List[Any], mtp: List[Any]):
+        if not isinstance(backbone, list) or not isinstance(mtp, list):
+            raise TypeError("native MTP caches must be caller-owned lists")
+        if not backbone or not mtp:
+            raise ValueError("native MTP requires non-empty backbone and MTP caches")
+        if backbone is mtp:
+            raise ValueError("native MTP backbone and MTP caches must be distinct")
+
+        self.model = model
+        self.backbone = backbone
+        self.mtp = mtp
+        self.identity = NativeMTPCacheIdentity(id(model), id(backbone), id(mtp))
+        self._backbone_entry_ids = tuple(id(entry) for entry in backbone)
+        self._mtp_entry_ids = tuple(id(entry) for entry in mtp)
+        self._state = NativeMTPCacheState(self.identity, 0, 0)
+        self._checkpoint: Optional[NativeMTPCacheCheckpoint] = None
+        self._sealed: Optional[NativeMTPCacheState] = None
+        self._replay_required: Optional[NativeMTPReplayRequired] = None
+        self._closed = False
+        self._validate_layout()
+
+    @property
+    def state(self) -> NativeMTPCacheState:
+        return self._state
+
+    @property
+    def checkpoint_active(self) -> bool:
+        return self._checkpoint is not None
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def replay_required(self) -> Optional[NativeMTPReplayRequired]:
+        return self._replay_required
+
+    def _validate_layout(self) -> None:
+        """Fail closed for unsupported batch, pipeline, and cache topologies."""
+
+        capability = getattr(self.model, "mtp_capability", None)
+        if capability is None:
+            raise RuntimeError("native_mtp_model_capability_missing")
+        if not capability.supported:
+            raise RuntimeError(capability.reason)
+        text_model = getattr(self.model, "model", None)
+        if text_model is None:
+            text_model = getattr(
+                getattr(self.model, "language_model", None), "model", None
+            )
+        if getattr(text_model, "pipeline_size", 1) != 1:
+            raise RuntimeError("native_mtp_pipeline_parallelism_unsupported")
+
+        expected_backbone = getattr(self.model, "layers", None)
+        mtp_module = getattr(self.model, "mtp", None)
+        expected_mtp = getattr(mtp_module, "layers", None)
+        if expected_backbone is None or expected_mtp is None:
+            raise RuntimeError("native_mtp_cache_topology_unavailable")
+        if len(self.backbone) != len(expected_backbone):
+            raise ValueError("native_mtp_backbone_cache_topology_mismatch")
+        if len(self.mtp) != len(expected_mtp):
+            raise ValueError("native_mtp_head_cache_topology_mismatch")
+        entry_ids = tuple(id(entry) for entry in self.backbone + self.mtp)
+        if len(entry_ids) != len(set(entry_ids)):
+            raise ValueError("native_mtp_cache_entries_must_be_unique")
+
+        for index, (layer, entry) in enumerate(zip(expected_backbone, self.backbone)):
+            expected_type = (
+                ArraysCache if layer.is_linear else (KVCache, QuantizedKVCache)
+            )
+            if not isinstance(entry, expected_type):
+                raise TypeError(
+                    f"native_mtp_backbone_cache_type_mismatch: entry={index}"
+                )
+            self._validate_batch_size(entry)
+        for index, entry in enumerate(self.mtp):
+            if not isinstance(entry, (KVCache, QuantizedKVCache)):
+                raise TypeError(f"native_mtp_head_cache_type_mismatch: entry={index}")
+            self._validate_batch_size(entry)
+
+    @staticmethod
+    def _validate_batch_size(entry: Any) -> None:
+        if isinstance(entry, ArraysCache):
+            if entry.batch_size != 1:
+                raise RuntimeError("native_mtp_batch_size_unsupported")
+            return
+        keys = entry.keys
+        if isinstance(entry, QuantizedKVCache) and keys is not None:
+            keys = keys[0]
+        if keys is not None and keys.shape[0] != 1:
+            raise RuntimeError("native_mtp_batch_size_unsupported")
+
+    def _assert_owned(self) -> None:
+        if self.identity != NativeMTPCacheIdentity(
+            id(self.model), id(self.backbone), id(self.mtp)
+        ):
+            raise RuntimeError("native_mtp_cache_container_identity_changed")
+        if tuple(id(entry) for entry in self.backbone) != self._backbone_entry_ids:
+            raise RuntimeError("native_mtp_backbone_cache_entry_replaced_externally")
+        if tuple(id(entry) for entry in self.mtp) != self._mtp_entry_ids:
+            raise RuntimeError("native_mtp_head_cache_entry_replaced_externally")
+
+    @staticmethod
+    def _entry_checkpoint(index: int, entry: Any) -> _NativeMTPEntryCheckpoint:
+        if isinstance(entry, ArraysCache):
+            return _NativeMTPEntryCheckpoint(
+                index=index,
+                cache=entry,
+                offset=None,
+                array_state=tuple(_mtp_copy_array(value) for value in entry.cache),
+                left_padding=_mtp_copy_array(entry.left_padding),
+                lengths=_mtp_copy_array(entry.lengths),
+            )
+        return _NativeMTPEntryCheckpoint(
+            index=index,
+            cache=entry,
+            offset=entry.offset,
+            array_state=None,
+            left_padding=None,
+            lengths=None,
+        )
+
+    @classmethod
+    def create(cls, model: Any, *, prompt_cache: Optional[Any] = None):
+        """Create fresh aligned target/MTP caches, refusing prefix reuse."""
+
+        if prompt_cache is not None:
+            raise ValueError("native_mtp_prefix_reuse_unsupported")
+        capability = getattr(model, "mtp_capability", None)
+        if capability is None:
+            raise RuntimeError("native_mtp_model_capability_missing")
+        if not capability.supported:
+            raise RuntimeError(capability.reason)
+        return cls(model, model.make_cache(), model.make_mtp_cache())
+
+    def assert_aligned(self, *, backbone_tokens: int, mtp_tokens: int) -> None:
+        """Assert exact logical/cache alignment before output may be emitted."""
+
+        self._assert_owned()
+        self._validate_layout()
+        if backbone_tokens < 0 or mtp_tokens < 0:
+            raise ValueError("native MTP logical positions must be non-negative")
+        for name, entries, expected in (
+            ("backbone", self.backbone, backbone_tokens),
+            ("mtp", self.mtp, mtp_tokens),
+        ):
+            for index, entry in enumerate(entries):
+                if isinstance(entry, ArraysCache):
+                    continue
+                if entry.offset != expected:
+                    raise RuntimeError(
+                        f"native_mtp_{name}_cache_position_mismatch: entry={index} "
+                        f"cache={entry.offset} logical={expected}"
+                    )
+
+    def checkpoint(self) -> NativeMTPCacheCheckpoint:
+        """Start a reversible draft transaction at the current aligned state."""
+
+        if self._closed:
+            raise RuntimeError("native_mtp_cache_closed")
+        if self._replay_required is not None:
+            raise RuntimeError("native_mtp_cache_replay_required")
+        if self._checkpoint is not None:
+            raise RuntimeError("native_mtp_cache_checkpoint_already_active")
+        self.assert_aligned(
+            backbone_tokens=self._state.backbone_tokens,
+            mtp_tokens=self._state.mtp_tokens,
+        )
+        self._checkpoint = NativeMTPCacheCheckpoint(
+            state=self._state,
+            backbone=tuple(
+                self._entry_checkpoint(index, entry)
+                for index, entry in enumerate(self.backbone)
+            ),
+            mtp=tuple(
+                self._entry_checkpoint(index, entry)
+                for index, entry in enumerate(self.mtp)
+            ),
+        )
+        return self._checkpoint
+
+    def seal_verified(
+        self, *, backbone_tokens: int, mtp_tokens: int
+    ) -> NativeMTPCacheState:
+        """Seal a full verified forward before it may be committed.
+
+        A sealed state is an all-or-nothing boundary.  It prevents a caller
+        from using attention-cache trimming to retain only part of a verification
+        forward while incorrectly keeping the final recurrent state.
+        """
+
+        if self._checkpoint is None:
+            raise RuntimeError("native_mtp_cache_checkpoint_missing")
+        if self._sealed is not None:
+            raise RuntimeError("native_mtp_cache_verification_already_sealed")
+        previous = self._checkpoint.state
+        if (
+            backbone_tokens < previous.backbone_tokens
+            or mtp_tokens < previous.mtp_tokens
+        ):
+            raise ValueError("native MTP sealed positions cannot move backwards")
+        self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
+        self._sealed = NativeMTPCacheState(self.identity, backbone_tokens, mtp_tokens)
+        return self._sealed
+
+    @staticmethod
+    def _restore_entries(entries, checkpoints) -> None:
+        for snapshot in checkpoints:
+            entry = snapshot.cache
+            entries[snapshot.index] = entry
+            if snapshot.array_state is not None:
+                entry.cache = list(snapshot.array_state)
+                entry.left_padding = snapshot.left_padding
+                entry.lengths = snapshot.lengths
+                continue
+            if entry.offset < snapshot.offset:
+                raise RuntimeError("native_mtp_cache_advanced_backwards")
+            trim = entry.offset - snapshot.offset
+            if trim:
+                removed = entry.trim(trim)
+                if removed != trim or entry.offset != snapshot.offset:
+                    raise RuntimeError("native_mtp_cache_rollback_inexact")
+
+    def rollback(self) -> NativeMTPCacheState:
+        """Discard the active draft suffix and restore its exact checkpoint."""
+
+        if self._checkpoint is None:
+            raise RuntimeError("native_mtp_cache_checkpoint_missing")
+        checkpoint = self._checkpoint
+        self._restore_entries(self.backbone, checkpoint.backbone)
+        self._restore_entries(self.mtp, checkpoint.mtp)
+        self._backbone_entry_ids = tuple(id(entry) for entry in self.backbone)
+        self._mtp_entry_ids = tuple(id(entry) for entry in self.mtp)
+        self._state = checkpoint.state
+        self._checkpoint = None
+        self._sealed = None
+        self.assert_aligned(
+            backbone_tokens=self._state.backbone_tokens,
+            mtp_tokens=self._state.mtp_tokens,
+        )
+        return self._state
+
+    def commit(self, *, backbone_tokens: int, mtp_tokens: int) -> NativeMTPCacheState:
+        """Commit only the exact full state previously sealed by verification."""
+
+        if self._closed:
+            raise RuntimeError("native_mtp_cache_closed")
+        if self._checkpoint is None:
+            raise RuntimeError("native_mtp_cache_checkpoint_missing")
+        if self._sealed is None:
+            raise RuntimeError("native_mtp_cache_verification_not_sealed")
+        if (backbone_tokens, mtp_tokens) != (
+            self._sealed.backbone_tokens,
+            self._sealed.mtp_tokens,
+        ):
+            raise RuntimeError("native_mtp_partial_commit_requires_replay")
+        self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
+        self._state = self._sealed
+        self._checkpoint = None
+        self._sealed = None
+        return self._state
+
+    def reject_partial(
+        self, *, accepted_backbone_tokens: int, accepted_mtp_tokens: int
+    ) -> NativeMTPReplayRequired:
+        """Rollback a strict verified prefix and require sequential replay."""
+
+        if self._checkpoint is None or self._sealed is None:
+            raise RuntimeError("native_mtp_cache_verification_not_sealed")
+        start = self._checkpoint.state
+        backbone_delta = self._sealed.backbone_tokens - start.backbone_tokens
+        mtp_delta = self._sealed.mtp_tokens - start.mtp_tokens
+        if not (
+            0 <= accepted_backbone_tokens <= backbone_delta
+            and 0 <= accepted_mtp_tokens <= mtp_delta
+        ):
+            raise ValueError("native MTP partial acceptance exceeds verified tokens")
+        if (
+            accepted_backbone_tokens == backbone_delta
+            and accepted_mtp_tokens == mtp_delta
+        ):
+            raise ValueError("full verified acceptance must use native MTP commit")
+        replay = NativeMTPReplayRequired(
+            state=start,
+            replay_to_backbone_tokens=start.backbone_tokens + accepted_backbone_tokens,
+            replay_to_mtp_tokens=start.mtp_tokens + accepted_mtp_tokens,
+        )
+        self.rollback()
+        self._replay_required = replay
+        return replay
+
+    def retain(self, *, backbone_tokens: int, mtp_tokens: int) -> NativeMTPCacheState:
+        """Record a non-speculative retained token boundary."""
+
+        if self._replay_required is not None:
+            raise RuntimeError("native_mtp_cache_replay_required")
+        if self._checkpoint is not None:
+            raise RuntimeError("native_mtp_cache_verification_not_sealed")
+        if (
+            backbone_tokens < self._state.backbone_tokens
+            or mtp_tokens < self._state.mtp_tokens
+        ):
+            raise ValueError("native MTP retained positions cannot move backwards")
+        self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
+        self._state = NativeMTPCacheState(self.identity, backbone_tokens, mtp_tokens)
+        return self._state
+
+    def replay_retained(
+        self, *, backbone_tokens: int, mtp_tokens: int
+    ) -> NativeMTPCacheState:
+        """Record exactly one sequential replay step after partial rejection."""
+
+        replay = self._replay_required
+        if replay is None:
+            raise RuntimeError("native_mtp_cache_replay_not_required")
+        if not (
+            self._state.backbone_tokens
+            <= backbone_tokens
+            <= replay.replay_to_backbone_tokens
+            and self._state.mtp_tokens <= mtp_tokens <= replay.replay_to_mtp_tokens
+        ):
+            raise ValueError(
+                "native MTP replay position is outside the accepted prefix"
+            )
+        if (
+            backbone_tokens - self._state.backbone_tokens not in (0, 1)
+            or mtp_tokens - self._state.mtp_tokens not in (0, 1)
+            or (backbone_tokens, mtp_tokens)
+            == (self._state.backbone_tokens, self._state.mtp_tokens)
+        ):
+            raise ValueError("native MTP replay must advance one retained token step")
+        self.assert_aligned(backbone_tokens=backbone_tokens, mtp_tokens=mtp_tokens)
+        self._state = NativeMTPCacheState(self.identity, backbone_tokens, mtp_tokens)
+        if (backbone_tokens, mtp_tokens) == (
+            replay.replay_to_backbone_tokens,
+            replay.replay_to_mtp_tokens,
+        ):
+            self._replay_required = None
+        return self._state
+
+    def quantize(
+        self, *, kv_bits: Optional[int], kv_group_size: int = 64, start: int = 0
+    ):
+        """Quantize eligible caches in place through the caller-owned lists."""
+
+        if kv_bits is None:
+            return 0
+        if self._closed:
+            raise RuntimeError("native_mtp_cache_closed")
+        self._assert_owned()
+        staged_backbone = list(self.backbone)
+        staged_mtp = list(self.mtp)
+        staged_values = []
+        converted = 0
+        for entries in (staged_backbone, staged_mtp):
+            for index, entry in enumerate(entries):
+                if not isinstance(entry, KVCache) or entry.offset < start:
+                    continue
+                staged = entry.to_quantized(group_size=kv_group_size, bits=kv_bits)
+                entries[index] = staged
+                staged_values.extend((staged.keys, staged.values))
+                converted += 1
+        try:
+            mx.eval(staged_values)
+        except Exception as error:
+            raise RuntimeError("native_mtp_cache_quantization_failed") from error
+        for index, entry in enumerate(staged_backbone):
+            self.backbone[index] = entry
+        for index, entry in enumerate(staged_mtp):
+            self.mtp[index] = entry
+        self._backbone_entry_ids = tuple(id(entry) for entry in self.backbone)
+        self._mtp_entry_ids = tuple(id(entry) for entry in self.mtp)
+        return converted
+
+    def finish(self, reason: str) -> NativeMTPCacheState:
+        """Close safely for EOS, length, cancellation, or generator shutdown."""
+
+        if reason not in {"eos", "length", "cancelled", "generator_closed"}:
+            raise ValueError(f"unsupported native MTP finish reason: {reason}")
+        if self._closed:
+            return self._state
+        if self._checkpoint is not None:
+            self.rollback()
+        self._replay_required = None
+        self._closed = True
+        return self._state
+
+
 class ChunkedKVCache(_BaseCache):
     step = 256
 

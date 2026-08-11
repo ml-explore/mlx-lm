@@ -238,6 +238,20 @@ def test_no_head_model_preserves_normal_forward_and_refuses_dispatch():
         model.make_mtp_cache()
 
 
+@pytest.mark.parametrize("moe", (False, True))
+def test_dense_and_moe_models_expose_the_same_structured_mtp_cache_contract(moe):
+    model = _model(moe=moe)
+    _sanitize_and_load(model, _checkpoint(model, moe=moe))
+
+    request = model.make_mtp_request_cache()
+    assert request.backbone is not request.mtp
+    assert request.state.backbone_tokens == 0
+    assert request.state.mtp_tokens == 0
+    request.assert_aligned(backbone_tokens=0, mtp_tokens=0)
+    with pytest.raises(ValueError, match="native_mtp_prefix_reuse_unsupported"):
+        model.make_mtp_request_cache(prompt_cache=model.make_cache())
+
+
 def test_exact_sanitize_load_handshake_rejects_filtered_non_strict_load():
     model = _model()
     sanitized = model.sanitize(_checkpoint(model))

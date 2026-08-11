@@ -13,7 +13,7 @@ from .base import (
     create_attention_mask,
     create_ssm_mask,
 )
-from .cache import ArraysCache, KVCache
+from .cache import ArraysCache, KVCache, NativeMTPRequestCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -516,6 +516,16 @@ class TextModel(nn.Module):
         self._require_mtp()
         return [KVCache() for _ in self.mtp.layers]
 
+    def make_mtp_request_cache(self, *, prompt_cache: Optional[Any] = None):
+        """Return fresh, request-local native-MTP cache state.
+
+        Generic prefix caches are intentionally rejected here: they cannot yet
+        establish exact recurrent/MTP-head alignment.  The generation layer
+        will use this structured owner instead of positional cache splitting.
+        """
+
+        return NativeMTPRequestCache.create(self, prompt_cache=prompt_cache)
+
     @staticmethod
     def _weight_handshake(weights):
         """Identify the exact sanitized key/array mapping handed to the loader."""
@@ -922,6 +932,9 @@ class Model(nn.Module):
 
     def make_mtp_cache(self) -> List[KVCache]:
         return self.language_model.make_mtp_cache()
+
+    def make_mtp_request_cache(self, *, prompt_cache: Optional[Any] = None):
+        return self.language_model.make_mtp_request_cache(prompt_cache=prompt_cache)
 
     @property
     def quant_predicate(self):
