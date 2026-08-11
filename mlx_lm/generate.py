@@ -9,8 +9,19 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from enum import Enum
 from functools import partial
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Generator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -45,6 +56,40 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+
+
+class GenerationForwardPhase(str, Enum):
+    """A stable description of a model forward within generation.
+
+    ``DRAFT`` and ``VERIFY`` are used by external speculative decoding.  The
+    enum deliberately describes generation mechanics rather than a particular
+    model architecture so callers can use the same callback with ordinary and
+    speculative generation.
+    """
+
+    PREFILL = "prefill"
+    DECODE = "decode"
+    DRAFT = "draft"
+    VERIFY = "verify"
+
+
+@dataclass(frozen=True)
+class GenerationForward:
+    """Immutable metadata for one Python model-call graph construction.
+
+    The callback scope deliberately covers graph construction only.  MLX
+    realization may remain asynchronously pipelined after the scope exits.
+    ``input_tokens`` has the exact batched shape passed to the model.
+    """
+
+    model: nn.Module
+    input_tokens: mx.array
+    cache: Any
+    phase: GenerationForwardPhase
+    input_embeddings: Optional[mx.array] = None
+
+
+GenerationForwardContext = Callable[[GenerationForward], ContextManager[None]]
 
 
 def str2bool(string):
@@ -295,6 +340,23 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
+def _prompt_cache_has_tokens(prompt_cache: Any) -> bool:
+    """Return whether a supplied prompt cache already represents a prefix.
+
+    ``offset`` is the public occupancy contract of the standard KV cache
+    families.  A few cache implementations expose only ``empty()``; use that
+    as a conservative fallback without asking callers to identify cache types.
+    """
+    for entry in prompt_cache:
+        offset = getattr(entry, "offset", None)
+        if isinstance(offset, int) and offset > 0:
+            return True
+        is_empty = getattr(entry, "empty", None)
+        if callable(is_empty) and not is_empty():
+            return True
+    return False
+
+
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -310,6 +372,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    model_forward_context: Optional[GenerationForwardContext] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -338,6 +401,9 @@ def generate_step(
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
+        model_forward_context (Callable[[GenerationForward], ContextManager], optional):
+          A request-local context factory invoked around each Python model call.
+          The scope covers MLX graph construction, not deferred realization.
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
@@ -358,6 +424,14 @@ def generate_step(
 
     tokens = None
 
+    # The final prompt token is a semantic prefill for a fresh cache, but a
+    # decode when the caller supplies an already-populated continuation cache.
+    has_cached_prefix = (
+        model_forward_context is not None
+        and prompt_cache is not None
+        and _prompt_cache_has_tokens(prompt_cache)
+    )
+
     # Create the KV cache for generation
     if prompt_cache is None:
         prompt_cache = cache.make_prompt_cache(
@@ -376,15 +450,39 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
-        if input_embeddings is not None:
-            return model(
-                input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
-            )
-        else:
+    def _model_call(
+        input_tokens: mx.array,
+        input_embeddings: Optional[mx.array],
+        phase: GenerationForwardPhase,
+    ):
+        # Preserve the ordinary generation path when no caller needs forward
+        # metadata: no context-manager or metadata allocation occurs here.
+        if model_forward_context is None:
+            if input_embeddings is not None:
+                return model(
+                    input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
+                )
             return model(input_tokens, cache=prompt_cache)
 
-    def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
+        forward = GenerationForward(
+            model=model,
+            input_tokens=input_tokens,
+            cache=prompt_cache,
+            phase=phase,
+            input_embeddings=input_embeddings,
+        )
+        with model_forward_context(forward):
+            if input_embeddings is not None:
+                return model(
+                    input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
+                )
+            return model(input_tokens, cache=prompt_cache)
+
+    def _step(
+        input_tokens: mx.array,
+        input_embeddings: Optional[mx.array] = None,
+        phase: GenerationForwardPhase = GenerationForwardPhase.DECODE,
+    ):
         nonlocal tokens
 
         with mx.stream(generation_stream):
@@ -393,6 +491,7 @@ def generate_step(
                 input_embeddings=(
                     input_embeddings[None] if input_embeddings is not None else None
                 ),
+                phase=phase,
             )
 
             logits = logits[:, -1, :]
@@ -428,6 +527,7 @@ def generate_step(
                     if input_embeddings is not None
                     else None
                 ),
+                phase=GenerationForwardPhase.PREFILL,
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
@@ -441,7 +541,15 @@ def generate_step(
             )
             mx.clear_cache()
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        y, logprobs = _step(
+            input_tokens=prompt,
+            input_embeddings=input_embeddings,
+            phase=(
+                GenerationForwardPhase.DECODE
+                if has_cached_prefix
+                else GenerationForwardPhase.PREFILL
+            ),
+        )
 
     mx.async_eval(y, logprobs)
     n = 0
@@ -475,6 +583,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    model_forward_context: Optional[GenerationForwardContext] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -500,6 +609,9 @@ def speculative_generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        model_forward_context (Callable[[GenerationForward], ContextManager], optional):
+          A request-local context factory invoked around each Python model call.
+          The scope covers MLX graph construction, not deferred realization.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
@@ -541,9 +653,23 @@ def speculative_generate_step(
         y = sampler(logprobs)
         return y, logprobs
 
-    def _step(model, cache, y, n_predict=1):
+    def _model_call(model, cache, input_tokens, phase):
+        # Keep the no-callback path direct: this is the hot path for ordinary
+        # speculative decoding and does not allocate a context or metadata.
+        if model_forward_context is None:
+            return model(input_tokens, cache=cache)
+        forward = GenerationForward(
+            model=model,
+            input_tokens=input_tokens,
+            cache=cache,
+            phase=phase,
+        )
+        with model_forward_context(forward):
+            return model(input_tokens, cache=cache)
+
+    def _step(model, cache, y, n_predict=1, phase=GenerationForwardPhase.VERIFY):
         with mx.stream(generation_stream):
-            logits = model(y[None], cache=cache)
+            logits = _model_call(model, cache, y[None], phase)
             logits = logits[:, -n_predict:, :]
 
             quantize_cache_fn(cache)
@@ -570,7 +696,12 @@ def speculative_generate_step(
     def _prefill(model, cache, y):
         while y.size > 1:
             n_to_process = min(prefill_step_size, y.size - 1)
-            model(y[:n_to_process][None], cache=cache)
+            _model_call(
+                model,
+                cache,
+                y[:n_to_process][None],
+                GenerationForwardPhase.PREFILL,
+            )
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
             y = y[n_to_process:]
@@ -586,7 +717,12 @@ def speculative_generate_step(
             return mx.array([], mx.uint32)
         ys = []
         for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
+            y, _ = _step(
+                draft_model,
+                draft_cache,
+                y,
+                phase=GenerationForwardPhase.DRAFT,
+            )
             mx.async_eval(y)
             ys.append(y)
         return mx.concatenate(ys)
@@ -599,6 +735,7 @@ def speculative_generate_step(
     # Set these so the finally block doesn't raise
     num_draft = 0
     n = 0
+    first_target_round = True
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -606,7 +743,22 @@ def speculative_generate_step(
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
-            tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+            tokens, logprobs = _step(
+                model,
+                model_cache,
+                y,
+                num_draft + 1,
+                phase=(
+                    GenerationForwardPhase.VERIFY
+                    if num_draft
+                    else (
+                        GenerationForwardPhase.PREFILL
+                        if first_target_round
+                        else GenerationForwardPhase.DECODE
+                    )
+                ),
+            )
+            first_target_round = False
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
@@ -651,6 +803,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    model_forward_context: Optional[GenerationForwardContext] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -666,6 +819,9 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        model_forward_context (Callable[[GenerationForward], ContextManager], optional):
+          A request-local context factory forwarded to the selected generation
+          implementation. The scope covers Python model-call graph construction.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -688,6 +844,8 @@ def stream_generate(
     detokenizer = tokenizer.detokenizer
 
     kwargs["max_tokens"] = max_tokens
+    if model_forward_context is not None:
+        kwargs["model_forward_context"] = model_forward_context
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
