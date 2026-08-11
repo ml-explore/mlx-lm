@@ -46,6 +46,17 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertEqual(text, "!!!!!")
 
+    def test_stream_generate_zero_max_tokens(self):
+        prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "Write a story about Einstein"}],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
+        responses = list(
+            stream_generate(self.model, self.tokenizer, prompt, max_tokens=0)
+        )
+        self.assertEqual(responses, [])
+
     def test_stream_generate_max_tokens(self):
         prompt = self.tokenizer.apply_chat_template(
             [{"role": "user", "content": "Write a story about Einstein"}],

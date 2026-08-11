@@ -704,6 +704,9 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
+        # max_tokens=0 (or a generator that yields nothing) must not reach
+        # the final response, which reads the loop variables.
+        token = None
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
@@ -730,6 +733,8 @@ def stream_generate(
             )
 
         detokenizer.finalize()
+        if token is None:
+            return
         yield GenerationResponse(
             text=detokenizer.last_segment,
             token=token,
