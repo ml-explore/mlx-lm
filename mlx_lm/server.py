@@ -34,6 +34,7 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
+    NativeMTPSamplingConfig,
     StopSequenceMatcher,
     TextStateMachine,
     make_stop_matcher,
@@ -43,6 +44,10 @@ from .generate import (
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
+
+
+class NativeMTPRequestError(ValueError):
+    """A native-MTP request cannot be executed under the server contract."""
 
 
 def get_system_fingerprint():
@@ -191,6 +196,7 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    mtp: bool = False
 
 
 @dataclass
@@ -229,6 +235,9 @@ class Response:
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+    mtp_bypass_reason: Optional[str] = None
 
 
 class TimeBudget:
@@ -391,7 +400,7 @@ def _make_sampler(args, tokenizer):
 
 
 def _make_logits_processors(args):
-    return make_logits_processors(
+    processors = make_logits_processors(
         args.logits.logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
@@ -400,6 +409,44 @@ def _make_logits_processors(args):
         args.logits.frequency_penalty,
         args.logits.frequency_context_size,
     )
+    # The built-in processors are pure functions of token history and logits,
+    # so native MTP can replay them exactly after a rejected verification.
+    for processor in processors:
+        processor.native_mtp_replay_safe = True
+    return processors
+
+
+def _make_native_mtp_sampling_config(sampling, seed):
+    if sampling.xtc_probability != 0:
+        raise ValueError("native_mtp_xtc_unsupported")
+    return NativeMTPSamplingConfig(
+        temperature=sampling.temperature,
+        top_p=sampling.top_p,
+        top_k=sampling.top_k,
+        min_p=sampling.min_p,
+        seed=seed,
+    )
+
+
+def _validate_native_mtp_model(model, sampling):
+    capability = getattr(model, "mtp_capability", None)
+    if capability is None or not capability.supported:
+        reason = (
+            "native_mtp_model_capability_missing"
+            if capability is None
+            else capability.reason
+        )
+        raise NativeMTPRequestError(reason or "native_mtp_model_unsupported")
+
+    vocab_size = getattr(model, "vocab_size", None)
+    if vocab_size is None:
+        vocab_size = getattr(getattr(model, "args", None), "vocab_size", None)
+    if not isinstance(vocab_size, int) or isinstance(vocab_size, bool):
+        raise NativeMTPRequestError("native_mtp_vocab_size_unavailable")
+    if sampling.top_k > 0 and sampling.top_k >= vocab_size:
+        raise NativeMTPRequestError(
+            "native MTP top_k must be smaller than vocabulary size"
+        )
 
 
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
@@ -619,7 +666,7 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return self.model_provider.is_batchable and args.seed is None and not args.mtp
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -877,9 +924,24 @@ class ResponseGenerator:
             model = self.model_provider.model
             tokenizer = self.model_provider.tokenizer
             draft_model = self.model_provider.draft_model
+            if args.mtp and draft_model is not None:
+                raise NativeMTPRequestError("native_mtp_external_draft_unsupported")
+            if args.mtp:
+                if isinstance(args.max_tokens, bool) or args.max_tokens <= 0:
+                    raise NativeMTPRequestError(
+                        "native_mtp_max_tokens_must_be_positive"
+                    )
+                _validate_native_mtp_model(model, args.sampling)
+            mtp_sampling_config = (
+                _make_native_mtp_sampling_config(args.sampling, args.seed)
+                if args.mtp
+                else None
+            )
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            if args.mtp and not prompt:
+                raise NativeMTPRequestError("native_mtp_prompt_must_be_nonempty")
             stop_matcher, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -898,28 +960,35 @@ class ResponseGenerator:
             rqueue.put(ctx)
 
             # Seed if requested
-            if args.seed is not None:
+            if args.seed is not None and not args.mtp:
                 mx.random.seed(args.seed)
 
             # Make the sampler and logit processor
-            sampler = _make_sampler(args, tokenizer)
+            sampler = None if args.mtp else _make_sampler(args, tokenizer)
             logits_processors = _make_logits_processors(args)
 
             # Load the KV cache
-            self._log_cache_stats()
-            cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
-            )
-            ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
-            if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
-                    cache += make_prompt_cache(self.model_provider.draft_model)
+            if args.mtp:
+                # Native MTP owns a request-local transactional target+MTP
+                # cache.  Generic prefix reuse is deliberately fail-closed.
+                cache = None
+                rest = prompt
+                ctx.prompt_cache_count = 0
+            else:
+                self._log_cache_stats()
+                cache, rest = self.prompt_cache.fetch_nearest_cache(
+                    self.model_provider.model_key, prompt
+                )
+                ctx.prompt_cache_count = len(prompt) - len(rest)
+                if cache is None:
+                    cache = make_prompt_cache(self.model_provider.model)
+                    if self.model_provider.draft_model is not None:
+                        cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
             stop_state = stop_matcher.make_state()
-            for gen in stream_generate(
+            generation_kwargs = dict(
                 model=model,
                 tokenizer=tokenizer,
                 prompt=rest,
@@ -931,43 +1000,57 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
-            ):
-                finish_reason = gen.finish_reason
-
-                # Token-level stop word detection
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, gen.token
+            )
+            if args.mtp:
+                generation_kwargs.update(
+                    mtp=True,
+                    mtp_sampling_config=mtp_sampling_config,
                 )
-                if matched:
-                    finish_reason = "stop"
+            generation = stream_generate(**generation_kwargs)
+            try:
+                for gen in generation:
+                    finish_reason = gen.finish_reason
 
-                rqueue.put(
-                    Response(
-                        gen.text,
-                        gen.token,
-                        gen.logprobs[gen.token].item(),
-                        finish_reason,
-                        _format_top_logprobs(
-                            gen.logprobs, args.top_logprobs, tokenizer
-                        ),
+                    # Token-level stop word detection
+                    stop_state, matched = StopSequenceMatcher.match(
+                        stop_state, stop_matcher._trie, gen.token
                     )
-                )
-                cache_key.append(gen.token)
+                    if matched:
+                        finish_reason = "stop"
 
-                if ctx._should_stop:
-                    if self._is_distributed:
-                        raise NotImplementedError()
-                    break
+                    rqueue.put(
+                        Response(
+                            gen.text,
+                            gen.token,
+                            gen.logprobs[gen.token].item(),
+                            finish_reason,
+                            _format_top_logprobs(
+                                gen.logprobs, args.top_logprobs, tokenizer
+                            ),
+                            mtp_drafts=gen.mtp_drafts,
+                            mtp_accepted=gen.mtp_accepted,
+                            mtp_bypass_reason=gen.mtp_bypass_reason,
+                        )
+                    )
+                    cache_key.append(gen.token)
 
-                if finish_reason is not None:
-                    break
+                    if ctx._should_stop:
+                        if self._is_distributed:
+                            raise NotImplementedError()
+                        break
+
+                    if finish_reason is not None:
+                        break
+            finally:
+                generation.close()
 
             rqueue.put(None)
 
             # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
+            if not args.mtp:
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
 
         except Exception as e:
             rqueue.put(e)
@@ -1042,6 +1125,22 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
+
+    def _send_structured_error(self, status_code: int, error: Exception):
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": str(error),
+                    "type": "invalid_request_error",
+                    "code": str(error),
+                }
+            }
+        ).encode()
+        self._set_completion_headers(status_code)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+        self.wfile.flush()
 
     def do_OPTIONS(self):
         self._set_completion_headers(204)
@@ -1138,8 +1237,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
+        self.mtp = self.body.get("mtp", False)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except (TypeError, ValueError) as error:
+            self._send_structured_error(422, error)
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1147,7 +1251,11 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        try:
+            request = request_factories[self.path]()
+        except (AssertionError, TypeError, ValueError) as error:
+            self._send_structured_error(400, error)
+            return
         self.handle_completion(request, stop_words)
 
     def _validate(
@@ -1178,6 +1286,7 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
+        self._validate("mtp", bool)
         self._validate("max_tokens", int, min_val=0)
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
@@ -1199,6 +1308,30 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
 
+        if self.mtp:
+            if isinstance(self.max_tokens, bool) or self.max_tokens <= 0:
+                raise NativeMTPRequestError("native_mtp_max_tokens_must_be_positive")
+            configured_draft = (
+                self.body.get("draft_model")
+                if "draft_model" in self.body
+                else getattr(self.response_generator.cli_args, "draft_model", None)
+            )
+            if configured_draft is not None:
+                raise NativeMTPRequestError("native_mtp_external_draft_unsupported")
+            if self.body.get("prompt_cache") not in (None, False):
+                raise NativeMTPRequestError("native_mtp_prefix_reuse_unsupported")
+            _make_native_mtp_sampling_config(
+                SamplingArguments(
+                    self.temperature,
+                    self.top_p,
+                    self.top_k,
+                    self.min_p,
+                    self.xtc_probability,
+                    self.xtc_threshold,
+                ),
+                self.seed,
+            )
+
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
@@ -1217,6 +1350,9 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens: Optional[List[int]] = None,
         tool_calls: Optional[List[str]] = None,
         reasoning_text: Optional[str] = None,
+        mtp_drafts: Optional[int] = None,
+        mtp_accepted: Optional[int] = None,
+        mtp_bypass_reason: Optional[str] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -1262,6 +1398,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 },
             ],
         }
+        if mtp_drafts is not None:
+            response["generation_metadata"] = {
+                "mtp_drafts": mtp_drafts,
+                "mtp_accepted": mtp_accepted or 0,
+                "mtp_bypass_reason": mtp_bypass_reason,
+            }
 
         if top_logprobs:
             response["choices"][0]["logprobs"] = {
@@ -1352,6 +1494,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            mtp=self.mtp,
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -1371,9 +1514,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            if isinstance(e, (TypeError, ValueError)):
+                self._send_structured_error(422, e)
+            else:
+                self._set_completion_headers(404)
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
 
         # Prepare the headers
@@ -1402,6 +1548,9 @@ class APIHandler(BaseHTTPRequestHandler):
         tokens = []
         token_logprobs = []
         top_tokens = []
+        mtp_drafts = 0
+        mtp_accepted = 0
+        mtp_bypass_reason = None
 
         try:
             for gen in response:
@@ -1460,6 +1609,9 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
+                mtp_drafts = gen.mtp_drafts
+                mtp_accepted = gen.mtp_accepted
+                mtp_bypass_reason = gen.mtp_bypass_reason
 
                 prev_state = current_state
 
@@ -1476,6 +1628,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason,
                     tool_calls=tool_formatter(tool_calls),
                     reasoning_text=reasoning_text,
+                    mtp_drafts=mtp_drafts if self.mtp else None,
+                    mtp_accepted=mtp_accepted,
+                    mtp_bypass_reason=mtp_bypass_reason,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
@@ -1504,6 +1659,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     tokens=tokens,
                     reasoning_text=reasoning_text,
                     tool_calls=tool_formatter(tool_calls),
+                    mtp_drafts=mtp_drafts if self.mtp else None,
+                    mtp_accepted=mtp_accepted,
+                    mtp_bypass_reason=mtp_bypass_reason,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
@@ -1516,6 +1674,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
         finally:
             ctx.stop()
+            response.close()
 
     def completion_usage_response(
         self,
