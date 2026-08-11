@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import math
 from functools import partial
@@ -44,7 +44,12 @@ def make_sampler(
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+
+        def sampler(logprobs):
+            return mx.argmax(logprobs, axis=-1)
+
+        sampler.temp = 0.0
+        return sampler
 
     # Create sampler chain
     sampling_methods = []
@@ -66,6 +71,12 @@ def make_sampler(
         # Return the sampled token
         return categorical_sampling(logprobs, temp)
 
+    if not sampling_methods:
+        # Plain temperature sampling: expose the temperature so that
+        # consumers which need the sampled distribution (e.g. the
+        # ``accept_rule`` options of ``speculative_generate_step``) can
+        # recover it from the log-probabilities.
+        sampler.temp = temp
     return sampler
 
 

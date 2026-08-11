@@ -1,10 +1,11 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2026 Apple Inc.
 
 import argparse
 import contextlib
 import copy
 import functools
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -209,6 +210,16 @@ def setup_arg_parser():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--accept-rule",
+        type=str,
+        choices=["exact", "residual", "block"],
+        help="Draft-token acceptance rule for speculative decoding. "
+        "'residual' and 'block' raise the acceptance rate at temperature > 0 "
+        "without changing the sampled distribution; they require plain "
+        "temperature sampling.",
+        default="exact",
     )
     return parser
 
@@ -461,6 +472,108 @@ def generate_step(
         n += 1
 
 
+def _sampling_logprobs(logprobs: mx.array, temp: float) -> mx.array:
+    """Log-probabilities of the distribution actually sampled from at the
+    given temperature, i.e. the log-softmax of ``logprobs / temp``."""
+    logprobs = logprobs.astype(mx.float32)
+    if temp != 1.0:
+        logprobs = logprobs * (1.0 / temp)
+    return logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)
+
+
+def _acceptance_probs(
+    target_logprobs: mx.array, draft_logprobs: mx.array, draft_tokens: List[int]
+) -> mx.array:
+    """Per-token speculative sampling acceptance probabilities
+    ``min(1, p(x) / q(x))`` for drafts ``x ~ q``.
+
+    The ratio is computed in log space, ``exp(min(log p - log q, 0))``, so
+    that tokens whose probabilities are far below any fixed linear-space
+    floor are still accepted at the correct rate.
+    """
+    idx = mx.array(draft_tokens, mx.uint32)[:, None]
+    t = mx.take_along_axis(target_logprobs, idx, axis=-1).squeeze(-1)
+    d = mx.take_along_axis(draft_logprobs, idx, axis=-1).squeeze(-1)
+    return mx.exp(mx.minimum(t - d, 0.0))
+
+
+def _residual_sample(
+    target_logprobs: mx.array, draft_logprobs: mx.array, scale: float = 1.0
+) -> int:
+    """Sample the correction token from the normalized residual
+    ``relu(scale * p - q)``.
+
+    ``scale`` is the block-verification cumulative ratio; ``1.0`` gives the
+    standard per-token rejection sampling residual. If the residual has no
+    mass (``scale * p <= q`` everywhere), fall back to a plain sample from
+    the target distribution.
+    """
+    residual = mx.maximum(scale * mx.exp(target_logprobs) - mx.exp(draft_logprobs), 0.0)
+    if mx.sum(residual).item() <= 0.0:
+        return mx.random.categorical(target_logprobs).item()
+    return mx.random.categorical(mx.log(residual)).item()
+
+
+def _block_verify(
+    target_logprobs: mx.array, draft_logprobs: mx.array, draft_tokens: List[int]
+) -> Tuple[int, Optional[int]]:
+    """Block verification (Sun et al., https://arxiv.org/abs/2403.10444).
+
+    Instead of independent per-token accept/reject coin flips, the drafted
+    block is verified through the cumulative likelihood ratio of its
+    prefixes, ``p_cum_i = min(p_cum_{i-1} * p_i(x_i) / q_i(x_i), 1)``. A
+    prefix of length ``i`` passes when a uniform draw falls below its
+    threshold: ``h_k = p_cum_k`` for the full block, and
+    ``h_i = S_i / (S_i + 1 - p_cum_i)`` with
+    ``S_i = sum(relu(p_cum_i * p_{i+1} - q_{i+1}))`` otherwise. The accepted
+    length is the LARGEST passing prefix, so a later position can rescue an
+    earlier failure; this accepts at least as many tokens in expectation as
+    per-token rejection sampling while committing tokens with exactly the
+    target distribution.
+
+    ``target_logprobs`` holds ``k + 1`` rows and ``draft_logprobs`` the
+    ``k`` rows the drafts were sampled from, both already at the sampling
+    temperature. Returns the accepted length and the correction token
+    (sampled from the scaled residual ``relu(p_cum * p - q)``), or ``None``
+    for the correction when the full block was accepted.
+    """
+    k = len(draft_tokens)
+    etas = mx.random.uniform(shape=(k,))
+    idx = mx.array(draft_tokens, mx.uint32)[:, None]
+    t = mx.take_along_axis(target_logprobs[:k], idx, axis=-1).squeeze(-1)
+    d = mx.take_along_axis(draft_logprobs, idx, axis=-1).squeeze(-1)
+    mx.eval(etas)
+    etas = etas.tolist()
+    log_ratios = (t - d).tolist()
+    log_p_cum = 0.0
+    p_cums = [1.0]
+    tau = 0
+    for i in range(k):
+        log_p_cum = min(log_p_cum + log_ratios[i], 0.0)
+        p_cum = math.exp(log_p_cum)
+        p_cums.append(p_cum)
+        if i == k - 1:
+            h = p_cum
+        else:
+            s = mx.sum(
+                mx.maximum(
+                    p_cum * mx.exp(target_logprobs[i + 1])
+                    - mx.exp(draft_logprobs[i + 1]),
+                    0.0,
+                )
+            ).item()
+            denom = s + (1.0 - p_cum)
+            h = 1.0 if denom <= 0.0 else s / denom
+        if etas[i] <= h:
+            tau = i + 1
+    if tau == k:
+        return tau, None
+    correction = _residual_sample(
+        target_logprobs[tau], draft_logprobs[tau], scale=p_cums[tau]
+    )
+    return tau, correction
+
+
 def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -475,6 +588,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    accept_rule: str = "exact",
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -500,11 +614,48 @@ def speculative_generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        accept_rule (str): How to decide which draft tokens to accept. One of:
+
+          - ``"exact"``: accept a draft token only when it matches the token
+            sampled from the target model (the default, unchanged behavior).
+          - ``"residual"``: speculative rejection sampling — accept a draft
+            token ``x ~ q`` with probability ``min(1, p(x) / q(x))`` and
+            resample rejections from ``relu(p - q)`` normalized.
+          - ``"block"``: block verification (Sun et al.,
+            https://arxiv.org/abs/2403.10444) — verify the whole drafted
+            block through cumulative likelihood ratios; accepts at least as
+            many tokens in expectation as ``"residual"``.
+
+          All three rules commit tokens distributed exactly as the target
+          model's sampling distribution; ``"residual"`` and ``"block"`` only
+          raise the acceptance rate at temperature > 0. They require the
+          sampled distribution and are therefore only supported with plain
+          temperature samplers from :func:`make_sampler` (no top-p / min-p /
+          top-k / xtc). With greedy sampling all rules coincide with
+          ``"exact"``. Default: ``"exact"``.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
           and a bool indicating if the token was generated by the draft model
     """
+    if accept_rule not in ("exact", "residual", "block"):
+        raise ValueError(
+            f"accept_rule must be one of 'exact', 'residual', or 'block', "
+            f"got {accept_rule!r}"
+        )
+    accept_temp = 0.0
+    if accept_rule != "exact":
+        accept_temp = 0.0 if sampler is None else getattr(sampler, "temp", None)
+        if accept_temp is None:
+            raise ValueError(
+                f"accept_rule {accept_rule!r} requires the distribution the "
+                "tokens are sampled from, which is only available for plain "
+                "temperature samplers made by make_sampler (no top_p, min_p, "
+                "top_k, or xtc). Use a supported sampler or accept_rule='exact'."
+            )
+        if accept_temp == 0.0:
+            # With greedy sampling every rule reduces to exact matching
+            accept_rule = "exact"
 
     y = prompt.astype(mx.uint32)
     prev_tokens = None
@@ -582,14 +733,41 @@ def speculative_generate_step(
         cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
+        keep_logprobs = accept_rule != "exact"
         if num_draft == 0:
-            return mx.array([], mx.uint32)
-        ys = []
+            return mx.array([], mx.uint32), None
+        ys, lps = [], []
         for _ in range(num_draft):
-            y, _ = _step(draft_model, draft_cache, y)
+            y, logprobs = _step(draft_model, draft_cache, y)
             mx.async_eval(y)
             ys.append(y)
-        return mx.concatenate(ys)
+            if keep_logprobs:
+                lps.append(logprobs)
+        return mx.concatenate(ys), (
+            mx.concatenate(lps, axis=0) if keep_logprobs else None
+        )
+
+    def _verify(draft_tokens, draft_logprobs, tokens, logprobs):
+        num_draft = len(draft_tokens)
+        target_lp = _sampling_logprobs(logprobs, accept_temp)
+        draft_lp = _sampling_logprobs(draft_logprobs, accept_temp)
+        if accept_rule == "block":
+            n, correction = _block_verify(target_lp, draft_lp, draft_tokens)
+        else:
+            probs = _acceptance_probs(target_lp[:num_draft], draft_lp, draft_tokens)
+            us = mx.random.uniform(shape=(num_draft,))
+            mx.eval(probs, us)
+            probs, us = probs.tolist(), us.tolist()
+            n = 0
+            while n < num_draft and us[n] <= probs[n]:
+                n += 1
+            correction = None
+            if n < num_draft:
+                correction = _residual_sample(target_lp[n], draft_lp[n])
+        # On full acceptance the target's own sample at the bonus position
+        # is a fresh draw from the target distribution, so reuse it. On
+        # rejection commit the residual-sampled correction instead.
+        return n, tokens[n] if correction is None else correction
 
     with mx.stream(generation_stream):
         draft_y = _prefill(draft_model, draft_cache, y)
@@ -602,7 +780,7 @@ def speculative_generate_step(
     try:
         while True:
             num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
+            draft_tokens, draft_logprobs = _draft_generate(draft_y, num_draft)
             if prev_tokens is not None:
                 prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
             y = mx.concatenate([y, draft_tokens])
@@ -610,24 +788,37 @@ def speculative_generate_step(
             mx.eval(tokens, draft_tokens)
             draft_tokens = draft_tokens.tolist()
             tokens = tokens.tolist()
-            n = 0
-            while n < num_draft:
-                tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                if tn != dtn:
-                    break
-                n += 1
-                ntoks += 1
-                yield tn, lpn, True
-                if ntoks == max_tokens:
-                    break
+            if accept_rule == "exact":
+                n = 0
+                while n < num_draft:
+                    tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
+                    if tn != dtn:
+                        break
+                    n += 1
+                    ntoks += 1
+                    yield tn, lpn, True
+                    if ntoks == max_tokens:
+                        break
+                last_token = tokens[n]
+            else:
+                n_accept, last_token = _verify(
+                    draft_tokens, draft_logprobs, tokens, logprobs
+                )
+                n = 0
+                while n < n_accept:
+                    n += 1
+                    ntoks += 1
+                    yield draft_tokens[n - 1], logprobs[n - 1], True
+                    if ntoks == max_tokens:
+                        break
             if ntoks < max_tokens:
                 ntoks += 1
-                yield tokens[n], logprobs[n], False
+                yield last_token, logprobs[n], False
 
             if ntoks == max_tokens:
                 break
 
-            y = mx.array([tokens[n]], mx.uint32)
+            y = mx.array([last_token], mx.uint32)
             draft_y = y
 
             # If we accepted all the draft tokens, include the last
@@ -691,6 +882,7 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("accept_rule", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
@@ -2181,6 +2373,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        accept_rule=args.accept_rule,
     )
     if not args.verbose:
         print(response)
