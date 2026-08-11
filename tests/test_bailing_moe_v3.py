@@ -104,6 +104,39 @@ def test_fp8_model_keeps_quantized_projection_layers():
     assert isinstance(model.layers[1].mlp.switch_mlp.gate_proj, QuantizedSwitchLinear)
 
 
+def test_flash_mla_uses_direct_q_projection():
+    args = replace(_model_args("head_wise"), q_lora_rank=None, quantization_config=None)
+    model = Model(args)
+    attention = model.layers[0].attention
+
+    assert isinstance(attention.q_proj, nn.Linear)
+    assert not hasattr(attention, "q_a_proj")
+
+    logits = model(mx.array([[1, 2]], dtype=mx.int32))
+    mx.eval(logits)
+
+    assert logits.shape == (1, 2, args.vocab_size)
+
+
+def test_sanitize_discards_mtp_layers():
+    args = replace(
+        _model_args(None), quantization_config=None, num_nextn_predict_layers=1
+    )
+    model = Model(args)
+    main_key = "model.layers.0.input_layernorm.weight"
+    mtp_key = "model.layers.1.eh_proj.weight"
+
+    weights = model.sanitize(
+        {
+            main_key: mx.ones((args.hidden_size,)),
+            mtp_key: mx.ones((args.hidden_size, 2 * args.hidden_size)),
+        }
+    )
+
+    assert main_key in weights
+    assert mtp_key not in weights
+
+
 def test_bf16_sanitize_stacks_expert_weights_without_scales():
     args = _bf16_model_args()
     model = Model(args)

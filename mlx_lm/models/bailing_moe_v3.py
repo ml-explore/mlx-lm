@@ -35,12 +35,13 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: int = 8
     num_shared_experts: int = 1
     first_k_dense_replace: int = 1
+    num_nextn_predict_layers: int = 0
     n_group: int = 8
     topk_group: int = 4
     routed_scaling_factor: float = 2.5
     layer_group_size: int = 4
     head_dim: int = 128
-    q_lora_rank: int = 256
+    q_lora_rank: int | None = 256
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
@@ -67,6 +68,14 @@ def _is_kda_layer(
         (layer_index + 1) % layer_group_size == 0
         or layer_index >= num_hidden_layers // layer_group_size * layer_group_size
     )
+
+
+def _is_mtp_weight(key: str, num_hidden_layers: int) -> bool:
+    prefix = "model.layers."
+    if not key.startswith(prefix):
+        return False
+    layer_index = key[len(prefix) :].split(".", 1)[0]
+    return layer_index.isdigit() and int(layer_index) >= num_hidden_layers
 
 
 def _uses_fp8(args: ModelArgs) -> bool:
@@ -221,13 +230,20 @@ class BailingMLA(nn.Module):
         self.v_head_dim = args.v_head_dim
         self.scale = self.qk_head_dim**-0.5
 
-        self.q_a_proj = nn.Linear(args.hidden_size, args.q_lora_rank, bias=False)
-        self.q_a_layernorm = nn.RMSNorm(args.q_lora_rank, eps=args.rms_norm_eps)
-        self.q_b_proj = nn.Linear(
-            args.q_lora_rank,
-            args.num_attention_heads * args.qk_head_dim,
-            bias=False,
-        )
+        if self.q_lora_rank is None:
+            self.q_proj = nn.Linear(
+                args.hidden_size,
+                args.num_attention_heads * args.qk_head_dim,
+                bias=False,
+            )
+        else:
+            self.q_a_proj = nn.Linear(args.hidden_size, self.q_lora_rank, bias=False)
+            self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=args.rms_norm_eps)
+            self.q_b_proj = nn.Linear(
+                self.q_lora_rank,
+                args.num_attention_heads * args.qk_head_dim,
+                bias=False,
+            )
         self.kv_a_proj_with_mqa = nn.Linear(
             args.hidden_size,
             args.kv_lora_rank + args.qk_rope_head_dim,
@@ -281,7 +297,10 @@ class BailingMLA(nn.Module):
         cache: Any | None = None,
     ) -> mx.array:
         batch, length, _ = x.shape
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+        if self.q_lora_rank is None:
+            q = self.q_proj(x)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
         q = q.reshape(batch, length, self.num_heads, self.qk_head_dim).transpose(
             0, 2, 1, 3
         )
@@ -548,7 +567,11 @@ class Model(nn.Module):
             )
 
     def sanitize(self, weights):
-        weights = dict(weights)
+        weights = {
+            key: value
+            for key, value in weights.items()
+            if not _is_mtp_weight(key, self.args.num_hidden_layers)
+        }
         scale_keys = [key for key in weights if key.endswith("weight_scale_inv")]
         uses_fp8 = _uses_fp8(self.args)
         if not uses_fp8 and scale_keys:
