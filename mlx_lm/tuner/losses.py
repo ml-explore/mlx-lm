@@ -51,8 +51,10 @@ def _make_kl_forward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
                 sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
                 sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
@@ -75,11 +77,15 @@ def _make_kl_forward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
-                sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
-                sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                if (offset + j < V) {
+                    sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
+                    sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                }
             }
         }
 
@@ -101,8 +107,10 @@ def _make_kl_forward_kernel():
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Share the sum_exp across the threadgroup
-        sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-        sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+        float rq = prev_max_q - max_q;
+        float rp = prev_max_p - max_p;
+        sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+        sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
         sum_exp_q = simd_sum(sum_exp_q);
         sum_exp_p = simd_sum(sum_exp_p);
         if (simd_lane_id == 0) {
@@ -150,7 +158,9 @@ def _make_kl_forward_kernel():
             }
 
             for (int j=0; j<M; j++) {
-                kl += metal::fast::exp(vals_p[j] - lse_p) * (vals_p[j] - vals_q[j] + lse_q_minus_p);
+                if (offset + j < V) {
+                    kl += metal::fast::exp(vals_p[j] - lse_p) * (vals_p[j] - vals_q[j] + lse_q_minus_p);
+                }
             }
         }
 
@@ -222,8 +232,10 @@ def _make_kl_backward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
                 sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
                 sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
@@ -246,11 +258,15 @@ def _make_kl_backward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
-                sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
-                sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                if (offset + j < V) {
+                    sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
+                    sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                }
             }
         }
 
@@ -272,8 +288,10 @@ def _make_kl_backward_kernel():
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Share the sum_exp across the threadgroup
-        sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-        sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+        float rq = prev_max_q - max_q;
+        float rp = prev_max_p - max_p;
+        sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+        sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
         sum_exp_q = simd_sum(sum_exp_q);
         sum_exp_p = simd_sum(sum_exp_p);
         if (simd_lane_id == 0) {
@@ -308,7 +326,8 @@ def _make_kl_backward_kernel():
 
             for (int j=0; j<M; j++) {
                 out[offset + j] = static_cast<T>(
-                    c * (metal::fast::exp(vals_q[j] - lse_q) - metal::fast::exp(vals_p[j] - lse_p)));
+                    c * (metal::fast::exp(min(vals_q[j] - lse_q, 0.0f))
+                       - metal::fast::exp(min(vals_p[j] - lse_p, 0.0f))));
             }
 
             // Move to the next block
@@ -325,7 +344,8 @@ def _make_kl_backward_kernel():
             for (int j=0; j<M; j++) {
                 if (offset + j < V) {
                     out[offset + j] = static_cast<T>(
-                        c * (metal::fast::exp(vals_q[j] - lse_q) - metal::fast::exp(vals_p[j] - lse_p)));
+                        c * (metal::fast::exp(min(vals_q[j] - lse_q, 0.0f))
+                           - metal::fast::exp(min(vals_p[j] - lse_p, 0.0f))));
                 }
             }
         }
@@ -434,8 +454,10 @@ def _make_js_forward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
                 sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
                 sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
@@ -458,11 +480,15 @@ def _make_js_forward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
-                sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
-                sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                if (offset + j < V) {
+                    sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
+                    sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                }
             }
         }
 
@@ -484,8 +510,10 @@ def _make_js_forward_kernel():
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Share the sum_exp across the threadgroup
-        sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-        sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+        float rq = prev_max_q - max_q;
+        float rp = prev_max_p - max_p;
+        sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+        sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
         sum_exp_q = simd_sum(sum_exp_q);
         sum_exp_p = simd_sum(sum_exp_p);
         if (simd_lane_id == 0) {
@@ -540,12 +568,14 @@ def _make_js_forward_kernel():
             }
 
             for (int j=0; j<M; j++) {
-                float logp_j = vals_p[j] - lse_p;
-                float logq_j = vals_q[j] - lse_q;
-                float p_j = metal::fast::exp(logp_j);
-                float q_j = metal::fast::exp(logq_j);
-                kl_p += p_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logq_j - logp_j)));
-                kl_q += q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)));
+                if (offset + j < V) {
+                    float logp_j = vals_p[j] - lse_p;
+                    float logq_j = vals_q[j] - lse_q;
+                    float p_j = metal::fast::exp(logp_j);
+                    float q_j = metal::fast::exp(logq_j);
+                    kl_p += p_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logq_j - logp_j)));
+                    kl_q += q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)));
+                }
             }
         }
 
@@ -623,8 +653,10 @@ def _make_js_backward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
                 sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
                 sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
@@ -647,11 +679,15 @@ def _make_js_backward_kernel():
                 max_q = max(max_q, vals_q[j]);
                 max_p = max(max_p, vals_p[j]);
             }
-            sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-            sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+            float rq = prev_max_q - max_q;
+            float rp = prev_max_p - max_p;
+            sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+            sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
             for (int j=0; j<M; j++) {
-                sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
-                sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                if (offset + j < V) {
+                    sum_exp_q += metal::fast::exp(vals_q[j] - max_q);
+                    sum_exp_p += metal::fast::exp(vals_p[j] - max_p);
+                }
             }
         }
 
@@ -673,8 +709,10 @@ def _make_js_backward_kernel():
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Share the sum_exp across the threadgroup
-        sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
-        sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
+        float rq = prev_max_q - max_q;
+        float rp = prev_max_p - max_p;
+        sum_exp_q *= (rq < -80.0f) ? 0.0f : metal::fast::exp(rq);
+        sum_exp_p *= (rp < -80.0f) ? 0.0f : metal::fast::exp(rp);
         sum_exp_q = simd_sum(sum_exp_q);
         sum_exp_p = simd_sum(sum_exp_p);
         if (simd_lane_id == 0) {
@@ -709,8 +747,8 @@ def _make_js_backward_kernel():
             }
 
             for (int j=0; j<M; j++) {
-                float logp_j = vals_p[j] - lse_p;
-                float logq_j = vals_q[j] - lse_q;
+                float logp_j = min(vals_p[j] - lse_p, 0.0f);
+                float logq_j = min(vals_q[j] - lse_q, 0.0f);
                 float q_j = metal::fast::exp(logq_j);
                 out_q[offset + j] = static_cast<T>(
                     c * 0.5 * q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)) - kl_q)
@@ -730,8 +768,8 @@ def _make_js_backward_kernel():
 
             for (int j=0; j<M; j++) {
                 if (offset + j < V) {
-                    float logp_j = vals_p[j] - lse_p;
-                    float logq_j = vals_q[j] - lse_q;
+                    float logp_j = min(vals_p[j] - lse_p, 0.0f);
+                    float logq_j = min(vals_q[j] - lse_q, 0.0f);
                     float q_j = metal::fast::exp(logq_j);
                     out_q[offset + j] = static_cast<T>(
                         c * 0.5 * q_j * (logtwo - metal::fast::log(1 + metal::fast::exp(logp_j - logq_j)) - kl_q)
