@@ -263,12 +263,12 @@ class _GenerationForwardCanonicalRecord:
     logical_positions: Tuple[int, ...]
     token_ids: Tuple[int, ...]
     immediate_successor_token_ids: Tuple[int, ...]
-    logits: mx.array
-    logits_evidence: tuple
-    canonical_final_logits: Optional[mx.array]
+    logits: Optional[mx.array]
+    logits_evidence: Optional[tuple]
+    logits_content_digest: Optional[mx.array]
     hidden_rows: mx.array
     hidden_evidence: tuple
-    canonical_hidden_rows: mx.array
+    hidden_content_digest: mx.array
 
 
 @dataclass
@@ -289,7 +289,7 @@ class GenerationForwardPositionReceipt:
     logical_positions: Tuple[int, ...]
     token_ids: Tuple[int, ...]
     immediate_successor_token_ids: Tuple[int, ...]
-    logits: mx.array
+    logits: Optional[mx.array]
     hidden_rows: mx.array
     _issuer_seal: Any
     _record_token: Any
@@ -407,20 +407,24 @@ class GenerationForwardPositionAck:
         if not isinstance(result, tuple) or len(result) != 2:
             raise RuntimeError("generation_logical_position_receipt_missing_hidden")
         logits, hidden_rows = result
-        canonical_hidden_rows = hidden_rows + mx.zeros(
+        retained_hidden_rows = hidden_rows + mx.zeros(
             hidden_rows.shape, dtype=hidden_rows.dtype
         )
-        canonical_final_logits = None
+        hidden_content_digest = _array_content_digest(retained_hidden_rows)
+        retained_final_logits = None
+        logits_content_digest = None
         cache_content_digest = None
         if len(self._immediate_successor_token_ids) == len(self._logical_positions) - 1:
             final_logits = logits[:, -1:, :]
-            canonical_final_logits = final_logits + mx.zeros(
+            retained_final_logits = final_logits + mx.zeros(
                 final_logits.shape, dtype=final_logits.dtype
             )
+            logits_content_digest = _array_content_digest(retained_final_logits)
             cache_content_digest = _cache_content_digest(self._cache)
-        canonical_values = [canonical_hidden_rows]
-        if canonical_final_logits is not None:
-            canonical_values.append(canonical_final_logits)
+        canonical_values = [retained_hidden_rows, hidden_content_digest]
+        if retained_final_logits is not None:
+            canonical_values.append(retained_final_logits)
+            canonical_values.append(logits_content_digest)
             canonical_values.append(cache_content_digest)
         mx.eval(canonical_values)
         record_token = _GenerationForwardReceiptToken()
@@ -434,8 +438,8 @@ class GenerationForwardPositionAck:
             logical_positions=self._logical_positions,
             token_ids=self._token_ids,
             immediate_successor_token_ids=self._immediate_successor_token_ids,
-            logits=logits,
-            hidden_rows=hidden_rows,
+            logits=retained_final_logits,
+            hidden_rows=retained_hidden_rows,
             record_token=record_token,
         )
         record = _GenerationForwardCanonicalRecord(
@@ -451,12 +455,12 @@ class GenerationForwardPositionAck:
             logical_positions=self._logical_positions,
             token_ids=self._token_ids,
             immediate_successor_token_ids=self._immediate_successor_token_ids,
-            logits=logits,
-            logits_evidence=_array_identity_evidence(logits),
-            canonical_final_logits=canonical_final_logits,
-            hidden_rows=hidden_rows,
-            hidden_evidence=_array_identity_evidence(hidden_rows),
-            canonical_hidden_rows=canonical_hidden_rows,
+            logits=retained_final_logits,
+            logits_evidence=_array_identity_evidence(retained_final_logits),
+            logits_content_digest=logits_content_digest,
+            hidden_rows=retained_hidden_rows,
+            hidden_evidence=_array_identity_evidence(retained_hidden_rows),
+            hidden_content_digest=hidden_content_digest,
         )
         with _GENERATION_FORWARD_RECEIPT_LOCK:
             _GENERATION_FORWARD_RECEIPTS[record_token] = _GenerationForwardAuthority(
@@ -614,13 +618,17 @@ def _verify_sparse_canonical_content(records):
     """Realize all mutable evidence checks with one aggregate host decision."""
 
     checks = [
-        mx.array_equal(record.hidden_rows, record.canonical_hidden_rows)
+        mx.array_equal(
+            _array_content_digest(record.hidden_rows), record.hidden_content_digest
+        )
         for record in records
     ]
     final = records[-1]
     checks.extend(
         (
-            mx.array_equal(final.logits[:, -1:, :], final.canonical_final_logits),
+            mx.array_equal(
+                _array_content_digest(final.logits), final.logits_content_digest
+            ),
             mx.array_equal(
                 _cache_content_digest(final.cache), final.cache_content_digest
             ),
@@ -642,11 +650,11 @@ class _NativeMTPSparseClaim:
 
     @property
     def final_target_hidden(self):
-        return self.records[-1].canonical_hidden_rows[:, -1:, :]
+        return self.records[-1].hidden_rows[:, -1:, :]
 
     @property
     def final_target_logits(self):
-        return self.records[-1].canonical_final_logits
+        return self.records[-1].logits
 
 
 def abandon_native_mtp_sparse_receipts(
@@ -712,6 +720,154 @@ class NativeMTPSparseBootstrap:
         """
 
         abandon_native_mtp_sparse_receipts(self.receipts)
+
+    def _abandonable_authority_locked(self):
+        """Return this exact unreserved authority set using host metadata only."""
+
+        if not isinstance(self.receipts, tuple) or not self.receipts:
+            return None
+        if not isinstance(self.target_cache, list) or not self.target_cache:
+            return None
+        if not all(
+            isinstance(values, tuple)
+            for values in (
+                self.selected_logical_positions,
+                self.selected_token_ids,
+                self.immediate_successor_token_ids,
+            )
+        ):
+            return None
+        if isinstance(self.next_logical_position, bool) or not isinstance(
+            self.next_logical_position, int
+        ):
+            return None
+
+        records = []
+        record_tokens = []
+        for receipt in self.receipts:
+            record_token = getattr(receipt, "_record_token", None)
+            if not isinstance(record_token, _GenerationForwardReceiptToken):
+                return None
+            authority = _GENERATION_FORWARD_RECEIPTS.get(record_token)
+            if authority is None or authority.reservation is not None:
+                return None
+            try:
+                _validate_receipt_against_record(receipt, authority.record)
+            except Exception:
+                return None
+            records.append(authority.record)
+            record_tokens.append(record_token)
+        if len(record_tokens) != len(set(record_tokens)):
+            return None
+
+        final = records[-1]
+        try:
+            current_entry_ids = tuple(id(entry) for entry in self.target_cache)
+            current_cache_state = _cache_state_identity_evidence(self.target_cache)
+        except Exception:
+            return None
+        if (
+            id(self.target_cache) != final.cache_container_id
+            or current_entry_ids != final.cache_entry_ids
+            or current_cache_state != final.cache_state_evidence
+        ):
+            return None
+
+        positions = tuple(
+            position for record in records for position in record.logical_positions
+        )
+        token_ids = tuple(
+            token_id for record in records for token_id in record.token_ids
+        )
+        successors = tuple(
+            token_id
+            for record in records
+            for token_id in record.immediate_successor_token_ids
+        )
+        if (
+            positions != self.selected_logical_positions
+            or token_ids != self.selected_token_ids
+            or successors != self.immediate_successor_token_ids
+            or not positions
+            or self.next_logical_position != positions[-1] + 1
+        ):
+            return None
+        previous_position = -1
+        for position in positions:
+            if (
+                isinstance(position, bool)
+                or not isinstance(position, int)
+                or position <= previous_position
+            ):
+                return None
+            previous_position = position
+        if any(
+            isinstance(token_id, bool)
+            or not isinstance(token_id, int)
+            or token_id < 0
+            for token_id in (*token_ids, *successors)
+        ):
+            return None
+
+        for index, record in enumerate(records):
+            is_final = index == len(records) - 1
+            expected_successors = len(record.token_ids) - int(is_final)
+            if (
+                record.cache is not self.target_cache
+                or record.phase is not GenerationForwardPhase.PREFILL
+                or len(record.logical_positions) != len(record.token_ids)
+                or len(record.immediate_successor_token_ids) != expected_successors
+                or (record.logits is None) is is_final
+                or (record.logits_content_digest is None) is is_final
+                or (record.cache_content_digest is None) is is_final
+            ):
+                return None
+            if is_final and (
+                record.logits.ndim != 3
+                or record.logits.shape[0] != 1
+                or record.logits.shape[1] != 1
+            ):
+                return None
+        return tuple(records), tuple(record_tokens)
+
+    def try_abandon_unclaimed(self) -> bool:
+        """Atomically consume valid unclaimed authority for safe dense replay.
+
+        Canonical payload hashes are verified off-lock. The final locked pass
+        rechecks every exact receipt and reservation before deleting all keys;
+        a concurrent claim therefore either owns the complete set or loses to
+        this abandonment, never a partial mixture.
+        """
+
+        try:
+            with _GENERATION_FORWARD_RECEIPT_LOCK:
+                snapshot = self._abandonable_authority_locked()
+        except Exception:
+            return False
+        if snapshot is None:
+            return False
+        records, _ = snapshot
+        try:
+            _verify_sparse_canonical_content(records)
+        except Exception:
+            return False
+
+        try:
+            with _GENERATION_FORWARD_RECEIPT_LOCK:
+                current = self._abandonable_authority_locked()
+                if current is None:
+                    return False
+                current_records, record_tokens = current
+                if any(
+                    current_record is not snapshot_record
+                    for current_record, snapshot_record in zip(current_records, records)
+                ):
+                    return False
+                for record_token in record_tokens:
+                    del _GENERATION_FORWARD_RECEIPTS[record_token]
+        except Exception:
+            return False
+        return True
 
     def _canonical_records_locked(self, reservation=None):
         records = []
@@ -794,12 +950,16 @@ class NativeMTPSparseBootstrap:
         if getattr(model_args, "hidden_size", None) is None:
             model_args = getattr(getattr(model, "language_model", None), "args", None)
         expected_hidden_width = getattr(model_args, "hidden_size", None)
-        if canonical_records[-1].canonical_final_logits is None:
+        if canonical_records[-1].logits is None:
             raise RuntimeError("native_mtp_sparse_final_logits_evidence_missing")
+        if canonical_records[-1].logits_content_digest is None:
+            raise RuntimeError("native_mtp_sparse_final_logits_digest_missing")
         if canonical_records[-1].cache_content_digest is None:
             raise RuntimeError("native_mtp_sparse_final_cache_evidence_missing")
         if any(
-            record.canonical_final_logits is not None
+            record.logits is not None
+            or record.logits_content_digest is not None
+            or record.cache_content_digest is not None
             for record in canonical_records[:-1]
         ):
             raise RuntimeError("native_mtp_sparse_final_logits_evidence_order_mismatch")
@@ -859,15 +1019,21 @@ class NativeMTPSparseBootstrap:
                 and hidden.shape[2] != expected_hidden_width
             ):
                 raise ValueError("native_mtp_sparse_hidden_model_width_mismatch")
-            if (
-                not isinstance(logits, mx.array)
-                or logits.ndim != 3
-                or logits.shape[0] != 1
-                or logits.shape[1] != chunk_size
-                or logits.dtype not in floating_dtypes
-                or (vocab_size is not None and logits.shape[2] != vocab_size)
-            ):
-                raise ValueError("native_mtp_sparse_logits_shape_or_dtype_mismatch")
+            is_final = index == len(self.receipts) - 1
+            if is_final:
+                if (
+                    not isinstance(logits, mx.array)
+                    or logits.ndim != 3
+                    or logits.shape[0] != 1
+                    or logits.shape[1] != 1
+                    or logits.dtype not in floating_dtypes
+                    or (vocab_size is not None and logits.shape[2] != vocab_size)
+                ):
+                    raise ValueError(
+                        "native_mtp_sparse_final_logits_shape_or_dtype_mismatch"
+                    )
+            elif logits is not None:
+                raise ValueError("native_mtp_sparse_nonfinal_logits_retained")
 
             receipt_positions.extend(receipt.logical_positions)
             receipt_tokens.extend(receipt.token_ids)
@@ -2056,7 +2222,7 @@ def mtp_generate_step(
                     while pair_start < pair_count:
                         pair_end = min(pair_start + prefill_step_size, pair_count)
                         _mtp_call(
-                            record.canonical_hidden_rows[:, pair_start:pair_end, :],
+                            record.hidden_rows[:, pair_start:pair_end, :],
                             mx.array(
                                 record.immediate_successor_token_ids[
                                     pair_start:pair_end
@@ -2073,7 +2239,7 @@ def mtp_generate_step(
                         mx.clear_cache()
                 mx.eval(
                     tuple(
-                        record.canonical_hidden_rows for record in sparse_claim.records
+                        record.hidden_rows for record in sparse_claim.records
                     ),
                     sparse_claim.final_target_logits,
                     [entry.state for entry in request.backbone],

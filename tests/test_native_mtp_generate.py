@@ -332,6 +332,70 @@ def _receipt_authority(receipt):
     return generate_module._GENERATION_FORWARD_RECEIPTS.get(receipt._record_token)
 
 
+def test_sparse_receipts_retain_one_hidden_copy_and_only_final_compact_logits():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    target_cache = model.make_cache()
+    chunk_size = 3
+    chunk_count = 8
+    positions = tuple(range(chunk_size * chunk_count))
+    token_ids = tuple(position % model.vocab_size for position in positions)
+    successors = tuple(
+        (position + 1) % model.vocab_size for position in positions[:-1]
+    )
+    receipts = []
+    immediate_results = []
+    for chunk_index in range(chunk_count):
+        start = chunk_index * chunk_size
+        end = start + chunk_size
+        result, receipt = attested_target_forward(
+            model,
+            token_ids[start:end],
+            target_cache,
+            phase=GenerationForwardPhase.PREFILL,
+            logical_positions=positions[start:end],
+            immediate_successor_token_ids=successors[
+                start : min(end, len(successors))
+            ],
+            model_forward_context=context.context,
+        )
+        immediate_results.append(result)
+        receipts.append(receipt)
+
+    bootstrap = NativeMTPSparseBootstrap(
+        receipts=tuple(receipts),
+        selected_logical_positions=positions,
+        selected_token_ids=token_ids,
+        immediate_successor_token_ids=successors,
+        target_cache=target_cache,
+        next_logical_position=positions[-1] + 1,
+    )
+    records = tuple(_receipt_authority(receipt).record for receipt in receipts)
+
+    assert all(receipt.logits is None for receipt in receipts[:-1])
+    assert all(record.logits is None for record in records[:-1])
+    assert receipts[-1].logits.shape == (1, 1, model.vocab_size)
+    assert records[-1].logits is receipts[-1].logits
+    assert sum(
+        0 if receipt.logits is None else receipt.logits.size for receipt in receipts
+    ) == model.vocab_size
+    for (original_logits, original_hidden), receipt, record in zip(
+        immediate_results, receipts, records
+    ):
+        assert original_hidden is not receipt.hidden_rows
+        assert receipt.hidden_rows is record.hidden_rows
+        assert original_logits is not record.logits
+        assert record.hidden_content_digest.shape == (2,)
+    assert records[-1].logits_content_digest.shape == (2,)
+    retained_payload_bytes = sum(record.hidden_rows.nbytes for record in records)
+    retained_payload_bytes += records[-1].logits.nbytes
+    expected_payload_bytes = sum(result[1].nbytes for result in immediate_results)
+    expected_payload_bytes += model.vocab_size * records[-1].logits.itemsize
+    assert retained_payload_bytes == expected_payload_bytes
+
+    bootstrap.validate(model)
+
+
 def test_sparse_bootstrap_close_before_iteration_is_idempotent_and_non_mutating():
     model = _NativeMTPModel()
     context = _PositionContext()
@@ -468,6 +532,195 @@ def test_sparse_bootstrap_close_preserves_reserved_claim_failure_cleanup(monkeyp
     assert model.requests == []
     with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
         bootstrap.claim(model)
+
+
+def test_sparse_bootstrap_try_abandon_and_claim_race_has_one_owner():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def claim():
+        barrier.wait(timeout=5)
+        try:
+            outcomes.append(("claim", bootstrap.claim(model)))
+        except RuntimeError as error:
+            outcomes.append(("claim_error", str(error)))
+
+    def abandon():
+        barrier.wait(timeout=5)
+        outcomes.append(("abandon", bootstrap.try_abandon_unclaimed()))
+
+    threads = [threading.Thread(target=claim), threading.Thread(target=abandon)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    abandoned = next(value for kind, value in outcomes if kind == "abandon")
+    if abandoned:
+        assert any(kind == "claim_error" for kind, _ in outcomes)
+    else:
+        assert any(kind == "claim" for kind, _ in outcomes)
+    assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
+    assert model.requests == []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"sampler": lambda _logprobs: mx.array(0)}, "opaque_sampler"),
+        ({"logits_processors": [lambda _tokens, logits: logits]}, "non_replay_safe"),
+        ({"prefill_step_size": 0}, "prefill_step_size"),
+    ),
+)
+def test_preclaim_native_mtp_validation_failure_can_abandon_for_dense_replay(
+    kwargs, message
+):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+
+    with pytest.raises(ValueError, match=message):
+        next(
+            mtp_generate_step(
+                None,
+                model,
+                sparse_bootstrap=bootstrap,
+                model_forward_context=context.context,
+                **kwargs,
+            )
+        )
+
+    assert bootstrap.try_abandon_unclaimed()
+    assert not bootstrap.try_abandon_unclaimed()
+    assert model.requests == []
+
+
+def test_postclaim_failure_cannot_authorize_dense_replay():
+    model = _NativeMTPModel(fail_mtp_offsets={0})
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic unexpected next draft"):
+        list(
+            mtp_generate_step(
+                None,
+                model,
+                sparse_bootstrap=bootstrap,
+                model_forward_context=context.context,
+            )
+        )
+
+    assert not bootstrap.try_abandon_unclaimed()
+
+
+def test_try_abandon_rejects_mutated_and_mixed_authority_without_partial_delete():
+    first_model = _NativeMTPModel()
+    first_context = _PositionContext()
+    first = _make_sparse_bootstrap(
+        first_model,
+        first_context,
+        positions=(0,),
+        selected_token_ids=(0,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    second_model = _NativeMTPModel()
+    second_context = _PositionContext()
+    second = _make_sparse_bootstrap(
+        second_model,
+        second_context,
+        positions=(1,),
+        selected_token_ids=(1,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    mixed = replace(
+        first,
+        receipts=(first.receipts[0], second.receipts[0]),
+        selected_logical_positions=(0, 1),
+        selected_token_ids=(0, 1),
+        immediate_successor_token_ids=(),
+        next_logical_position=2,
+    )
+
+    assert not mixed.try_abandon_unclaimed()
+    assert _receipt_authority(first.receipts[0]) is not None
+    assert _receipt_authority(second.receipts[0]) is not None
+
+    first.receipts[0].hidden_rows[:, 0, 0] += 1
+    assert not first.try_abandon_unclaimed()
+    assert _receipt_authority(first.receipts[0]) is not None
+    first.close()
+    second.close()
+
+
+def test_try_abandon_rejects_boolean_cursor_and_preserves_claim_authority():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0,),
+        selected_token_ids=(0,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    malformed = replace(bootstrap, next_logical_position=True)
+
+    assert not malformed.try_abandon_unclaimed()
+    assert _receipt_authority(bootstrap.receipts[0]) is not None
+    claim = bootstrap.claim(model)
+    assert claim.target_cache is bootstrap.target_cache
+
+
+@pytest.mark.parametrize("replacement", (KVCache(), object()))
+def test_try_abandon_rejects_same_list_cache_replacement_without_consuming(
+    replacement,
+):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0,),
+        selected_token_ids=(0,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    original_entry = bootstrap.target_cache[1]
+    bootstrap.target_cache[1] = replacement
+
+    assert not bootstrap.try_abandon_unclaimed()
+    assert _receipt_authority(bootstrap.receipts[0]) is not None
+
+    bootstrap.target_cache[1] = original_entry
+    claim = bootstrap.claim(model)
+    assert claim.target_cache is bootstrap.target_cache
 
 
 def test_abandon_sparse_receipts_cleans_partial_chunks_after_later_forward_failure():
@@ -1404,12 +1657,12 @@ def test_sparse_claim_uses_one_aggregate_host_decision_and_final_cache_scan(
         chunk_sizes=(1, 1),
     )
     assert scans == 1
-    # Two recurrent arrays plus active K and V: one fixed-width reduction each.
-    assert hash_reductions == 4
+    # Two hidden payloads, one final logit, two recurrent arrays, active K/V.
+    assert hash_reductions == 7
     bootstrap.claim(model)
     assert scans == 2
     assert decisions == 1
-    assert hash_reductions == 8
+    assert hash_reductions == 14
 
 
 def test_unrelated_sparse_claim_reserves_while_device_verification_is_blocked(
