@@ -1527,6 +1527,64 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gemma3n_batch_caches_match_plain_caches(self):
+        """The batched generation path must agree with the plain caches.
+
+        The batch caches return a 4-tuple state and hold their offset in an
+        mx.array that ``update_and_fetch`` mutates in place, so gemma3n used to
+        crash on the shared layers and rotate the queries with a post-update
+        offset on the others.
+        """
+        from mlx_lm.models import gemma3n
+        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        args = gemma3n.ModelArgs(
+            model_type="gemma3n",
+            text_config={
+                "model_type": "gemma3n",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 1000,
+                "sliding_window": 8,
+                "max_position_embeddings": 1000,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                "hidden_size_per_layer_input": 256,
+                "altup_num_inputs": 4,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 8,
+            },
+        )
+        model = gemma3n.Model(args)
+        inputs = mx.array([[1, 2, 3, 4, 5, 6]])
+
+        def to_batch(c):
+            if isinstance(c, RotatingKVCache):
+                return BatchRotatingKVCache(c.max_size, [0])
+            return BatchKVCache([0])
+
+        plain = model(inputs, cache=make_prompt_cache(model))[:, -1, :]
+        batched = model(inputs, cache=[to_batch(c) for c in model.make_cache()])
+        batched = batched[:, -1, :]
+        self.assertTrue(mx.allclose(plain, batched, atol=1e-4, rtol=1e-4))
+
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text
 

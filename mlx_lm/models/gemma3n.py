@@ -127,15 +127,20 @@ class Gemma3nAttention(nn.Module):
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
 
-        offset = 0
+        # Read the offset and rotate the queries before the cache is updated.
+        # The batch caches keep their offset in an mx.array that
+        # update_and_fetch mutates in place, so an offset read here would
+        # silently become the post-update value.
+        offset = cache.offset if cache is not None else 0
+        queries = queries.transpose(0, 2, 1, 3)
+        queries = self.rope(queries, offset=offset)
+
         if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
-            offset = cache.offset
+            # For shared layers, retrieve KV from the designated cache layer.
+            # The batch caches carry (keys, values, offset, left_padding).
+            keys, values = cache.state[:2]
 
         else:
-            if cache is not None:
-                offset = cache.offset
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
@@ -147,9 +152,6 @@ class Gemma3nAttention(nn.Module):
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
-
-        queries = queries.transpose(0, 2, 1, 3)
-        queries = self.rope(queries, offset=offset)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
