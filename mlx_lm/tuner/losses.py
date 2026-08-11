@@ -98,6 +98,8 @@ def _make_kl_forward_kernel():
         max_q = simd_max(max_q);
         max_p = simd_max(max_p);
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         // Share the sum_exp across the threadgroup
         sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
         sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
@@ -117,7 +119,7 @@ def _make_kl_forward_kernel():
         lse_q_minus_p = max_q + metal::fast::log(sum_exp_q) - lse_p;
     }
 
-    threadgroup_barrier(mem_flags::mem_none);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     {
         float kl = 0;
@@ -157,7 +159,7 @@ def _make_kl_forward_kernel():
         if (simd_lane_id == 0) {
             shared[simd_group_id] = kl;
         }
-        threadgroup_barrier(mem_flags::mem_none);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         kl = shared[simd_lane_id];
         kl = simd_sum(kl);
 
@@ -267,6 +269,8 @@ def _make_kl_backward_kernel():
         max_q = simd_max(max_q);
         max_p = simd_max(max_p);
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         // Share the sum_exp across the threadgroup
         sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
         sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
@@ -286,7 +290,7 @@ def _make_kl_backward_kernel():
         lse_q = max_q + metal::fast::log(sum_exp_q);
     }
 
-    threadgroup_barrier(mem_flags::mem_none);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     {
         float kl = 0;
@@ -477,6 +481,8 @@ def _make_js_forward_kernel():
         max_q = simd_max(max_q);
         max_p = simd_max(max_p);
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         // Share the sum_exp across the threadgroup
         sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
         sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
@@ -496,7 +502,7 @@ def _make_js_forward_kernel():
         lse_q = max_q + metal::fast::log(sum_exp_q);
     }
 
-    threadgroup_barrier(mem_flags::mem_none);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     {
         float kl_p = 0;
@@ -664,6 +670,8 @@ def _make_js_backward_kernel():
         max_q = simd_max(max_q);
         max_p = simd_max(max_p);
 
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         // Share the sum_exp across the threadgroup
         sum_exp_q *= metal::fast::exp(prev_max_q - max_q);
         sum_exp_p *= metal::fast::exp(prev_max_p - max_p);
@@ -683,7 +691,7 @@ def _make_js_backward_kernel():
         lse_q = max_q + metal::fast::log(sum_exp_q);
     }
 
-    threadgroup_barrier(mem_flags::mem_none);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     {
         float c = cotan[0];
