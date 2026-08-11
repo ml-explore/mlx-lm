@@ -22,6 +22,7 @@ from .switch_layers import QuantizedSwitchLinear, SwitchLinear
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "bailing_hybrid"
+    architectures: list[str] | None = None
     vocab_size: int = 157184
     hidden_size: int = 1536
     intermediate_size: int = 4608
@@ -71,6 +72,16 @@ def _is_kda_layer(
 def _uses_fp8(args: ModelArgs) -> bool:
     config = args.quantization_config
     return config is not None and config.get("quant_method") == "fp8"
+
+
+def _normalize_kda_qk(
+    q: mx.array, k: mx.array, head_dim: int
+) -> tuple[mx.array, mx.array]:
+    inv_scale = head_dim**-0.5
+    eps = 1e-6 / head_dim
+    q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+    k = inv_scale * mx.fast.rms_norm(k, None, eps)
+    return q, k
 
 
 def _linear(
@@ -408,9 +419,7 @@ class BailingKDA(nn.Module):
         k = k.reshape(batch, length, self.num_heads, self.head_dim)
         v = v.reshape(batch, length, self.num_heads, self.head_dim)
 
-        inv_scale = self.head_dim**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = _normalize_kda_qk(q, k, self.head_dim)
 
         raw_gate = self.f_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
         dt_bias = self.dt_bias.reshape(self.num_heads, self.head_dim)

@@ -5,12 +5,18 @@ import pytest
 from mlx import nn
 from mlx.utils import tree_flatten
 
-from mlx_lm.models.bailing_hybrid import Model, ModelArgs, _is_kda_layer
+from mlx_lm.models.bailing_moe_v3 import (
+    Model,
+    ModelArgs,
+    _is_kda_layer,
+    _normalize_kda_qk,
+)
 from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 
 
 def _model_args(granularity):
     return ModelArgs(
+        architectures=["BailingMoeV3ForCausalLM"],
         vocab_size=64,
         hidden_size=32,
         intermediate_size=32,
@@ -57,6 +63,22 @@ def _bf16_model_args():
 
 def test_incomplete_layer_group_tail_uses_mla():
     assert [i for i in range(5) if _is_kda_layer(i, 2, 5)] == [0, 2]
+
+
+def test_kda_qk_normalization_matches_reference_l2norm_epsilon():
+    head_dim = 32
+    q = mx.arange(2 * head_dim, dtype=mx.float32).reshape(1, 2, 1, head_dim)
+    k = mx.arange(1, 2 * head_dim + 1, dtype=mx.float32).reshape(1, 2, 1, head_dim)
+    q = (q - head_dim) * 1e-4
+    k = (k - head_dim) * 1e-4
+
+    actual_q, actual_k = _normalize_kda_qk(q, k, head_dim)
+    ref_q = q * mx.rsqrt((q * q).sum(axis=-1, keepdims=True) + 1e-6)
+    ref_k = k * mx.rsqrt((k * k).sum(axis=-1, keepdims=True) + 1e-6)
+    ref_q = (head_dim**-0.5) * ref_q
+
+    assert mx.allclose(actual_q, ref_q, rtol=1e-5, atol=1e-7)
+    assert mx.allclose(actual_k, ref_k, rtol=1e-5, atol=1e-7)
 
 
 def test_rejects_non_fp8_checkpoint_config():
