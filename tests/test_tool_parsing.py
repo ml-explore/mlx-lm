@@ -214,9 +214,9 @@ class TestToolParsing(unittest.TestCase):
         ]
         test_case = (
             "<function=edit>"
-            "<parameter=edits>[{\"oldText\": \"const first = 1;\n"
-            "const second = 2;\", \"newText\": \"const first = 3;\n"
-            "const second = 4;\"}]</parameter>"
+            '<parameter=edits>[{"oldText": "const first = 1;\n'
+            'const second = 2;", "newText": "const first = 3;\n'
+            'const second = 4;"}]</parameter>'
             "</function>"
         )
 
@@ -230,6 +230,41 @@ class TestToolParsing(unittest.TestCase):
                     "newText": "const first = 3;\nconst second = 4;",
                 }
             ],
+        )
+
+    def test_qwen3_coder_backtick_string_params(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "edits": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+        old_text = (
+            "import React, { useState, useRef, useEffect, useCallback } from "
+            "'react';\nconst title = \"Hello\";"
+        )
+        new_text = "import React from 'react';\nconst title = \"Goodbye\";"
+        test_case = (
+            '<function=edit><parameter=edits>[{"oldText": `'
+            + old_text
+            + '`, "newText": `'
+            + new_text
+            + "`}]</parameter></function>"
+        )
+
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+
+        self.assertEqual(
+            tool_call["arguments"]["edits"],
+            [{"oldText": old_text, "newText": new_text}],
         )
 
     def test_gemma4(self):

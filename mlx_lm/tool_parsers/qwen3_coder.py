@@ -33,6 +33,47 @@ def _get_arguments_config(func_name: str, tools: Optional[Any]) -> dict:
     return {}
 
 
+def _normalize_backtick_strings(param_value: str) -> str:
+    """Convert Qwen's backtick-delimited strings to JSON strings."""
+    result = []
+    backtick_value = []
+    in_double_quote = False
+    in_backtick = False
+    escaped = False
+
+    for char in param_value:
+        if in_backtick:
+            if escaped:
+                if char != "`":
+                    backtick_value.append("\\")
+                backtick_value.append(char)
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == "`":
+                result.append(json.dumps("".join(backtick_value)))
+                backtick_value = []
+                in_backtick = False
+            else:
+                backtick_value.append(char)
+        else:
+            result.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\" and in_double_quote:
+                escaped = True
+            elif char == '"':
+                in_double_quote = not in_double_quote
+            elif char == "`" and not in_double_quote:
+                result.pop()
+                in_backtick = True
+
+    if in_backtick:
+        raise ValueError("Unterminated backtick string")
+
+    return "".join(result)
+
+
 def _convert_param_value(param_value: str, param_name: str, param_config: dict) -> Any:
     """Convert parameter value based on its type in the schema."""
     if param_value.lower() == "null":
@@ -72,6 +113,7 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             or param_type.startswith("list")
         ):
             try:
+                param_value = _normalize_backtick_strings(param_value)
                 # Qwen sometimes emits literal control characters, such as
                 # newlines in source-code strings. Accept them while parsing
                 # model-generated JSON; valid JSON is unaffected.

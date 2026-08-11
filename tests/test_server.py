@@ -17,6 +17,7 @@ from mlx_lm.server import (
     Response,
     ResponseGenerator,
     SamplingArguments,
+    ToolCallFormatter,
     _make_sampler,
 )
 from mlx_lm.utils import load
@@ -196,6 +197,19 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(text, "f[ARGS]{}")
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
+
+
+class TestToolCallFormatter(unittest.TestCase):
+    def test_syntax_error_is_skipped(self):
+        def parser(tool_text, tools):
+            raise SyntaxError("invalid tool arguments")
+
+        formatter = ToolCallFormatter(parser, [])
+
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(formatter(["tool call"]), [])
+
+        self.assertIn("SyntaxError", logs.output[0])
 
 
 class TestServer(unittest.TestCase):
