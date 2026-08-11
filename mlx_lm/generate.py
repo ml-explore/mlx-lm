@@ -5,6 +5,7 @@ import contextlib
 import copy
 import functools
 import json
+import math
 import sys
 import time
 from collections import deque
@@ -15,6 +16,7 @@ from typing import (
     Any,
     Callable,
     ContextManager,
+    Dict,
     Generator,
     List,
     Optional,
@@ -40,7 +42,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import apply_min_p, apply_top_k, apply_top_p, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -71,6 +73,7 @@ class GenerationForwardPhase(str, Enum):
     DECODE = "decode"
     DRAFT = "draft"
     VERIFY = "verify"
+    MTP_DRAFT = "mtp_draft"
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,54 @@ class GenerationForward:
 
 
 GenerationForwardContext = Callable[[GenerationForward], ContextManager[None]]
+
+
+@dataclass(frozen=True)
+class NativeMTPSamplingConfig:
+    """Replay-safe sampling contract for native MTP speculation."""
+
+    temperature: float = 0.0
+    top_p: float = 1.0
+    top_k: int = 0
+    min_p: float = 0.0
+    min_tokens_to_keep: int = 1
+    seed: Optional[int] = None
+
+    def __post_init__(self):
+        for name in ("temperature", "top_p", "min_p"):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"native MTP {name} must be a finite number")
+        if isinstance(self.top_k, bool) or not isinstance(self.top_k, int):
+            raise ValueError("native MTP top_k must be an integer")
+        if isinstance(self.min_tokens_to_keep, bool) or not isinstance(
+            self.min_tokens_to_keep, int
+        ):
+            raise ValueError("native MTP min_tokens_to_keep must be an integer")
+        if self.seed is not None and (
+            isinstance(self.seed, bool) or not isinstance(self.seed, int)
+        ):
+            raise ValueError("native MTP seed must be an integer or None")
+        if self.temperature < 0:
+            raise ValueError("native MTP temperature must be non-negative")
+        if not 0 < self.top_p <= 1:
+            raise ValueError("native MTP top_p must be in (0, 1]")
+        if self.top_k < 0:
+            raise ValueError("native MTP top_k must be non-negative")
+        if not 0 <= self.min_p <= 1:
+            raise ValueError("native MTP min_p must be in [0, 1]")
+        if self.min_tokens_to_keep < 1:
+            raise ValueError("native MTP min_tokens_to_keep must be positive")
+        if self.seed is not None and self.seed < 0:
+            raise ValueError("native MTP seed must be non-negative")
+
+    @property
+    def stochastic(self) -> bool:
+        return self.temperature > 0
 
 
 def str2bool(string):
@@ -330,6 +381,9 @@ class GenerationResponse:
     generation_tps: float
     peak_memory: float
     finish_reason: Optional[str] = None
+    mtp_drafts: int = 0
+    mtp_accepted: int = 0
+    mtp_bypass_reason: Optional[str] = None
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
@@ -797,12 +851,434 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    model_forward_context: Optional[GenerationForwardContext] = None,
+    sampling_config: Optional[NativeMTPSamplingConfig] = None,
+    eos_token_ids: Optional[Sequence[int]] = None,
+    telemetry: Optional[Dict[str, Any]] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """Stream native-Qwen MTP with request-local transactional cache state.
+
+    This implementation intentionally supports a single sequence and no
+    prefix cache.  A full verification commits atomically.  A rejected draft
+    rolls the full transaction back and replays the already-emitted token
+    before continuing, which is required for the Qwen recurrent layers.
+
+    Stochastic sampling is described by :class:`NativeMTPSamplingConfig` and
+    uses an explicit per-request MLX key.  Opaque filters and stateful logits
+    processors fail before cache construction because they cannot be replayed
+    exactly after a rejected recurrent verification.
+    """
+
+    if prompt_cache is not None:
+        raise ValueError("native_mtp_prefix_reuse_unsupported")
+    capability = getattr(model, "mtp_capability", None)
+    if capability is None or not capability.supported:
+        reason = (
+            "native_mtp_model_capability_missing"
+            if capability is None
+            else capability.reason
+        )
+        if telemetry is not None:
+            telemetry["mtp_bypass_reason"] = reason
+        raise RuntimeError(reason)
+    if prompt.ndim != 1 or prompt.size == 0:
+        raise ValueError("native MTP requires one non-empty unbatched prompt")
+    if max_tokens < 0:
+        raise ValueError("native MTP requires a finite non-negative max_tokens")
+    sampling_config = sampling_config or NativeMTPSamplingConfig()
+    model_vocab_size = getattr(model, "vocab_size", None)
+    if model_vocab_size is None:
+        model_vocab_size = getattr(getattr(model, "args", None), "vocab_size", None)
+    if (
+        sampling_config.top_k > 0
+        and model_vocab_size is not None
+        and sampling_config.top_k >= model_vocab_size
+    ):
+        raise ValueError("native MTP top_k must be smaller than vocabulary size")
+    if sampler is not None and (
+        sampling_config.stochastic
+        or not getattr(sampler, "native_mtp_deterministic", False)
+    ):
+        raise ValueError("native_mtp_opaque_sampler_unsupported")
+    if logits_processors and any(
+        not getattr(processor, "native_mtp_replay_safe", False)
+        for processor in logits_processors
+    ):
+        raise ValueError("native_mtp_non_replay_safe_logits_processor")
+
+    request = model.make_mtp_request_cache()
+    if telemetry is not None:
+        telemetry.update(
+            mtp_drafts=0,
+            mtp_accepted=0,
+            mtp_bypass_reason=None,
+        )
+    eos_token_ids = frozenset(eos_token_ids or ())
+    rng_key = mx.random.key(
+        sampling_config.seed
+        if sampling_config.seed is not None
+        else (time.time_ns() & ((1 << 63) - 1))
+    )
+
+    def _next_rng_key():
+        nonlocal rng_key
+        keys = mx.random.split(rng_key)
+        rng_key = keys[0]
+        return keys[1]
+
+    def _sample(logprobs):
+        if sampling_config.stochastic:
+            return mx.random.categorical(logprobs, key=_next_rng_key())
+        if sampler is None:
+            return mx.argmax(logprobs, axis=-1)
+        return sampler(logprobs)
+
+    def _reported_logprobs(logits, tokens):
+        if logits.ndim == 1:
+            logits = logits[None]
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        return (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).squeeze(0)
+
+    def _sampling_distribution(reported_logprobs):
+        logprobs = reported_logprobs[None]
+        if sampling_config.top_p < 1:
+            logprobs = apply_top_p(logprobs, sampling_config.top_p)
+        if sampling_config.min_p > 0:
+            keep = sampling_config.min_tokens_to_keep
+            vocab_size = logprobs.shape[-1]
+            if keep > vocab_size:
+                raise ValueError(
+                    "native MTP min_tokens_to_keep cannot exceed vocabulary size"
+                )
+            if keep < vocab_size:
+                # apply_min_p's multi-token branch passes a Python bool to
+                # put_along_axis, which newer MLX releases reject.  Preserve
+                # the standard filter exactly by restoring the requested top
+                # tokens with array-valued replacements.
+                unfiltered = logprobs
+                logprobs = apply_min_p(logprobs, sampling_config.min_p)
+                if keep > 1:
+                    top_indices = mx.argpartition(unfiltered, kth=-keep, axis=-1)[
+                        ..., -keep:
+                    ]
+                    top_values = mx.take_along_axis(unfiltered, top_indices, axis=-1)
+                    logprobs = mx.put_along_axis(
+                        logprobs, top_indices, top_values, axis=-1
+                    )
+        if sampling_config.top_k > 0:
+            if sampling_config.top_k >= logprobs.shape[-1]:
+                raise ValueError(
+                    "native MTP top_k must be smaller than vocabulary size"
+                )
+            logprobs = apply_top_k(logprobs, sampling_config.top_k)
+        if sampling_config.stochastic:
+            logprobs = logprobs / sampling_config.temperature
+        return (logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)).squeeze(0)
+
+    def _target_call(input_tokens, phase, *, return_hidden=False):
+        batched = input_tokens[None]
+        if model_forward_context is None:
+            return model(batched, cache=request.backbone, return_hidden=return_hidden)
+        forward = GenerationForward(
+            model=model,
+            input_tokens=batched,
+            cache=request.backbone,
+            phase=phase,
+        )
+        with model_forward_context(forward):
+            return model(batched, cache=request.backbone, return_hidden=return_hidden)
+
+    def _mtp_call(hidden, next_tokens):
+        next_ids = next_tokens.reshape(1, -1)
+        if model_forward_context is None:
+            return model.mtp_forward(hidden, next_ids, request.mtp)
+        forward = GenerationForward(
+            model=model,
+            input_tokens=next_ids,
+            cache=request.mtp,
+            phase=GenerationForwardPhase.MTP_DRAFT,
+        )
+        with model_forward_context(forward):
+            return model.mtp_forward(hidden, next_ids, request.mtp)
+
+    def _quantize():
+        request.quantize(
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            start=quantized_kv_start,
+        )
+
+    def _assert_target_mtp_alignment():
+        state = request.state
+        if state.backbone_tokens != state.mtp_tokens:
+            raise RuntimeError("native_mtp_target_head_alignment_mismatch")
+        request.assert_aligned(
+            backbone_tokens=state.backbone_tokens,
+            mtp_tokens=state.mtp_tokens,
+        )
+
+    def _draft(hidden, next_tokens, token_history):
+        with mx.stream(generation_stream):
+            logits = _mtp_call(hidden, next_tokens)[:, -1, :]
+            _quantize()
+            request.retain(
+                backbone_tokens=request.state.backbone_tokens,
+                mtp_tokens=request.state.mtp_tokens + next_tokens.size,
+            )
+            _assert_target_mtp_alignment()
+            draft_reported_logprobs = _reported_logprobs(
+                logits.squeeze(0), token_history
+            )
+            draft_logprobs = _sampling_distribution(draft_reported_logprobs)
+            draft_token = _sample(draft_logprobs)
+        mx.eval(draft_token, draft_logprobs)
+        if telemetry is not None:
+            telemetry["mtp_drafts"] += 1
+        return draft_token.reshape(-1), draft_logprobs
+
+    def _residual_sample(target_logprobs, draft_logprobs):
+        target_probs = mx.exp(target_logprobs)
+        draft_probs = mx.exp(draft_logprobs)
+        residual = mx.maximum(target_probs - draft_probs, 0)
+        normalizer = mx.sum(residual)
+        residual_logprobs = mx.where(
+            normalizer > 0,
+            mx.log(residual / normalizer),
+            target_logprobs,
+        )
+        return _sample(residual_logprobs), residual_logprobs
+
+    finish_reason = "generator_closed"
+    generated = 0
+    try:
+        if max_tokens == 0:
+            finish_reason = "length"
+            return
+
+        # Shifted hidden/token pairs prefill the MTP head to the same physical
+        # and logical position as the target before decode begins.
+        remaining = prompt.astype(mx.uint32)
+        with mx.stream(generation_stream):
+            while remaining.size > 1:
+                count = min(prefill_step_size, remaining.size - 1)
+                _, hidden = _target_call(
+                    remaining[:count],
+                    GenerationForwardPhase.PREFILL,
+                    return_hidden=True,
+                )
+                _mtp_call(hidden, remaining[1 : count + 1])
+                _quantize()
+                mx.eval(
+                    [entry.state for entry in request.backbone],
+                    [entry.state for entry in request.mtp],
+                )
+                request.retain(
+                    backbone_tokens=request.state.backbone_tokens + count,
+                    mtp_tokens=request.state.mtp_tokens + count,
+                )
+                _assert_target_mtp_alignment()
+                remaining = remaining[count:]
+                mx.clear_cache()
+
+            initial_logits, initial_hidden = _target_call(
+                remaining, GenerationForwardPhase.PREFILL, return_hidden=True
+            )
+            _quantize()
+            request.retain(
+                backbone_tokens=request.state.backbone_tokens + 1,
+                mtp_tokens=request.state.mtp_tokens,
+            )
+            # Match generate_step: processors see only the input tokens passed
+            # to its final prefill/decode step, not chunks consumed by _step.
+            history = remaining.astype(mx.uint32)
+            current_logprobs = _reported_logprobs(
+                initial_logits[:, -1, :].squeeze(0), history
+            )
+            current_sampling_logprobs = _sampling_distribution(current_logprobs)
+            current_token = _sample(current_sampling_logprobs).reshape(-1)
+        mx.eval(current_token, current_logprobs)
+        current_hidden = initial_hidden[:, -1:, :]
+        history = mx.concatenate([history, current_token])
+
+        generated = 1
+        current_id = current_token.item()
+        terminal = current_id in eos_token_ids or generated >= max_tokens
+        if terminal:
+            finish_reason = "eos" if current_id in eos_token_ids else "length"
+            request.finish(finish_reason)
+        yield current_id, current_logprobs, False
+        if terminal:
+            return
+        draft_token, draft_logprobs = _draft(current_hidden, current_token, history)
+
+        while True:
+
+            request.checkpoint()
+            verify_inputs = mx.concatenate([current_token, draft_token])
+            with mx.stream(generation_stream):
+                verify_logits, verify_hidden = _target_call(
+                    verify_inputs,
+                    GenerationForwardPhase.VERIFY,
+                    return_hidden=True,
+                )
+                _quantize()
+                request.seal_verified(
+                    backbone_tokens=request.state.backbone_tokens + 2,
+                    mtp_tokens=request.state.mtp_tokens,
+                )
+                verify_logprobs = _reported_logprobs(
+                    verify_logits[:, 0, :].squeeze(0), history
+                )
+                verify_sampling_logprobs = _sampling_distribution(verify_logprobs)
+
+            if sampling_config.stochastic:
+                draft_id = draft_token.item()
+                acceptance = mx.minimum(
+                    mx.exp(
+                        verify_sampling_logprobs[draft_id] - draft_logprobs[draft_id]
+                    ),
+                    1.0,
+                )
+                accepted = mx.random.uniform(key=_next_rng_key()) < acceptance
+                mx.eval(accepted)
+                accepted = bool(accepted.item())
+                replacement_token = replacement_logprobs = None
+                if not accepted:
+                    replacement_token, replacement_logprobs = _residual_sample(
+                        verify_sampling_logprobs, draft_logprobs
+                    )
+                    replacement_token = replacement_token.reshape(-1)
+                    mx.eval(replacement_token, replacement_logprobs)
+            else:
+                replacement_token = _sample(verify_sampling_logprobs).reshape(-1)
+                mx.eval(replacement_token)
+                accepted = replacement_token.item() == draft_token.item()
+                replacement_logprobs = verify_sampling_logprobs
+
+            if accepted:
+                request.commit(
+                    backbone_tokens=request.state.backbone_tokens + 2,
+                    mtp_tokens=request.state.mtp_tokens,
+                )
+                if telemetry is not None:
+                    telemetry["mtp_accepted"] += 1
+                generated += 1
+                draft_id = draft_token.item()
+                draft_terminal = draft_id in eos_token_ids or generated >= max_tokens
+                if draft_terminal:
+                    finish_reason = "eos" if draft_id in eos_token_ids else "length"
+                    request.finish(finish_reason)
+                yield draft_id, verify_logprobs, True
+                if draft_terminal:
+                    return
+
+                # Bonus processing begins only after the accepted draft has
+                # crossed its yield/resume boundary.
+                bonus_history = mx.concatenate([history, draft_token])
+                bonus_logprobs = _reported_logprobs(
+                    verify_logits[:, 1, :].squeeze(0), bonus_history
+                )
+                bonus_sampling_logprobs = _sampling_distribution(bonus_logprobs)
+                bonus_token = _sample(bonus_sampling_logprobs).reshape(-1)
+                mx.eval(bonus_token, bonus_logprobs)
+                next_history = mx.concatenate([bonus_history, bonus_token])
+                generated += 1
+                bonus_id = bonus_token.item()
+                bonus_terminal = bonus_id in eos_token_ids or generated >= max_tokens
+                if bonus_terminal:
+                    finish_reason = "eos" if bonus_id in eos_token_ids else "length"
+                    request.finish(finish_reason)
+                yield bonus_id, bonus_logprobs, False
+                if bonus_terminal:
+                    return
+
+                # Catch the MTP state up and create the next draft only after
+                # the bonus token has crossed its yield/resume boundary.
+                mtp_hidden = mx.concatenate(
+                    [verify_hidden[:, 0:1, :], verify_hidden[:, 1:2, :]], axis=1
+                )
+                mtp_tokens = mx.concatenate([draft_token, bonus_token])
+                next_draft, next_draft_logprobs = _draft(
+                    mtp_hidden, mtp_tokens, next_history
+                )
+                history = next_history
+                current_token = bonus_token
+                current_logprobs = bonus_logprobs
+                current_hidden = verify_hidden[:, 1:2, :]
+                draft_token = next_draft
+                draft_logprobs = next_draft_logprobs
+                continue
+
+            # The prior output token was physically included by verify but
+            # recurrent state cannot retain a prefix of that forward.  Restore
+            # then replay exactly that token before drafting from the residual.
+            request.reject_partial(accepted_backbone_tokens=1, accepted_mtp_tokens=0)
+            with mx.stream(generation_stream):
+                _, replay_hidden = _target_call(
+                    current_token,
+                    GenerationForwardPhase.DECODE,
+                    return_hidden=True,
+                )
+                _quantize()
+                request.replay_retained(
+                    backbone_tokens=request.state.backbone_tokens + 1,
+                    mtp_tokens=request.state.mtp_tokens,
+                )
+            next_history = mx.concatenate([history, replacement_token])
+            generated += 1
+            replacement_id = replacement_token.item()
+            replacement_terminal = (
+                replacement_id in eos_token_ids or generated >= max_tokens
+            )
+            if replacement_terminal:
+                finish_reason = "eos" if replacement_id in eos_token_ids else "length"
+                request.finish(finish_reason)
+            yield replacement_id, verify_logprobs, False
+            if replacement_terminal:
+                return
+
+            next_draft, next_draft_logprobs = _draft(
+                replay_hidden[:, -1:, :], replacement_token, next_history
+            )
+            history = next_history
+            current_token = replacement_token
+            current_logprobs = verify_logprobs
+            current_hidden = replay_hidden[:, -1:, :]
+            draft_token = next_draft
+            draft_logprobs = next_draft_logprobs
+    except GeneratorExit:
+        finish_reason = "generator_closed"
+        raise
+    except BaseException:
+        finish_reason = "cancelled"
+        raise
+    finally:
+        if not request.closed:
+            request.finish(finish_reason)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    mtp: bool = False,
+    mtp_sampling_config: Optional[NativeMTPSamplingConfig] = None,
     model_forward_context: Optional[GenerationForwardContext] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
@@ -819,6 +1295,10 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        mtp (bool): Request native model-owned MTP.  This is text-only,
+          B=1, and does not support prefix cache reuse.
+        mtp_sampling_config (NativeMTPSamplingConfig, optional): Immutable,
+          request-local native MTP sampling and filtering policy.
         model_forward_context (Callable[[GenerationForward], ContextManager], optional):
           A request-local context factory forwarded to the selected generation
           implementation. The scope covers Python model-call graph construction.
@@ -847,7 +1327,37 @@ def stream_generate(
     if model_forward_context is not None:
         kwargs["model_forward_context"] = model_forward_context
 
-    if draft_model is None:
+    mtp_telemetry = {
+        "mtp_drafts": 0,
+        "mtp_accepted": 0,
+        "mtp_bypass_reason": None,
+    }
+    if draft_model is None and mtp:
+        capability = getattr(model, "mtp_capability", None)
+        if capability is not None and capability.supported:
+            kwargs.pop("max_kv_size", None)
+            kwargs.pop("prompt_progress_callback", None)
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = mtp_generate_step(
+                prompt,
+                model,
+                sampling_config=mtp_sampling_config,
+                eos_token_ids=tokenizer.eos_token_ids,
+                telemetry=mtp_telemetry,
+                **kwargs,
+            )
+        else:
+            mtp_telemetry["mtp_bypass_reason"] = (
+                "native_mtp_model_capability_missing"
+                if capability is None
+                else capability.reason
+            )
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = generate_step(prompt, model, **kwargs)
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
@@ -855,6 +1365,8 @@ def stream_generate(
             (token, logprobs, False) for token, logprobs in token_generator
         )
     else:
+        if mtp:
+            mtp_telemetry["mtp_bypass_reason"] = "native_mtp_external_draft_unsupported"
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
@@ -862,30 +1374,43 @@ def stream_generate(
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+        token = 0
+        logprobs = mx.array([])
+        from_draft = False
+        prompt_tps = 0.0
+        n = -1
+        try:
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+                detokenizer.add_token(token)
+                if (n + 1) == max_tokens:
+                    break
 
-            yield GenerationResponse(
-                text=detokenizer.last_segment,
-                token=token,
-                logprobs=logprobs,
-                from_draft=from_draft,
-                prompt_tokens=prompt.size,
-                prompt_tps=prompt_tps,
-                generation_tokens=n + 1,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
-                peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
-            )
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                    mtp_drafts=mtp_telemetry["mtp_drafts"],
+                    mtp_accepted=mtp_telemetry["mtp_accepted"],
+                    mtp_bypass_reason=mtp_telemetry["mtp_bypass_reason"],
+                )
+        finally:
+            close = getattr(token_generator, "close", None)
+            if close is not None:
+                close()
 
         detokenizer.finalize()
         yield GenerationResponse(
@@ -899,6 +1424,9 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+            mtp_drafts=mtp_telemetry["mtp_drafts"],
+            mtp_accepted=mtp_telemetry["mtp_accepted"],
+            mtp_bypass_reason=mtp_telemetry["mtp_bypass_reason"],
         )
 
 

@@ -806,10 +806,11 @@ def _mtp_copy_array(value):
 class NativeMTPRequestCache:
     """B=1 transactional cache owner for native Qwen MTP.
 
-    This is intentionally an unused engine-neutral foundation.  No generation
-    lifecycle consumes it yet, so it cannot certify native MTP by itself.  A
-    future generation loop must record every retained backbone/MTP token
-    through :meth:`commit`, and use a checkpoint around each proposed draft.
+    This engine-neutral owner is consumed by ``mtp_generate_step``, which
+    records retained backbone/MTP tokens and owns every checkpoint, verified
+    seal, commit, partial rollback/replay, and terminal finish boundary.
+    Server and continuous-batching integrations still require separate
+    qualification evidence.
     Cache replacement caused by KV quantization is performed through these
     caller-owned containers, so a rollback restores the exact pre-draft entry
     object when necessary.
