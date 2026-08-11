@@ -197,6 +197,41 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_multiline_string_params(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "edit",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "edits": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=edit>"
+            "<parameter=edits>[{\"oldText\": \"const first = 1;\n"
+            "const second = 2;\", \"newText\": \"const first = 3;\n"
+            "const second = 4;\"}]</parameter>"
+            "</function>"
+        )
+
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+
+        self.assertEqual(
+            tool_call["arguments"]["edits"],
+            [
+                {
+                    "oldText": "const first = 1;\nconst second = 2;",
+                    "newText": "const first = 3;\nconst second = 4;",
+                }
+            ],
+        )
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
