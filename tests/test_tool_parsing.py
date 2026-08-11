@@ -16,6 +16,24 @@ from mlx_lm.tool_parsers import (
 
 
 class TestToolParsing(unittest.TestCase):
+    def test_pythonic_multiple_calls(self):
+        # The pythonic block is a list of calls; every call must survive.
+        # A single non-greedy search merged the args of call 1..n and
+        # silently dropped calls 2..n.
+        calls = pythonic.parse_tool_call('[get_weather(city="SF"), get_time(tz="PST")]')
+        self.assertEqual(
+            calls,
+            [
+                {"name": "get_weather", "arguments": {"city": "SF"}},
+                {"name": "get_time", "arguments": {"tz": "PST"}},
+            ],
+        )
+        # A ')' inside a quoted argument must not terminate the call.
+        call = pythonic.parse_tool_call('[run(cmd="echo )")]')
+        self.assertEqual(call, {"name": "run", "arguments": {"cmd": "echo )"}})
+        with self.assertRaises(ValueError):
+            pythonic.parse_tool_call("no calls here")
+
     def test_parsers(self):
         test_cases = [
             ("call:multiply{a:12234585,b:48838483920}", function_gemma),
