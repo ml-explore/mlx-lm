@@ -2,6 +2,7 @@
 import copy
 import importlib
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 import mlx.core as mx
@@ -399,6 +400,209 @@ class TestModels(unittest.TestCase):
 
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
+
+    @staticmethod
+    def _bailing_moe_v3_args(granularity=None):
+        from mlx_lm.models.bailing_moe_v3 import ModelArgs
+
+        return ModelArgs(
+            architectures=["BailingMoeV3ForCausalLM"],
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            moe_intermediate_size=32,
+            moe_shared_expert_intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            num_experts=2,
+            num_experts_per_tok=1,
+            num_shared_experts=1,
+            n_group=1,
+            topk_group=1,
+            layer_group_size=1,
+            head_dim=32,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=16,
+            qk_head_dim=32,
+            v_head_dim=32,
+            gated_attention_proj_granularity_type=granularity,
+            quantization_config={
+                "quant_method": "fp8",
+                "fmt": "e4m3",
+                "scale_fmt": "ue8m0",
+                "weight_block_size": [128, 128],
+            },
+        )
+
+    def _bailing_moe_v3_bf16_args(self):
+        return replace(
+            self._bailing_moe_v3_args(),
+            quantization_config=None,
+            num_hidden_layers=4,
+            layer_group_size=4,
+            num_experts=4,
+            num_experts_per_tok=2,
+            n_group=2,
+            topk_group=1,
+        )
+
+    def test_bailing_moe_v3_layer_layout(self):
+        from mlx_lm.models.bailing_moe_v3 import Model, ModelArgs, _is_kda_layer
+        from mlx_lm.models.switch_layers import (
+            QuantizedSwitchLinear,
+            SwitchLinear,
+        )
+
+        self.assertEqual([i for i in range(5) if _is_kda_layer(i, 2, 5)], [0, 2])
+
+        with self.assertRaisesRegex(ValueError, "requires an FP8 E4M3 checkpoint"):
+            Model(ModelArgs(quantization_config={"quant_method": "fp8"}))
+
+        bf16_model = Model(self._bailing_moe_v3_bf16_args())
+        self.assertIsInstance(bf16_model.layers[0].attention.q_proj, nn.Linear)
+        self.assertIsInstance(bf16_model.layers[0].mlp.gate_proj, nn.Linear)
+        self.assertIsInstance(
+            bf16_model.layers[1].mlp.switch_mlp.gate_proj,
+            SwitchLinear,
+        )
+        self.assertIsInstance(bf16_model.layers[3].attention.dense, nn.Linear)
+
+        fp8_config = self._bailing_moe_v3_args().quantization_config
+        fp8_model = Model(
+            replace(self._bailing_moe_v3_bf16_args(), quantization_config=fp8_config)
+        )
+        self.assertIsInstance(fp8_model.layers[0].attention.q_proj, nn.QuantizedLinear)
+        self.assertIsInstance(fp8_model.layers[3].attention.dense, nn.QuantizedLinear)
+        self.assertIsInstance(
+            fp8_model.layers[1].mlp.switch_mlp.gate_proj,
+            QuantizedSwitchLinear,
+        )
+
+    def test_bailing_moe_v3_mla_gate(self):
+        from mlx_lm.models.bailing_moe_v3 import Model
+
+        for granularity in [None, "head_wise", "element_wise"]:
+            with self.subTest(granularity=granularity):
+                attention = (
+                    Model(self._bailing_moe_v3_args(granularity)).layers[0].attention
+                )
+                if granularity is None:
+                    self.assertIsNone(attention.g_proj)
+                else:
+                    self.assertIsNotNone(attention.g_proj)
+
+        with self.assertRaisesRegex(ValueError, "Unsupported gated_attention"):
+            Model(self._bailing_moe_v3_args("token_wise"))
+
+    def test_bailing_moe_v3_flash_direct_q_projection(self):
+        from mlx_lm.models.bailing_moe_v3 import Model
+
+        args = replace(
+            self._bailing_moe_v3_args("head_wise"),
+            q_lora_rank=None,
+            quantization_config=None,
+        )
+        model = Model(args)
+        attention = model.layers[0].attention
+
+        self.assertIsInstance(attention.q_proj, nn.Linear)
+        self.assertFalse(hasattr(attention, "q_a_proj"))
+
+        logits = model(mx.array([[1, 2]], dtype=mx.int32))
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 2, args.vocab_size))
+
+    def test_bailing_moe_v3_kda_normalization(self):
+        from mlx_lm.models.bailing_moe_v3 import _normalize_kda_qk
+
+        head_dim = 32
+        q = mx.arange(2 * head_dim, dtype=mx.float32).reshape(1, 2, 1, head_dim)
+        k = mx.arange(1, 2 * head_dim + 1, dtype=mx.float32).reshape(1, 2, 1, head_dim)
+        q = (q - head_dim) * 1e-4
+        k = (k - head_dim) * 1e-4
+
+        actual_q, actual_k = _normalize_kda_qk(q, k, head_dim)
+        ref_q = q * mx.rsqrt((q * q).sum(axis=-1, keepdims=True) + 1e-6)
+        ref_k = k * mx.rsqrt((k * k).sum(axis=-1, keepdims=True) + 1e-6)
+        ref_q = (head_dim**-0.5) * ref_q
+
+        self.assertTrue(mx.allclose(actual_q, ref_q, rtol=1e-5, atol=1e-7))
+        self.assertTrue(mx.allclose(actual_k, ref_k, rtol=1e-5, atol=1e-7))
+
+    def test_bailing_moe_v3_sanitize(self):
+        from mlx_lm.models.bailing_moe_v3 import Model
+
+        mtp_args = replace(
+            self._bailing_moe_v3_args(),
+            quantization_config=None,
+            num_nextn_predict_layers=1,
+        )
+        mtp_model = Model(mtp_args)
+        main_key = "model.layers.0.input_layernorm.weight"
+        mtp_key = "model.layers.1.eh_proj.weight"
+        weights = mtp_model.sanitize(
+            {
+                main_key: mx.ones((mtp_args.hidden_size,)),
+                mtp_key: mx.ones((mtp_args.hidden_size, 2 * mtp_args.hidden_size)),
+            }
+        )
+        self.assertIn(main_key, weights)
+        self.assertNotIn(mtp_key, weights)
+
+        args = self._bailing_moe_v3_bf16_args()
+        model = Model(args)
+        weights = {}
+        projection_shapes = {
+            "gate_proj": (args.moe_intermediate_size, args.hidden_size),
+            "up_proj": (args.moe_intermediate_size, args.hidden_size),
+            "down_proj": (args.hidden_size, args.moe_intermediate_size),
+        }
+        for layer_index in range(args.first_k_dense_replace, args.num_hidden_layers):
+            for expert in range(args.num_experts):
+                for projection, shape in projection_shapes.items():
+                    key = (
+                        f"model.layers.{layer_index}.mlp.experts.{expert}."
+                        f"{projection}.weight"
+                    )
+                    weights[key] = mx.full(shape, expert + 1, dtype=mx.bfloat16)
+
+        weights = model.sanitize(weights)
+
+        for layer_index in range(args.first_k_dense_replace, args.num_hidden_layers):
+            for projection, shape in projection_shapes.items():
+                key = f"model.layers.{layer_index}.mlp.switch_mlp.{projection}.weight"
+                self.assertEqual(weights[key].shape, (args.num_experts, *shape))
+        self.assertFalse(any(key.endswith(".scales") for key in weights))
+
+    def test_bailing_moe_v3_bf16_forward(self):
+        from mlx_lm.models.bailing_moe_v3 import Model
+
+        args = self._bailing_moe_v3_bf16_args()
+        checkpoint_model = Model(args)
+        checkpoint_model.set_dtype(mx.bfloat16)
+
+        checkpoint = {}
+        for key, value in tree_flatten(checkpoint_model.parameters()):
+            if ".switch_mlp." not in key or not key.endswith(".weight"):
+                checkpoint[key] = value
+                continue
+            prefix, suffix = key.split(".switch_mlp.", 1)
+            projection = suffix.removesuffix(".weight")
+            for expert in range(args.num_experts):
+                expert_key = f"{prefix}.experts.{expert}.{projection}.weight"
+                checkpoint[expert_key] = value[expert]
+
+        model = Model(args)
+        weights = model.sanitize(checkpoint)
+        model.load_weights(list(weights.items()), strict=True)
+
+        logits = model(mx.array([[1, 2]], dtype=mx.int32))
+        mx.eval(logits)
+        self.assertEqual(logits.shape, (1, 2, args.vocab_size))
+        self.assertEqual(logits.dtype, mx.bfloat16)
 
     def test_llama(self):
         from mlx_lm.models import llama
