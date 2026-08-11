@@ -16,6 +16,7 @@ from mlx_lm.generate import (
     GenerationForwardPositionReceipt,
     NativeMTPSamplingConfig,
     NativeMTPSparseBootstrap,
+    abandon_native_mtp_sparse_receipts,
     attested_target_forward,
     mtp_generate_step,
     stream_generate,
@@ -325,6 +326,212 @@ def _make_sparse_bootstrap(
         target_cache=target_cache,
         next_logical_position=positions[-1] + 1,
     )
+
+
+def _receipt_authority(receipt):
+    return generate_module._GENERATION_FORWARD_RECEIPTS.get(receipt._record_token)
+
+
+def test_sparse_bootstrap_close_before_iteration_is_idempotent_and_non_mutating():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+    target_offset = bootstrap.target_cache[1].offset
+    assert all(_receipt_authority(receipt) is not None for receipt in bootstrap.receipts)
+
+    bootstrap.close()
+    bootstrap.close()
+
+    assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
+    assert bootstrap.target_cache[1].offset == target_offset
+    assert model.requests == []
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+        bootstrap.claim(model)
+
+
+def test_sparse_bootstrap_close_after_claim_is_idempotent_and_non_mutating():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+    target_offset = bootstrap.target_cache[1].offset
+
+    claim = bootstrap.claim(model)
+    bootstrap.close()
+    bootstrap.close()
+
+    assert claim.target_cache is bootstrap.target_cache
+    assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
+    assert bootstrap.target_cache[1].offset == target_offset
+    assert model.requests == []
+
+
+def test_sparse_bootstrap_close_and_claim_have_exactly_one_owner(monkeypatch):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def claim():
+        barrier.wait(timeout=5)
+        try:
+            outcomes.append(("claim", bootstrap.claim(model)))
+        except RuntimeError as error:
+            outcomes.append(("error", str(error)))
+
+    def close():
+        barrier.wait(timeout=5)
+        bootstrap.close()
+        outcomes.append(("close", None))
+
+    threads = [threading.Thread(target=claim), threading.Thread(target=close)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert [kind for kind, _ in outcomes].count("close") == 1
+    assert [kind for kind, _ in outcomes].count("claim") + [
+        kind for kind, _ in outcomes
+    ].count("error") == 1
+    if any(kind == "claim" for kind, _ in outcomes):
+        assert any(kind == "claim" for kind, _ in outcomes)
+    else:
+        assert any("already_claimed" in value for kind, value in outcomes if kind == "error")
+    assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
+    assert model.requests == []
+
+
+def test_sparse_bootstrap_close_preserves_reserved_claim_failure_cleanup(monkeypatch):
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0, 3),
+        selected_token_ids=(0, 3),
+        immediate_successor_token_ids=(1,),
+        chunk_sizes=(1, 1),
+    )
+    blocked = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def fail_after_reservation(_records):
+        blocked.set()
+        assert release.wait(timeout=5)
+        raise RuntimeError("synthetic claimed verification failure")
+
+    monkeypatch.setattr(
+        generate_module, "_verify_sparse_canonical_content", fail_after_reservation
+    )
+
+    def claim():
+        try:
+            bootstrap.claim(model)
+        except RuntimeError as error:
+            errors.append(str(error))
+
+    thread = threading.Thread(target=claim)
+    thread.start()
+    assert blocked.wait(timeout=5)
+    bootstrap.close()
+    assert all(_receipt_authority(receipt) is not None for receipt in bootstrap.receipts)
+    release.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert errors == ["synthetic claimed verification failure"]
+    assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
+    assert model.requests == []
+    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+        bootstrap.claim(model)
+
+
+def test_abandon_sparse_receipts_cleans_partial_chunks_after_later_forward_failure():
+    class _FailSecondTarget(_NativeMTPModel):
+        def __init__(self):
+            super().__init__()
+            self.target_calls = 0
+
+        def __call__(self, *args, **kwargs):
+            self.target_calls += 1
+            if self.target_calls == 2:
+                raise RuntimeError("synthetic later target chunk failure")
+            return super().__call__(*args, **kwargs)
+
+    model = _FailSecondTarget()
+    context = _PositionContext()
+    target_cache = model.make_cache()
+    (_, _), first_receipt = attested_target_forward(
+        model,
+        (0,),
+        target_cache,
+        phase=GenerationForwardPhase.PREFILL,
+        logical_positions=(0,),
+        immediate_successor_token_ids=(1,),
+        model_forward_context=context.context,
+    )
+    target_offset = target_cache[1].offset
+    with pytest.raises(RuntimeError, match="synthetic later target chunk failure"):
+        attested_target_forward(
+            model,
+            (1,),
+            target_cache,
+            phase=GenerationForwardPhase.PREFILL,
+            logical_positions=(1,),
+            immediate_successor_token_ids=(),
+            model_forward_context=context.context,
+        )
+
+    abandon_native_mtp_sparse_receipts([first_receipt])
+    abandon_native_mtp_sparse_receipts([first_receipt])
+
+    assert _receipt_authority(first_receipt) is None
+    assert target_cache[1].offset == target_offset
+    assert model.requests == []
+
+
+def test_sparse_bootstrap_close_cleans_mutated_canonical_receipt_authority():
+    model = _NativeMTPModel()
+    context = _PositionContext()
+    bootstrap = _make_sparse_bootstrap(
+        model,
+        context,
+        positions=(0,),
+        selected_token_ids=(0,),
+        immediate_successor_token_ids=(),
+        chunk_sizes=(1,),
+    )
+    receipt = bootstrap.receipts[0]
+    object.__setattr__(receipt, "logical_positions", (99,))
+
+    bootstrap.close()
+
+    assert _receipt_authority(receipt) is None
+    assert model.requests == []
 
 
 def test_stream_generate_dispatches_attested_sparse_bootstrap_without_prompt_array(

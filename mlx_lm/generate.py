@@ -649,6 +649,35 @@ class _NativeMTPSparseClaim:
         return self.records[-1].canonical_final_logits
 
 
+def abandon_native_mtp_sparse_receipts(
+    receipts: Sequence[GenerationForwardPositionReceipt],
+) -> None:
+    """Consume issued, unreserved sparse receipts without touching model state.
+
+    This is the narrow owner for a partial ordered receipt set when a later
+    attested target chunk fails before a complete bootstrap can be formed.
+    It is deliberately best-effort for malformed caller containers: only a
+    live canonical receipt can remove its own direct weak-registry authority.
+    A claim reservation always wins over abandonment and remains responsible
+    for its existing finally-path cleanup.
+    """
+
+    if not isinstance(receipts, (list, tuple)):
+        return
+    with _GENERATION_FORWARD_RECEIPT_LOCK:
+        for receipt in receipts:
+            record_token = getattr(receipt, "_record_token", None)
+            if not isinstance(record_token, _GenerationForwardReceiptToken):
+                continue
+            authority = _GENERATION_FORWARD_RECEIPTS.get(record_token)
+            if (
+                authority is not None
+                and authority.reservation is None
+                and authority.record.receipt_id == id(receipt)
+            ):
+                del _GENERATION_FORWARD_RECEIPTS[record_token]
+
+
 @dataclass(frozen=True)
 class NativeMTPSparseBootstrap:
     """Attested sparse target state from which native MTP may start.
@@ -672,6 +701,17 @@ class NativeMTPSparseBootstrap:
     @property
     def final_target_logits(self) -> mx.array:
         return self.receipts[-1].logits
+
+    def close(self) -> None:
+        """Abandon this bootstrap's still-unclaimed receipt authority.
+
+        Closing is idempotent and does not sample, construct an MTP request,
+        or mutate the attested target cache. A claim that already reserved the
+        same receipts remains its sole owner and consumes them in its own
+        finally path.
+        """
+
+        abandon_native_mtp_sparse_receipts(self.receipts)
 
     def _canonical_records_locked(self, reservation=None):
         records = []
