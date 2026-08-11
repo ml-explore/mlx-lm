@@ -291,7 +291,15 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
-        if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
+        if isinstance(c, CacheList):
+            # Hybrid attention/recurrent models (baichuan_m1, falcon_h1,
+            # deepseek_v32, longcat_flash*) hold their KV cache one level down.
+            # The wrapper defines no to_quantized(), so without recursing here
+            # the nested KV leaves silently ignore kv_bits.
+            leaves = list(c.caches)
+            maybe_quantize_kv_cache(leaves, quantized_kv_start, kv_group_size, kv_bits)
+            c.caches = tuple(leaves)
+        elif hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
 
@@ -1746,6 +1754,30 @@ class BatchGenerator:
                     self.kv_group_size,
                     self.kv_bits,
                 )
+
+            if self.kv_bits is not None:
+                # Both lanes, not just supplied caches: _make_new_cache() wraps
+                # only top-level KVCache entries for max_kv_size and does not
+                # descend into CacheList, so a fresh job on a hybrid model can
+                # carry a nested leaf that quantizes to a non-mergeable class
+                # too. Checked here rather than inside maybe_quantize_kv_cache
+                # because that helper is shared with generate_step, where a
+                # merge-less QuantizedKVCache is the normal, correct result.
+                for c in caches[i]:
+                    # CacheList.merge merges leaf-wise, but _merge_caches only
+                    # inspects the wrapper — which does have merge() — so a
+                    # non-mergeable nested leaf would otherwise slip past and
+                    # fail as an AttributeError inside CacheList.merge once the
+                    # batch forms. Check the leaves, not the wrapper.
+                    for leaf in c.caches if isinstance(c, CacheList) else (c,):
+                        if not hasattr(leaf, "merge"):
+                            raise ValueError(
+                                "kv_bits is set but the cache for this job "
+                                f"quantizes to {type(leaf).__name__}, which does "
+                                "not support batching. Batched KV-cache "
+                                "quantization currently requires rotating "
+                                "caches, so set max_kv_size."
+                            )
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,

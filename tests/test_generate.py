@@ -16,6 +16,8 @@ from mlx_lm.generate import (
     stream_generate,
 )
 from mlx_lm.models.cache import (
+    ArraysCache,
+    CacheList,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -426,22 +428,21 @@ class TestGenerate(unittest.TestCase):
                 quantized_kv_start=4,
             )
 
-    def test_batch_insert_external_cache_is_quantized(self):
+    def test_batch_insert_external_rotating_cache_is_quantized(self):
         """A caller-supplied cache bypasses _make_new_cache(), which is where
         quantization is applied, so kv_bits used to be silently ignored for it:
         the caller asked for a quantized cache and got a full-precision one with
-        no error. insert() must quantize supplied caches too."""
-        prompt = self.tokenizer.encode("Hello")
-        external = make_prompt_cache(self.model)
-        self.assertTrue(
-            all(isinstance(c, KVCache) for c in external),
-            "precondition: a fresh cache for this model should be unquantized",
-        )
+        no error. insert() must quantize supplied caches too, and the rotating
+        config is the one that can actually go on to batch, so this covers the
+        conversion and generation through the merged path."""
+        prompt = self.tokenizer.encode("Hello there")
+        external = [RotatingKVCache(max_size=64) for _ in range(len(self.model.layers))]
 
         batch_gen = BatchGenerator(
             self.model,
             stop_tokens=self.tokenizer.eos_token_ids,
             max_tokens=4,
+            max_kv_size=64,
             kv_bits=8,
             kv_group_size=32,
         )
@@ -450,9 +451,14 @@ class TestGenerate(unittest.TestCase):
         # maybe_quantize_kv_cache rewrites the list in place, same as
         # generate_step, so the caller's list reflects the conversion.
         self.assertTrue(
-            all(isinstance(c, QuantizedKVCache) for c in external),
+            all(isinstance(c, RotatingQuantizedKVCache) for c in external),
             f"supplied cache not quantized: {[type(c).__name__ for c in external]}",
         )
+
+        tokens = []
+        while responses := batch_gen.next_generated():
+            tokens.extend(r.token for r in responses)
+        self.assertGreater(len(tokens), 0, "supplied-cache job produced no tokens")
 
     def test_batch_insert_external_cache_untouched_without_kv_bits(self):
         """Control for the above: with no kv_bits the supplied cache must be
@@ -470,14 +476,42 @@ class TestGenerate(unittest.TestCase):
 
         self.assertEqual(before, [type(c) for c in external])
 
-    def test_batch_insert_external_cache_already_quantized(self):
+    def test_batch_insert_external_rotating_cache_already_quantized(self):
         """An already-quantized supplied cache must not be re-quantized. The
         quantized classes define no to_quantized(), so maybe_quantize_kv_cache
-        skips them; this pins that behaviour."""
+        skips them; this pins that behaviour on the rotating config, which is
+        the one that can actually batch."""
+        prompt = self.tokenizer.encode("Hello")
+        external = [
+            RotatingKVCache(max_size=64).to_quantized(group_size=32, bits=8)
+            for _ in range(len(self.model.layers))
+        ]
+        ids_before = [id(c) for c in external]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        batch_gen.insert([prompt], caches=[external])
+
+        self.assertEqual(ids_before, [id(c) for c in external])
+
+    def test_batch_insert_plain_kv_bits_without_max_kv_size_raises(self):
+        """kv_bits without max_kv_size quantizes plain KVCache to
+        QuantizedKVCache, which has no merge(), so the job can never form a
+        batch. _merge_caches would eventually reject it with a message about
+        "batching with history" even for a job that has none, so refuse it at
+        insert with a message that names the actual fix."""
         prompt = self.tokenizer.encode("Hello")
         external = make_prompt_cache(self.model)
-        external = [c.to_quantized(group_size=32, bits=8) for c in external]
-        ids_before = [id(c) for c in external]
+        self.assertTrue(
+            all(isinstance(c, KVCache) for c in external),
+            "precondition: a fresh cache for this model should be unquantized",
+        )
 
         batch_gen = BatchGenerator(
             self.model,
@@ -486,9 +520,72 @@ class TestGenerate(unittest.TestCase):
             kv_bits=8,
             kv_group_size=32,
         )
+        with self.assertRaises(ValueError) as ctx:
+            batch_gen.insert([prompt], caches=[external])
+        self.assertIn(QuantizedKVCache.__name__, str(ctx.exception))
+        self.assertIn("max_kv_size", str(ctx.exception))
+
+    def test_batch_insert_external_cachelist_nested_kv_is_quantized(self):
+        """Composite CacheList layer caches (hybrid attention+recurrent models:
+        baichuan_m1, falcon_h1, deepseek_v32, longcat_flash*) hold their KV
+        cache one level down. The wrapper has merge() but no to_quantized(), so
+        without recursing into the leaves a supplied CacheList silently stays
+        full-precision while the fresh lane quantizes, and the mixed cohort then
+        dies in CacheList.merge with AttributeError. Insert-level assertion,
+        model-independent: supplied caches only, no generation (this model's
+        attention layers don't consume CacheList). Leaf order mirrors
+        baichuan_m1's sliding-window layers: (conv ArraysCache,
+        RotatingKVCache)."""
+        prompt = self.tokenizer.encode("Hello")
+        external = [
+            CacheList(ArraysCache(size=2), RotatingKVCache(max_size=64))
+            for _ in range(len(self.model.layers))
+        ]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
         batch_gen.insert([prompt], caches=[external])
 
-        self.assertEqual(ids_before, [id(c) for c in external])
+        for c in external:
+            self.assertIsInstance(c, CacheList)
+            self.assertIsInstance(c.caches[0], ArraysCache)
+            self.assertIsInstance(
+                c.caches[1],
+                RotatingQuantizedKVCache,
+                f"nested KV leaf not quantized: {type(c.caches[1]).__name__}",
+            )
+
+    def test_batch_insert_external_cachelist_non_mergeable_raises(self):
+        """A nested plain KVCache quantizes to QuantizedKVCache, which has no
+        merge(). _merge_caches' hasattr check only inspects the wrapper, and
+        CacheList does have merge(), so a non-mergeable nested leaf would dodge
+        the friendly ValueError and die later as an AttributeError inside
+        CacheList.merge. It must fail loudly at insert instead. baichuan_m1
+        makes the shape concrete: its non-sliding-window layers are
+        CacheList(ArraysCache, KVCache), so a blanket recursive pass leaves one
+        model mergeable on some layers and not on others."""
+        prompt = self.tokenizer.encode("Hello")
+        external = [
+            CacheList(ArraysCache(size=2), KVCache())
+            for _ in range(len(self.model.layers))
+        ]
+
+        batch_gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=4,
+            max_kv_size=64,
+            kv_bits=8,
+            kv_group_size=32,
+        )
+        with self.assertRaises(ValueError):
+            batch_gen.insert([prompt], caches=[external])
 
     def test_batch_continued_generation_quantized(self):
         """Round trip in the shape a real caller uses: generate, harvest the
