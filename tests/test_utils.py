@@ -41,6 +41,17 @@ class TestUtils(unittest.TestCase):
         p2 = model_lazy.layers[0].mlp.up_proj.weight
         self.assertTrue(mx.allclose(p1, p2))
 
+    def test_load_model_bin_weights_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            (d / "pytorch_model.bin").write_bytes(b"")
+            with open(d / "config.json", "w") as f:
+                json.dump({"model_type": "llama"}, f)
+            with self.assertRaises(FileNotFoundError) as cm:
+                utils.load_model(d)
+            self.assertIn("safetensors", str(cm.exception))
+            self.assertIn("pytorch_model.bin", str(cm.exception))
+
     def test_make_shards(self):
         from mlx_lm.models import llama
 

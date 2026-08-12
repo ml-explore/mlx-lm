@@ -335,6 +335,17 @@ def load_model(
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:
+        bin_files = glob.glob(str(model_path / "*.bin")) + glob.glob(
+            str(model_path / "*.pt")
+        )
+        if bin_files:
+            raise FileNotFoundError(
+                f"No safetensors found in {model_path}, but PyTorch weight "
+                f"files ({', '.join(Path(f).name for f in bin_files)}) are "
+                "present. mlx-lm can only load models in the safetensors "
+                "format. Convert the weights first, e.g. with "
+                "https://huggingface.co/spaces/safetensors/convert"
+            )
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
