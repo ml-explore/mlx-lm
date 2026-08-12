@@ -1431,7 +1431,7 @@ class TestModels(unittest.TestCase):
             num_hidden_layers=4,
             num_attention_heads=4,
             num_key_value_heads=2,
-            kv_lora_rank=4,
+            kv_lora_rank=32,
             q_lora_rank=4,
             qk_rope_head_dim=32,
             v_head_dim=16,
@@ -1447,8 +1447,73 @@ class TestModels(unittest.TestCase):
             },
         )
         model = deepseek_v2.Model(args)
+        self.assertTrue(hasattr(model.layers[0].self_attn, "embed_q"))
+        self.assertTrue(hasattr(model.layers[0].self_attn, "unembed_out"))
+        self.assertFalse(hasattr(model.layers[0].self_attn, "kv_b_proj"))
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        prefix = "model.layers.0.self_attn"
+        head_dim = args.qk_nope_head_dim + args.v_head_dim
+        kv_b_proj = mx.arange(
+            args.num_attention_heads * head_dim * args.kv_lora_rank,
+            dtype=mx.float32,
+        ).reshape(args.num_attention_heads * head_dim, args.kv_lora_rank)
+
+        weights = model.sanitize({f"{prefix}.kv_b_proj.weight": kv_b_proj})
+        kv_b_proj = kv_b_proj.reshape(
+            args.num_attention_heads, head_dim, args.kv_lora_rank
+        )
+        expected_embed_q = kv_b_proj[:, : args.qk_nope_head_dim, :].swapaxes(-1, -2)
+        expected_unembed_out = kv_b_proj[:, args.qk_nope_head_dim :, :]
+
+        self.assertTrue(
+            mx.array_equal(weights[f"{prefix}.embed_q.weight"], expected_embed_q)
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.unembed_out.weight"], expected_unembed_out
+            )
+        )
+
+        q_weight, q_scales, *q_biases = mx.quantize(
+            kv_b_proj.reshape(args.num_attention_heads * head_dim, args.kv_lora_rank),
+            group_size=32,
+            bits=4,
+        )
+        q_biases = q_biases[0]
+        weights = model.sanitize(
+            {
+                f"{prefix}.kv_b_proj.weight": q_weight,
+                f"{prefix}.kv_b_proj.scales": q_scales,
+                f"{prefix}.kv_b_proj.biases": q_biases,
+            }
+        )
+        q_shape = (args.num_attention_heads, head_dim, -1)
+        self.assertNotIn(f"{prefix}.embed_q.scales", weights)
+        self.assertIn(f"{prefix}.unembed_out.scales", weights)
+        self.assertEqual(
+            weights[f"{prefix}.embed_q.weight"].shape,
+            (args.num_attention_heads, args.kv_lora_rank, args.qk_nope_head_dim),
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.unembed_out.weight"],
+                q_weight.reshape(q_shape)[:, args.qk_nope_head_dim :, :],
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.unembed_out.scales"],
+                q_scales.reshape(q_shape)[:, args.qk_nope_head_dim :, :],
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.unembed_out.biases"],
+                q_biases.reshape(q_shape)[:, args.qk_nope_head_dim :, :],
+            )
         )
 
     def test_deepseek_v3(self):
