@@ -3,7 +3,7 @@
 import sys
 from pathlib import Path
 
-from setuptools import setup
+from setuptools import find_packages, setup
 
 package_dir = Path(__file__).parent / "mlx_lm"
 sys.path.append(str(package_dir))
@@ -32,18 +32,26 @@ setup(
         "pyyaml",
         "jinja2",
     ],
-    packages=[
-        "mlx_lm",
-        "mlx_lm.models",
-        "mlx_lm.quant",
-        "mlx_lm.tuner",
-        "mlx_lm.tool_parsers",
-        "mlx_lm.chat_templates",
-    ],
+    packages=find_packages(include=["mlx_lm", "mlx_lm.*"], exclude=["*.tests"]),
+    package_data={
+        "mlx_lm.train": [
+            "configs/*/*.py",
+            "configs/*/*/*.py",
+            "configs/*/*/*/*.py",
+        ],
+    },
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],
-        "train": ["datasets", "tqdm"],
+        "train": [
+            f"mlx[cuda13]>={MIN_MLX_VERSION}",
+            "boto3",
+            "datasets",
+            "ml_collections",
+            "tqdm",
+            "wandb",
+            "zstandard",
+        ],
         "evaluate": ["lm-eval", "tqdm"],
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
         "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],

@@ -1,0 +1,4 @@
+boto3>=1.28            
+huggingface_hub>=0.23   
+pyarrow>=14             
+zstandard>=0.19         
