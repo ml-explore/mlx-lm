@@ -1365,7 +1365,7 @@ class TestModels(unittest.TestCase):
             num_hidden_layers=4,
             num_attention_heads=4,
             num_key_value_heads=2,
-            kv_lora_rank=4,
+            kv_lora_rank=32,
             q_lora_rank=4,
             qk_rope_head_dim=32,
             v_head_dim=16,
@@ -1383,6 +1383,66 @@ class TestModels(unittest.TestCase):
         model = deepseek_v2.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # kv_b_proj -> embed_q/unembed_out folding (test shape adapted from
+        # rohash123's #1715).
+        prefix = "model.layers.0.self_attn"
+        head_dim = args.qk_nope_head_dim + args.v_head_dim
+        nope = args.qk_nope_head_dim
+        kv_b_proj = mx.random.normal(
+            (args.num_attention_heads * head_dim, args.kv_lora_rank)
+        )
+
+        # Dense checkpoint: exact split + transpose.
+        weights = model.sanitize({f"{prefix}.kv_b_proj.weight": kv_b_proj})
+        per_head = kv_b_proj.reshape(
+            args.num_attention_heads, head_dim, args.kv_lora_rank
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.embed_q.weight"],
+                per_head[:, :nope, :].swapaxes(-1, -2),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.unembed_out.weight"], per_head[:, nope:, :]
+            )
+        )
+
+        # Quantized checkpoint: embed_q stays dense (a transposed piece would
+        # requantize with different groups); unembed_out is a bit-exact packed
+        # row slice.
+        q_weight, q_scales, q_biases = mx.quantize(kv_b_proj, group_size=32, bits=4)
+        weights = model.sanitize(
+            {
+                f"{prefix}.kv_b_proj.weight": q_weight,
+                f"{prefix}.kv_b_proj.scales": q_scales,
+                f"{prefix}.kv_b_proj.biases": q_biases,
+            }
+        )
+        self.assertNotIn(f"{prefix}.embed_q.scales", weights)
+        dequant = mx.dequantize(
+            q_weight, q_scales, q_biases, group_size=32, bits=4
+        ).reshape(args.num_attention_heads, head_dim, args.kv_lora_rank)
+        self.assertTrue(
+            mx.array_equal(
+                weights[f"{prefix}.embed_q.weight"],
+                dequant[:, :nope, :].swapaxes(-1, -2),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                mx.dequantize(
+                    weights[f"{prefix}.unembed_out.weight"],
+                    weights[f"{prefix}.unembed_out.scales"],
+                    weights[f"{prefix}.unembed_out.biases"],
+                    group_size=32,
+                    bits=4,
+                ),
+                dequant[:, nope:, :],
+            )
         )
 
     def test_deepseek_v3(self):

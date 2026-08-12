@@ -514,28 +514,44 @@ class Model(nn.Module):
                     # Try to infer bits and group size
                     bits = (v.shape[-1] * 32) // dims
                     group_size = dims // scales.shape[-1]
+                num_heads = self.args.num_attention_heads
+                nope = self.args.qk_nope_head_dim
+                if quantized:
+                    # V-side: slice the original packed rows (bit-exact —
+                    # rows are the output dim; quantization groups run along
+                    # the input dim, so a row slice keeps groups intact).
+                    qv = v.reshape(num_heads, head_dim, -1)
+                    qs = scales.reshape(num_heads, head_dim, -1)
+                    qb = biases.reshape(num_heads, head_dim, -1)
+                    weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(
+                        qv[:, nope:, :]
+                    )
+                    weights[f"{prefix}.unembed_out.scales"] = mx.contiguous(
+                        qs[:, nope:, :]
+                    )
+                    weights[f"{prefix}.unembed_out.biases"] = mx.contiguous(
+                        qb[:, nope:, :]
+                    )
+                    # K-side: dequantize -> transpose -> keep dense. The
+                    # transpose regroups the quantization blocks, so a
+                    # requantized embed_q no longer round-trips to the
+                    # checkpoint weights and measurably perturbs attention
+                    # scores; a dense embed_q is exact.
                     v = mx.dequantize(
                         v, scales, biases, bits=bits, group_size=group_size
                     )
-                num_heads = self.args.num_attention_heads
-                v = v.reshape(num_heads, head_dim, -1)
-                wk = mx.contiguous(
-                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
-                )
-                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
-                if quantized:
-                    wk, wk_scales, wk_biases = mx.quantize(
-                        wk, bits=bits, group_size=group_size
+                    v = v.reshape(num_heads, head_dim, -1)
+                    weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
+                        v[:, :nope, :].swapaxes(-1, -2)
                     )
-                    wv, wv_scales, wv_biases = mx.quantize(
-                        wv, bits=bits, group_size=group_size
+                else:
+                    v = v.reshape(num_heads, head_dim, -1)
+                    weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
+                        v[:, :nope, :].swapaxes(-1, -2)
                     )
-                    weights[f"{prefix}.embed_q.scales"] = wk_scales
-                    weights[f"{prefix}.unembed_out.scales"] = wv_scales
-                    weights[f"{prefix}.embed_q.biases"] = wk_biases
-                    weights[f"{prefix}.unembed_out.biases"] = wv_biases
-                weights[f"{prefix}.embed_q.weight"] = wk
-                weights[f"{prefix}.unembed_out.weight"] = wv
+                    weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(
+                        v[:, nope:, :]
+                    )
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
