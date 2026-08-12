@@ -1171,6 +1171,9 @@ class PendingSequence:
 
         Returns the chunk and whether it ended a segment.
         """
+        assert (
+            not self.ready_to_decode
+        ), f"Sequence {self.policy.uid} has no prompt left to prefill."
         boundary = next(b for b in self.boundaries if b > self.cursor)
         end = min(self.cursor + step_size, boundary)
         chunk = self.prompt[self.cursor : end]
@@ -1275,17 +1278,15 @@ class PromptProcessingBatch:
     def split_ready(self) -> Tuple["Self", "Self"]:
         """Split into ``(ready, still_prefilling)``."""
         ready, prefilling = [], []
-        empty = dataclasses.replace(self, sequences=[], prompt_cache=[])
         for i, sequence in enumerate(self.sequences):
-            if sequence.ready_to_decode:
-                ready.append(i)
-            else:
-                prefilling.append(i)
+            (ready if sequence.ready_to_decode else prefilling).append(i)
 
-        if not prefilling:
-            return self, empty
         if not ready:
+            empty = dataclasses.replace(self, sequences=[], prompt_cache=[])
             return empty, self
+        if not prefilling:
+            empty = dataclasses.replace(self, sequences=[], prompt_cache=[])
+            return self, empty
 
         selected = self._copy()
         selected.filter(ready)
@@ -1530,6 +1531,19 @@ class GenerationBatch:
 
     def extend(self, batch: "Self") -> None:
         """Extend this batch with another generation batch."""
+        # Both sides must hold a step for every sequence they bring, or the
+        # merged batch ends up with more sequences than pending rows and only
+        # trips over it a tick later.
+        assert (self._pending is None) == (not self.sequences), (
+            f"batch has {len(self.sequences)} sequences but "
+            f"{'no' if self._pending is None else 'a'} pending step"
+        )
+        assert (batch._pending is None) == (not batch.sequences), (
+            f"incoming batch has {len(batch.sequences)} sequences but "
+            f"{'no' if batch._pending is None else 'a'} pending step; "
+            "it has not been started"
+        )
+
         self.sequences.extend(batch.sequences)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         if self._pending is None:
@@ -1646,6 +1660,8 @@ class BatchGenerator:
         num_segments = len(segments)
 
         max_tokens = max_tokens or [self.max_tokens] * num_segments
+        # Seeds the context passed to ``logits_processors``, not just what
+        # ``Response.all_tokens`` reports.
         all_tokens = all_tokens or [[] for _ in segments]
         samplers = _normalize_samplers(samplers, n=num_segments, fallback=self.sampler)
         logits_processors = _normalize_logits_processors(
