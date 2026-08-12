@@ -7,6 +7,18 @@ from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
+# The ChatML template that ``PreTrainedTokenizerBase.default_chat_template``
+# returned before transformers removed it in v4.44. Used for models that ship
+# no chat template of their own.
+DEFAULT_CHAT_TEMPLATE = (
+    "{% for message in messages %}"
+    "{{ '<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n' }}"
+    "{% endfor %}"
+    "{% if add_generation_prompt %}"
+    "{{ '<|im_start|>assistant\n' }}"
+    "{% endif %}"
+)
+
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -341,6 +353,12 @@ class TokenizerWrapper:
 
         kwargs["return_dict"] = False
         return self._tokenizer.apply_chat_template(*args, tokenize=tokenize, **kwargs)
+
+    def use_default_chat_template(self):
+        """Install a default chat template if the model does not ship one."""
+        if self._tokenizer.chat_template is None:
+            self._tokenizer.chat_template = DEFAULT_CHAT_TEMPLATE
+            self.has_chat_template = True
 
     def add_eos_token(self, token: str):
         token_id = None

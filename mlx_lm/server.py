@@ -336,8 +336,7 @@ class ModelProvider:
 
         # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
-            if tokenizer.chat_template is None:
-                tokenizer.chat_template = tokenizer.default_chat_template
+            tokenizer.use_default_chat_template()
 
         # Load the draft model for speculative decoding
         draft_model = None

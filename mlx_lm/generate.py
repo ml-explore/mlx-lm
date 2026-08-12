@@ -2112,6 +2112,9 @@ def main():
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
 
+    if args.use_default_chat_template:
+        tokenizer.use_default_chat_template()
+
     template_kwargs = {}
     if args.chat_template_config is not None:
         template_kwargs = json.loads(args.chat_template_config)
