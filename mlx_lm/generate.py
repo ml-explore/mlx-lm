@@ -877,6 +877,10 @@ def _build_trie(
         try:
             for tok in seq:
                 node = node.setdefault(tok, {})
+            if node is trie:
+                # An empty pattern would mark the root as a completed match,
+                # so every token would report one.
+                continue
             node["__match__"] = (tuple(seq), idx)
         except TypeError:
             node = node.setdefault(seq, {})
@@ -1486,7 +1490,6 @@ class GenerationBatch:
         sequence's ledger. The sampled tokens are only recorded when they come
         back as the next ``inputs``.
         """
-        # Forward pass
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
 
