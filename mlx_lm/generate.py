@@ -1490,18 +1490,19 @@ class GenerationBatch:
         logits = self.model(inputs[:, None], cache=self.prompt_cache)
         logits = logits[:, -1, :]
 
-        token_context = [
-            s.token_context.update_and_fetch(inputs[i : i + 1])
-            for i, s in enumerate(self.sequences)
-        ]
-        # Logits processors
         all_processors = [s.policy.logits_processors for s in self.sequences]
+        contexts = []
         if any(all_processors):
             processed_logits = []
-            for e, processors in enumerate(all_processors):
-                sample_logits = logits[e : e + 1]
-                for processor in processors:
-                    sample_logits = processor(token_context[e], sample_logits)
+            for i, (sequence, processors) in enumerate(
+                zip(self.sequences, all_processors, strict=True)
+            ):
+                sample_logits = logits[i : i + 1]
+                if processors:
+                    context = sequence.token_context.update_and_fetch(inputs[i : i + 1])
+                    contexts.append(context)
+                    for processor in processors:
+                        sample_logits = processor(context, sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
@@ -1515,12 +1516,12 @@ class GenerationBatch:
             sampled = samplers[0](logprobs)
         else:
             sampled = mx.concatenate(
-                [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)],
+                [s(logprobs[i : i + 1]) for i, s in enumerate(samplers)],
                 axis=0,
             )
 
         step = self.Step(tokens=sampled, logprobs=logprobs)
-        mx.async_eval(step.tokens, step.logprobs, token_context)
+        mx.async_eval(step.tokens, step.logprobs, contexts)
 
         # ``inputs`` are in the KV cache now, so record them on each sequence.
         mx.eval(inputs)
