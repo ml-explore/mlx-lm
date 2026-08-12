@@ -1398,18 +1398,18 @@ class GenerationBatch:
     @dataclasses.dataclass(kw_only=True, frozen=True)
     class Step:
         tokens: mx.array
-        logprobs: List[mx.array]
+        logprobs: mx.array
 
         def concat(self, other: "Self") -> "Self":
             return GenerationBatch.Step(
                 tokens=mx.concatenate([self.tokens, other.tokens]),
-                logprobs=self.logprobs + other.logprobs,
+                logprobs=mx.concatenate([self.logprobs, other.logprobs]),
             )
 
         def filter(self, keep: List[int]) -> "Self":
             return GenerationBatch.Step(
                 tokens=self.tokens[keep],
-                logprobs=[self.logprobs[i] for i in keep],
+                logprobs=self.logprobs[keep],
             )
 
     model: nn.Module
@@ -1452,10 +1452,7 @@ class GenerationBatch:
         if self._pending is None:
             raise ValueError("Batch has sequences but has not started decoding")
 
-        # Take the step that was computed last time, and immediately start the
-        # one after it so the model runs during the bookkeeping below.
         ready = self._pending
-        mx.eval(ready.tokens, ready.logprobs)
         self._pending = self._decode(ready.tokens)
 
         tokens = ready.tokens.tolist()
@@ -1522,7 +1519,7 @@ class GenerationBatch:
                 axis=0,
             )
 
-        step = self.Step(tokens=sampled, logprobs=list(logprobs))
+        step = self.Step(tokens=sampled, logprobs=logprobs)
         mx.async_eval(step.tokens, step.logprobs, token_context)
 
         # ``inputs`` are in the KV cache now, so record them on each sequence.
