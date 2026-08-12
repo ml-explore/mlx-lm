@@ -29,7 +29,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import make_logits_processors, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -42,6 +42,8 @@ DEFAULT_TOP_K = 0
 DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
+DEFAULT_REPETITION_PENALTY = None
+DEFAULT_REPETITION_CONTEXT_SIZE = 20
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
@@ -132,6 +134,19 @@ def setup_arg_parser():
         type=int,
         default=DEFAULT_MIN_TOKENS_TO_KEEP,
         help="Minimum tokens to keep for min-p sampling.",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=DEFAULT_REPETITION_PENALTY,
+        help="Penalty for repeating tokens (>1 discourages repetition). "
+        "Off by default.",
+    )
+    parser.add_argument(
+        "--repetition-context-size",
+        type=int,
+        default=DEFAULT_REPETITION_CONTEXT_SIZE,
+        help="Number of recent tokens the repetition penalty considers.",
     )
     parser.add_argument(
         "--seed",
@@ -2167,6 +2182,10 @@ def main():
         xtc_threshold=args.xtc_threshold,
         xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
+    logits_processors = make_logits_processors(
+        repetition_penalty=args.repetition_penalty,
+        repetition_context_size=args.repetition_context_size,
+    )
     response = generate(
         model,
         tokenizer,
@@ -2174,6 +2193,7 @@ def main():
         max_tokens=args.max_tokens,
         verbose=args.verbose,
         sampler=sampler,
+        logits_processors=logits_processors,
         max_kv_size=args.max_kv_size,
         prompt_cache=prompt_cache if using_cache else None,
         kv_bits=args.kv_bits,
