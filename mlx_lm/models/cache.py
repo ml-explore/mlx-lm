@@ -1023,8 +1023,8 @@ class BatchKVCache(_BaseCache):
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
-        # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        mx.eval(self.left_padding)
+        min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -1079,7 +1079,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
-        padding = self.left_padding[idx].item()
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
