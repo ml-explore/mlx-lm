@@ -2,6 +2,7 @@
 import copy
 import importlib
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -337,6 +338,37 @@ class TestModels(unittest.TestCase):
             mask=mask,
             scale=1.0,
         )
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
+    def test_quantized_sdpa_gqa_batched_mask(self):
+        # Regression test: quantized SDPA with grouped-query attention and a
+        # batched (B >= 2) padding mask used to crash with a broadcast error
+        # because the mask lacked the n_repeats axis introduced by the GQA
+        # reshape of the scores.
+        B, n_q_heads, n_kv_heads, L, D = 2, 8, 2, 16, 32
+
+        cache = KVCache()
+        k = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        v = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        k_up, v_up = cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+        qk_up, qv_up = quant_cache.state
+
+        q = 1e-1 * mx.random.normal(shape=(B, n_q_heads, L, D))
+
+        # Batched padding mask, shape (B, 1, L, L), as produced by BatchKVCache.
+        mask = mx.ones((B, 1, L, L), dtype=mx.bool_)
+        mask[1, :, :, L // 2 :] = False
+
+        out = scaled_dot_product_attention(
+            q, k_up, v_up, cache=cache, mask=mask, scale=1.0
+        )
+        qout = scaled_dot_product_attention(
+            q, qk_up, qv_up, cache=quant_cache, mask=mask, scale=1.0
+        )
+        mx.eval(out, qout)
+        self.assertEqual(qout.shape, (B, n_q_heads, L, D))
+        self.assertTrue(mx.all(mx.isfinite(qout)).item())
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
@@ -1184,6 +1216,40 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_falcon_mamba_bcdt_normalization(self):
+        from mlx_lm.models import mamba
+
+        args = mamba.ModelArgs(
+            model_type="falcon_mamba",
+            vocab_size=32,
+            use_bias=False,
+            use_conv_bias=True,
+            conv_kernel=4,
+            hidden_size=4,
+            num_hidden_layers=1,
+            state_size=2,
+            intermediate_size=8,
+            time_step_rank=2,
+        )
+        block = mamba.MambaBlock(args)
+
+        x = mx.ones((1, args.intermediate_size))
+        A = -mx.ones((args.intermediate_size, args.state_size))
+
+        with (
+            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
+            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
+        ):
+            y, state = block.ssm_step(x, A)
+
+        mx.eval(y, state)
+        self.assertEqual(rms_norm.call_count, 3)
+        for call in rms_norm.call_args_list:
+            self.assertIsNone(call.kwargs["weight"])
+        self.assertEqual(ones.call_count, 0)
+        self.assertEqual(y.shape, (1, args.intermediate_size))
+        self.assertEqual(state.shape, (1, args.intermediate_size, args.state_size))
 
     def test_falcon_h1(self):
         from mlx_lm.models import falcon_h1
@@ -2345,6 +2411,48 @@ class TestModels(unittest.TestCase):
                     "block_auto_adjust_ff_dim": True,
                     "layer_types": ["full_attention", "", "full_attention", ""],
                     "rope_theta": 1000,
+                },
+            },
+            {
+                "model_type": "laguna",
+                "vocab_size": 10_000,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 4,
+                "partial_rotary_factor": 0.5,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 128,
+                "shared_expert_intermediate_size": 128,
+                "moe_routed_scaling_factor": 2.5,
+                "layer_types": [
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+                "num_attention_heads_per_layer": [4, 4, 4, 4],
+                "rope_parameters": {
+                    "full_attention": {
+                        "rope_type": "yarn",
+                        "rope_theta": 500000.0,
+                        "factor": 8.0,
+                        "original_max_position_embeddings": 4096,
+                        "beta_slow": 1.0,
+                        "beta_fast": 32.0,
+                        "partial_rotary_factor": 0.5,
+                    },
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 1.0,
+                    },
                 },
             },
             {

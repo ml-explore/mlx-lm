@@ -500,7 +500,7 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
         return [self._postprocess_text(d) for d in decoded]
 
 
-AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+AutoTokenizer.register(NewlineTokenizer, fast_tokenizer_class=NewlineTokenizer)
 
 
 def _match(a, b):
