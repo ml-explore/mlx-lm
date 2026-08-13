@@ -693,9 +693,10 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
-    assert (
-        max_tokens != 0
-    ), "Maximum number of tokens must be non-zero (use -1 for no limit)."
+    if max_tokens == 0:
+        raise ValueError(
+            "Maximum number of tokens must be non-zero (use -1 for no limit)."
+        )
 
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
@@ -1095,9 +1096,8 @@ class SequencePolicy:
     max_tokens: int = DEFAULT_MAX_TOKENS
 
     def __post_init__(self):
-        assert (
-            self.max_tokens > 0
-        ), f"sequence {self.uid} has max_tokens={self.max_tokens}, must be positive"
+        if self.max_tokens <= 0:
+            raise ValueError(f"Sequence {self.uid}'s max_tokens must be > 0.")
 
 
 @dataclasses.dataclass(kw_only=True)
@@ -1118,8 +1118,10 @@ class PendingSequence:
     tokens: List[int] = dataclasses.field(default_factory=list)
 
     def __post_init__(self):
-        assert self.prompt, f"sequence {self.policy.uid} has an empty prompt"
-        assert self.cursor >= 0, f"sequence {self.policy.uid}'s cursor must be >= 0"
+        if not self.prompt:
+            raise ValueError(f"Sequence {self.policy.uid} has an empty prompt.")
+        if self.cursor < 0:
+            raise ValueError(f"Sequence {self.policy.uid}'s cursor must be >= 0.")
 
     @classmethod
     def create(
@@ -1179,9 +1181,10 @@ class PendingSequence:
 
         Returns the chunk and whether it ended a segment.
         """
-        assert (
-            not self.ready_to_decode
-        ), f"Sequence {self.policy.uid} has no prompt left to prefill."
+        if self.ready_to_decode:
+            raise ValueError(
+                f"Sequence {self.policy.uid} has no prompt left to prefill."
+            )
         boundary = next(b for b in self.boundaries if b > self.cursor)
         end = min(self.cursor + step_size, boundary)
         chunk = self.prompt[self.cursor : end]
@@ -1190,10 +1193,11 @@ class PendingSequence:
 
     def to_decoding(self) -> "DecodingSequence":
         """Start generating. The prompt has been processed into the cache."""
-        assert self.ready_to_decode, (
-            f"sequence {self.policy.uid} has "
-            f"{self.num_prompt_tokens - 1 - self.cursor} prompt tokens left"
-        )
+        if not self.ready_to_decode:
+            raise ValueError(
+                f"Sequence {self.policy.uid} has "
+                f"{self.num_prompt_tokens - 1 - self.cursor} prompt tokens left."
+            )
         return DecodingSequence(policy=self.policy, tokens=self.tokens)
 
 
@@ -1219,7 +1223,8 @@ class PromptProcessingBatch:
     prefill_step_size: int = 2048
 
     def __post_init__(self):
-        assert self.prefill_step_size > 0, "prefill_step_size must be positive"
+        if self.prefill_step_size <= 0:
+            raise ValueError("The prefill_step_size must be > 0.")
 
     def __len__(self):
         return len(self.sequences)
@@ -1239,7 +1244,7 @@ class PromptProcessingBatch:
             tokens: List of token sequences to process.
         """
         if len(self) != len(tokens):
-            raise ValueError("The batch length doesn't match the number of inputs")
+            raise ValueError("The batch length doesn't match the number of inputs.")
 
         if not tokens:
             return
@@ -1358,9 +1363,11 @@ class DecodingSequence:
     num_tokens: int = 0
 
     def __post_init__(self):
-        assert (
-            self.num_tokens >= 0
-        ), f"sequence {self.policy.uid} has num_tokens={self.num_tokens}, must be >= 0"
+        if self.num_tokens < 0:
+            raise ValueError(
+                f"Sequence {self.policy.uid} has num_tokens={self.num_tokens}, "
+                "must be >= 0."
+            )
         self.token_context = TokenBuffer(self.tokens)
         self.stop_matcher = self.policy.stop_sequences.matcher()
 
@@ -1422,11 +1429,15 @@ class GenerationBatch:
     _pending: Optional["GenerationBatch.Step"] = None
 
     def start(self, inputs: mx.array) -> "Self":
-        assert self._pending is None, "Batch has already started decoding."
-        assert self.sequences, "Cannot start a batch with no sequences."
-        assert inputs.shape == (
-            len(self),
-        ), f"Expected one input token per sequence, got {inputs.shape} for {len(self.sequences)} sequences."
+        if self._pending is not None:
+            raise ValueError("Batch has already started decoding.")
+        if not self.sequences:
+            raise ValueError("Cannot start a batch with no sequences.")
+        if inputs.shape != (len(self),):
+            raise ValueError(
+                f"Expected one input token per sequence, got {inputs.shape} "
+                f"for {len(self.sequences)} sequences."
+            )
         self._pending = self._decode(inputs)
         return self
 
@@ -1454,7 +1465,7 @@ class GenerationBatch:
         if not self.sequences:
             return []
         if self._pending is None:
-            raise ValueError("Batch has sequences but has not started decoding")
+            raise ValueError("Batch has sequences but has not started decoding.")
 
         ready = self._pending
         self._pending = self._decode(ready.tokens)
@@ -1539,15 +1550,17 @@ class GenerationBatch:
         # Both sides must hold a step for every sequence they bring, or the
         # merged batch ends up with more sequences than pending rows and only
         # trips over it a tick later.
-        assert (self._pending is None) == (not self.sequences), (
-            f"batch has {len(self.sequences)} sequences but "
-            f"{'no' if self._pending is None else 'a'} pending step"
-        )
-        assert (batch._pending is None) == (not batch.sequences), (
-            f"incoming batch has {len(batch.sequences)} sequences but "
-            f"{'no' if batch._pending is None else 'a'} pending step; "
-            "it has not been started"
-        )
+        if (self._pending is None) != (not self.sequences):
+            raise ValueError(
+                f"Batch has {len(self.sequences)} sequences but "
+                f"{'no' if self._pending is None else 'a'} pending step."
+            )
+        if (batch._pending is None) != (not batch.sequences):
+            raise ValueError(
+                f"Incoming batch has {len(batch.sequences)} sequences but "
+                f"{'no' if batch._pending is None else 'a'} pending step; "
+                "it has not been started."
+            )
 
         self.sequences.extend(batch.sequences)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
@@ -1690,8 +1703,8 @@ class BatchGenerator:
         for k, v in opts.items():
             if len(v) != num_segments:
                 raise ValueError(
-                    f"{k} must have one entry per segment: expected "
-                    f"{num_segments}, got {len(v)}"
+                    f"Option {k} must have one entry per segment: expected "
+                    f"{num_segments}, got {len(v)}."
                 )
 
         uids = list(range(self._uid_count, self._uid_count + num_segments))
@@ -1756,12 +1769,13 @@ class BatchGenerator:
                     self._prompt_batch.extract_cache(idx),
                     self._prompt_batch.sequences[idx].tokens,
                 )
-            else:
-                assert stage == stage.DECODING, stage
+            elif stage is Stage.DECODING:
                 results[uid] = (
                     self._generation_batch.extract_cache(idx),
                     self._generation_batch.tokens[idx],
                 )
+            else:
+                raise ValueError(f"Sequence {uid} has an unknown stage {stage}.")
         return results
 
     def remove(
