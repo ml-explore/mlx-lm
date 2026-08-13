@@ -653,7 +653,7 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     shards = []
     shard, shard_size = {}, 0
     for k, v in weights.items():
-        if shard_size + v.nbytes > max_file_size_bytes:
+        if shard and shard_size + v.nbytes > max_file_size_bytes:
             shards.append(shard)
             shard, shard_size = {}, 0
         shard[k] = v

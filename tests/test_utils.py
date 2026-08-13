@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,6 +59,15 @@ class TestUtils(unittest.TestCase):
         gb = sum(p.nbytes for _, p in weights) // 2**30
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
+
+    def test_make_shards_does_not_prepend_empty_shard_for_oversized_weight(self):
+        oversized_weight = SimpleNamespace(nbytes=(1 << 30) + 1)
+        weights = {"model.embed_tokens.weight": oversized_weight}
+
+        shards = utils.make_shards(weights, max_file_size_gb=1)
+
+        self.assertEqual(shards, [weights])
+        self.assertTrue(all(shards))
 
     def test_quantize(self):
         from mlx_lm.models import llama
