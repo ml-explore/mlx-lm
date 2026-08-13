@@ -1640,6 +1640,12 @@ class NativeMTPAdmission:
     model: nn.Module
     rows: Tuple[NativeMTPRowSpec, ...]
     cohort: _NativeMTPCohortCache
+    # Sparse admission is deliberately represented by the already-claimed
+    # canonical records, never by caller-provided duplicate values.  Keeping
+    # this private also prevents a later caller from reusing a bootstrap after
+    # its receipt authority was consumed.
+    _sparse_claims: Optional[Tuple["_NativeMTPSparseClaim", ...]] = None
+    _position_context: Optional[GenerationForwardContext] = None
 
     @classmethod
     def create(
@@ -1692,6 +1698,142 @@ class NativeMTPAdmission:
                 model, request_caches, uids=tuple(row.uid for row in rows)
             ),
         )
+
+    @classmethod
+    def create_from_sparse_bootstraps(
+        cls,
+        model: nn.Module,
+        rows: Sequence[NativeMTPRowSpec],
+        bootstraps: Sequence["NativeMTPSparseBootstrap"],
+    ) -> "NativeMTPAdmission":
+        """Atomically adopt B=1 sparse target receipts into one cohort.
+
+        Every bootstrap is claimed before any MTP cache is made observable.
+        Its target cache remains the attested cache; only the retained hidden
+        rows and their original immediate successors initialize the fresh MTP
+        cache.  Destination cohort construction happens last, after every
+        source request has reached the exact ``target=N, mtp=N-1`` state.
+        """
+
+        rows = tuple(rows)
+        bootstraps = tuple(bootstraps)
+        if not rows or len(rows) != len(bootstraps):
+            raise ValueError("native_mtp_sparse_batch_rows_and_bootstraps_required")
+        if any(not isinstance(row, NativeMTPRowSpec) for row in rows):
+            raise TypeError("native_mtp_batch_row_spec_required")
+        if any(not isinstance(item, NativeMTPSparseBootstrap) for item in bootstraps):
+            raise TypeError("native_mtp_sparse_bootstrap_invalid")
+        if len({row.uid for row in rows}) != len(rows):
+            raise ValueError("native_mtp_batch_uid_collision")
+        # Reject an incoherent caller contract before reserving or consuming a
+        # single receipt.  This is admission validation, not a partial batch
+        # failure, so the caller may correct the row metadata and retry its
+        # still-live sparse evidence.
+        for row, bootstrap in zip(rows, bootstraps):
+            if row.prompt != bootstrap.selected_token_ids:
+                raise ValueError("native_mtp_sparse_row_prompt_mismatch")
+        capability = getattr(model, "mtp_capability", None)
+        if capability is None or not capability.supported:
+            raise RuntimeError(
+                "native_mtp_model_capability_missing"
+                if capability is None
+                else capability.reason
+            )
+
+        # Establish the only valid model-owned consumer before consuming
+        # receipts.  This fails without touching receipt authority.
+        position_context = _native_mtp_position_context(model, None)
+        claims = []
+        requests = []
+        cohort = None
+        try:
+            for bootstrap in bootstraps:
+                claim = bootstrap.claim(model)
+                claims.append(claim)
+                request = cache.NativeMTPRequestCache.adopt_sparse_target(
+                    model,
+                    target_cache=claim.target_cache,
+                    target_tokens=len(claim.selected_token_ids),
+                    next_logical_position=claim.next_logical_position,
+                )
+                requests.append(request)
+                cls._initialize_sparse_mtp_request(
+                    model, request, claim, position_context
+                )
+            cohort = _NativeMTPCohortCache(
+                model, requests, uids=tuple(row.uid for row in rows)
+            )
+            return cls(
+                model,
+                rows,
+                cohort,
+                _sparse_claims=tuple(claims),
+                _position_context=position_context,
+            )
+        except BaseException:
+            # ``claim`` consumes receipt authority even if validation fails;
+            # close every not-yet-claimed bootstrap as well so a failed batch
+            # can never be retried as an accidental partial cohort.
+            for bootstrap in bootstraps:
+                bootstrap.close()
+            for request in requests:
+                if not request.closed:
+                    request.finish("cancelled")
+            if cohort is not None:
+                cohort.poison("native_mtp_sparse_batch_admission_failed")
+            raise
+
+    @staticmethod
+    def _initialize_sparse_mtp_request(model, request, claim, position_context):
+        """Populate one fresh MTP cache from attested hidden/successor pairs."""
+
+        try:
+            for record in claim.records:
+                if not record.immediate_successor_token_ids:
+                    continue
+                positions = record.logical_positions[
+                    : len(record.immediate_successor_token_ids)
+                ]
+                tokens = mx.array(
+                    record.immediate_successor_token_ids, dtype=mx.uint32
+                )[None]
+                ack = GenerationForwardPositionAck(
+                    positions,
+                    model=model,
+                    cache=request.mtp,
+                    phase=GenerationForwardPhase.MTP_DRAFT,
+                )
+                forward = GenerationForward(
+                    model=model,
+                    input_tokens=tokens,
+                    cache=request.mtp,
+                    phase=GenerationForwardPhase.MTP_DRAFT,
+                    logical_positions=positions,
+                    logical_position_ack=ack,
+                )
+                with position_context(forward):
+                    ack._activate()
+                    try:
+                        model.mtp_forward(
+                            record.hidden_rows[:, : len(positions), :],
+                            tokens,
+                            request.mtp,
+                        )
+                        ack._require_acknowledged()
+                    finally:
+                        ack._finish()
+            request.seal_verified(
+                backbone_tokens=len(claim.selected_token_ids),
+                mtp_tokens=len(claim.immediate_successor_token_ids),
+            )
+            request.commit(
+                backbone_tokens=len(claim.selected_token_ids),
+                mtp_tokens=len(claim.immediate_successor_token_ids),
+            )
+        except BaseException:
+            if not request.closed:
+                request.finish("cancelled")
+            raise
 
 
 class _NativeMTPEpoch:
@@ -1852,6 +1994,43 @@ class NativeMTPBatchGenerator:
             for row in admission.rows
         }
         self._last_failed_owners = ()
+        self._sparse_claims = admission._sparse_claims
+        self._position_context = admission._position_context
+        self._logical_cursor = (
+            {
+                row.uid: claim.next_logical_position
+                for row, claim in zip(admission.rows, self._sparse_claims)
+            }
+            if self._sparse_claims is not None
+            else None
+        )
+        self._initial_mtp_positions = (
+            {
+                row.uid: claim.selected_logical_positions[-1]
+                for row, claim in zip(admission.rows, self._sparse_claims)
+            }
+            if self._sparse_claims is not None
+            else None
+        )
+        if self._sparse_claims is not None:
+            # Canonical B=1 sparse generation deliberately begins processor
+            # history at the final retained target anchor, not the caller's
+            # original selected-token sequence.  The latter would alter
+            # stateful/replay-safe processors and make a batched sparse row
+            # diverge before its first emitted head.
+            self._history = {
+                row.uid: mx.array([claim.selected_token_ids[-1]], dtype=mx.uint32)
+                for row, claim in zip(admission.rows, self._sparse_claims)
+            }
+
+    def start_sparse(self):
+        """Start a sparse admission from its retained final target evidence."""
+
+        if self._sparse_claims is None:
+            raise RuntimeError("native_mtp_sparse_batch_admission_required")
+        if self._epoch is not None or self._closed:
+            raise RuntimeError("native_mtp_batch_initial_already_started")
+        return self._sparse_initial()
 
     @property
     def telemetry(self) -> tuple:
@@ -1881,6 +2060,8 @@ class NativeMTPBatchGenerator:
 
         if self._epoch is not None or self._closed:
             raise RuntimeError("native_mtp_batch_initial_already_started")
+        if self._sparse_claims is not None:
+            raise RuntimeError("native_mtp_sparse_batch_requires_start_sparse")
         if (
             isinstance(prefill_step_size, bool)
             or not isinstance(prefill_step_size, int)
@@ -1979,6 +2160,34 @@ class NativeMTPBatchGenerator:
                 raise
         return tuple(emissions), self._initial(emissions)
 
+    def _sparse_initial(self):
+        """Turn retained final sparse logits into the Initial epoch only."""
+
+        emissions = []
+        try:
+            for row, claim in zip(self._admission.rows, self._sparse_claims):
+                uid = row.uid
+                state = self._sampling[uid]
+                reported = state.reported_logprobs(
+                    claim.final_target_logits[0, -1, :], self._history[uid]
+                )
+                sampled = state.sample(
+                    state.sampling_distribution(reported),
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                mx.eval(sampled, reported)
+                self._head[uid] = sampled
+                self._hidden[uid] = claim.final_target_hidden
+                emissions.append(
+                    self._make_emission(uid, sampled.item(), reported, False)
+                )
+        except BaseException:
+            self._poison_all("native_mtp_sparse_initial_failed")
+            raise
+        return tuple(emissions), self._initial(emissions)
+
     def _move_to_front(self, uids):
         """Return a selected move-only owner while keeping the selected UIDs first."""
 
@@ -2032,15 +2241,13 @@ class NativeMTPBatchGenerator:
             )
         )
 
-    def _target_forward(self, tokens, *, phase):
+    def _target_forward(self, tokens, *, phase, logical_positions=None):
         try:
             self._cohort.bind_before_mutation()
             inputs = mx.array(tokens, dtype=mx.uint32)
             if inputs.ndim == 1:
                 inputs = inputs[:, None]
-            result = self._admission.model(
-                inputs, cache=self._cohort.backbone, return_hidden=True
-            )
+            result = self._positioned_target_call(inputs, phase, logical_positions)
             if not isinstance(result, tuple) or len(result) != 2:
                 raise RuntimeError("native_mtp_batch_target_hidden_missing")
             self._seal_delta(backbone=inputs.shape[1], mtp=0)
@@ -2049,18 +2256,103 @@ class NativeMTPBatchGenerator:
             self._poison_all("native_mtp_batch_target_failed")
             raise
 
-    def _mtp_forward(self, hidden, tokens):
+    def _mtp_forward(self, hidden, tokens, *, logical_positions=None):
         try:
             self._cohort.bind_before_mutation()
             inputs = mx.array(tokens, dtype=mx.uint32)
             if inputs.ndim == 1:
                 inputs = inputs[:, None]
-            result = self._admission.model.mtp_forward(hidden, inputs, self._cohort.mtp)
+            result = self._positioned_mtp_call(hidden, inputs, logical_positions)
             self._seal_delta(backbone=0, mtp=inputs.shape[1])
             return result
         except BaseException:
             self._poison_all("native_mtp_batch_mtp_failed")
             raise
+
+    def _positioned_target_call(self, inputs, phase, logical_positions):
+        if logical_positions is None:
+            return self._admission.model(
+                inputs, cache=self._cohort.backbone, return_hidden=True
+            )
+        if self._position_context is None:
+            raise RuntimeError("native_mtp_sparse_position_context_missing")
+        ack = GenerationForwardPositionAck(
+            logical_positions,
+            model=self._admission.model,
+            cache=self._cohort.backbone,
+            phase=phase,
+        )
+        forward = GenerationForward(
+            model=self._admission.model,
+            input_tokens=inputs,
+            cache=self._cohort.backbone,
+            phase=phase,
+            logical_positions=logical_positions,
+            logical_position_ack=ack,
+        )
+        with self._position_context(forward):
+            ack._activate()
+            try:
+                result = self._admission.model(
+                    inputs, cache=self._cohort.backbone, return_hidden=True
+                )
+                ack._require_acknowledged()
+                return result
+            finally:
+                ack._finish()
+
+    def _positioned_mtp_call(self, hidden, inputs, logical_positions):
+        if logical_positions is None:
+            return self._admission.model.mtp_forward(hidden, inputs, self._cohort.mtp)
+        if self._position_context is None:
+            raise RuntimeError("native_mtp_sparse_position_context_missing")
+        ack = GenerationForwardPositionAck(
+            logical_positions,
+            model=self._admission.model,
+            cache=self._cohort.mtp,
+            phase=GenerationForwardPhase.MTP_DRAFT,
+        )
+        forward = GenerationForward(
+            model=self._admission.model,
+            input_tokens=inputs,
+            cache=self._cohort.mtp,
+            phase=GenerationForwardPhase.MTP_DRAFT,
+            logical_positions=logical_positions,
+            logical_position_ack=ack,
+        )
+        with self._position_context(forward):
+            ack._activate()
+            try:
+                result = self._admission.model.mtp_forward(
+                    hidden, inputs, self._cohort.mtp
+                )
+                ack._require_acknowledged()
+                return result
+            finally:
+                ack._finish()
+
+    @staticmethod
+    def _position_argument(rows):
+        """Keep B=1 on the canonical vector contract, B>1 on matrices."""
+
+        return rows[0] if len(rows) == 1 else tuple(rows)
+
+    def _position_rows(self, uids, width, *, start_delta):
+        if self._logical_cursor is None:
+            return None
+        return tuple(
+            tuple(
+                self._logical_cursor[uid] + start_delta + index
+                for index in range(width)
+            )
+            for uid in uids
+        )
+
+    def _positions(self, uids, width, *, start_delta):
+        """Return exact B=1 vectors or explicit B>1 position matrices."""
+
+        rows = self._position_rows(uids, width, start_delta=start_delta)
+        return None if rows is None else self._position_argument(rows)
 
     def _make_emission(self, uid, token, logprobs, from_draft):
         row = self._rows[uid]
@@ -2098,6 +2390,8 @@ class NativeMTPBatchGenerator:
         for emission in emissions:
             row = self._rows[emission.uid]
             self._generated[emission.uid] += 1
+            if self._logical_cursor is not None:
+                self._logical_cursor[emission.uid] += 1
             terminal = (
                 emission.finish_reason is not None
                 or self._generated[emission.uid] >= row.max_tokens
@@ -2145,6 +2439,13 @@ class NativeMTPBatchGenerator:
             logits = self._mtp_forward(
                 mx.concatenate([self._hidden[uid] for uid in drafts], axis=0),
                 tuple(self._head[uid].item() for uid in drafts),
+                logical_positions=(
+                    self._position_argument(
+                        tuple((self._initial_mtp_positions[uid],) for uid in drafts)
+                    )
+                    if self._initial_mtp_positions is not None
+                    else None
+                ),
             )[:, -1, :]
             for index, uid in enumerate(drafts):
                 state = self._sampling[uid]
@@ -2171,6 +2472,17 @@ class NativeMTPBatchGenerator:
         epoch._consume()
         try:
             self._cohort.checkpoint()
+            verify_rows = self._position_rows(epoch.active_uids, 2, start_delta=-1)
+            self._verify_positions = (
+                self._position_argument(verify_rows)
+                if verify_rows is not None
+                else None
+            )
+            self._verify_position_by_uid = (
+                dict(zip(epoch.active_uids, verify_rows))
+                if verify_rows is not None
+                else None
+            )
             inputs = mx.stack(
                 [
                     mx.concatenate([self._head[uid], self._draft[uid]])
@@ -2178,11 +2490,11 @@ class NativeMTPBatchGenerator:
                 ],
                 axis=0,
             )
-            self._cohort.bind_before_mutation()
-            verify_logits, verify_hidden = self._admission.model(
-                inputs, cache=self._cohort.backbone, return_hidden=True
+            verify_logits, verify_hidden = self._target_forward(
+                inputs,
+                phase=GenerationForwardPhase.VERIFY,
+                logical_positions=self._verify_positions,
             )
-            self._seal_delta(backbone=2, mtp=0)
             (
                 self._verify_hidden,
                 self._verify_logits,
@@ -2294,10 +2606,21 @@ class NativeMTPBatchGenerator:
                     ],
                     axis=0,
                 )
-                verify_logits, verify_hidden = self._admission.model(
-                    inputs, cache=self._cohort.backbone, return_hidden=True
+                accepted_positions = (
+                    self._position_argument(
+                        tuple(
+                            self._verify_position_by_uid[uid]
+                            for uid in epoch.accepted_uids
+                        )
+                    )
+                    if self._verify_position_by_uid is not None
+                    else None
                 )
-                self._seal_delta(backbone=2, mtp=0)
+                verify_logits, verify_hidden = self._target_forward(
+                    inputs,
+                    phase=GenerationForwardPhase.VERIFY,
+                    logical_positions=accepted_positions,
+                )
                 self._cohort.commit()
                 for index, uid in enumerate(epoch.accepted_uids):
                     self._verify_hidden[uid] = verify_hidden[index : index + 1]
@@ -2351,9 +2674,27 @@ class NativeMTPBatchGenerator:
         rejected_ready = ()
         if self._mixed_rejected_uids:
             self._cohort = self._mixed_rejected_owner
+            self._replay_position_by_uid = (
+                {
+                    uid: self._logical_cursor[uid] - 2
+                    for uid in self._mixed_rejected_uids
+                }
+                if self._logical_cursor is not None
+                else None
+            )
             _, replay_hidden = self._target_forward(
                 tuple(self._head[uid].item() for uid in self._mixed_rejected_uids),
                 phase=GenerationForwardPhase.DECODE,
+                logical_positions=(
+                    self._position_argument(
+                        tuple(
+                            (self._replay_position_by_uid[uid],)
+                            for uid in self._mixed_rejected_uids
+                        )
+                    )
+                    if self._replay_position_by_uid is not None
+                    else None
+                ),
             )
             self._replay_hidden = {}
             for index, uid in enumerate(self._mixed_rejected_uids):
@@ -2365,6 +2706,16 @@ class NativeMTPBatchGenerator:
                 ),
                 tuple(
                     self._replacement[uid].item() for uid in self._mixed_rejected_uids
+                ),
+                logical_positions=(
+                    self._position_argument(
+                        tuple(
+                            (self._replay_position_by_uid[uid],)
+                            for uid in self._mixed_rejected_uids
+                        )
+                    )
+                    if self._replay_position_by_uid is not None
+                    else None
                 ),
             )[:, -1, :]
             rejected_ready = self._mixed_rejected_uids
@@ -2384,7 +2735,6 @@ class NativeMTPBatchGenerator:
                 ).reshape(-1)
                 self._draft_logprobs[uid] = draft_logprobs
         emissions = []
-        accepted_bonus = ()
         if self._mixed_accepted_owner is not None:
             self._cohort = self._mixed_accepted_owner
             for uid in self._mixed_accepted_uids:
@@ -2404,18 +2754,19 @@ class NativeMTPBatchGenerator:
                 self._head[uid] = token
                 emission = self._make_emission(uid, token.item(), reported, False)
                 emissions.append(emission)
-                if emission.finish_reason is None:
-                    accepted_bonus += (uid,)
-        # Bonus is an emission boundary: terminal accepted rows must not be
-        # caught up or rejoined with the rejected Ready owner.
+        # This is a real public emission boundary.  Record it exactly once
+        # before terminal pruning so generated counts, finish semantics and
+        # sparse logical cursors remain B=1-equivalent.
+        accepted_bonus = self._record_emissions(
+            _NativeMTPPhase.BONUS,
+            emissions,
+            expected=self._mixed_accepted_uids,
+        )
+        # Terminal accepted rows must not be caught up or rejoined with the
+        # rejected Ready owner.
         self._mixed_accepted_uids = accepted_bonus
         self._mixed_accepted_owner = self._filter_owner_uids(
             self._mixed_accepted_owner, accepted_bonus
-        )
-        self._events = self._events + (
-            _NativeMTPTelemetryEvent(
-                _NativeMTPPhase.BONUS, accepted_bonus, "mixed_accepted_bonus_emission"
-            ),
         )
         self._mixed_rejected_ready = rejected_ready
         self._mixed_accepted_ready = accepted_bonus
@@ -2433,9 +2784,16 @@ class NativeMTPBatchGenerator:
                 dtype=mx.uint32,
             )
             self._cohort.bind_before_mutation()
-            logits = self._admission.model.mtp_forward(
-                hidden, tokens, self._cohort.mtp
-            )[:, -1, :]
+            accepted_positions = (
+                self._position_argument(
+                    tuple(self._verify_position_by_uid[uid] for uid in uids)
+                )
+                if self._verify_position_by_uid is not None
+                else None
+            )
+            logits = self._positioned_mtp_call(hidden, tokens, accepted_positions)[
+                :, -1, :
+            ]
             self._seal_delta(backbone=0, mtp=2)
             for index, uid in enumerate(uids):
                 state = self._sampling[uid]
@@ -2506,8 +2864,16 @@ class NativeMTPBatchGenerator:
                 dtype=mx.uint32,
             )
             self._cohort.bind_before_mutation()
-            logits = self._admission.model.mtp_forward(
-                hidden, tokens, self._cohort.mtp
+            logits = self._positioned_mtp_call(
+                hidden,
+                tokens,
+                (
+                    self._position_argument(
+                        tuple(self._verify_position_by_uid[uid] for uid in drafts)
+                    )
+                    if getattr(self, "_verify_position_by_uid", None) is not None
+                    else None
+                ),
             )[:, -1, :]
             self._seal_delta(backbone=0, mtp=2)
             for index, uid in enumerate(drafts):
@@ -2536,9 +2902,24 @@ class NativeMTPBatchGenerator:
                     "native_mtp_batch_mixed_decision_requires_branch_resolution"
                 )
             self._cohort.rollback()
+            self._replay_position_by_uid = (
+                {uid: self._logical_cursor[uid] - 1 for uid in epoch.rejected_uids}
+                if self._logical_cursor is not None
+                else None
+            )
             _, replay_hidden = self._target_forward(
                 tuple(self._head[uid].item() for uid in epoch.rejected_uids),
                 phase=GenerationForwardPhase.DECODE,
+                logical_positions=(
+                    self._position_argument(
+                        tuple(
+                            (self._replay_position_by_uid[uid],)
+                            for uid in epoch.rejected_uids
+                        )
+                    )
+                    if self._replay_position_by_uid is not None
+                    else None
+                ),
             )
             self._replay_hidden = {}
             emissions = []
@@ -2570,6 +2951,13 @@ class NativeMTPBatchGenerator:
             logits = self._mtp_forward(
                 mx.concatenate([self._replay_hidden[uid] for uid in drafts], axis=0),
                 tuple(self._replacement[uid].item() for uid in drafts),
+                logical_positions=(
+                    self._position_argument(
+                        tuple((self._replay_position_by_uid[uid],) for uid in drafts)
+                    )
+                    if getattr(self, "_replay_position_by_uid", None) is not None
+                    else None
+                ),
             )[:, -1, :]
             for index, uid in enumerate(drafts):
                 state = self._sampling[uid]

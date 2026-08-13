@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 """Typed public lifecycle coverage for native-MTP cohort admission."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from collections import deque
 
@@ -10,18 +11,24 @@ import pytest
 from test_qwen3_5_mtp_model import _checkpoint, _model, _sanitize_and_load
 
 from mlx_lm.generate import (
+    GenerationForward,
+    GenerationForwardPositionAck,
+    GenerationForwardPhase,
     NativeMTPAdmission,
     NativeMTPBatchGenerator,
     NativeMTPEmission,
     NativeMTPRejectedEpoch,
     NativeMTPRowSpec,
     NativeMTPSamplingConfig,
+    NativeMTPSparseBootstrap,
+    attested_target_forward,
     mtp_generate_step,
 )
 from mlx_lm.generate import (
     _NativeMTPCohortCache,
     _NativeMTPCohortMutationDelta,
     _NativeMTPSamplingState,
+    _native_mtp_position_context,
 )
 from mlx_lm.models.cache import ArraysCache, KVCache, NativeMTPRequestCache
 
@@ -106,6 +113,94 @@ class _MixedRerunFailureModel(_BatchModel):
         if self.fail_rerun:
             raise RuntimeError("injected_mixed_rerun_failure")
         return super().__call__(inputs, cache=cache, return_hidden=return_hidden)
+
+
+class _SparseBatchModel(_BatchModel):
+    """Tiny B>1 target/MTP double with an acknowledged Qwen position seam."""
+
+    def __init__(self):
+        # Exercise the same topology checks as real Qwen rather than relying
+        # on inherited class attributes that happen to look cache-compatible.
+        self.layers = [type("_Attention", (), {"is_linear": False})()]
+        self.mtp = type("_MTP", (), {"layers": [object()]})()
+        self.forwards = []
+        self.target_calls = 0
+        self.mtp_calls = 0
+        self._forward = None
+
+    @contextmanager
+    def generation_forward_context(self, forward):
+        self.forwards.append(forward)
+        previous, self._forward = self._forward, forward
+        try:
+            yield
+        finally:
+            self._forward = previous
+
+    def _ack(self):
+        if self._forward is not None and self._forward.logical_position_ack is not None:
+            self._forward.logical_position_ack.acknowledge(
+                self._forward.logical_positions
+            )
+
+    def __call__(self, inputs, *, cache, return_hidden=False):
+        self.target_calls += 1
+        self._ack()
+        return super().__call__(inputs, cache=cache, return_hidden=return_hidden)
+
+    def mtp_forward(self, hidden, next_tokens, cache):
+        self.mtp_calls += 1
+        self._ack()
+        return super().mtp_forward(hidden, next_tokens, cache)
+
+
+class _SparseMoEBatchModel(_SparseBatchModel):
+    """Token-routed tiny MoE oracle; cache behavior remains identical."""
+
+    architecture = "qwen3_5_moe"
+    num_experts = 2
+
+    def _logits(self, inputs, delta=1):
+        expert = inputs.astype(mx.int32) % self.num_experts
+        zero = inputs.astype(mx.int32) + delta
+        one = inputs.astype(mx.int32) - (self.vocab_size - delta)
+        ids = mx.where(expert == 0, zero, one) % self.vocab_size
+        logits = mx.full((*inputs.shape, self.vocab_size), -20.0)
+        for row in range(inputs.shape[0]):
+            for column in range(inputs.shape[1]):
+                logits[row, column, ids[row, column]] = 20.0
+        return logits
+
+
+def _sparse_bootstrap(model, tokens, positions, *, chunks=(1, 1)):
+    cache = model.make_cache()
+    successors = tuple((token + 1) % model.vocab_size for token in tokens[:-1])
+    receipts = []
+    start = 0
+    for size in chunks:
+        end = start + size
+        (_, _), receipt = attested_target_forward(
+            model,
+            tuple(tokens[start:end]),
+            cache,
+            phase=GenerationForwardPhase.PREFILL,
+            logical_positions=tuple(positions[start:end]),
+            immediate_successor_token_ids=tuple(
+                successors[start : min(end, len(successors))]
+            ),
+            model_forward_context=model.generation_forward_context,
+        )
+        receipts.append(receipt)
+        start = end
+    assert start == len(tokens)
+    return NativeMTPSparseBootstrap(
+        receipts=tuple(receipts),
+        selected_logical_positions=tuple(positions),
+        selected_token_ids=tuple(tokens),
+        immediate_successor_token_ids=successors,
+        target_cache=cache,
+        next_logical_position=positions[-1] + 1,
+    )
 
 
 def _admission(*, max_tokens=8):
@@ -619,6 +714,77 @@ def _tiny_qwen_b1_emissions(
     return emissions, requests[0]
 
 
+def _actual_sparse_bootstrap(target, token_ids, logical_positions, *, chunk_sizes):
+    """Produce real Qwen sparse evidence without reconstructing hidden rows."""
+
+    target_cache = target.make_cache()
+    successors = tuple(token_ids[1:])
+    receipts = []
+    start = 0
+    for size in chunk_sizes:
+        end = start + size
+        (_, _), receipt = attested_target_forward(
+            target,
+            tuple(token_ids[start:end]),
+            target_cache,
+            phase=GenerationForwardPhase.PREFILL,
+            logical_positions=tuple(logical_positions[start:end]),
+            immediate_successor_token_ids=tuple(
+                successors[start : min(end, len(successors))]
+            ),
+            model_forward_context=target.generation_forward_context,
+        )
+        receipts.append(receipt)
+        start = end
+    assert start == len(token_ids)
+    return NativeMTPSparseBootstrap(
+        receipts=tuple(receipts),
+        selected_logical_positions=tuple(logical_positions),
+        selected_token_ids=tuple(token_ids),
+        immediate_successor_token_ids=successors,
+        target_cache=target_cache,
+        next_logical_position=logical_positions[-1] + 1,
+    )
+
+
+def _tiny_qwen_b1_sparse_emissions(
+    monkeypatch, *, moe, weights, tokens, positions, sampling, uniform, count
+):
+    """Pause a real sparse B1 stream at the same lifecycle boundary as batch."""
+
+    model = _model(moe=moe)
+    _load_shared_qwen_checkpoint(model, weights)
+    bootstrap = _actual_sparse_bootstrap(
+        model, tokens, positions, chunk_sizes=(1,) * len(tokens)
+    )
+    requests = []
+    original_adopt = NativeMTPRequestCache.adopt_sparse_target.__func__
+
+    def capture_adopt(cls, *args, **kwargs):
+        request = original_adopt(cls, *args, **kwargs)
+        requests.append(request)
+        return request
+
+    with monkeypatch.context() as local_monkeypatch:
+        local_monkeypatch.setattr(
+            NativeMTPRequestCache, "adopt_sparse_target", classmethod(capture_adopt)
+        )
+        _force_acceptance_uniform(local_monkeypatch, uniform)
+        stream = mtp_generate_step(
+            None,
+            model,
+            max_tokens=8,
+            prefill_step_size=1,
+            sampling_config=sampling,
+            sparse_bootstrap=bootstrap,
+        )
+        try:
+            emissions = tuple(next(stream) for _ in range(count))
+        finally:
+            stream.close()
+    return emissions, requests[0]
+
+
 def _assert_cohort_recurrent_row_matches_b1(owner, uid, request):
     row = owner.uids.index(uid)
     for cohort_entry, b1_entry in zip(owner.backbone, request.backbone):
@@ -652,6 +818,251 @@ def _assert_cohort_offsets_match_b1(owner, uid, request):
         if isinstance(cohort_entry, ArraysCache):
             continue
         assert cohort_entry.offset[row].item() == b1_entry.offset
+
+
+def _assert_cohort_cache_payload_row_matches_b1(owner, uid, request):
+    """Compare the live KV and recurrent payloads, not merely their offsets."""
+
+    row = owner.uids.index(uid)
+    for cohort_entry, b1_entry in zip(
+        owner.backbone + owner.mtp, request.backbone + request.mtp
+    ):
+        if isinstance(cohort_entry, ArraysCache):
+            continue
+        for name in ("keys", "values"):
+            cohort_value = getattr(cohort_entry, name)
+            b1_value = getattr(b1_entry, name)
+            if b1_value is None:
+                assert cohort_value is None
+            else:
+                offset = b1_entry.offset
+                padding = cohort_entry.left_padding[row].item()
+                assert mx.allclose(
+                    cohort_value[row : row + 1, ..., padding : padding + offset, :],
+                    b1_value[..., :offset, :],
+                    rtol=1e-4,
+                    atol=1e-5,
+                ).item()
+
+
+class _B1SparsePhaseOracle:
+    """Manual sparse B1 transaction stopped exactly at the Ready boundary."""
+
+    def __init__(self, model, tokens, positions, sampling, *, accepted):
+        bootstrap = _actual_sparse_bootstrap(
+            model, tokens, positions, chunk_sizes=(1,) * len(tokens)
+        )
+        claim = bootstrap.claim(model)
+        self.request = NativeMTPRequestCache.adopt_sparse_target(
+            model,
+            target_cache=claim.target_cache,
+            target_tokens=len(claim.selected_token_ids),
+            next_logical_position=claim.next_logical_position,
+        )
+        self.context = _native_mtp_position_context(model, None)
+        NativeMTPAdmission._initialize_sparse_mtp_request(
+            model, self.request, claim, self.context
+        )
+        self.model = model
+        self.sampling = _NativeMTPSamplingState(sampling, seed=sampling.seed)
+        self.history = mx.array([tokens[-1]], dtype=mx.uint32)
+        self.cursor = claim.next_logical_position
+        self._initial(claim)
+        self._draft_initial(positions[-1])
+        self._verify(expected_accepted=accepted)
+        if self.accepted:
+            self.emissions = self._accept_bonus_catchup()
+        else:
+            self.emissions = (self._reject_replay_redraft(),)
+
+    def _target(self, tokens, positions, phase):
+        inputs = mx.array(tokens, dtype=mx.uint32)[None]
+        ack = GenerationForwardPositionAck(
+            tuple(positions), model=self.model, cache=self.request.backbone, phase=phase
+        )
+        forward = GenerationForward(
+            model=self.model,
+            input_tokens=inputs,
+            cache=self.request.backbone,
+            phase=phase,
+            logical_positions=tuple(positions),
+            logical_position_ack=ack,
+        )
+        with self.context(forward):
+            ack._activate()
+            try:
+                result = self.model(
+                    inputs, cache=self.request.backbone, return_hidden=True
+                )
+                ack._require_acknowledged()
+                return result
+            finally:
+                ack._finish()
+
+    def _mtp(self, hidden, tokens, positions):
+        inputs = mx.array(tokens, dtype=mx.uint32)[None]
+        ack = GenerationForwardPositionAck(
+            tuple(positions),
+            model=self.model,
+            cache=self.request.mtp,
+            phase=GenerationForwardPhase.MTP_DRAFT,
+        )
+        forward = GenerationForward(
+            model=self.model,
+            input_tokens=inputs,
+            cache=self.request.mtp,
+            phase=GenerationForwardPhase.MTP_DRAFT,
+            logical_positions=tuple(positions),
+            logical_position_ack=ack,
+        )
+        with self.context(forward):
+            ack._activate()
+            try:
+                result = self.model.mtp_forward(hidden, inputs, self.request.mtp)
+                ack._require_acknowledged()
+                return result
+            finally:
+                ack._finish()
+
+    def _sample(self, reported):
+        return self.sampling.sample(
+            self.sampling.sampling_distribution(reported),
+            rng_key=(
+                self.sampling.next_rng_key()
+                if self.sampling.config.stochastic
+                else None
+            ),
+        ).reshape(-1)
+
+    def _initial(self, claim):
+        reported = self.sampling.reported_logprobs(
+            claim.final_target_logits[0, -1, :], self.history
+        )
+        self.head = self._sample(reported)
+        self.hidden = claim.final_target_hidden
+        mx.eval(self.head, reported)
+        self.history = mx.concatenate([self.history, self.head])
+        self.cursor += 1
+        self.initial = (self.head.item(), reported, False)
+
+    def _draft_initial(self, initial_mtp_position):
+        logits = self._mtp(self.hidden, self.head, (initial_mtp_position,))[:, -1, :]
+        self.request.retain(
+            backbone_tokens=self.request.state.backbone_tokens,
+            mtp_tokens=self.request.state.mtp_tokens + 1,
+        )
+        self.draft_logprobs = self.sampling.sampling_distribution(
+            self.sampling.reported_logprobs(logits.squeeze(0), self.history)
+        )
+        self.draft = self.sampling.sample(
+            self.draft_logprobs,
+            rng_key=(
+                self.sampling.next_rng_key()
+                if self.sampling.config.stochastic
+                else None
+            ),
+        ).reshape(-1)
+        mx.eval(self.draft)
+
+    def _verify(self, *, expected_accepted):
+        self.request.checkpoint()
+        positions = (self.cursor - 1, self.cursor)
+        logits, hidden = self._target(
+            mx.concatenate([self.head, self.draft]),
+            positions,
+            GenerationForwardPhase.VERIFY,
+        )
+        self.request.seal_verified(
+            backbone_tokens=self.request.state.backbone_tokens + 2,
+            mtp_tokens=self.request.state.mtp_tokens,
+        )
+        self.verify_positions = positions
+        self.verify_logits, self.verify_hidden = logits, hidden
+        self.verify_reported = self.sampling.reported_logprobs(
+            logits[:, 0, :].squeeze(0), self.history
+        )
+        sampled = self.sampling.sampling_distribution(self.verify_reported)
+        probability = mx.minimum(
+            mx.exp(sampled[self.draft.item()] - self.draft_logprobs[self.draft.item()]),
+            1.0,
+        )
+        accepted = mx.random.uniform(key=self.sampling.next_rng_key()) < probability
+        mx.eval(accepted)
+        self.accepted = bool(accepted.item())
+        assert self.accepted is expected_accepted
+
+    def _accept_bonus_catchup(self):
+        self.request.commit(
+            backbone_tokens=self.request.state.backbone_tokens + 2,
+            mtp_tokens=self.request.state.mtp_tokens,
+        )
+        accepted = (self.draft.item(), self.verify_reported, True)
+        self.cursor += 1
+        history = mx.concatenate([self.history, self.draft])
+        bonus_reported = self.sampling.reported_logprobs(
+            self.verify_logits[:, 1, :].squeeze(0), history
+        )
+        self.head = self._sample(bonus_reported)
+        mx.eval(self.head, bonus_reported)
+        self.history = mx.concatenate([history, self.head])
+        self.cursor += 1
+        logits = self._mtp(
+            self.verify_hidden,
+            mx.concatenate([self.draft, self.head]),
+            self.verify_positions,
+        )[:, -1, :]
+        self.request.retain(
+            backbone_tokens=self.request.state.backbone_tokens,
+            mtp_tokens=self.request.state.mtp_tokens + 2,
+        )
+        reported = self.sampling.reported_logprobs(logits.squeeze(0), self.history)
+        self.draft_logprobs = self.sampling.sampling_distribution(reported)
+        self.draft = self.sampling.sample(
+            self.draft_logprobs,
+            rng_key=(
+                self.sampling.next_rng_key()
+                if self.sampling.config.stochastic
+                else None
+            ),
+        ).reshape(-1)
+        mx.eval(self.draft)
+        return accepted, (self.head.item(), bonus_reported, False)
+
+    def _reject_replay_redraft(self):
+        self.request.reject_partial(accepted_backbone_tokens=1, accepted_mtp_tokens=0)
+        replay_position = self.cursor - 1
+        _, hidden = self._target(
+            self.head, (replay_position,), GenerationForwardPhase.DECODE
+        )
+        self.request.replay_retained(
+            backbone_tokens=self.request.state.backbone_tokens + 1,
+            mtp_tokens=self.request.state.mtp_tokens,
+        )
+        sampled = self.sampling.sampling_distribution(self.verify_reported)
+        self.head, _ = self.sampling.residual_sample(
+            sampled, self.draft_logprobs, rng_key=self.sampling.next_rng_key()
+        )
+        self.head = self.head.reshape(-1)
+        mx.eval(self.head)
+        self.history = mx.concatenate([self.history, self.head])
+        self.cursor += 1
+        logits = self._mtp(hidden[:, -1:, :], self.head, (replay_position,))[:, -1, :]
+        self.request.retain(
+            backbone_tokens=self.request.state.backbone_tokens,
+            mtp_tokens=self.request.state.mtp_tokens + 1,
+        )
+        reported = self.sampling.reported_logprobs(logits.squeeze(0), self.history)
+        self.draft_logprobs = self.sampling.sampling_distribution(reported)
+        self.draft = self.sampling.sample(
+            self.draft_logprobs,
+            rng_key=(
+                self.sampling.next_rng_key()
+                if self.sampling.config.stochastic
+                else None
+            ),
+        ).reshape(-1)
+        mx.eval(self.draft)
+        return self.head.item(), self.verify_reported, False
 
 
 class _B1PhaseOracle:
@@ -951,6 +1362,192 @@ def test_actual_qwen_mixed_ready_matches_independent_b1_phase_oracle(moe, monkey
     assert generator._draft[3].item() == rejected.draft.item()
     assert mx.array_equal(generator._rng_key[7], accepted.sampling._rng_key).item()
     assert mx.array_equal(generator._rng_key[3], rejected.sampling._rng_key).item()
+
+
+@pytest.mark.parametrize("moe", (False, True))
+def test_actual_qwen_sparse_mixed_lifecycle_matches_independent_b1_oracles(
+    moe, monkeypatch
+):
+    """Sparse B>=2 Ready is identical to the manual B1 sparse transaction."""
+
+    accepted_sampling = NativeMTPSamplingConfig(temperature=0.7, seed=17)
+    rejected_sampling = NativeMTPSamplingConfig(temperature=0.7, seed=29)
+    weights = _shared_qwen_checkpoint(moe=moe)
+    accepted_tokens, accepted_positions = (1, 2, 3), (2, 7, 12)
+    rejected_tokens, rejected_positions = (4, 5), (3, 11)
+    accepted_model = _model(moe=moe)
+    _load_shared_qwen_checkpoint(accepted_model, weights)
+    with monkeypatch.context() as local_monkeypatch:
+        _force_acceptance_uniform(local_monkeypatch, (-1.0,))
+        accepted_b1 = _B1SparsePhaseOracle(
+            accepted_model,
+            accepted_tokens,
+            accepted_positions,
+            accepted_sampling,
+            accepted=True,
+        )
+    rejected_model = _model(moe=moe)
+    _load_shared_qwen_checkpoint(rejected_model, weights)
+    with monkeypatch.context() as local_monkeypatch:
+        _force_acceptance_uniform(local_monkeypatch, (2.0,))
+        rejected_b1 = _B1SparsePhaseOracle(
+            rejected_model,
+            rejected_tokens,
+            rejected_positions,
+            rejected_sampling,
+            accepted=False,
+        )
+
+    model = _model(moe=moe)
+    _load_shared_qwen_checkpoint(model, weights)
+    rows = (
+        NativeMTPRowSpec(
+            7, accepted_tokens, 8, seed=17, sampling_config=accepted_sampling
+        ),
+        NativeMTPRowSpec(
+            3, rejected_tokens, 8, seed=29, sampling_config=rejected_sampling
+        ),
+    )
+    admission = NativeMTPAdmission.create_from_sparse_bootstraps(
+        model,
+        rows,
+        (
+            _actual_sparse_bootstrap(
+                model, accepted_tokens, accepted_positions, chunk_sizes=(1, 2)
+            ),
+            _actual_sparse_bootstrap(
+                model, rejected_tokens, rejected_positions, chunk_sizes=(1, 1)
+            ),
+        ),
+    )
+    generator = NativeMTPBatchGenerator(admission)
+    with monkeypatch.context() as local_monkeypatch:
+        _force_acceptance_uniform(local_monkeypatch, (-1.0, 2.0))
+        initial, initial_epoch = generator.start_sparse()
+        decision = initial_epoch.resume().decide()
+        resolution, continuation = decision.resolve()
+        bonus, bonus_continuation = continuation.resume_after_resolution()
+        ready = bonus_continuation.resume_after_bonus()
+
+    assert decision.accepted_uids == (7,)
+    assert decision.rejected_uids == (3,)
+    for actual, expected in zip(initial, (accepted_b1.initial, rejected_b1.initial)):
+        assert actual.token == expected[0]
+        assert mx.allclose(actual.logprobs, expected[1]).item()
+    resolved = {item.uid: item for item in resolution}
+    assert resolved[7].token == accepted_b1.emissions[0][0]
+    assert resolved[3].token == rejected_b1.emissions[0][0]
+    assert mx.allclose(resolved[7].logprobs, accepted_b1.emissions[0][1]).item()
+    assert mx.allclose(resolved[3].logprobs, rejected_b1.emissions[0][1]).item()
+    assert bonus[0].token == accepted_b1.emissions[1][0]
+    assert mx.allclose(bonus[0].logprobs, accepted_b1.emissions[1][1]).item()
+    assert generator._history[7].tolist() == accepted_b1.history.tolist()
+    assert generator._history[3].tolist() == rejected_b1.history.tolist()
+    assert generator._verify_position_by_uid == {7: (13, 14), 3: (12, 13)}
+    assert generator._logical_cursor == {7: 16, 3: 14}
+    assert generator._logical_cursor == {7: accepted_b1.cursor, 3: rejected_b1.cursor}
+    for uid, oracle in ((7, accepted_b1), (3, rejected_b1)):
+        assert mx.array_equal(generator._rng_key[uid], oracle.sampling._rng_key).item()
+        assert generator._head[uid].item() == oracle.head.item()
+        assert generator._draft[uid].item() == oracle.draft.item()
+        _assert_cohort_offsets_match_b1(ready._generator._cohort, uid, oracle.request)
+        _assert_cohort_recurrent_row_matches_b1(
+            ready._generator._cohort, uid, oracle.request
+        )
+        _assert_cohort_cache_payload_row_matches_b1(
+            ready._generator._cohort, uid, oracle.request
+        )
+    ready.cancel()
+    assert generator.closed
+
+
+@pytest.mark.parametrize("moe", (False, True))
+def test_actual_qwen_sparse_terminal_rows_are_filtered_before_ready_join(
+    moe, monkeypatch
+):
+    """A sparse mixed epoch retains only the non-terminal survivor's owner."""
+
+    weights = _shared_qwen_checkpoint(moe=moe)
+    model = _model(moe=moe)
+    _load_shared_qwen_checkpoint(model, weights)
+    configs = {
+        7: NativeMTPSamplingConfig(temperature=0.7, seed=17),
+        3: NativeMTPSamplingConfig(temperature=0.7, seed=29),
+        11: NativeMTPSamplingConfig(temperature=0.7, seed=43),
+    }
+    values = {
+        7: ((1, 2), (2, 8)),
+        3: ((4, 5), (3, 10)),
+        11: ((6, 7), (4, 12)),
+    }
+    rows = tuple(
+        NativeMTPRowSpec(
+            uid,
+            values[uid][0],
+            2 if uid in (7, 3) else 8,
+            seed=configs[uid].seed,
+            sampling_config=configs[uid],
+        )
+        for uid in (7, 3, 11)
+    )
+    admission = NativeMTPAdmission.create_from_sparse_bootstraps(
+        model,
+        rows,
+        tuple(
+            _actual_sparse_bootstrap(
+                model, values[uid][0], values[uid][1], chunk_sizes=(1, 1)
+            )
+            for uid in (7, 3, 11)
+        ),
+    )
+    generator = NativeMTPBatchGenerator(admission)
+    with monkeypatch.context() as local_monkeypatch:
+        _force_acceptance_uniform(local_monkeypatch, (-1.0, 2.0, -1.0))
+        _, initial = generator.start_sparse()
+        resolution, continuation = initial.resume().decide().resolve()
+        bonus, after_bonus = continuation.resume_after_resolution()
+        ready = after_bonus.resume_after_bonus()
+    by_uid = {item.uid: item for item in resolution}
+    assert by_uid[7].finish_reason == "length"
+    assert by_uid[3].finish_reason == "length"
+    assert tuple(item.uid for item in bonus) == (11,)
+    assert ready.active_uids == (11,)
+    assert ready._generator._cohort.uids == (11,)
+
+
+@pytest.mark.parametrize("moe", (False, True))
+def test_actual_qwen_sparse_partial_admission_failure_consumes_every_bootstrap(
+    moe, monkeypatch
+):
+    """A later B1 MTP-init failure cannot leave a claim or owner reusable."""
+
+    weights = _shared_qwen_checkpoint(moe=moe)
+    model = _model(moe=moe)
+    _load_shared_qwen_checkpoint(model, weights)
+    first = _actual_sparse_bootstrap(model, (1, 2), (2, 8), chunk_sizes=(1, 1))
+    second = _actual_sparse_bootstrap(model, (4, 5), (3, 10), chunk_sizes=(1, 1))
+    original_mtp = model.mtp_forward
+    calls = 0
+
+    def fail_second_mtp(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("injected_sparse_second_mtp_init_failure")
+        return original_mtp(*args, **kwargs)
+
+    rows = (NativeMTPRowSpec(7, (1, 2), 8), NativeMTPRowSpec(3, (4, 5), 8))
+    with monkeypatch.context() as local_monkeypatch:
+        local_monkeypatch.setattr(model, "mtp_forward", fail_second_mtp)
+        with pytest.raises(
+            RuntimeError, match="injected_sparse_second_mtp_init_failure"
+        ):
+            NativeMTPAdmission.create_from_sparse_bootstraps(
+                model, rows, (first, second)
+            )
+    for bootstrap in (first, second):
+        with pytest.raises(RuntimeError, match="already_claimed"):
+            bootstrap.claim(model)
 
 
 @pytest.mark.parametrize("after_bonus", (False, True))
@@ -1304,3 +1901,124 @@ def test_ready_owner_join_failure_poison_closes_and_preserves_primary(monkeypatc
     with pytest.raises(RuntimeError, match="injected_ready_owner_join_failure"):
         after_bonus.resume_after_bonus()
     _assert_mixed_failure_closed(generator, owners, "ready join")
+
+
+@pytest.mark.parametrize("model_type", (_SparseBatchModel, _SparseMoEBatchModel))
+def test_sparse_admission_claims_b1_receipts_then_starts_batched_without_target_replay(
+    model_type,
+):
+    model = model_type()
+    bootstraps = (
+        _sparse_bootstrap(model, (1, 2), (5, 8)),
+        _sparse_bootstrap(model, (4, 5), (11, 14)),
+    )
+    target_calls_before = model.target_calls
+    rows = (
+        NativeMTPRowSpec(7, (1, 2), 8, seed=17),
+        NativeMTPRowSpec(3, (4, 5), 8, seed=29),
+    )
+
+    admission = NativeMTPAdmission.create_from_sparse_bootstraps(
+        model, rows, bootstraps
+    )
+    generator = NativeMTPBatchGenerator(admission)
+    emissions, initial = generator.start_sparse()
+
+    assert [item.uid for item in emissions] == [7, 3]
+    assert initial.phase == "initial"
+    # Sparse admission performs MTP initialization only; sampling initial
+    # heads must retain the receipts' compact final target logits.
+    assert model.target_calls == target_calls_before
+    assert model.mtp_calls == 2
+    # ``start_sparse`` emits the initial head, so each cursor has already
+    # advanced once beyond its bootstrap's attested next logical position.
+    assert generator._logical_cursor == {7: 10, 3: 16}
+    assert admission.cohort.uids == (7, 3)
+
+
+def test_sparse_ready_uses_explicit_per_row_target_position_matrix():
+    model = _SparseBatchModel()
+    rows = (
+        NativeMTPRowSpec(7, (1, 2), 8),
+        NativeMTPRowSpec(3, (4, 5), 8),
+    )
+    generator = NativeMTPBatchGenerator(
+        NativeMTPAdmission.create_from_sparse_bootstraps(
+            model,
+            rows,
+            (
+                _sparse_bootstrap(model, (1, 2), (2, 9)),
+                _sparse_bootstrap(model, (4, 5), (11, 14)),
+            ),
+        )
+    )
+    _, initial = generator.start_sparse()
+    decision = initial.resume().decide()
+
+    assert decision.active_uids == (7, 3)
+    verify = [
+        forward
+        for forward in model.forwards
+        if forward.phase is GenerationForwardPhase.VERIFY
+    ]
+    assert verify[-1].logical_positions == ((10, 11), (15, 16))
+
+
+def test_sparse_admission_uses_original_noncontiguous_successors_and_exact_cursor():
+    model = _SparseBatchModel()
+    cache = model.make_cache()
+    # The successor is intentionally not derived from the sparse token IDs.
+    (_, _), first = attested_target_forward(
+        model,
+        (1,),
+        cache,
+        phase=GenerationForwardPhase.PREFILL,
+        logical_positions=(2,),
+        immediate_successor_token_ids=(6,),
+        model_forward_context=model.generation_forward_context,
+    )
+    (_, _), final = attested_target_forward(
+        model,
+        (6,),
+        cache,
+        phase=GenerationForwardPhase.PREFILL,
+        logical_positions=(9,),
+        immediate_successor_token_ids=(),
+        model_forward_context=model.generation_forward_context,
+    )
+    bootstrap = NativeMTPSparseBootstrap(
+        receipts=(first, final),
+        selected_logical_positions=(2, 9),
+        selected_token_ids=(1, 6),
+        immediate_successor_token_ids=(6,),
+        target_cache=cache,
+        next_logical_position=10,
+    )
+    admission = NativeMTPAdmission.create_from_sparse_bootstraps(
+        model, (NativeMTPRowSpec(9, (1, 6), 8),), (bootstrap,)
+    )
+    generator = NativeMTPBatchGenerator(admission)
+    _, initial = generator.start_sparse()
+    ready = initial.resume()
+
+    mtp_forwards = [
+        forward
+        for forward in model.forwards
+        if forward.phase is GenerationForwardPhase.MTP_DRAFT
+    ]
+    assert mtp_forwards[0].logical_positions == (2,)
+    assert mtp_forwards[-1].logical_positions == (9,)
+    assert generator._logical_cursor == {9: 11}
+    assert ready.active_uids == (9,)
+
+
+def test_sparse_admission_prevalidation_preserves_unclaimed_receipts():
+    model = _SparseBatchModel()
+    first = _sparse_bootstrap(model, (1, 2), (0, 3))
+    second = _sparse_bootstrap(model, (3, 4), (1, 4))
+    # Row metadata is rejected before any bootstrap is claimed or adopted.
+    rows = (NativeMTPRowSpec(1, (1, 2), 8), NativeMTPRowSpec(2, (0,), 8))
+    with pytest.raises(ValueError, match="row_prompt_mismatch"):
+        NativeMTPAdmission.create_from_sparse_bootstraps(model, rows, (first, second))
+    assert first.claim(model).selected_token_ids == (1, 2)
+    assert second.claim(model).selected_token_ids == (3, 4)
