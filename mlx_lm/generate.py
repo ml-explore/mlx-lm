@@ -1619,10 +1619,14 @@ class NativeMTPReadyEpoch(_NativeMTPEpoch):
 
 
 class NativeMTPDecisionEpoch(_NativeMTPEpoch):
-    def accept(self) -> "NativeMTPAcceptedEpoch":
+    def accept(
+        self,
+    ) -> Tuple[Tuple[NativeMTPEmission, ...], "NativeMTPAcceptedEpoch"]:
         return self._generator._accept(self)
 
-    def reject(self) -> "NativeMTPRejectedEpoch":
+    def reject(
+        self,
+    ) -> Tuple[Tuple[NativeMTPEmission, ...], "NativeMTPRejectedEpoch"]:
         return self._generator._reject(self)
 
     def resolve(self):
@@ -2142,7 +2146,7 @@ class NativeMTPBatchGenerator:
         )
         result = NativeMTPAcceptedEpoch(self, _NativeMTPPhase.ACCEPTED, active)
         result._deferred_rejected = epoch.rejected_uids
-        return self._replace(result, "accepted_draft_emission")
+        return emissions, self._replace(result, "accepted_draft_emission")
 
     def _resolve_mixed(self, epoch):
         """Split only after rollback; branch owners never share recurrent state."""
@@ -2441,7 +2445,7 @@ class NativeMTPBatchGenerator:
         active = self._record_emissions(
             _NativeMTPPhase.REJECTED, emissions, expected=epoch.rejected_uids
         )
-        return self._replace(
+        return emissions, self._replace(
             NativeMTPRejectedEpoch(self, _NativeMTPPhase.REJECTED, active),
             "rollback_replay_replacement_emission",
         )

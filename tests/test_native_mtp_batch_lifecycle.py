@@ -288,7 +288,7 @@ def test_public_decision_methods_reject_positional_and_keyword_forgery():
         decision.reject((3,))
     with pytest.raises(TypeError):
         decision.reject(emissions=())
-    accepted = decision.accept()
+    _, accepted = decision.accept()
     with pytest.raises(TypeError):
         accepted.bonus(())
     with pytest.raises(TypeError):
@@ -402,10 +402,80 @@ def test_actual_merged_chunked_prefill_and_all_accepted_round():
     ready = initial.resume()
     decision = ready.decide()
     assert decision.accepted_uids == (7, 3)
-    accepted = decision.accept()
+    _, accepted = decision.accept()
     bonus = accepted.bonus()
     ready = bonus.catch_up()
     assert ready.phase == "ready"
+
+
+def test_public_b1_all_accept_returns_one_resolution_emission_and_epoch():
+    model = _BatchModel()
+    row = NativeMTPRowSpec(7, (1, 2), 8)
+    generator = NativeMTPBatchGenerator(
+        NativeMTPAdmission.create(model, (row,), (_request(model),))
+    )
+
+    initial_emissions, initial = generator.prefill(prefill_step_size=1)
+    decision = initial.resume().decide()
+    emissions, accepted = decision.accept()
+
+    assert len(initial_emissions) == 1
+    assert decision.accepted_uids == (7,)
+    assert decision.rejected_uids == ()
+    assert len(emissions) == 1
+    assert emissions[0].uid == 7
+    assert emissions[0].token == generator._draft[7].item()
+    assert emissions[0].from_draft is True
+    assert emissions[0].finish_reason is None
+    assert accepted.phase == "accepted"
+    assert accepted.active_uids == (7,)
+
+
+def test_public_b1_all_reject_returns_one_resolution_emission_and_epoch(monkeypatch):
+    sampling = NativeMTPSamplingConfig(temperature=0.7, seed=17)
+    model = _BatchModel()
+    row = NativeMTPRowSpec(7, (1, 2), 8, seed=17, sampling_config=sampling)
+    generator = NativeMTPBatchGenerator(
+        NativeMTPAdmission.create(model, (row,), (_request(model),))
+    )
+
+    with monkeypatch.context() as local_monkeypatch:
+        _force_acceptance_uniform(local_monkeypatch, (2.0,))
+        _, initial = generator.prefill(prefill_step_size=1)
+        decision = initial.resume().decide()
+        emissions, rejected = decision.reject()
+
+    assert decision.accepted_uids == ()
+    assert decision.rejected_uids == (7,)
+    assert len(emissions) == 1
+    assert emissions[0].uid == 7
+    assert emissions[0].token == generator._replacement[7].item()
+    assert emissions[0].from_draft is False
+    assert emissions[0].finish_reason is None
+    assert rejected.phase == "rejected"
+    assert rejected.active_uids == (7,)
+
+
+@pytest.mark.parametrize("accepted", (True, False))
+def test_public_b1_terminal_resolution_emission_is_returned(accepted, monkeypatch):
+    sampling = NativeMTPSamplingConfig(temperature=0.7, seed=17)
+    model = _BatchModel()
+    row = NativeMTPRowSpec(7, (1, 2), 2, seed=17, sampling_config=sampling)
+    generator = NativeMTPBatchGenerator(
+        NativeMTPAdmission.create(model, (row,), (_request(model),))
+    )
+
+    with monkeypatch.context() as local_monkeypatch:
+        _force_acceptance_uniform(local_monkeypatch, ((-1.0,) if accepted else (2.0,)))
+        _, initial = generator.prefill(prefill_step_size=1)
+        decision = initial.resume().decide()
+        emissions, epoch = decision.accept() if accepted else decision.reject()
+
+    assert len(emissions) == 1
+    assert emissions[0].uid == 7
+    assert emissions[0].from_draft is accepted
+    assert emissions[0].finish_reason == "length"
+    assert epoch.active_uids == ()
 
 
 def test_bonus_uses_verified_target_logits_not_hidden_width():
@@ -419,7 +489,8 @@ def test_bonus_uses_verified_target_logits_not_hidden_width():
     )
     _, initial = generator.prefill(prefill_step_size=2)
     decision = initial.resume().decide()
-    bonus = decision.accept().bonus()
+    _, accepted = decision.accept()
+    bonus = accepted.bonus()
     # The tiny model's hidden width is 2 while its vocabulary is 7.  These
     # values can only be correct when bonus sampling reads verify logits[:, 1].
     assert bonus.active_uids == (7, 3)
@@ -462,7 +533,8 @@ def test_uid_rng_uses_post_initial_b1_sequential_draw_chain():
     )
     _, initial = generator.prefill(prefill_step_size=2)
     decision = initial.resume().decide()
-    decision.accept().bonus()
+    _, accepted = decision.accept()
+    accepted.bonus()
 
     # B=1 draws initial, draft, acceptance, then accepted bonus.  The retained
     # key remains UID-owned, so cohort reordering cannot affect this chain.
