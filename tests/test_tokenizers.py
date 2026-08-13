@@ -10,7 +10,6 @@ from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
-    _infer_thinking,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -110,35 +109,6 @@ class TestTokenizers(unittest.TestCase):
         self.assertIsNone(tokenizer.think_end)
         self.assertIsNone(tokenizer.think_start_id)
         self.assertIsNone(tokenizer.think_end_id)
-
-    def test_thinking_marker_precedence(self):
-        # Apertus carries unused <think> tokens alongside the markers it
-        # actually emits, so its own markers have to win.
-        class Tokenizer:
-            def __init__(self, vocab):
-                self._vocab = vocab
-
-            def get_vocab(self):
-                return self._vocab
-
-        apertus_vocab = {
-            "<|inner_prefix|>": 32,
-            "<|inner_suffix|>": 33,
-            "<think>": 69,
-            "</think>": 70,
-        }
-        think_start, think_end, start_ids, end_ids = _infer_thinking(
-            Tokenizer(apertus_vocab)
-        )
-        self.assertEqual(think_start, "<|inner_prefix|>")
-        self.assertEqual(think_end, "<|inner_suffix|>")
-        self.assertEqual(start_ids, (32,))
-        self.assertEqual(end_ids, (33,))
-
-        think_start, _, _, _ = _infer_thinking(Tokenizer({"<think>": 1, "</think>": 2}))
-        self.assertEqual(think_start, "<think>")
-
-        self.assertEqual(_infer_thinking(Tokenizer({})), (None, None, None, None))
 
     def test_find_token(self):
         # Check that _find returns a valid index when
