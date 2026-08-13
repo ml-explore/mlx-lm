@@ -294,9 +294,12 @@ class TestGenerate(unittest.TestCase):
         num_toks = [2, 3, 4, 5]
         uids = gen.insert(prompts, max_tokens=num_toks)
         batch_responses = {uid: [] for uid in uids}
+        finished = {}
         while responses := gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    finished[r.uid] = r
 
         # Do a test for each prompt the logits are close
         for e, prompt in enumerate(prompts):
@@ -312,6 +315,10 @@ class TestGenerate(unittest.TestCase):
 
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
+
+            # The ledger matches the cache: the prompt, then exactly the tokens
+            # generated for it.
+            self.assertEqual(finished[uids[e]].all_tokens, list(prompt) + batch_tokens)
 
     def test_batch_sliding_window(self):
         prompts = [
