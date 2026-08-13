@@ -15,6 +15,10 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache, NativeMTPRequestCache
 from .gated_delta import gated_delta_update
+from .generation_context import (
+    consume_generation_positions,
+    generation_forward_context,
+)
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
@@ -157,8 +161,16 @@ class GatedDeltaNet(nn.Module):
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
+
+        # Gated-delta recurrence has no absolute-position transform: its state
+        # evolves with the ordered token stream.  Still accept and validate the
+        # same matrix that attention consumes, so a batched logical-position
+        # context cannot be accidentally applied to only part of a Qwen block.
+        if position_ids is not None and tuple(position_ids.shape) != (B, S):
+            raise ValueError("qwen_position_ids_shape_mismatch")
 
         if self.sharding_group is not None:
             inputs = sum_gradients(self.sharding_group)(inputs)
@@ -253,11 +265,16 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, position_ids=position_ids
+            )
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            r = self.self_attn(
+                self.input_layernorm(x), mask, cache, position_ids=position_ids
+            )
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
@@ -289,8 +306,11 @@ class MTPDecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        h = x + self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + self.self_attn(
+            self.input_layernorm(x), mask, cache, position_ids=position_ids
+        )
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
@@ -316,6 +336,7 @@ class MTPModule(nn.Module):
         next_token_ids: mx.array,
         embed_tokens: nn.Embedding,
         cache: Optional[List[Any]] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if cache is None:
             cache = [None] * len(self.layers)
@@ -327,7 +348,7 @@ class MTPModule(nn.Module):
         states = self.fc(mx.concatenate([embeddings, hidden_states], axis=-1))
         mask = create_attention_mask(states, cache[0]) if cache else None
         for layer, layer_cache in zip(self.layers, cache):
-            states = layer(states, mask, layer_cache)
+            states = layer(states, mask, layer_cache, position_ids=position_ids)
         return self.norm(states)
 
 
@@ -360,6 +381,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
         return_pre_norm: bool = False,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if return_pre_norm and self.pipeline_size != 1:
             raise RuntimeError(
@@ -389,7 +411,12 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states,
+                mask=mask,
+                cache=c,
+                position_ids=position_ids,
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -435,6 +462,7 @@ class TextModel(nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
         return_hidden: bool = False,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if return_hidden and not self.supports_mtp:
             raise RuntimeError(self.mtp_capability.reason)
@@ -444,10 +472,16 @@ class TextModel(nn.Module):
                 cache,
                 input_embeddings=input_embeddings,
                 return_pre_norm=True,
+                position_ids=position_ids,
             )
             out = self.model.norm(hidden)
         else:
-            out = self.model(inputs, cache, input_embeddings=input_embeddings)
+            out = self.model(
+                inputs,
+                cache,
+                input_embeddings=input_embeddings,
+                position_ids=position_ids,
+            )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -495,11 +529,16 @@ class TextModel(nn.Module):
         hidden_states: mx.array,
         next_token_ids: mx.array,
         mtp_cache: List[Any],
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         """Project an MTP step through the backbone's shared output head."""
         self._require_mtp()
         states = self.mtp(
-            hidden_states, next_token_ids, self.model.embed_tokens, mtp_cache
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            mtp_cache,
+            position_ids=position_ids,
         )
         if self.args.tie_word_embeddings:
             return self.model.embed_tokens.as_linear(states)
@@ -725,6 +764,11 @@ class ModelArgs(BaseModelArgs):
 
 
 class Model(nn.Module):
+    # Public model-owned hook selected by native MTP when logical positions
+    # are active.  ``staticmethod`` preserves the canonical callable identity
+    # used to reject a conflicting external consumer.
+    generation_forward_context = staticmethod(generation_forward_context)
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -738,11 +782,17 @@ class Model(nn.Module):
         input_embeddings: Optional[mx.array] = None,
         return_hidden: bool = False,
     ):
+        positions = consume_generation_positions(self, cache, inputs, mtp=False)
+        if positions is not None:
+            positions = mx.array(positions, dtype=mx.uint32)
+            if positions.ndim == 1:
+                positions = positions[None]
         return self.language_model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             return_hidden=return_hidden,
+            position_ids=positions,
         )
 
     @property
@@ -934,7 +984,16 @@ class Model(nn.Module):
         next_token_ids: mx.array,
         mtp_cache: List[Any],
     ) -> mx.array:
-        return self.language_model.mtp_forward(hidden_states, next_token_ids, mtp_cache)
+        positions = consume_generation_positions(
+            self, mtp_cache, next_token_ids, mtp=True
+        )
+        if positions is not None:
+            positions = mx.array(positions, dtype=mx.uint32)
+            if positions.ndim == 1:
+                positions = positions[None]
+        return self.language_model.mtp_forward(
+            hidden_states, next_token_ids, mtp_cache, position_ids=positions
+        )
 
     def make_mtp_cache(self) -> List[KVCache]:
         return self.language_model.make_mtp_cache()

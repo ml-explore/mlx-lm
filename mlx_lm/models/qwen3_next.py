@@ -123,6 +123,7 @@ class Qwen3NextAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -142,13 +143,31 @@ class Qwen3NextAttention(nn.Module):
             0, 2, 1, 3
         )
 
-        if cache is not None:
+        if position_ids is not None:
+            if tuple(position_ids.shape) != (B, L):
+                raise ValueError("qwen_position_ids_shape_mismatch")
+
+            # ``rope`` supports a batch-vector offset, not an arbitrary BxS
+            # matrix.  Flatten BxS tokens into a B*S batch of one-token calls
+            # so every row/column receives its exact logical position in one
+            # device graph, without a host loop or per-row realization.
+            def apply_positions(values):
+                heads, width = values.shape[1], values.shape[-1]
+                flattened = values.transpose(0, 2, 1, 3).reshape(B * L, heads, 1, width)
+                rotated = self.rope(flattened, offset=position_ids.reshape(B * L))
+                return rotated.reshape(B, L, heads, width).transpose(0, 2, 1, 3)
+
+            queries = apply_positions(queries)
+            keys = apply_positions(keys)
+        elif cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask

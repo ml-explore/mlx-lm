@@ -12,12 +12,19 @@ import pytest
 from mlx.utils import tree_flatten
 
 from mlx_lm.generate import (
+    GenerationForward,
     GenerationForwardPhase,
+    GenerationForwardPositionAck,
     NativeMTPSparseBootstrap,
     attested_target_forward,
+    mtp_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import NativeMTPRequestCache
+from mlx_lm.models.cache import ArraysCache, KVCache, NativeMTPRequestCache
+from mlx_lm.models.generation_context import (
+    consume_generation_positions,
+    generation_forward_context,
+)
 
 HIDDEN = 32
 INTERMEDIATE = 64
@@ -199,6 +206,97 @@ def _sanitize_and_load(model, weights):
     return sanitized
 
 
+def _positioned_target(model, inputs, cache, positions):
+    ack = GenerationForwardPositionAck(
+        positions,
+        model=model,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=positions,
+        logical_position_ack=ack,
+    )
+    with generation_forward_context(forward):
+        ack._activate()
+        try:
+            result = model(inputs, cache=cache, return_hidden=True)
+            ack._require_acknowledged()
+            return result
+        finally:
+            ack._finish()
+
+
+def _positioned_mtp(model, hidden, next_tokens, cache, positions):
+    ack = GenerationForwardPositionAck(
+        positions,
+        model=model,
+        cache=cache,
+        phase=GenerationForwardPhase.MTP_DRAFT,
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=next_tokens,
+        cache=cache,
+        phase=GenerationForwardPhase.MTP_DRAFT,
+        logical_positions=positions,
+        logical_position_ack=ack,
+    )
+    with generation_forward_context(forward):
+        ack._activate()
+        try:
+            result = model.mtp_forward(hidden, next_tokens, cache)
+            ack._require_acknowledged()
+            return result
+        finally:
+            ack._finish()
+
+
+def _assert_float_payload_matches(actual, expected):
+    # Batched and B=1 matmuls may differ in accumulation order by ~1e-6.
+    assert mx.allclose(actual, expected, rtol=1e-4, atol=1e-5).item()
+
+
+def _assert_batched_cache_matches_independent_rows(batched, independent_rows):
+    """Compare active cache payloads and recurrent metadata, row by row."""
+
+    assert len(batched) == len(independent_rows[0])
+    for entry_index, batched_entry in enumerate(batched):
+        row_entries = [row[entry_index] for row in independent_rows]
+        assert all(type(row_entry) is type(batched_entry) for row_entry in row_entries)
+        if isinstance(batched_entry, ArraysCache):
+            for state_index, value in enumerate(batched_entry.cache):
+                if value is None:
+                    assert all(row.cache[state_index] is None for row in row_entries)
+                else:
+                    for row_index, row in enumerate(row_entries):
+                        _assert_float_payload_matches(
+                            value[row_index : row_index + 1], row.cache[state_index]
+                        )
+            for name in ("left_padding", "lengths"):
+                value = getattr(batched_entry, name)
+                if value is None:
+                    assert all(getattr(row, name) is None for row in row_entries)
+                else:
+                    for row_index, row in enumerate(row_entries):
+                        assert mx.array_equal(
+                            value[row_index : row_index + 1], getattr(row, name)
+                        ).item()
+            continue
+        assert isinstance(batched_entry, KVCache)
+        assert all(row.offset == batched_entry.offset for row in row_entries)
+        for name in ("keys", "values"):
+            value = getattr(batched_entry, name)
+            for row_index, row in enumerate(row_entries):
+                _assert_float_payload_matches(
+                    value[row_index : row_index + 1], getattr(row, name)
+                )
+
+
 @contextmanager
 def _acknowledging_forward_context(forward):
     token = _ACTIVE_FORWARD.set(forward)
@@ -224,6 +322,20 @@ class _StreamTokenizer:
     def __init__(self):
         self.detokenizer = _StreamDetokenizer()
         self.eos_token_ids = frozenset()
+        self.eos_token_id = 0
+        self.chat_template = None
+
+    @staticmethod
+    def get_vocab():
+        return {}
+
+    @staticmethod
+    def encode(_text, *, add_special_tokens=False):
+        return [1]
+
+    @staticmethod
+    def decode(tokens):
+        return "".join(str(token) for token in tokens)
 
 
 def _sparse_bootstrap(model):
@@ -235,7 +347,7 @@ def _sparse_bootstrap(model):
         phase=GenerationForwardPhase.PREFILL,
         logical_positions=(0, 1),
         immediate_successor_token_ids=(1,),
-        model_forward_context=_acknowledging_forward_context,
+        model_forward_context=model.generation_forward_context,
     )
     return NativeMTPSparseBootstrap(
         receipts=(receipt,),
@@ -391,7 +503,6 @@ def test_outer_dense_and_moe_sparse_bootstrap_stream_adopts_outer_topology(
             mtp=True,
             max_tokens=1,
             sparse_bootstrap=bootstrap,
-            model_forward_context=_acknowledging_forward_context,
         )
     )
 
@@ -572,3 +683,449 @@ def test_pipeline_parallelism_remains_ineligible():
     assert model.mtp_capability.reason == "native_mtp_pipeline_parallelism_unsupported"
     with pytest.raises(RuntimeError, match="pipeline_parallelism_unsupported"):
         model.make_mtp_cache()
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_batched_position_matrix_matches_independent_rows_for_target_and_mtp(moe):
+    """A real B=2 graph honours unequal, non-contiguous row positions."""
+
+    model = _model(moe=moe)
+    _sanitize_and_load(model, _checkpoint(model, moe=moe))
+    inputs = mx.array(((3, 7), (11, 5)), dtype=mx.uint32)
+    positions = ((5, 19), (103, 701))
+
+    batched_cache = model.make_cache()
+    batched_logits, batched_hidden = _positioned_target(
+        model, inputs, batched_cache, positions
+    )
+    assert batched_cache[-1].offset == inputs.shape[1]
+
+    single_targets = []
+    single_hidden = []
+    single_backbone_caches = []
+    for row, row_positions in zip(inputs, positions):
+        row_cache = model.make_cache()
+        logits, hidden = _positioned_target(model, row[None], row_cache, row_positions)
+        single_targets.append(logits)
+        single_hidden.append(hidden)
+        single_backbone_caches.append(row_cache)
+        assert row_cache[-1].offset == inputs.shape[1]
+    _assert_float_payload_matches(
+        batched_logits, mx.concatenate(single_targets, axis=0)
+    )
+    _assert_float_payload_matches(batched_hidden, mx.concatenate(single_hidden, axis=0))
+    _assert_batched_cache_matches_independent_rows(
+        batched_cache, single_backbone_caches
+    )
+
+    next_tokens = mx.array(((17, 23), (29, 31)), dtype=mx.uint32)
+    batched_mtp_cache = model.make_mtp_cache()
+    batched_mtp = _positioned_mtp(
+        model, batched_hidden, next_tokens, batched_mtp_cache, positions
+    )
+    assert batched_mtp_cache[-1].offset == next_tokens.shape[1]
+
+    single_mtp = []
+    single_mtp_caches = []
+    for index, row_positions in enumerate(positions):
+        row_mtp_cache = model.make_mtp_cache()
+        logits = _positioned_mtp(
+            model,
+            single_hidden[index],
+            next_tokens[index : index + 1],
+            row_mtp_cache,
+            row_positions,
+        )
+        single_mtp.append(logits)
+        single_mtp_caches.append(row_mtp_cache)
+        assert row_mtp_cache[-1].offset == next_tokens.shape[1]
+    _assert_float_payload_matches(batched_mtp, mx.concatenate(single_mtp, axis=0))
+    _assert_batched_cache_matches_independent_rows(batched_mtp_cache, single_mtp_caches)
+
+    # A later decode must retain both numerical outputs and every active cache
+    # payload after the heterogeneous first-position matrix.
+    continuation = mx.array(((37,), (43,)), dtype=mx.uint32)
+    continuation_positions = ((1003,), (9007,))
+    continued_logits, continued_hidden = _positioned_target(
+        model, continuation, batched_cache, continuation_positions
+    )
+    row_continued_logits = []
+    row_continued_hidden = []
+    for index, row_positions in enumerate(continuation_positions):
+        logits, hidden = _positioned_target(
+            model,
+            continuation[index : index + 1],
+            single_backbone_caches[index],
+            row_positions,
+        )
+        row_continued_logits.append(logits)
+        row_continued_hidden.append(hidden)
+    _assert_float_payload_matches(
+        continued_logits, mx.concatenate(row_continued_logits, axis=0)
+    )
+    _assert_float_payload_matches(
+        continued_hidden, mx.concatenate(row_continued_hidden, axis=0)
+    )
+    assert batched_cache[-1].offset == 3
+    _assert_batched_cache_matches_independent_rows(
+        batched_cache, single_backbone_caches
+    )
+
+    continued_mtp_tokens = mx.array(((47,), (53,)), dtype=mx.uint32)
+    continued_mtp = _positioned_mtp(
+        model,
+        continued_hidden,
+        continued_mtp_tokens,
+        batched_mtp_cache,
+        continuation_positions,
+    )
+    row_continued_mtp = []
+    for index, row_positions in enumerate(continuation_positions):
+        row_continued_mtp.append(
+            _positioned_mtp(
+                model,
+                row_continued_hidden[index],
+                continued_mtp_tokens[index : index + 1],
+                single_mtp_caches[index],
+                row_positions,
+            )
+        )
+    _assert_float_payload_matches(
+        continued_mtp, mx.concatenate(row_continued_mtp, axis=0)
+    )
+    assert batched_mtp_cache[-1].offset == 3
+    _assert_batched_cache_matches_independent_rows(batched_mtp_cache, single_mtp_caches)
+
+
+@pytest.mark.parametrize("moe", [False, True])
+def test_positioned_qwen_target_and_mtp_are_sensitive_to_each_row_position(moe):
+    """Prevent a B=2 position-matrix acknowledgement from becoming a no-op."""
+
+    model = _model(moe=moe)
+    _sanitize_and_load(model, _checkpoint(model, moe=moe))
+    inputs = mx.array(((3, 7), (11, 5)), dtype=mx.uint32)
+    heterogeneous = ((5, 19), (103, 701))
+    shifted = ((17, 47), (127, 761))
+
+    first_target_cache = model.make_cache()
+    first_logits, first_hidden = _positioned_target(
+        model, inputs, first_target_cache, heterogeneous
+    )
+    second_target_cache = model.make_cache()
+    second_logits, second_hidden = _positioned_target(
+        model, inputs, second_target_cache, shifted
+    )
+
+    # The tiny real-Qwen fixture changes logits by about 1e-6.  Active KV keys
+    # are the direct positional-consumption oracle; exact output inequality
+    # still proves the position matrix reaches the target calculation.
+    assert not mx.array_equal(first_logits, second_logits).item()
+    assert not mx.array_equal(first_hidden, second_hidden).item()
+    assert not mx.array_equal(
+        first_target_cache[-1].keys, second_target_cache[-1].keys
+    ).item()
+
+    next_tokens = mx.array(((17, 23), (29, 31)), dtype=mx.uint32)
+    first_mtp_cache = model.make_mtp_cache()
+    first_mtp_logits = _positioned_mtp(
+        model, first_hidden, next_tokens, first_mtp_cache, heterogeneous
+    )
+    second_mtp_cache = model.make_mtp_cache()
+    second_mtp_logits = _positioned_mtp(
+        model, first_hidden, next_tokens, second_mtp_cache, shifted
+    )
+
+    # Qwen's native MTP topology is attention-only, so its active keys are an
+    # independent direct oracle that the MTP context consumed the matrix too.
+    assert not mx.array_equal(first_mtp_logits, second_mtp_logits).item()
+    assert not mx.array_equal(
+        first_mtp_cache[-1].keys, second_mtp_cache[-1].keys
+    ).item()
+
+
+@pytest.mark.parametrize(
+    ("positions", "message"),
+    (
+        ((1, 2), "batch_requires_matrix"),
+        (((1, 2), (3,)), "matrix_ragged"),
+        (((1, 2, 3), (4, 5, 6)), "input_shape_mismatch"),
+        (((1, -2), (3, 4)), "value_invalid"),
+        (((1, True), (3, 4)), "value_invalid"),
+        (((1, "two"), (3, 4)), "value_invalid"),
+    ),
+)
+def test_batched_position_matrix_rejects_broadcast_ragged_and_malformed_inputs(
+    positions, message
+):
+    with pytest.raises(ValueError, match=message):
+        GenerationForward(
+            model=object(),
+            input_tokens=mx.zeros((2, 2), dtype=mx.uint32),
+            cache=[],
+            phase=GenerationForwardPhase.VERIFY,
+            logical_positions=positions,
+        )
+
+
+def test_position_ack_is_one_shot_and_context_resets_after_model_error():
+    model = _model()
+    _sanitize_and_load(model, _checkpoint(model))
+    inputs = mx.array(((3,),), dtype=mx.uint32)
+    cache = model.make_cache()
+    ack = GenerationForwardPositionAck(
+        (37,), model=model, cache=cache, phase=GenerationForwardPhase.VERIFY
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=(37,),
+        logical_position_ack=ack,
+    )
+    with generation_forward_context(forward):
+        ack._activate()
+        try:
+            model(inputs, cache=cache, return_hidden=True)
+            with pytest.raises(RuntimeError, match="ack_reused"):
+                ack.acknowledge((37,))
+        finally:
+            ack._finish()
+
+    # A failing scoped call must not leak positions into the next unscoped call.
+    with pytest.raises(RuntimeError, match="forced position-context failure"):
+        with generation_forward_context(forward):
+            raise RuntimeError("forced position-context failure")
+    fresh_cache = model.make_cache()
+    logits = model(inputs, cache=fresh_cache)
+    assert logits.shape[:2] == (1, 1)
+
+
+def test_single_row_rejects_matrix_form_before_the_model_is_called():
+    with pytest.raises(ValueError, match="single_row_requires_vector"):
+        GenerationForward(
+            model=object(),
+            input_tokens=mx.zeros((1, 2), dtype=mx.uint32),
+            cache=[],
+            phase=GenerationForwardPhase.VERIFY,
+            logical_positions=((1, 2),),
+        )
+
+
+def test_position_context_rejects_model_cache_phase_and_capability_mismatches():
+    model = _model()
+    other_model = _model()
+    _sanitize_and_load(model, _checkpoint(model))
+    _sanitize_and_load(other_model, _checkpoint(other_model))
+    inputs = mx.array(((3,),), dtype=mx.uint32)
+    cache = model.make_cache()
+    ack = GenerationForwardPositionAck(
+        (11,), model=model, cache=cache, phase=GenerationForwardPhase.VERIFY
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=(11,),
+        logical_position_ack=ack,
+    )
+
+    with generation_forward_context(forward):
+        ack._activate()
+        try:
+            with pytest.raises(RuntimeError, match="model_mismatch"):
+                other_model(inputs, cache=cache, return_hidden=True)
+        finally:
+            ack._finish()
+
+    wrong_cache = model.make_cache()
+    ack = GenerationForwardPositionAck(
+        (11,), model=model, cache=cache, phase=GenerationForwardPhase.VERIFY
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=(11,),
+        logical_position_ack=ack,
+    )
+    with generation_forward_context(forward):
+        ack._activate()
+        try:
+            with pytest.raises(RuntimeError, match="cache_mismatch"):
+                model(inputs, cache=wrong_cache, return_hidden=True)
+        finally:
+            ack._finish()
+
+    mtp_cache = model.make_mtp_cache()
+    phase_ack = GenerationForwardPositionAck(
+        (11,), model=model, cache=mtp_cache, phase=GenerationForwardPhase.VERIFY
+    )
+    phase_forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=mtp_cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=(11,),
+        logical_position_ack=phase_ack,
+    )
+    with generation_forward_context(phase_forward):
+        phase_ack._activate()
+        try:
+            with pytest.raises(RuntimeError, match="phase_mismatch"):
+                model.mtp_forward(mx.zeros((1, 1, HIDDEN)), inputs, mtp_cache)
+        finally:
+            phase_ack._finish()
+
+    capability_ack = GenerationForwardPositionAck(
+        (11,), model=model, cache=cache, phase=GenerationForwardPhase.VERIFY
+    )
+    capability_forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=(11,),
+        logical_position_ack=capability_ack,
+    )
+    model.language_model._mtp_weights_loaded = False
+    try:
+        with generation_forward_context(capability_forward):
+            capability_ack._activate()
+            try:
+                with pytest.raises(RuntimeError, match="capability_mismatch"):
+                    model(inputs, cache=cache, return_hidden=True)
+            finally:
+                capability_ack._finish()
+    finally:
+        model.language_model._mtp_weights_loaded = True
+
+
+def test_activated_model_error_resets_the_position_context():
+    class ExplodingModel:
+        generation_forward_context = staticmethod(generation_forward_context)
+
+        def __call__(self, inputs, *, cache):
+            consume_generation_positions(self, cache, inputs, mtp=False)
+            raise RuntimeError("forced model failure")
+
+    model = ExplodingModel()
+    inputs = mx.array(((3,),), dtype=mx.uint32)
+    cache = []
+    ack = GenerationForwardPositionAck(
+        (11,), model=model, cache=cache, phase=GenerationForwardPhase.VERIFY
+    )
+    forward = GenerationForward(
+        model=model,
+        input_tokens=inputs,
+        cache=cache,
+        phase=GenerationForwardPhase.VERIFY,
+        logical_positions=(11,),
+        logical_position_ack=ack,
+    )
+    with pytest.raises(RuntimeError, match="forced model failure"):
+        with generation_forward_context(forward):
+            ack._activate()
+            try:
+                model(inputs, cache=cache)
+            finally:
+                ack._finish()
+
+    # The following unscoped call proves the failing active context was reset.
+    with pytest.raises(RuntimeError, match="forced model failure"):
+        model(inputs, cache=[])
+
+
+def test_position_matrix_rope_path_has_no_host_row_extraction_or_sync():
+    import inspect
+    from mlx_lm.models.qwen3_next import Qwen3NextAttention
+
+    source = inspect.getsource(Qwen3NextAttention.__call__)
+    assert "B * L" in source
+    assert ".item(" not in source
+    assert ".tolist(" not in source
+    assert "for row" not in source
+
+
+def test_single_row_vector_is_compatible_with_the_existing_dense_call_shape():
+    model = _model()
+    _sanitize_and_load(model, _checkpoint(model))
+    inputs = mx.array(((3, 7),), dtype=mx.uint32)
+
+    ordinary_cache = model.make_cache()
+    ordinary_logits, ordinary_hidden = model(
+        inputs, cache=ordinary_cache, return_hidden=True
+    )
+    positioned_cache = model.make_cache()
+    positioned_logits, positioned_hidden = _positioned_target(
+        model, inputs, positioned_cache, (0, 1)
+    )
+
+    _assert_float_payload_matches(ordinary_logits, positioned_logits)
+    _assert_float_payload_matches(ordinary_hidden, positioned_hidden)
+    assert ordinary_cache[-1].offset == positioned_cache[-1].offset == 2
+
+
+def test_positioned_mtp_generate_uses_qwen_context_without_manual_ack():
+    model = _model()
+    _sanitize_and_load(model, _checkpoint(model))
+    telemetry = {}
+
+    output = list(
+        mtp_generate_step(
+            mx.array((3, 7), dtype=mx.uint32),
+            model,
+            max_tokens=1,
+            telemetry=telemetry,
+            prompt_logical_positions=(41, 97),
+        )
+    )
+
+    assert len(output) == 1
+    assert telemetry["mtp_bypass_reason"] is None
+
+
+def test_positioned_stream_generate_uses_qwen_context_without_callback(monkeypatch):
+    model = _model()
+    _sanitize_and_load(model, _checkpoint(model))
+    generate_module = importlib.import_module("mlx_lm.generate")
+    monkeypatch.setattr(generate_module, "TokenizerWrapper", _StreamTokenizer)
+    tokenizer = _StreamTokenizer()
+
+    output = list(
+        stream_generate(
+            model,
+            tokenizer,
+            mx.array((3, 7), dtype=mx.uint32),
+            mtp=True,
+            max_tokens=1,
+            prompt_logical_positions=(41, 97),
+        )
+    )
+
+    assert output[-1].mtp_bypass_reason is None
+    assert tokenizer.detokenizer.finalized
+
+
+def test_positioned_qwen_rejects_manual_ack_context_as_ambiguous_before_forward():
+    model = _model()
+    _sanitize_and_load(model, _checkpoint(model))
+
+    @contextmanager
+    def manual_ack(forward):
+        if forward.logical_position_ack is not None:
+            forward.logical_position_ack.acknowledge(forward.logical_positions)
+        yield
+
+    with pytest.raises(ValueError, match="native_mtp_position_context_ambiguous"):
+        list(
+            mtp_generate_step(
+                mx.array((3, 7), dtype=mx.uint32),
+                model,
+                max_tokens=1,
+                prompt_logical_positions=(41, 97),
+                model_forward_context=manual_ack,
+            )
+        )

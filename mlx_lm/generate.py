@@ -79,6 +79,58 @@ class GenerationForwardPhase(str, Enum):
     MTP_DRAFT = "mtp_draft"
 
 
+LogicalPositionVector = Tuple[int, ...]
+LogicalPositionMatrix = Tuple[LogicalPositionVector, ...]
+GenerationLogicalPositions = Union[LogicalPositionVector, LogicalPositionMatrix]
+
+
+def _logical_position_shape(
+    logical_positions: GenerationLogicalPositions,
+) -> Tuple[int, int]:
+    """Validate immutable host positions and return their exact ``(B, S)``.
+
+    A legacy vector is deliberately only valid for a single row.  Batched
+    callers must supply one explicit immutable row per input batch entry, so a
+    shared row can never be silently broadcast over another request.
+    """
+
+    if not isinstance(logical_positions, tuple) or not logical_positions:
+        raise ValueError("generation_logical_positions_required")
+    first = logical_positions[0]
+    if isinstance(first, tuple):
+        rows = logical_positions
+        if not rows or any(not isinstance(row, tuple) or not row for row in rows):
+            raise ValueError("generation_logical_position_matrix_ragged")
+        sequence_length = len(rows[0])
+        if any(len(row) != sequence_length for row in rows):
+            raise ValueError("generation_logical_position_matrix_ragged")
+        values = (position for row in rows for position in row)
+        shape = (len(rows), sequence_length)
+    else:
+        values = iter(logical_positions)
+        shape = (1, len(logical_positions))
+    if any(
+        isinstance(position, bool) or not isinstance(position, int) or position < 0
+        for position in values
+    ):
+        raise ValueError("generation_logical_position_value_invalid")
+    return shape
+
+
+def _validate_logical_positions_for_input(
+    logical_positions: GenerationLogicalPositions, input_shape: Tuple[int, ...]
+) -> None:
+    if len(input_shape) != 2:
+        raise ValueError("generation_logical_position_input_rank_invalid")
+    if input_shape[0] > 1 and not isinstance(logical_positions[0], tuple):
+        raise ValueError("generation_logical_position_batch_requires_matrix")
+    if input_shape[0] == 1 and isinstance(logical_positions[0], tuple):
+        raise ValueError("generation_logical_position_single_row_requires_vector")
+    position_shape = _logical_position_shape(logical_positions)
+    if position_shape != input_shape:
+        raise ValueError("generation_logical_position_input_shape_mismatch")
+
+
 @dataclass(frozen=True)
 class GenerationForward:
     """Immutable metadata for one Python model-call graph construction.
@@ -93,8 +145,22 @@ class GenerationForward:
     cache: Any
     phase: GenerationForwardPhase
     input_embeddings: Optional[mx.array] = None
-    logical_positions: Optional[Tuple[int, ...]] = None
+    logical_positions: Optional[GenerationLogicalPositions] = None
     logical_position_ack: Optional["GenerationForwardPositionAck"] = None
+
+    def __post_init__(self):
+        if self.logical_positions is not None:
+            _validate_logical_positions_for_input(
+                self.logical_positions, tuple(self.input_tokens.shape)
+            )
+            if self.logical_position_ack is not None and (
+                self.logical_position_ack._logical_positions != self.logical_positions
+                or self.logical_position_ack._position_shape
+                != tuple(self.input_tokens.shape)
+            ):
+                raise ValueError("generation_logical_position_ack_binding_mismatch")
+        elif self.logical_position_ack is not None:
+            raise ValueError("generation_logical_position_ack_requires_positions")
 
 
 @dataclass(frozen=True)
@@ -345,7 +411,7 @@ class GenerationForwardPositionAck:
 
     def __init__(
         self,
-        logical_positions: Tuple[int, ...],
+        logical_positions: GenerationLogicalPositions,
         *,
         model: Optional[nn.Module] = None,
         cache: Optional[Any] = None,
@@ -354,12 +420,18 @@ class GenerationForwardPositionAck:
         phase: Optional[GenerationForwardPhase] = None,
         _receipt_issuer=None,
     ):
+        self._position_shape = _logical_position_shape(logical_positions)
         self._logical_positions = logical_positions
         self._model = model
         self._cache = cache
         self._token_ids = token_ids
         self._immediate_successor_token_ids = immediate_successor_token_ids
         self._phase = phase
+        self._capability = (
+            NativeMTPCapabilityFingerprint.from_model(model)
+            if model is not None and getattr(model, "mtp_capability", None) is not None
+            else None
+        )
         self._receipt_issuer = _receipt_issuer
         self._active = False
         self._acknowledged = False
@@ -370,7 +442,7 @@ class GenerationForwardPositionAck:
     def receipt(self) -> Optional[GenerationForwardPositionReceipt]:
         return self._receipt
 
-    def acknowledge(self, logical_positions: Tuple[int, ...]) -> None:
+    def acknowledge(self, logical_positions: GenerationLogicalPositions) -> None:
         if not self._active or self._finished:
             raise RuntimeError("generation_logical_position_ack_outside_forward")
         if self._acknowledged:
@@ -380,6 +452,21 @@ class GenerationForwardPositionAck:
         ):
             raise RuntimeError("generation_logical_position_ack_mismatch")
         self._acknowledged = True
+
+    def _assert_consumer_binding(self, *, model, cache, phase, input_shape) -> None:
+        """Reject a context consumed by a different model-call graph."""
+
+        if (
+            self._model is not model
+            or self._cache is not cache
+            or self._phase is not phase
+            or tuple(input_shape) != self._position_shape
+        ):
+            raise RuntimeError("generation_logical_position_consumer_mismatch")
+        if self._capability is not None and (
+            NativeMTPCapabilityFingerprint.from_model(model) != self._capability
+        ):
+            raise RuntimeError("generation_logical_position_capability_mismatch")
 
     def _activate(self) -> None:
         if self._active or self._finished:
@@ -472,6 +559,32 @@ class GenerationForwardPositionAck:
 
 
 GenerationForwardContext = Callable[[GenerationForward], ContextManager[None]]
+
+
+def _native_mtp_position_context(
+    model: nn.Module,
+    external_context: Optional[GenerationForwardContext],
+) -> GenerationForwardContext:
+    """Choose the one authoritative position consumer for native MTP.
+
+    Qwen publishes a model-owned context hook.  It is selected automatically
+    so callers cannot accidentally request sparse logical positions without
+    applying them inside the model.  Older third-party native-MTP models may
+    still provide the existing external callback, but a Qwen hook and a
+    different external callback would create ambiguous dual consumers and is
+    rejected before any cache is constructed.
+    """
+
+    canonical_context = getattr(model, "generation_forward_context", None)
+    if canonical_context is not None and not callable(canonical_context):
+        raise TypeError("native_mtp_model_position_context_invalid")
+    if canonical_context is not None:
+        if external_context is not None and external_context is not canonical_context:
+            raise ValueError("native_mtp_position_context_ambiguous")
+        return canonical_context
+    if external_context is None:
+        raise ValueError("native_mtp_position_context_missing")
+    return external_context
 
 
 def attested_target_forward(
@@ -3742,8 +3855,9 @@ def mtp_generate_step(
     uses an explicit per-request MLX key.  Opaque filters and stateful logits
     processors fail before cache construction because they cannot be replayed
     exactly after a rejected recurrent verification.  Optional sparse prompt
-    coordinates are immutable host metadata only: every forward must be
-    acknowledged by the request-local context consumer that applies them.
+    coordinates are immutable host metadata only: Qwen selects its canonical
+    in-model context automatically and every forward must acknowledge exact
+    consumption before its request cache can be retained.
     """
 
     if prompt_cache is not None:
@@ -3766,8 +3880,6 @@ def mtp_generate_step(
             raise ValueError("native_mtp_sparse_bootstrap_owns_selected_tokens")
         if prompt_logical_positions is not None:
             raise ValueError("native_mtp_sparse_bootstrap_owns_logical_positions")
-        if model_forward_context is None:
-            raise ValueError("native_mtp_sparse_bootstrap_requires_position_context")
     if max_tokens < 0:
         raise ValueError("native MTP requires a finite non-negative max_tokens")
     if (
@@ -3799,8 +3911,6 @@ def mtp_generate_step(
 
     logical_prompt = None
     if prompt_logical_positions is not None:
-        if model_forward_context is None:
-            raise ValueError("native_mtp_logical_positions_require_forward_context")
         if isinstance(prompt_logical_positions, mx.array) or not isinstance(
             prompt_logical_positions, Sequence
         ):
@@ -3829,6 +3939,11 @@ def mtp_generate_step(
     logical_positions_active = (
         logical_prompt is not None or sparse_bootstrap is not None
     )
+    position_forward_context = (
+        _native_mtp_position_context(model, model_forward_context)
+        if logical_positions_active
+        else None
+    )
 
     request = None
     sparse_claim = None
@@ -3842,10 +3957,20 @@ def mtp_generate_step(
         immediate_successor_token_ids=(),
     ):
         batched = input_tokens[None]
-        if model_forward_context is None:
+        forward_context = (
+            position_forward_context
+            if logical_positions is not None
+            else model_forward_context
+        )
+        if forward_context is None:
             return model(batched, cache=request.backbone, return_hidden=return_hidden)
         position_ack = (
-            GenerationForwardPositionAck(logical_positions)
+            GenerationForwardPositionAck(
+                logical_positions,
+                model=model,
+                cache=request.backbone,
+                phase=phase,
+            )
             if logical_positions is not None
             else None
         )
@@ -3857,7 +3982,7 @@ def mtp_generate_step(
             logical_positions=logical_positions,
             logical_position_ack=position_ack,
         )
-        with model_forward_context(forward):
+        with forward_context(forward):
             if position_ack is None:
                 return model(
                     batched, cache=request.backbone, return_hidden=return_hidden
@@ -3874,10 +3999,20 @@ def mtp_generate_step(
 
     def _mtp_call(hidden, next_tokens, *, logical_positions=None):
         next_ids = next_tokens.reshape(1, -1)
-        if model_forward_context is None:
+        forward_context = (
+            position_forward_context
+            if logical_positions is not None
+            else model_forward_context
+        )
+        if forward_context is None:
             return model.mtp_forward(hidden, next_ids, request.mtp)
         position_ack = (
-            GenerationForwardPositionAck(logical_positions)
+            GenerationForwardPositionAck(
+                logical_positions,
+                model=model,
+                cache=request.mtp,
+                phase=GenerationForwardPhase.MTP_DRAFT,
+            )
             if logical_positions is not None
             else None
         )
@@ -3889,7 +4024,7 @@ def mtp_generate_step(
             logical_positions=logical_positions,
             logical_position_ack=position_ack,
         )
-        with model_forward_context(forward):
+        with forward_context(forward):
             if position_ack is None:
                 return model.mtp_forward(hidden, next_ids, request.mtp)
             position_ack._activate()
@@ -4365,8 +4500,6 @@ def stream_generate(
             raise ValueError("native_mtp_sparse_bootstrap_external_draft_unsupported")
         if prompt is not None:
             raise ValueError("native_mtp_sparse_bootstrap_owns_selected_tokens")
-        if model_forward_context is None:
-            raise ValueError("native_mtp_sparse_bootstrap_requires_position_context")
         if kwargs.get("prompt_logical_positions") is not None:
             raise ValueError("native_mtp_sparse_bootstrap_owns_logical_positions")
         if kwargs.get("prompt_cache") is not None:

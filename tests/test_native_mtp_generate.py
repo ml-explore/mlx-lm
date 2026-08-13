@@ -288,6 +288,20 @@ class _StreamTokenizer:
     def __init__(self):
         self.detokenizer = _StreamDetokenizer()
         self.eos_token_ids = frozenset()
+        self.eos_token_id = 0
+        self.chat_template = None
+
+    @staticmethod
+    def get_vocab():
+        return {}
+
+    @staticmethod
+    def encode(_text, *, add_special_tokens=False):
+        return [1]
+
+    @staticmethod
+    def decode(tokens):
+        return "".join(str(token) for token in tokens)
 
 
 def _make_sparse_bootstrap(
@@ -340,9 +354,7 @@ def test_sparse_receipts_retain_one_hidden_copy_and_only_final_compact_logits():
     chunk_count = 8
     positions = tuple(range(chunk_size * chunk_count))
     token_ids = tuple(position % model.vocab_size for position in positions)
-    successors = tuple(
-        (position + 1) % model.vocab_size for position in positions[:-1]
-    )
+    successors = tuple((position + 1) % model.vocab_size for position in positions[:-1])
     receipts = []
     immediate_results = []
     for chunk_index in range(chunk_count):
@@ -354,9 +366,7 @@ def test_sparse_receipts_retain_one_hidden_copy_and_only_final_compact_logits():
             target_cache,
             phase=GenerationForwardPhase.PREFILL,
             logical_positions=positions[start:end],
-            immediate_successor_token_ids=successors[
-                start : min(end, len(successors))
-            ],
+            immediate_successor_token_ids=successors[start : min(end, len(successors))],
             model_forward_context=context.context,
         )
         immediate_results.append(result)
@@ -376,9 +386,12 @@ def test_sparse_receipts_retain_one_hidden_copy_and_only_final_compact_logits():
     assert all(record.logits is None for record in records[:-1])
     assert receipts[-1].logits.shape == (1, 1, model.vocab_size)
     assert records[-1].logits is receipts[-1].logits
-    assert sum(
-        0 if receipt.logits is None else receipt.logits.size for receipt in receipts
-    ) == model.vocab_size
+    assert (
+        sum(
+            0 if receipt.logits is None else receipt.logits.size for receipt in receipts
+        )
+        == model.vocab_size
+    )
     for (original_logits, original_hidden), receipt, record in zip(
         immediate_results, receipts, records
     ):
@@ -408,7 +421,9 @@ def test_sparse_bootstrap_close_before_iteration_is_idempotent_and_non_mutating(
         chunk_sizes=(1, 1),
     )
     target_offset = bootstrap.target_cache[1].offset
-    assert all(_receipt_authority(receipt) is not None for receipt in bootstrap.receipts)
+    assert all(
+        _receipt_authority(receipt) is not None for receipt in bootstrap.receipts
+    )
 
     bootstrap.close()
     bootstrap.close()
@@ -416,7 +431,9 @@ def test_sparse_bootstrap_close_before_iteration_is_idempotent_and_non_mutating(
     assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
     assert bootstrap.target_cache[1].offset == target_offset
     assert model.requests == []
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"
+    ):
         bootstrap.claim(model)
 
 
@@ -483,7 +500,9 @@ def test_sparse_bootstrap_close_and_claim_have_exactly_one_owner(monkeypatch):
     if any(kind == "claim" for kind, _ in outcomes):
         assert any(kind == "claim" for kind, _ in outcomes)
     else:
-        assert any("already_claimed" in value for kind, value in outcomes if kind == "error")
+        assert any(
+            "already_claimed" in value for kind, value in outcomes if kind == "error"
+        )
     assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
     assert model.requests == []
 
@@ -522,7 +541,9 @@ def test_sparse_bootstrap_close_preserves_reserved_claim_failure_cleanup(monkeyp
     thread.start()
     assert blocked.wait(timeout=5)
     bootstrap.close()
-    assert all(_receipt_authority(receipt) is not None for receipt in bootstrap.receipts)
+    assert all(
+        _receipt_authority(receipt) is not None for receipt in bootstrap.receipts
+    )
     release.set()
     thread.join(timeout=10)
 
@@ -530,7 +551,9 @@ def test_sparse_bootstrap_close_preserves_reserved_claim_failure_cleanup(monkeyp
     assert errors == ["synthetic claimed verification failure"]
     assert all(_receipt_authority(receipt) is None for receipt in bootstrap.receipts)
     assert model.requests == []
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"
+    ):
         bootstrap.claim(model)
 
 
@@ -924,15 +947,60 @@ def test_stream_generate_rejects_invalid_sparse_none_combinations_before_prompt_
     if bootstrap == "valid":
         bootstrap = valid_bootstrap
 
-    def prompt_conversion_forbidden(*_args, **_kwargs):
-        raise AssertionError("prompt conversion must not run before sparse validation")
+    calls = {
+        "adopt": 0,
+        "request_cache": 0,
+        "mtp_cache": 0,
+        "target_forward": 0,
+        "mtp_forward": 0,
+        "prompt_encode": 0,
+    }
+    original_adopt = NativeMTPRequestCache.adopt_sparse_target.__func__
+    original_target_forward = _NativeMTPModel.__call__
+    original_mtp_forward = _NativeMTPModel.mtp_forward
+    original_prompt_encode = _StreamTokenizer.encode
 
-    monkeypatch.setattr(generate_module.mx, "array", prompt_conversion_forbidden)
+    def capture_adopt(cls, *args, **kwargs):
+        calls["adopt"] += 1
+        return original_adopt(cls, *args, **kwargs)
+
+    def capture_request_cache(*args, **kwargs):
+        calls["request_cache"] += 1
+        return original_request_cache(*args, **kwargs)
+
+    def capture_mtp_cache(*args, **kwargs):
+        calls["mtp_cache"] += 1
+        return original_mtp_cache(*args, **kwargs)
+
+    def capture_target_forward(self, *args, **kwargs):
+        calls["target_forward"] += 1
+        return original_target_forward(self, *args, **kwargs)
+
+    def capture_mtp_forward(self, *args, **kwargs):
+        calls["mtp_forward"] += 1
+        return original_mtp_forward(self, *args, **kwargs)
+
+    def capture_prompt_encode(*args, **kwargs):
+        calls["prompt_encode"] += 1
+        return original_prompt_encode(*args, **kwargs)
+
+    original_request_cache = model.make_mtp_request_cache
+    original_mtp_cache = model.make_mtp_cache
+    tokenizer = _StreamTokenizer()
+    monkeypatch.setattr(
+        NativeMTPRequestCache, "adopt_sparse_target", classmethod(capture_adopt)
+    )
+    monkeypatch.setattr(model, "make_mtp_request_cache", capture_request_cache)
+    monkeypatch.setattr(model, "make_mtp_cache", capture_mtp_cache)
+    monkeypatch.setattr(_NativeMTPModel, "__call__", capture_target_forward)
+    monkeypatch.setattr(_NativeMTPModel, "mtp_forward", capture_mtp_forward)
+    monkeypatch.setattr(tokenizer, "encode", capture_prompt_encode)
+
     with pytest.raises((TypeError, ValueError), match=message):
         list(
             stream_generate(
                 model,
-                _StreamTokenizer(),
+                tokenizer,
                 prompt,
                 mtp=mtp,
                 draft_model=draft_model,
@@ -941,12 +1009,13 @@ def test_stream_generate_rejects_invalid_sparse_none_combinations_before_prompt_
                 **kwargs,
             )
         )
+    assert calls == {name: 0 for name in calls}
 
 
 @pytest.mark.parametrize(
     ("model_capability", "context", "message"),
     (
-        (None, None, "native_mtp_sparse_bootstrap_requires_position_context"),
+        (None, None, "native_mtp_position_context_missing"),
         (
             _Capability(False, "native_mtp_weights_not_loaded"),
             "context",
@@ -972,15 +1041,60 @@ def test_stream_generate_sparse_rejects_context_and_capability_before_mutation(
     if context == "context":
         context = position_context.context
 
-    def prompt_conversion_forbidden(*_args, **_kwargs):
-        raise AssertionError("prompt conversion must not run before sparse validation")
+    calls = {
+        "adopt": 0,
+        "request_cache": 0,
+        "mtp_cache": 0,
+        "target_forward": 0,
+        "mtp_forward": 0,
+        "prompt_encode": 0,
+    }
+    original_adopt = NativeMTPRequestCache.adopt_sparse_target.__func__
+    original_target_forward = _NativeMTPModel.__call__
+    original_mtp_forward = _NativeMTPModel.mtp_forward
+    original_prompt_encode = _StreamTokenizer.encode
 
-    monkeypatch.setattr(generate_module.mx, "array", prompt_conversion_forbidden)
+    def capture_adopt(cls, *args, **kwargs):
+        calls["adopt"] += 1
+        return original_adopt(cls, *args, **kwargs)
+
+    def capture_request_cache(*args, **kwargs):
+        calls["request_cache"] += 1
+        return original_request_cache(*args, **kwargs)
+
+    def capture_mtp_cache(*args, **kwargs):
+        calls["mtp_cache"] += 1
+        return original_mtp_cache(*args, **kwargs)
+
+    def capture_target_forward(self, *args, **kwargs):
+        calls["target_forward"] += 1
+        return original_target_forward(self, *args, **kwargs)
+
+    def capture_mtp_forward(self, *args, **kwargs):
+        calls["mtp_forward"] += 1
+        return original_mtp_forward(self, *args, **kwargs)
+
+    def capture_prompt_encode(*args, **kwargs):
+        calls["prompt_encode"] += 1
+        return original_prompt_encode(*args, **kwargs)
+
+    original_request_cache = model.make_mtp_request_cache
+    original_mtp_cache = model.make_mtp_cache
+    tokenizer = _StreamTokenizer()
+    monkeypatch.setattr(
+        NativeMTPRequestCache, "adopt_sparse_target", classmethod(capture_adopt)
+    )
+    monkeypatch.setattr(model, "make_mtp_request_cache", capture_request_cache)
+    monkeypatch.setattr(model, "make_mtp_cache", capture_mtp_cache)
+    monkeypatch.setattr(_NativeMTPModel, "__call__", capture_target_forward)
+    monkeypatch.setattr(_NativeMTPModel, "mtp_forward", capture_mtp_forward)
+    monkeypatch.setattr(tokenizer, "encode", capture_prompt_encode)
+
     with pytest.raises((RuntimeError, ValueError), match=message):
         list(
             stream_generate(
                 model,
-                _StreamTokenizer(),
+                tokenizer,
                 None,
                 mtp=True,
                 sparse_bootstrap=bootstrap,
@@ -988,6 +1102,11 @@ def test_stream_generate_sparse_rejects_context_and_capability_before_mutation(
             )
         )
     assert model.requests == []
+    # TokenizerWrapper performs one detokenizer capability probe.  Sparse
+    # prompt conversion is still absent (the prompt is None), and every
+    # model/cache authority boundary remains untouched.
+    assert calls.pop("prompt_encode") in (0, 1)
+    assert calls == {name: 0 for name in calls}
 
 
 def test_stream_generate_sparse_bootstrap_is_one_shot_and_closes_on_failure(
@@ -1031,7 +1150,9 @@ def test_stream_generate_sparse_bootstrap_is_one_shot_and_closes_on_failure(
     assert request.closed
     assert context.active == 0
 
-    with pytest.raises(RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"):
+    with pytest.raises(
+        RuntimeError, match="native_mtp_sparse_bootstrap_already_claimed"
+    ):
         list(
             stream_generate(
                 model,
@@ -1990,7 +2111,7 @@ def test_sparse_bootstrap_admission_fails_before_request_adoption():
         immediate_successor_token_ids=(),
         chunk_sizes=(1,),
     )
-    with pytest.raises(ValueError, match="requires_position_context"):
+    with pytest.raises(ValueError, match="native_mtp_position_context_missing"):
         list(mtp_generate_step(None, model, sparse_bootstrap=bootstrap))
     with pytest.raises(ValueError, match="owns_selected_tokens"):
         list(
