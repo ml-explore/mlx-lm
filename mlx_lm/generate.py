@@ -693,6 +693,10 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    assert (
+        max_tokens != 0
+    ), "Maximum number of tokens must be non-zero (use -1 for no limit)."
+
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
