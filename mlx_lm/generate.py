@@ -862,10 +862,10 @@ def _normalize_samplers(
 
 def _normalize_logits_processors(
     logits_processors: Optional[List[Optional[List[LogitsProcessor]]]], *, n: int
-) -> List[List[LogitsProcessor]]:
+) -> List[Tuple[LogitsProcessor, ...]]:
     if not logits_processors:
-        return [[] for _ in range(n)]
-    return [list(lp) if lp else [] for lp in logits_processors]
+        return [() for _ in range(n)]
+    return [tuple(lp) if lp else () for lp in logits_processors]
 
 
 def _build_trie(
@@ -1661,7 +1661,6 @@ class BatchGenerator:
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_sequences: Optional[List[StopSequences]] = None,
     ) -> List[int]:
-        uids = []
         num_segments = len(segments)
 
         max_tokens = max_tokens or [self.max_tokens] * num_segments
@@ -1680,27 +1679,38 @@ class BatchGenerator:
         caches = caches or [None] * num_segments
         caches = [self._make_new_cache() if c is None else c for c in caches]
 
-        for seq, m, c, at, s, lp, ss in zip(
-            segments,
-            max_tokens,
-            caches,
-            all_tokens,
-            samplers,
-            logits_processors,
-            stop_sequences,
-            strict=True,
-        ):
+        opts = {
+            "max_tokens": max_tokens,
+            "caches": caches,
+            "all_tokens": all_tokens,
+            "samplers": samplers,
+            "logits_processors": logits_processors,
+            "stop_sequences": stop_sequences,
+        }
+        for k, v in opts.items():
+            if len(v) != num_segments:
+                raise ValueError(
+                    f"{k} must have one entry per segment: expected "
+                    f"{num_segments}, got {len(v)}"
+                )
+
+        uids = list(range(self._uid_count, self._uid_count + num_segments))
+        pending = []
+        for i, uid in enumerate(uids):
             policy = SequencePolicy(
-                uid=self._uid_count,
-                sampler=s,
-                stop_sequences=ss,
-                logits_processors=tuple(lp),
-                max_tokens=m,
+                uid=uid,
+                sampler=samplers[i],
+                stop_sequences=stop_sequences[i],
+                logits_processors=logits_processors[i],
+                max_tokens=max_tokens[i],
             )
-            queued_seq = PendingSequence.create(policy=policy, segments=seq, tokens=at)
-            self._unprocessed_sequences.append((queued_seq, c))
-            uids.append(self._uid_count)
-            self._uid_count += 1
+            sequence = PendingSequence.create(
+                policy=policy, segments=segments[i], tokens=all_tokens[i]
+            )
+            pending.append((sequence, caches[i]))
+
+        self._unprocessed_sequences.extend(pending)
+        self._uid_count += num_segments
 
         return uids
 
