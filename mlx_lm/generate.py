@@ -18,7 +18,9 @@ from typing import (
     Callable,
     ContextManager,
     Dict,
+    FrozenSet,
     Generator,
+    Iterable,
     List,
     Optional,
     Sequence,
@@ -592,8 +594,8 @@ class _NativeMTPSamplingState:
 
     The single-request generator deliberately keeps this object private: its
     public call signature and draw order are part of the existing B=1
-    behaviour.  The batched native-MTP path uses the same operations with a
-    fixed set of per-row slots, rather than sharing a mutable global key.
+    behaviour.  The batched native-MTP path keeps an equivalent UID-local
+    retained key, rather than sharing a mutable global key across rows.
     """
 
     def __init__(
@@ -660,14 +662,16 @@ class _NativeMTPSamplingState:
             logprobs = logprobs / self.config.temperature
         return (logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)).squeeze(0)
 
-    def sample(self, logprobs):
+    def sample(self, logprobs, *, rng_key=None):
         if self.config.stochastic:
-            return mx.random.categorical(logprobs, key=self.next_rng_key())
+            return mx.random.categorical(
+                logprobs, key=self.next_rng_key() if rng_key is None else rng_key
+            )
         if self.sampler is None:
             return mx.argmax(logprobs, axis=-1)
         return self.sampler(logprobs)
 
-    def residual_sample(self, target_logprobs, draft_logprobs):
+    def residual_sample(self, target_logprobs, draft_logprobs, *, rng_key=None):
         target_probs = mx.exp(target_logprobs)
         draft_probs = mx.exp(draft_logprobs)
         residual = mx.maximum(target_probs - draft_probs, 0)
@@ -677,7 +681,7 @@ class _NativeMTPSamplingState:
             mx.log(residual / normalizer),
             target_logprobs,
         )
-        return self.sample(residual_logprobs), residual_logprobs
+        return self.sample(residual_logprobs, rng_key=rng_key), residual_logprobs
 
 
 @dataclass(frozen=True)
@@ -987,21 +991,54 @@ class _NativeMTPCohortCache:
             zip(before, after, expected)
         ):
             # KV metadata is (_idx, offsets, left_padding); Arrays metadata is
-            # (None, left_padding, lengths). Both Arrays metadata values must
-            # remain exact across a native-MTP decode transaction.
+            # (None, left_padding, lengths).  Each ArraysCache vector is
+            # independently optional: an absent vector is an advance no-op;
+            # a present vector must retain its cohort width and exact delta.
             before_index, before_primary, *before_rest = before_layer
             after_index, after_primary, *after_rest = after_layer
             if before_index is None:
-                if before_primary != after_primary or tuple(before_rest) != tuple(
-                    after_rest
-                ):
+                if len(before_rest) != 1 or len(after_rest) != 1:
                     raise RuntimeError(
                         f"native_mtp_cohort_{name}_arrays_metadata_changed: layer={layer}"
                     )
-                if expected_layer:
-                    raise RuntimeError(
-                        f"native_mtp_cohort_{name}_array_delta_unsupported: layer={layer}"
-                    )
+                before_lengths, after_lengths = before_rest[0], after_rest[0]
+                if not expected_layer:
+                    if tuple(before_primary) != tuple(after_primary) or tuple(
+                        before_lengths
+                    ) != tuple(after_lengths):
+                        raise RuntimeError(
+                            f"native_mtp_cohort_{name}_arrays_metadata_changed: layer={layer}"
+                        )
+                    continue
+                expected_delta = tuple(-value for value in expected_layer)
+                for before_vector, after_vector in (
+                    (before_primary, after_primary),
+                    (before_lengths, after_lengths),
+                ):
+                    if not before_vector:
+                        if after_vector:
+                            raise RuntimeError(
+                                f"native_mtp_cohort_{name}_arrays_metadata_changed: layer={layer}"
+                            )
+                        continue
+                    if (
+                        not after_vector
+                        or len(before_vector) != len(expected_layer)
+                        or len(after_vector) != len(expected_layer)
+                    ):
+                        raise RuntimeError(
+                            f"native_mtp_cohort_{name}_arrays_metadata_changed: layer={layer}"
+                        )
+                    if (
+                        tuple(
+                            current - prior
+                            for prior, current in zip(before_vector, after_vector)
+                        )
+                        != expected_delta
+                    ):
+                        raise RuntimeError(
+                            f"native_mtp_cohort_{name}_array_delta_unsupported: layer={layer}"
+                        )
                 continue
             if tuple(after_rest) != tuple(before_rest):
                 raise RuntimeError(
@@ -1374,6 +1411,1081 @@ class _NativeMTPCohortCache:
         self._checkpoint = None
         self._transaction_sealed = False
         self._poisoned_reason = reason
+
+
+class _NativeMTPPhase(str, Enum):
+    """Public, linear phases of a native-MTP batch epoch.
+
+    This is intentionally a lifecycle API, not a second batch generator.  The
+    ordinary ``BatchGenerator`` owns its existing scheduling contract.  Native
+    MTP has a stricter transaction: a caller can advance only through the
+    phase handles returned by :class:`NativeMTPBatchGenerator`.
+    """
+
+    INITIAL = "initial"
+    READY = "ready"
+    DECISION = "decision"
+    ACCEPTED = "accepted"
+    BONUS = "bonus"
+    REJECTED = "rejected"
+    CLOSED = "closed"
+
+
+@dataclass(frozen=True)
+class NativeMTPRowSpec:
+    """Immutable admission contract for one native-MTP row.
+
+    ``seed`` is deliberately row-owned.  Batch split, reorder, and deferred
+    ready-join code must preserve this UID-to-seed binding rather than derive
+    random state from a cohort index.
+    """
+
+    uid: int
+    prompt: Tuple[int, ...]
+    max_tokens: int
+    seed: Optional[int] = None
+    eos_token_ids: FrozenSet[int] = frozenset()
+    sampling_config: NativeMTPSamplingConfig = NativeMTPSamplingConfig()
+
+    def __post_init__(self):
+        if isinstance(self.uid, bool) or not isinstance(self.uid, int):
+            raise TypeError("native_mtp_row_uid_invalid")
+        if not isinstance(self.prompt, tuple) or not self.prompt:
+            raise ValueError("native_mtp_row_prompt_required")
+        if any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.prompt
+        ):
+            raise ValueError("native_mtp_row_prompt_token_invalid")
+        if (
+            isinstance(self.max_tokens, bool)
+            or not isinstance(self.max_tokens, int)
+            or self.max_tokens < 0
+        ):
+            raise ValueError("native_mtp_row_max_tokens_invalid")
+        if self.seed is not None and (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, int)
+            or self.seed < 0
+        ):
+            raise ValueError("native_mtp_row_seed_invalid")
+        if not isinstance(self.eos_token_ids, frozenset) or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in self.eos_token_ids
+        ):
+            raise ValueError("native_mtp_row_eos_invalid")
+        if not isinstance(self.sampling_config, NativeMTPSamplingConfig):
+            raise TypeError("native_mtp_row_sampling_config_invalid")
+
+
+@dataclass(frozen=True)
+class NativeMTPEmission:
+    """One immutable token result at one public MTP emission boundary."""
+
+    uid: int
+    token: int
+    logprobs: mx.array
+    from_draft: bool
+    finish_reason: Optional[str] = None
+
+    def __post_init__(self):
+        if isinstance(self.uid, bool) or not isinstance(self.uid, int):
+            raise TypeError("native_mtp_emission_uid_invalid")
+        if (
+            isinstance(self.token, bool)
+            or not isinstance(self.token, int)
+            or self.token < 0
+        ):
+            raise ValueError("native_mtp_emission_token_invalid")
+        if not isinstance(self.logprobs, mx.array) or self.logprobs.ndim != 1:
+            raise TypeError("native_mtp_emission_logprobs_invalid")
+        if not isinstance(self.from_draft, bool):
+            raise TypeError("native_mtp_emission_draft_flag_invalid")
+        if self.finish_reason not in (None, "eos", "length", "cancelled"):
+            raise ValueError("native_mtp_emission_finish_reason_invalid")
+
+
+@dataclass(frozen=True)
+class _NativeMTPTelemetryEvent:
+    """Append-only public audit event; payload is never mutated in place."""
+
+    phase: _NativeMTPPhase
+    uids: Tuple[int, ...]
+    event: str
+
+
+@dataclass(frozen=True)
+class NativeMTPAdmission:
+    """Validated native-MTP cohort admission.
+
+    Admission is intentionally fail-closed.  Prefix reuse, media, external
+    drafters, sparse receipts, opaque processors, rotating caches and
+    quantized caches have different rollback/position contracts and must be
+    handled by later, separately qualified integrations.
+    """
+
+    model: nn.Module
+    rows: Tuple[NativeMTPRowSpec, ...]
+    cohort: _NativeMTPCohortCache
+
+    @classmethod
+    def create(
+        cls,
+        model: nn.Module,
+        rows: Sequence[NativeMTPRowSpec],
+        request_caches: Sequence[cache.NativeMTPRequestCache],
+        *,
+        prefix_cache=None,
+        media=None,
+        external_draft=None,
+        sparse_bootstrap=None,
+        logits_processors=None,
+        kv_bits=None,
+        max_kv_size=None,
+    ) -> "NativeMTPAdmission":
+        rows = tuple(rows)
+        request_caches = tuple(request_caches)
+        if not rows or len(rows) != len(request_caches):
+            raise ValueError("native_mtp_batch_rows_and_caches_required")
+        if any(not isinstance(row, NativeMTPRowSpec) for row in rows):
+            raise TypeError("native_mtp_batch_row_spec_required")
+        if len({row.uid for row in rows}) != len(rows):
+            raise ValueError("native_mtp_batch_uid_collision")
+        if prefix_cache is not None:
+            raise ValueError("native_mtp_batch_prefix_reuse_unsupported")
+        if media is not None:
+            raise ValueError("native_mtp_batch_media_unsupported")
+        if external_draft is not None:
+            raise ValueError("native_mtp_batch_external_draft_unsupported")
+        if sparse_bootstrap is not None:
+            raise ValueError("native_mtp_batch_sparse_bootstrap_unsupported")
+        if logits_processors:
+            raise ValueError("native_mtp_batch_logits_processors_unsupported")
+        if kv_bits is not None:
+            raise ValueError("native_mtp_batch_quantized_cache_unsupported")
+        if max_kv_size is not None:
+            raise ValueError("native_mtp_batch_rotating_cache_unsupported")
+        capability = getattr(model, "mtp_capability", None)
+        if capability is None or not capability.supported:
+            raise RuntimeError(
+                "native_mtp_model_capability_missing"
+                if capability is None
+                else capability.reason
+            )
+        return cls(
+            model,
+            rows,
+            _NativeMTPCohortCache(
+                model, request_caches, uids=tuple(row.uid for row in rows)
+            ),
+        )
+
+
+class _NativeMTPEpoch:
+    """Move-only base for public phase handles."""
+
+    def __init__(self, generator, phase, active_uids):
+        self._generator = generator
+        self._phase = phase
+        self._active_uids = tuple(active_uids)
+        self._moved = False
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @property
+    def active_uids(self) -> Tuple[int, ...]:
+        return self._active_uids
+
+    def _consume(self):
+        if self._moved or self._generator._epoch is not self:
+            raise RuntimeError("native_mtp_epoch_moved")
+        self._moved = True
+
+    def cancel(self) -> None:
+        self._consume()
+        self._generator._close("cancelled")
+
+
+class NativeMTPInitialEpoch(_NativeMTPEpoch):
+    def resume(self) -> "NativeMTPReadyEpoch":
+        return self._generator._resume_initial(self)
+
+
+class NativeMTPReadyEpoch(_NativeMTPEpoch):
+    def decide(self) -> "NativeMTPDecisionEpoch":
+        return self._generator._decide(self)
+
+
+class NativeMTPDecisionEpoch(_NativeMTPEpoch):
+    def accept(self) -> "NativeMTPAcceptedEpoch":
+        return self._generator._accept(self)
+
+    def reject(self) -> "NativeMTPRejectedEpoch":
+        return self._generator._reject(self)
+
+    def resolve(self):
+        return self._generator._resolve_mixed(self)
+
+
+class NativeMTPAcceptedEpoch(_NativeMTPEpoch):
+    def bonus(self) -> "NativeMTPBonusEpoch":
+        return self._generator._bonus(self)
+
+
+class NativeMTPBonusEpoch(_NativeMTPEpoch):
+    def catch_up(self) -> "NativeMTPReadyEpoch":
+        return self._generator._catch_up(self)
+
+
+class NativeMTPRejectedEpoch(_NativeMTPEpoch):
+    def redraft(self) -> "NativeMTPReadyEpoch":
+        return self._generator._redraft(self)
+
+
+class NativeMTPMixedContinuation:
+    """Opaque branch owner after one mixed decision emission boundary."""
+
+    def __init__(self, generator, accepted_uids, rejected_uids):
+        self._generator = generator
+        self._accepted_uids = accepted_uids
+        self._rejected_uids = rejected_uids
+        self._moved = False
+
+    def resume_after_resolution(self):
+        if self._moved:
+            raise RuntimeError("native_mtp_epoch_moved")
+        self._moved = True
+        try:
+            return self._generator._mixed_after_resolution(self)
+        except BaseException:
+            self._generator._poison_all("native_mtp_batch_mixed_resolution_failed")
+            raise
+
+    def cancel(self) -> None:
+        if self._moved:
+            raise RuntimeError("native_mtp_epoch_moved")
+        self._moved = True
+        self._generator._poison_all("native_mtp_batch_cancelled")
+
+
+class NativeMTPMixedBonusContinuation:
+    """Opaque accepted-bonus owner awaiting catch-up and Ready join."""
+
+    def __init__(self, generator):
+        self._generator = generator
+        self._moved = False
+
+    def resume_after_bonus(self):
+        if self._moved:
+            raise RuntimeError("native_mtp_epoch_moved")
+        self._moved = True
+        try:
+            return self._generator._mixed_after_bonus(self)
+        except BaseException:
+            self._generator._poison_all("native_mtp_batch_mixed_bonus_failed")
+            raise
+
+    def cancel(self) -> None:
+        if self._moved:
+            raise RuntimeError("native_mtp_epoch_moved")
+        self._moved = True
+        self._generator._poison_all("native_mtp_batch_cancelled")
+
+
+class NativeMTPBatchGenerator:
+    """Typed public lifecycle for a committed native-MTP cohort cache.
+
+    The numeric model calls remain private implementation detail.  This class
+    owns the externally observable epoch ordering, one-token emission rule,
+    terminal filtering, and immutable telemetry needed to make those calls
+    safe to batch.  It deliberately does not wire into ``BatchGenerator``.
+    """
+
+    def __init__(self, admission: NativeMTPAdmission):
+        if not isinstance(admission, NativeMTPAdmission):
+            raise TypeError("native_mtp_batch_admission_required")
+        self._admission = admission
+        self._cohort = admission.cohort
+        self._rows = {row.uid: row for row in admission.rows}
+        self._generated = {row.uid: 0 for row in admission.rows}
+        self._active = tuple(row.uid for row in admission.rows)
+        self._epoch = None
+        self._closed = False
+        self._events = ()
+        self._sampling = {
+            row.uid: _NativeMTPSamplingState(
+                row.sampling_config,
+                seed=row.seed if row.seed is not None else row.sampling_config.seed,
+            )
+            for row in admission.rows
+        }
+        self._history = {
+            row.uid: mx.array(row.prompt, dtype=mx.uint32) for row in admission.rows
+        }
+        self._head = {}
+        self._hidden = {}
+        self._draft = {}
+        self._draft_logprobs = {}
+        self._rng_key = {
+            row.uid: mx.random.key(
+                row.seed if row.seed is not None else (row.sampling_config.seed or 0)
+            )
+            for row in admission.rows
+        }
+        self._last_failed_owners = ()
+
+    @property
+    def telemetry(self) -> tuple:
+        return self._events
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def _initial(self, emissions: Iterable[NativeMTPEmission]) -> NativeMTPInitialEpoch:
+        active = self._record_emissions(
+            _NativeMTPPhase.INITIAL, emissions, expected=self._active
+        )
+        return self._replace(
+            NativeMTPInitialEpoch(self, _NativeMTPPhase.INITIAL, active),
+            "initial_emission",
+        )
+
+    def prefill(self, *, prefill_step_size: int = 512):
+        """Run isolated merged, variable-length shifted prefill and emit heads.
+
+        Rows are temporarily partitioned only when their remaining prompt work
+        differs.  Every target/MTP call still receives a merged cache owner;
+        the resulting temporary owner is joined back without host row-cache
+        extraction.  This is the required safe path for unequal prompt sizes.
+        """
+
+        if self._epoch is not None or self._closed:
+            raise RuntimeError("native_mtp_batch_initial_already_started")
+        if (
+            isinstance(prefill_step_size, bool)
+            or not isinstance(prefill_step_size, int)
+            or prefill_step_size < 1
+        ):
+            raise ValueError("native_mtp_batch_prefill_step_size_invalid")
+        positions = {uid: 0 for uid in self._active}
+        while True:
+            pending = tuple(
+                uid
+                for uid in self._active
+                if positions[uid] < len(self._rows[uid].prompt) - 1
+            )
+            if not pending:
+                break
+            # A chunk cohort contains only equal remaining work.  Unequal rows
+            # are partitioned on-device, processed as a real B×N call, then
+            # rejoined before the next size class.
+            by_count = {}
+            for uid in pending:
+                count = min(
+                    prefill_step_size, len(self._rows[uid].prompt) - 1 - positions[uid]
+                )
+                by_count.setdefault(count, []).append(uid)
+            for count, uids in by_count.items():
+                uids = tuple(uids)
+                remaining = self._move_to_front(uids)
+                selected = self._cohort
+                try:
+                    tokens = tuple(
+                        self._rows[uid].prompt[positions[uid] : positions[uid] + count]
+                        for uid in uids
+                    )
+                    successors = tuple(
+                        self._rows[uid].prompt[
+                            positions[uid] + 1 : positions[uid] + count + 1
+                        ]
+                        for uid in uids
+                    )
+                    _, hidden = self._target_forward(
+                        tokens, phase=GenerationForwardPhase.PREFILL
+                    )
+                    self._mtp_forward(hidden, successors)
+                    for uid in uids:
+                        positions[uid] += count
+                except BaseException:
+                    self._poison_all(
+                        "native_mtp_batch_prefill_failed", selected, remaining
+                    )
+                    raise
+                else:
+                    try:
+                        self._cohort = selected
+                        self._restore_from_front(remaining)
+                    except BaseException:
+                        self._poison_all(
+                            "native_mtp_batch_prefill_join_failed", selected, remaining
+                        )
+                        raise
+        final_uids = tuple(self._active)
+        remaining = self._move_to_front(final_uids)
+        selected = self._cohort
+        try:
+            tokens = tuple(self._rows[uid].prompt[-1] for uid in final_uids)
+            logits, hidden = self._target_forward(
+                tokens, phase=GenerationForwardPhase.PREFILL
+            )
+            emissions = []
+            for index, uid in enumerate(final_uids):
+                state = self._sampling[uid]
+                reported = state.reported_logprobs(
+                    logits[index, -1, :], self._history[uid]
+                )
+                sampled = state.sample(
+                    state.sampling_distribution(reported),
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                mx.eval(sampled, reported)
+                token = sampled.item()
+                self._head[uid] = sampled
+                self._hidden[uid] = hidden[index : index + 1, -1:, :]
+                emissions.append(self._make_emission(uid, token, reported, False))
+        except BaseException:
+            self._poison_all("native_mtp_batch_prefill_failed", selected, remaining)
+            raise
+        else:
+            try:
+                self._cohort = selected
+                self._restore_from_front(remaining)
+            except BaseException:
+                self._poison_all(
+                    "native_mtp_batch_prefill_join_failed", selected, remaining
+                )
+                raise
+        return tuple(emissions), self._initial(emissions)
+
+    def _move_to_front(self, uids):
+        """Return a selected move-only owner while keeping the selected UIDs first."""
+
+        uids = tuple(uids)
+        if not uids:
+            return None
+        indices = tuple(self._cohort.uids.index(uid) for uid in uids)
+        remaining = self._cohort
+        self._cohort = remaining.split(indices)
+        return remaining
+
+    def _restore_from_front(self, remaining):
+        if remaining is None:
+            return
+        self._cohort.join(remaining)
+
+    def _poison_all(self, reason, *extra_owners):
+        """Close every owned cohort after an irreversible lifecycle failure."""
+
+        owners = {id(self._cohort): self._cohort}
+        for name in ("_mixed_accepted_owner", "_mixed_rejected_owner"):
+            owner = getattr(self, name, None)
+            if owner is not None:
+                owners[id(owner)] = owner
+        for owner in extra_owners:
+            if owner is not None:
+                owners[id(owner)] = owner
+        for owner in owners.values():
+            owner.poison(reason)
+        self._last_failed_owners = tuple(owners.values())
+        self._closed = True
+        self._active = ()
+        self._epoch = None
+
+    @staticmethod
+    def _delta(entries, advance):
+        return tuple(
+            (
+                (advance,) * entry.batch_size
+                if isinstance(entry, ArraysCache)
+                else (advance,) * entry.offset.size
+            )
+            for entry in entries
+        )
+
+    def _seal_delta(self, *, backbone, mtp):
+        self._cohort.seal_after_mutation(
+            _NativeMTPCohortMutationDelta(
+                backbone=self._delta(self._cohort.backbone, backbone),
+                mtp=self._delta(self._cohort.mtp, mtp),
+            )
+        )
+
+    def _target_forward(self, tokens, *, phase):
+        try:
+            self._cohort.bind_before_mutation()
+            inputs = mx.array(tokens, dtype=mx.uint32)
+            if inputs.ndim == 1:
+                inputs = inputs[:, None]
+            result = self._admission.model(
+                inputs, cache=self._cohort.backbone, return_hidden=True
+            )
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise RuntimeError("native_mtp_batch_target_hidden_missing")
+            self._seal_delta(backbone=inputs.shape[1], mtp=0)
+            return result
+        except BaseException:
+            self._poison_all("native_mtp_batch_target_failed")
+            raise
+
+    def _mtp_forward(self, hidden, tokens):
+        try:
+            self._cohort.bind_before_mutation()
+            inputs = mx.array(tokens, dtype=mx.uint32)
+            if inputs.ndim == 1:
+                inputs = inputs[:, None]
+            result = self._admission.model.mtp_forward(hidden, inputs, self._cohort.mtp)
+            self._seal_delta(backbone=0, mtp=inputs.shape[1])
+            return result
+        except BaseException:
+            self._poison_all("native_mtp_batch_mtp_failed")
+            raise
+
+    def _make_emission(self, uid, token, logprobs, from_draft):
+        row = self._rows[uid]
+        total = self._generated[uid] + 1
+        reason = (
+            "eos"
+            if token in row.eos_token_ids
+            else ("length" if total >= row.max_tokens else None)
+        )
+        return NativeMTPEmission(uid, token, logprobs, from_draft, reason)
+
+    def _next_rng_key(self, uid):
+        """Consume one B=1-compatible stochastic draw for one stable UID."""
+
+        retained, draw = mx.random.split(self._rng_key[uid])
+        self._rng_key[uid] = retained
+        return draw
+
+    def _replace(self, epoch, event):
+        self._epoch = epoch
+        self._events = self._events + (
+            _NativeMTPTelemetryEvent(epoch.phase, epoch.active_uids, event),
+        )
+        return epoch
+
+    def _record_emissions(self, phase, emissions, *, expected):
+        emissions = tuple(emissions)
+        if len(emissions) != len(expected):
+            raise ValueError("native_mtp_batch_emission_boundary_incomplete")
+        if any(not isinstance(item, NativeMTPEmission) for item in emissions):
+            raise TypeError("native_mtp_batch_emission_required")
+        if {item.uid for item in emissions} != set(expected):
+            raise ValueError("native_mtp_batch_emission_uid_mismatch")
+        next_active = []
+        for emission in emissions:
+            row = self._rows[emission.uid]
+            self._generated[emission.uid] += 1
+            terminal = (
+                emission.finish_reason is not None
+                or self._generated[emission.uid] >= row.max_tokens
+            )
+            if not terminal:
+                next_active.append(emission.uid)
+        self._events = self._events + (
+            _NativeMTPTelemetryEvent(phase, tuple(expected), "emission"),
+        )
+        self._active = tuple(next_active)
+        return self._active
+
+    @staticmethod
+    def _filter_owner_uids(owner, uids):
+        if owner is None:
+            return None
+        if not uids:
+            owner.poison("native_mtp_batch_terminal_rows_removed")
+            return None
+        indices = tuple(owner.uids.index(uid) for uid in uids)
+        owner.filter(indices)
+        return owner
+
+    def _prune_mixed_terminal_owners(self, emissions, accepted_uids, rejected_uids):
+        """Drop terminal branch rows before a later branch forward or join."""
+
+        emission_by_uid = {emission.uid: emission for emission in emissions}
+        self._mixed_accepted_uids = tuple(
+            uid for uid in accepted_uids if emission_by_uid[uid].finish_reason is None
+        )
+        self._mixed_rejected_uids = tuple(
+            uid for uid in rejected_uids if emission_by_uid[uid].finish_reason is None
+        )
+        self._mixed_accepted_owner = self._filter_owner_uids(
+            self._mixed_accepted_owner, self._mixed_accepted_uids
+        )
+        self._mixed_rejected_owner = self._filter_owner_uids(
+            self._mixed_rejected_owner, self._mixed_rejected_uids
+        )
+
+    def _resume_initial(self, epoch):
+        epoch._consume()
+        drafts = tuple(epoch.active_uids)
+        if drafts:
+            logits = self._mtp_forward(
+                mx.concatenate([self._hidden[uid] for uid in drafts], axis=0),
+                tuple(self._head[uid].item() for uid in drafts),
+            )[:, -1, :]
+            for index, uid in enumerate(drafts):
+                state = self._sampling[uid]
+                self._history[uid] = mx.concatenate(
+                    [self._history[uid], self._head[uid]]
+                )
+                reported = state.reported_logprobs(logits[index], self._history[uid])
+                draft_logprobs = state.sampling_distribution(reported)
+                draft = state.sample(
+                    draft_logprobs,
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                mx.eval(draft, reported)
+                self._draft[uid] = draft
+                self._draft_logprobs[uid] = draft_logprobs
+        return self._replace(
+            NativeMTPReadyEpoch(self, _NativeMTPPhase.READY, drafts),
+            "initial_head_plus_one_draft",
+        )
+
+    def _decide(self, epoch):
+        epoch._consume()
+        try:
+            self._cohort.checkpoint()
+            inputs = mx.stack(
+                [
+                    mx.concatenate([self._head[uid], self._draft[uid]])
+                    for uid in epoch.active_uids
+                ],
+                axis=0,
+            )
+            self._cohort.bind_before_mutation()
+            verify_logits, verify_hidden = self._admission.model(
+                inputs, cache=self._cohort.backbone, return_hidden=True
+            )
+            self._seal_delta(backbone=2, mtp=0)
+            (
+                self._verify_hidden,
+                self._verify_logits,
+                self._verify_logprobs,
+                self._replacement,
+            ) = ({}, {}, {}, {})
+            accepted_values = []
+            for index, uid in enumerate(epoch.active_uids):
+                state = self._sampling[uid]
+                reported = state.reported_logprobs(
+                    verify_logits[index, 0, :], self._history[uid]
+                )
+                sampled = state.sampling_distribution(reported)
+                if state.config.stochastic:
+                    draft_id = self._draft[uid].item()
+                    probability = mx.minimum(
+                        mx.exp(sampled[draft_id] - self._draft_logprobs[uid][draft_id]),
+                        1.0,
+                    )
+                    accepted_value = (
+                        mx.random.uniform(key=self._next_rng_key(uid)) < probability
+                    )
+                    mx.eval(accepted_value)
+                    is_accepted = bool(accepted_value.item())
+                    replacement = self._draft[uid]
+                    if not is_accepted:
+                        replacement, _ = state.residual_sample(
+                            sampled,
+                            self._draft_logprobs[uid],
+                            rng_key=self._next_rng_key(uid),
+                        )
+                        replacement = replacement.reshape(-1)
+                else:
+                    replacement = state.sample(sampled).reshape(-1)
+                    is_accepted = replacement.item() == self._draft[uid].item()
+                mx.eval(replacement, reported)
+                self._verify_hidden[uid] = verify_hidden[index : index + 1]
+                self._verify_logits[uid] = verify_logits[index : index + 1, 1:2, :]
+                self._verify_logprobs[uid] = reported
+                self._replacement[uid] = replacement
+                if is_accepted:
+                    accepted_values.append(uid)
+            accepted = tuple(accepted_values)
+        except BaseException:
+            self._poison_all("native_mtp_batch_decision_failed")
+            raise
+        rejected = tuple(uid for uid in epoch.active_uids if uid not in set(accepted))
+        result = NativeMTPDecisionEpoch(
+            self, _NativeMTPPhase.DECISION, epoch.active_uids
+        )
+        result.accepted_uids = accepted
+        result.rejected_uids = rejected
+        return self._replace(result, "target_plus_two_checkpoint_decision")
+
+    def _accept(self, epoch):
+        epoch._consume()
+        try:
+            if epoch.rejected_uids:
+                raise RuntimeError(
+                    "native_mtp_batch_mixed_decision_requires_branch_resolution"
+                )
+            self._cohort.commit()
+            emissions = tuple(
+                self._make_emission(
+                    uid, self._draft[uid].item(), self._verify_logprobs[uid], True
+                )
+                for uid in epoch.accepted_uids
+            )
+        except BaseException:
+            self._poison_all("native_mtp_batch_accept_failed")
+            raise
+        active = self._record_emissions(
+            _NativeMTPPhase.ACCEPTED, emissions, expected=epoch.accepted_uids
+        )
+        result = NativeMTPAcceptedEpoch(self, _NativeMTPPhase.ACCEPTED, active)
+        result._deferred_rejected = epoch.rejected_uids
+        return self._replace(result, "accepted_draft_emission")
+
+    def _resolve_mixed(self, epoch):
+        """Split only after rollback; branch owners never share recurrent state."""
+
+        epoch._consume()
+        accepted_owner = rejected_owner = None
+        original_owner = self._cohort
+        try:
+            self._cohort.rollback()
+            accepted_indices = tuple(
+                self._cohort.uids.index(uid) for uid in epoch.accepted_uids
+            )
+            if accepted_indices:
+                accepted_owner = self._cohort.split(accepted_indices)
+                rejected_owner = self._cohort
+            else:
+                accepted_owner, rejected_owner = None, self._cohort
+            self._mixed_accepted_owner = accepted_owner
+            self._mixed_rejected_owner = rejected_owner
+            self._mixed_accepted_uids = epoch.accepted_uids
+            self._mixed_rejected_uids = epoch.rejected_uids
+            emissions = []
+            # Rerun the verified target call on the accepted owner, then commit its
+            # all-or-nothing recurrent state before its draft token is observable.
+            if accepted_owner is not None:
+                self._cohort = accepted_owner
+                self._cohort.checkpoint()
+                inputs = mx.stack(
+                    [
+                        mx.concatenate([self._head[uid], self._draft[uid]])
+                        for uid in epoch.accepted_uids
+                    ],
+                    axis=0,
+                )
+                verify_logits, verify_hidden = self._admission.model(
+                    inputs, cache=self._cohort.backbone, return_hidden=True
+                )
+                self._seal_delta(backbone=2, mtp=0)
+                self._cohort.commit()
+                for index, uid in enumerate(epoch.accepted_uids):
+                    self._verify_hidden[uid] = verify_hidden[index : index + 1]
+                    self._verify_logits[uid] = verify_logits[index : index + 1, 1:2, :]
+                    emissions.append(
+                        self._make_emission(
+                            uid,
+                            self._draft[uid].item(),
+                            self._verify_logprobs[uid],
+                            True,
+                        )
+                    )
+            for uid in epoch.rejected_uids:
+                emissions.append(
+                    self._make_emission(
+                        uid,
+                        self._replacement[uid].item(),
+                        self._verify_logprobs[uid],
+                        False,
+                    )
+                )
+            # This is the required exactly-one-token/UID resolution boundary.
+            self._record_emissions(
+                _NativeMTPPhase.DECISION, emissions, expected=epoch.active_uids
+            )
+            self._prune_mixed_terminal_owners(
+                emissions, epoch.accepted_uids, epoch.rejected_uids
+            )
+            self._events = self._events + (
+                _NativeMTPTelemetryEvent(
+                    _NativeMTPPhase.DECISION,
+                    epoch.active_uids,
+                    "mixed_resolution_emission",
+                ),
+            )
+            return tuple(emissions), NativeMTPMixedContinuation(
+                self, self._mixed_accepted_uids, self._mixed_rejected_uids
+            )
+        except BaseException:
+            self._poison_all(
+                "native_mtp_batch_mixed_resolve_failed",
+                original_owner,
+                accepted_owner,
+                rejected_owner,
+            )
+            raise
+
+    def _mixed_after_resolution(self, continuation):
+        """Replay rejected head, redraft it, and emit accepted bonus only."""
+
+        rejected_ready = ()
+        if self._mixed_rejected_uids:
+            self._cohort = self._mixed_rejected_owner
+            _, replay_hidden = self._target_forward(
+                tuple(self._head[uid].item() for uid in self._mixed_rejected_uids),
+                phase=GenerationForwardPhase.DECODE,
+            )
+            self._replay_hidden = {}
+            for index, uid in enumerate(self._mixed_rejected_uids):
+                self._replay_hidden[uid] = replay_hidden[index : index + 1, -1:, :]
+            logits = self._mtp_forward(
+                mx.concatenate(
+                    [self._replay_hidden[uid] for uid in self._mixed_rejected_uids],
+                    axis=0,
+                ),
+                tuple(
+                    self._replacement[uid].item() for uid in self._mixed_rejected_uids
+                ),
+            )[:, -1, :]
+            rejected_ready = self._mixed_rejected_uids
+            for index, uid in enumerate(rejected_ready):
+                state = self._sampling[uid]
+                self._head[uid] = self._replacement[uid]
+                self._history[uid] = mx.concatenate(
+                    [self._history[uid], self._head[uid]]
+                )
+                reported = state.reported_logprobs(logits[index], self._history[uid])
+                draft_logprobs = state.sampling_distribution(reported)
+                self._draft[uid] = state.sample(
+                    draft_logprobs,
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                self._draft_logprobs[uid] = draft_logprobs
+        emissions = []
+        accepted_bonus = ()
+        if self._mixed_accepted_owner is not None:
+            self._cohort = self._mixed_accepted_owner
+            for uid in self._mixed_accepted_uids:
+                state = self._sampling[uid]
+                history = mx.concatenate([self._history[uid], self._draft[uid]])
+                reported = state.reported_logprobs(
+                    self._verify_logits[uid].squeeze((0, 1)), history
+                )
+                token = state.sample(
+                    state.sampling_distribution(reported),
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                mx.eval(token, reported)
+                self._history[uid] = mx.concatenate([history, token])
+                self._head[uid] = token
+                emission = self._make_emission(uid, token.item(), reported, False)
+                emissions.append(emission)
+                if emission.finish_reason is None:
+                    accepted_bonus += (uid,)
+        # Bonus is an emission boundary: terminal accepted rows must not be
+        # caught up or rejoined with the rejected Ready owner.
+        self._mixed_accepted_uids = accepted_bonus
+        self._mixed_accepted_owner = self._filter_owner_uids(
+            self._mixed_accepted_owner, accepted_bonus
+        )
+        self._events = self._events + (
+            _NativeMTPTelemetryEvent(
+                _NativeMTPPhase.BONUS, accepted_bonus, "mixed_accepted_bonus_emission"
+            ),
+        )
+        self._mixed_rejected_ready = rejected_ready
+        self._mixed_accepted_ready = accepted_bonus
+        return tuple(emissions), NativeMTPMixedBonusContinuation(self)
+
+    def _mixed_after_bonus(self, continuation):
+        """Catch up accepted MTP state, then join compatible Ready owners."""
+
+        if self._mixed_accepted_owner is not None and self._mixed_accepted_ready:
+            self._cohort = self._mixed_accepted_owner
+            uids = self._mixed_accepted_ready
+            hidden = mx.concatenate([self._verify_hidden[uid] for uid in uids], axis=0)
+            tokens = mx.array(
+                [(self._draft[uid].item(), self._head[uid].item()) for uid in uids],
+                dtype=mx.uint32,
+            )
+            self._cohort.bind_before_mutation()
+            logits = self._admission.model.mtp_forward(
+                hidden, tokens, self._cohort.mtp
+            )[:, -1, :]
+            self._seal_delta(backbone=0, mtp=2)
+            for index, uid in enumerate(uids):
+                state = self._sampling[uid]
+                reported = state.reported_logprobs(logits[index], self._history[uid])
+                draft_logprobs = state.sampling_distribution(reported)
+                self._draft[uid] = state.sample(
+                    draft_logprobs,
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                self._draft_logprobs[uid] = draft_logprobs
+        owners = [
+            owner
+            for owner in (self._mixed_accepted_owner, self._mixed_rejected_owner)
+            if owner is not None
+        ]
+        if not owners:
+            self._close("cancelled")
+            raise RuntimeError("native_mtp_batch_mixed_owner_missing")
+        ready_owner = owners[0]
+        for owner in owners[1:]:
+            ready_owner.join(owner)
+        self._cohort = ready_owner
+        ready_uids = tuple(self._mixed_accepted_ready + self._mixed_rejected_ready)
+        if tuple(ready_owner.uids) != ready_uids:
+            self._poison_all("native_mtp_batch_mixed_ready_uid_mismatch", *owners)
+            raise RuntimeError("native_mtp_batch_mixed_ready_uid_mismatch")
+        self._active = ready_uids
+        return self._replace(
+            NativeMTPReadyEpoch(self, _NativeMTPPhase.READY, ready_uids),
+            "mixed_ready_join",
+        )
+
+    def _bonus(self, epoch):
+        epoch._consume()
+        emissions = []
+        for uid in epoch.active_uids:
+            state = self._sampling[uid]
+            history = mx.concatenate([self._history[uid], self._draft[uid]])
+            reported = state.reported_logprobs(
+                self._verify_logits[uid].squeeze((0, 1)), history
+            )
+            token = state.sample(
+                state.sampling_distribution(reported),
+                rng_key=self._next_rng_key(uid) if state.config.stochastic else None,
+            ).reshape(-1)
+            mx.eval(token, reported)
+            self._history[uid] = mx.concatenate([history, token])
+            self._head[uid] = token
+            emissions.append(self._make_emission(uid, token.item(), reported, False))
+        active = self._record_emissions(
+            _NativeMTPPhase.BONUS, emissions, expected=epoch.active_uids
+        )
+        result = NativeMTPBonusEpoch(self, _NativeMTPPhase.BONUS, active)
+        result._deferred_rejected = epoch._deferred_rejected
+        return self._replace(result, "bonus_emission")
+
+    def _catch_up(self, epoch):
+        epoch._consume()
+        drafts = tuple(epoch.active_uids)
+        if drafts:
+            hidden = mx.concatenate(
+                [self._verify_hidden[uid] for uid in drafts], axis=0
+            )
+            tokens = mx.array(
+                [(self._draft[uid].item(), self._head[uid].item()) for uid in drafts],
+                dtype=mx.uint32,
+            )
+            self._cohort.bind_before_mutation()
+            logits = self._admission.model.mtp_forward(
+                hidden, tokens, self._cohort.mtp
+            )[:, -1, :]
+            self._seal_delta(backbone=0, mtp=2)
+            for index, uid in enumerate(drafts):
+                state = self._sampling[uid]
+                reported = state.reported_logprobs(logits[index], self._history[uid])
+                draft_logprobs = state.sampling_distribution(reported)
+                draft = state.sample(
+                    draft_logprobs,
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                mx.eval(draft, reported)
+                self._draft[uid] = draft
+                self._draft_logprobs[uid] = draft_logprobs
+        return self._replace(
+            NativeMTPReadyEpoch(self, _NativeMTPPhase.READY, drafts),
+            "head_catch_up_plus_two",
+        )
+
+    def _reject(self, epoch):
+        epoch._consume()
+        try:
+            if epoch.accepted_uids:
+                raise RuntimeError(
+                    "native_mtp_batch_mixed_decision_requires_branch_resolution"
+                )
+            self._cohort.rollback()
+            _, replay_hidden = self._target_forward(
+                tuple(self._head[uid].item() for uid in epoch.rejected_uids),
+                phase=GenerationForwardPhase.DECODE,
+            )
+            self._replay_hidden = {}
+            emissions = []
+            for index, uid in enumerate(epoch.rejected_uids):
+                self._replay_hidden[uid] = replay_hidden[index : index + 1, -1:, :]
+                emissions.append(
+                    self._make_emission(
+                        uid,
+                        self._replacement[uid].item(),
+                        self._verify_logprobs[uid],
+                        False,
+                    )
+                )
+        except BaseException:
+            self._poison_all("native_mtp_batch_reject_failed")
+            raise
+        active = self._record_emissions(
+            _NativeMTPPhase.REJECTED, emissions, expected=epoch.rejected_uids
+        )
+        return self._replace(
+            NativeMTPRejectedEpoch(self, _NativeMTPPhase.REJECTED, active),
+            "rollback_replay_replacement_emission",
+        )
+
+    def _redraft(self, epoch):
+        epoch._consume()
+        drafts = tuple(epoch.active_uids)
+        if drafts:
+            logits = self._mtp_forward(
+                mx.concatenate([self._replay_hidden[uid] for uid in drafts], axis=0),
+                tuple(self._replacement[uid].item() for uid in drafts),
+            )[:, -1, :]
+            for index, uid in enumerate(drafts):
+                state = self._sampling[uid]
+                self._head[uid] = self._replacement[uid]
+                self._history[uid] = mx.concatenate(
+                    [self._history[uid], self._head[uid]]
+                )
+                reported = state.reported_logprobs(logits[index], self._history[uid])
+                draft_logprobs = state.sampling_distribution(reported)
+                draft = state.sample(
+                    draft_logprobs,
+                    rng_key=(
+                        self._next_rng_key(uid) if state.config.stochastic else None
+                    ),
+                ).reshape(-1)
+                mx.eval(draft, reported)
+                self._draft[uid] = draft
+                self._draft_logprobs[uid] = draft_logprobs
+        return self._replace(
+            NativeMTPReadyEpoch(self, _NativeMTPPhase.READY, drafts),
+            "head_redraft_plus_one",
+        )
+
+    def _close(self, reason):
+        if self._closed:
+            return
+        self._cohort.poison("native_mtp_batch_" + reason)
+        self._closed = True
+        self._epoch = None
+        self._active = ()
+        self._events = self._events + (
+            _NativeMTPTelemetryEvent(_NativeMTPPhase.CLOSED, (), reason),
+        )
 
 
 def _validate_receipt_against_record(receipt, record):
