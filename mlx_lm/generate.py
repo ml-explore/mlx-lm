@@ -587,6 +587,795 @@ class NativeMTPSamplingConfig:
         return self.temperature > 0
 
 
+class _NativeMTPSamplingState:
+    """Replay-safe sampling and RNG state for one native-MTP row.
+
+    The single-request generator deliberately keeps this object private: its
+    public call signature and draw order are part of the existing B=1
+    behaviour.  The batched native-MTP path uses the same operations with a
+    fixed set of per-row slots, rather than sharing a mutable global key.
+    """
+
+    def __init__(
+        self,
+        config: NativeMTPSamplingConfig,
+        *,
+        sampler: Optional[Callable[[mx.array], mx.array]] = None,
+        logits_processors: Optional[
+            List[Callable[[mx.array, mx.array], mx.array]]
+        ] = None,
+        seed: Optional[int] = None,
+    ):
+        self.config = config
+        self.sampler = sampler
+        self.logits_processors = logits_processors or []
+        self._rng_key = mx.random.key(
+            seed if seed is not None else (time.time_ns() & ((1 << 63) - 1))
+        )
+
+    def next_rng_key(self):
+        keys = mx.random.split(self._rng_key)
+        self._rng_key = keys[0]
+        return keys[1]
+
+    def reported_logprobs(self, logits, tokens):
+        if logits.ndim == 1:
+            logits = logits[None]
+        for processor in self.logits_processors:
+            logits = processor(tokens, logits)
+        return (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).squeeze(0)
+
+    def sampling_distribution(self, reported_logprobs):
+        logprobs = reported_logprobs[None]
+        if self.config.top_p < 1:
+            logprobs = apply_top_p(logprobs, self.config.top_p)
+        if self.config.min_p > 0:
+            keep = self.config.min_tokens_to_keep
+            vocab_size = logprobs.shape[-1]
+            if keep > vocab_size:
+                raise ValueError(
+                    "native MTP min_tokens_to_keep cannot exceed vocabulary size"
+                )
+            if keep < vocab_size:
+                # apply_min_p's multi-token branch passes a Python bool to
+                # put_along_axis, which newer MLX releases reject. Preserve
+                # the standard filter exactly by restoring requested top rows.
+                unfiltered = logprobs
+                logprobs = apply_min_p(logprobs, self.config.min_p)
+                if keep > 1:
+                    top_indices = mx.argpartition(unfiltered, kth=-keep, axis=-1)[
+                        ..., -keep:
+                    ]
+                    top_values = mx.take_along_axis(unfiltered, top_indices, axis=-1)
+                    logprobs = mx.put_along_axis(
+                        logprobs, top_indices, top_values, axis=-1
+                    )
+        if self.config.top_k > 0:
+            if self.config.top_k >= logprobs.shape[-1]:
+                raise ValueError(
+                    "native MTP top_k must be smaller than vocabulary size"
+                )
+            logprobs = apply_top_k(logprobs, self.config.top_k)
+        if self.config.stochastic:
+            logprobs = logprobs / self.config.temperature
+        return (logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)).squeeze(0)
+
+    def sample(self, logprobs):
+        if self.config.stochastic:
+            return mx.random.categorical(logprobs, key=self.next_rng_key())
+        if self.sampler is None:
+            return mx.argmax(logprobs, axis=-1)
+        return self.sampler(logprobs)
+
+    def residual_sample(self, target_logprobs, draft_logprobs):
+        target_probs = mx.exp(target_logprobs)
+        draft_probs = mx.exp(draft_logprobs)
+        residual = mx.maximum(target_probs - draft_probs, 0)
+        normalizer = mx.sum(residual)
+        residual_logprobs = mx.where(
+            normalizer > 0,
+            mx.log(residual / normalizer),
+            target_logprobs,
+        )
+        return self.sample(residual_logprobs), residual_logprobs
+
+
+@dataclass(frozen=True)
+class _NativeMTPCohortBinding:
+    """Exact cache identities bound before a cohort forward may mutate them."""
+
+    model_id: int
+    backbone_container_id: int
+    mtp_container_id: int
+    uids: Tuple[int, ...]
+    backbone_layout: Tuple[tuple, ...]
+    mtp_layout: Tuple[tuple, ...]
+    backbone_metadata: Tuple[tuple, ...]
+    mtp_metadata: Tuple[tuple, ...]
+
+
+@dataclass(frozen=True)
+class _NativeMTPCohortCacheCheckpoint:
+    """Recurrent-value / KV-offset transaction state for one cohort round."""
+
+    backbone: Tuple[tuple, ...]
+    mtp: Tuple[tuple, ...]
+
+
+@dataclass(frozen=True)
+class _NativeMTPCohortMutationDelta:
+    """Caller-declared physical cache advance for one verified cohort forward."""
+
+    backbone: Tuple[Tuple[int, ...], ...]
+    mtp: Tuple[Tuple[int, ...], ...]
+
+
+class _NativeMTPCohortCache:
+    """Private move-only cache owner for a homogeneous native-MTP cohort.
+
+    Rows enter as separately owned B=1 native-MTP requests, then become one
+    merged cohort cache.  The caller must bind immediately before each model
+    forward, so replacing a cache container or entry cannot silently redirect a
+    transaction.  KV rollback records only offsets and cache references; only
+    small recurrent ``ArraysCache`` values are copied at the transaction
+    boundary.  Rotating and quantized layouts are deliberately refused.
+    """
+
+    _MAX_RECURRENT_STATE_ELEMENTS = 65536
+
+    def __init__(
+        self,
+        model: nn.Module,
+        rows: Sequence[cache.NativeMTPRequestCache],
+        *,
+        uids: Optional[Sequence[int]] = None,
+    ):
+        if not rows:
+            raise ValueError("native_mtp_cohort_requires_rows")
+        if any(not isinstance(row, cache.NativeMTPRequestCache) for row in rows):
+            raise TypeError("native_mtp_cohort_requires_native_request_caches")
+        if any(row.model is not model for row in rows):
+            raise ValueError("native_mtp_cohort_model_mismatch")
+        if any(row.closed for row in rows):
+            raise RuntimeError("native_mtp_cohort_row_closed")
+        if any(row.checkpoint_active for row in rows):
+            raise RuntimeError("native_mtp_cohort_row_transaction_active")
+        for row in rows:
+            row.assert_aligned(
+                backbone_tokens=row.state.backbone_tokens,
+                mtp_tokens=row.state.mtp_tokens,
+            )
+
+        if uids is None:
+            uids = tuple(range(len(rows)))
+        if len(uids) != len(rows) or len(set(uids)) != len(uids):
+            raise ValueError("native_mtp_cohort_uids_invalid")
+
+        # Build every destination entry before consuming any source owner.  A
+        # source request becomes closed only after the full merged cohort is
+        # valid, which makes failed construction atomically non-consuming.
+        backbone = self._merge_entries([row.backbone for row in rows])
+        mtp = self._merge_entries([row.mtp for row in rows])
+        self.model = model
+        self._poisoned_reason = None
+        self._checkpoint = None
+        self._transaction_sealed = False
+        self._size = len(rows)
+        self.uids = tuple(uids)
+        self.backbone = backbone
+        self.mtp = mtp
+        self._binding = self._make_binding()
+        try:
+            for row in rows:
+                row.finish("generator_closed")
+        except BaseException:
+            for row in rows:
+                row._checkpoint = None
+                row._replay_required = None
+                row._closed = True
+            self.poison("native_mtp_cohort_source_consume_failed")
+            raise
+
+    @staticmethod
+    def _reject_entry(entry):
+        if isinstance(entry, (QuantizedKVCache, RotatingKVCache, BatchRotatingKVCache)):
+            raise RuntimeError("native_mtp_cohort_cache_layout_unsupported")
+        if not isinstance(entry, (KVCache, BatchKVCache, ArraysCache)):
+            raise TypeError("native_mtp_cohort_cache_type_unsupported")
+
+    @classmethod
+    def _merge_entries(cls, rows):
+        width = len(rows[0])
+        if width == 0 or any(len(row) != width for row in rows):
+            raise ValueError("native_mtp_cohort_cache_topology_mismatch")
+        merged = []
+        for index in range(width):
+            entries = [row[index] for row in rows]
+            for entry in entries:
+                cls._reject_entry(entry)
+            entry_type = type(entries[0])
+            if any(type(entry) is not entry_type for entry in entries):
+                raise TypeError("native_mtp_cohort_cache_type_mismatch")
+            schema = cls._entry_schema(entries[0])
+            if any(cls._entry_schema(entry) != schema for entry in entries[1:]):
+                raise TypeError("native_mtp_cohort_cache_storage_schema_mismatch")
+            merged.append(entry_type.merge(entries))
+        return merged
+
+    @property
+    def size(self):
+        return self._size
+
+    @property
+    def poisoned(self):
+        return self._poisoned_reason is not None
+
+    @staticmethod
+    def _array_layout(value):
+        if value is None:
+            return None
+        return id(value), tuple(value.shape), value.dtype
+
+    @classmethod
+    def _entry_schema(cls, entry):
+        """Stable topology/storage schema; excludes mutable sequence capacity."""
+
+        cls._reject_entry(entry)
+        if isinstance(entry, ArraysCache):
+            batch_size = entry.batch_size
+            if any(
+                value is not None
+                and math.prod(value.shape[1:]) > cls._MAX_RECURRENT_STATE_ELEMENTS
+                for value in entry.cache
+            ):
+                raise RuntimeError("native_mtp_cohort_recurrent_state_too_large")
+            slots = []
+            for value in entry.cache:
+                if value is None:
+                    slots.append(None)
+                    continue
+                if value.ndim < 1 or value.shape[0] != batch_size:
+                    raise RuntimeError(
+                        "native_mtp_cohort_recurrent_batch_size_mismatch"
+                    )
+                slots.append(
+                    (value.ndim, value.shape[0], tuple(value.shape[1:]), value.dtype)
+                )
+            return (
+                type(entry),
+                batch_size,
+                tuple(slots),
+            )
+
+        def kv_schema(value):
+            if value is None:
+                return None
+            return (
+                value.ndim,
+                value.shape[0],
+                value.shape[1],
+                value.shape[3],
+                value.dtype,
+            )
+
+        if entry.keys is None and isinstance(entry, BatchKVCache):
+            if entry.offset.size != entry.left_padding.size:
+                raise RuntimeError("native_mtp_cohort_batch_metadata_width_mismatch")
+            batch_size = entry.offset.size
+        else:
+            batch_size = entry.keys.shape[0] if entry.keys is not None else 1
+
+        return (
+            type(entry),
+            batch_size,
+            kv_schema(entry.keys),
+            kv_schema(entry.values),
+        )
+
+    @classmethod
+    def _entry_layout(cls, entry):
+        """Stable entry ownership plus schema; mutable backing storage is excluded."""
+
+        return id(entry), cls._entry_schema(entry)
+
+    @staticmethod
+    def _metadata_spec(entry):
+        if isinstance(entry, ArraysCache):
+            return (entry.left_padding, entry.lengths)
+        if not isinstance(entry, BatchKVCache):
+            return (mx.array([entry.offset]), None)
+        return (entry.offset, entry.left_padding)
+
+    @classmethod
+    def _host_metadata(cls, entries):
+        """Read mutable cache metadata through exactly one aggregate decision."""
+
+        arrays = []
+        widths = []
+        for entry in entries:
+            entry_widths = []
+            for value in cls._metadata_spec(entry):
+                width = 0 if value is None else value.size
+                entry_widths.append(width)
+                if value is not None:
+                    arrays.append(value.reshape(-1).astype(mx.int64))
+            widths.append(tuple(entry_widths))
+        flattened = mx.concatenate(arrays) if arrays else mx.array([], dtype=mx.int64)
+        mx.eval(flattened)
+        values = tuple(flattened.tolist())
+        cursor = 0
+        metadata = []
+        for entry_widths in widths:
+            entry_values = []
+            for width in entry_widths:
+                entry_values.append(values[cursor : cursor + width])
+                cursor += width
+            entry = entries[len(metadata)]
+            if isinstance(entry, ArraysCache):
+                metadata.append((None, *entry_values))
+            else:
+                metadata.append((entry._idx, *entry_values))
+        return tuple(metadata)
+
+    def _make_binding(self):
+        entries = self.backbone + self.mtp
+        metadata = self._host_metadata(entries)
+        split = len(self.backbone)
+        return _NativeMTPCohortBinding(
+            model_id=id(self.model),
+            backbone_container_id=id(self.backbone),
+            mtp_container_id=id(self.mtp),
+            uids=self.uids,
+            backbone_layout=tuple(self._entry_layout(entry) for entry in self.backbone),
+            mtp_layout=tuple(self._entry_layout(entry) for entry in self.mtp),
+            backbone_metadata=metadata[:split],
+            mtp_metadata=metadata[split:],
+        )
+
+    def _binding_topology_matches(self):
+        """Check ownership identity before reading mutable cache internals.
+
+        In particular, a same-type replacement can be deliberately incomplete
+        (for example, a fresh ``KVCache`` in place of a merged
+        ``BatchKVCache``).  Its identity mismatch is enough to reject it; do
+        not walk its metadata just to discover that its representation is not
+        a valid cohort entry.
+        """
+
+        binding = self._binding
+        if (
+            id(self.model) != binding.model_id
+            or id(self.backbone) != binding.backbone_container_id
+            or id(self.mtp) != binding.mtp_container_id
+            or self.uids != binding.uids
+        ):
+            return False
+
+        def entries_match(entries, layouts):
+            return len(entries) == len(layouts) and all(
+                id(entry) == entry_id and type(entry) is schema[0]
+                for entry, (entry_id, schema) in zip(entries, layouts)
+            )
+
+        return entries_match(self.backbone, binding.backbone_layout) and entries_match(
+            self.mtp, binding.mtp_layout
+        )
+
+    def bind_before_mutation(self):
+        """Assert that the exact cache identities survive until the forward."""
+
+        if self.poisoned:
+            raise RuntimeError(self._poisoned_reason)
+        if not self._binding_topology_matches():
+            self.poison("native_mtp_cohort_cache_binding_changed")
+            raise RuntimeError("native_mtp_cohort_cache_binding_changed")
+        try:
+            actual = self._make_binding()
+        except BaseException as exc:
+            self.poison("native_mtp_cohort_cache_binding_changed")
+            raise RuntimeError("native_mtp_cohort_cache_binding_changed") from exc
+        if actual != self._binding:
+            self.poison("native_mtp_cohort_cache_binding_changed")
+            raise RuntimeError("native_mtp_cohort_cache_binding_changed")
+        return self.backbone, self.mtp
+
+    @staticmethod
+    def _validate_delta(name, before, after, expected):
+        if len(before) != len(after) or len(before) != len(expected):
+            raise ValueError(f"native_mtp_cohort_{name}_delta_topology_mismatch")
+        for layer, (before_layer, after_layer, expected_layer) in enumerate(
+            zip(before, after, expected)
+        ):
+            # KV metadata is (_idx, offsets, left_padding); Arrays metadata is
+            # (None, left_padding, lengths). Both Arrays metadata values must
+            # remain exact across a native-MTP decode transaction.
+            before_index, before_primary, *before_rest = before_layer
+            after_index, after_primary, *after_rest = after_layer
+            if before_index is None:
+                if before_primary != after_primary or tuple(before_rest) != tuple(
+                    after_rest
+                ):
+                    raise RuntimeError(
+                        f"native_mtp_cohort_{name}_arrays_metadata_changed: layer={layer}"
+                    )
+                if expected_layer:
+                    raise RuntimeError(
+                        f"native_mtp_cohort_{name}_array_delta_unsupported: layer={layer}"
+                    )
+                continue
+            if tuple(after_rest) != tuple(before_rest):
+                raise RuntimeError(
+                    f"native_mtp_cohort_{name}_metadata_changed: layer={layer}"
+                )
+            actual_delta = tuple(
+                current - prior for prior, current in zip(before_primary, after_primary)
+            )
+            if (
+                len(before_primary) != len(after_primary)
+                or tuple(expected_layer) != actual_delta
+                or after_index - before_index
+                != (actual_delta[0] if actual_delta else 0)
+                or len(set(actual_delta)) > 1
+            ):
+                raise RuntimeError(
+                    f"native_mtp_cohort_{name}_delta_mismatch: layer={layer}"
+                )
+
+    @classmethod
+    def _schema_transition_allowed(cls, before, after):
+        """Allow only one-way first-population transitions for one owner."""
+
+        before_entry_id, before_schema = before
+        after_entry_id, after_schema = after
+        if (
+            before_entry_id != after_entry_id
+            or len(before_schema) < 2
+            or len(after_schema) < 2
+        ):
+            return False
+
+        before_type, before_batch = before_schema[:2]
+        after_type, after_batch = after_schema[:2]
+        if before_type is not after_type or before_batch != after_batch:
+            return False
+
+        def valid_dimension(value):
+            return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+        def valid_kv_schema(schema):
+            return (
+                isinstance(schema, tuple)
+                and len(schema) == 5
+                and schema[0] == 4
+                and schema[1] == before_batch
+                and valid_dimension(schema[2])
+                and valid_dimension(schema[3])
+                and schema[4] is not None
+            )
+
+        if before_type in (KVCache, BatchKVCache):
+            if len(before_schema) != 4 or len(after_schema) != 4:
+                return False
+            before_keys, before_values = before_schema[2:]
+            after_keys, after_values = after_schema[2:]
+            return (
+                before_keys is None
+                and before_values is None
+                and valid_kv_schema(after_keys)
+                and valid_kv_schema(after_values)
+            )
+
+        if before_type is ArraysCache:
+            if len(before_schema) != 3 or len(after_schema) != 3:
+                return False
+            before_slots, after_slots = before_schema[2], after_schema[2]
+            if len(before_slots) != len(after_slots):
+                return False
+
+            def valid_array_schema(schema):
+                return (
+                    isinstance(schema, tuple)
+                    and len(schema) == 4
+                    and valid_dimension(schema[0])
+                    and schema[1] == before_batch
+                    and isinstance(schema[2], tuple)
+                    and len(schema[2]) == schema[0] - 1
+                    and all(
+                        isinstance(dimension, int)
+                        and not isinstance(dimension, bool)
+                        and dimension >= 0
+                        for dimension in schema[2]
+                    )
+                    and schema[3] is not None
+                )
+
+            return any(
+                before_slot is None and after_slot is not None
+                for before_slot, after_slot in zip(before_slots, after_slots)
+            ) and all(
+                before_slot == after_slot
+                or (before_slot is None and valid_array_schema(after_slot))
+                for before_slot, after_slot in zip(before_slots, after_slots)
+            )
+
+        return False
+
+    def seal_after_mutation(self, expected: _NativeMTPCohortMutationDelta):
+        """Record the exact post-forward layout before a later forward.
+
+        Call immediately after the cohort's known model forward.  Subsequent
+        ``bind_before_mutation`` calls reject any topology, row ordering,
+        metadata, offset, or backing-array change made outside that boundary.
+        """
+
+        if self.poisoned:
+            raise RuntimeError(self._poisoned_reason)
+        if not isinstance(expected, _NativeMTPCohortMutationDelta):
+            raise TypeError("native_mtp_cohort_expected_delta_required")
+        before = self._binding
+        try:
+            after = self._make_binding()
+        except BaseException as exc:
+            self.poison("native_mtp_cohort_unexpected_layout_change")
+            raise RuntimeError("native_mtp_cohort_unexpected_layout_change") from exc
+        if (
+            before.model_id != after.model_id
+            or before.backbone_container_id != after.backbone_container_id
+            or before.mtp_container_id != after.mtp_container_id
+            or before.uids != after.uids
+            or len(before.backbone_layout) != len(after.backbone_layout)
+            or len(before.mtp_layout) != len(after.mtp_layout)
+            or any(
+                previous != current
+                and not self._schema_transition_allowed(previous, current)
+                for previous, current in zip(
+                    before.backbone_layout, after.backbone_layout
+                )
+            )
+            or any(
+                previous != current
+                and not self._schema_transition_allowed(previous, current)
+                for previous, current in zip(before.mtp_layout, after.mtp_layout)
+            )
+        ):
+            self.poison("native_mtp_cohort_unexpected_layout_change")
+            raise RuntimeError("native_mtp_cohort_unexpected_layout_change")
+        try:
+            self._validate_delta(
+                "backbone",
+                before.backbone_metadata,
+                after.backbone_metadata,
+                expected.backbone,
+            )
+            self._validate_delta(
+                "mtp", before.mtp_metadata, after.mtp_metadata, expected.mtp
+            )
+        except BaseException:
+            self.poison("native_mtp_cohort_unexpected_metadata_change")
+            raise
+        self._binding = after
+        self._transaction_sealed = True
+
+    @staticmethod
+    def _copy_recurrent(value):
+        """Copy a bounded recurrent value without retaining its write target."""
+
+        if value is None:
+            return None
+        return value + mx.zeros(value.shape, dtype=value.dtype)
+
+    @staticmethod
+    def _snapshot_entry(entry):
+        if isinstance(entry, ArraysCache):
+            return (
+                entry,
+                tuple(
+                    _NativeMTPCohortCache._copy_recurrent(value)
+                    for value in entry.cache
+                ),
+                _NativeMTPCohortCache._copy_recurrent(entry.left_padding),
+                _NativeMTPCohortCache._copy_recurrent(entry.lengths),
+            )
+        if not isinstance(entry, BatchKVCache):
+            raise TypeError("native_mtp_cohort_cache_type_unsupported")
+        return (entry, entry._idx, entry.offset, entry.left_padding)
+
+    @staticmethod
+    def _restore_entry(snapshot):
+        entry = snapshot[0]
+        if isinstance(entry, ArraysCache):
+            _, values, left_padding, lengths = snapshot
+            entry.cache = list(values)
+            entry.left_padding = left_padding
+            entry.lengths = lengths
+            return
+        _, previous_idx, previous_offset, previous_left_padding = snapshot
+        trim = entry._idx - previous_idx
+        if trim < 0 or (trim and entry.trim(trim) != trim):
+            raise RuntimeError("native_mtp_cohort_cache_rollback_inexact")
+        entry.offset = previous_offset
+        entry.left_padding = previous_left_padding
+
+    def checkpoint(self):
+        if self.poisoned:
+            raise RuntimeError(self._poisoned_reason)
+        if self._checkpoint is not None:
+            raise RuntimeError("native_mtp_cohort_checkpoint_already_active")
+        self.bind_before_mutation()
+        self._checkpoint = _NativeMTPCohortCacheCheckpoint(
+            backbone=tuple(self._snapshot_entry(entry) for entry in self.backbone),
+            mtp=tuple(self._snapshot_entry(entry) for entry in self.mtp),
+        )
+        self._transaction_sealed = False
+        return self._checkpoint
+
+    def commit(self):
+        if self._checkpoint is None:
+            raise RuntimeError("native_mtp_cohort_checkpoint_missing")
+        if not self._transaction_sealed:
+            raise RuntimeError("native_mtp_cohort_mutation_not_sealed")
+        self._checkpoint = None
+        self._transaction_sealed = False
+
+    def rollback(self):
+        if self._checkpoint is None:
+            raise RuntimeError("native_mtp_cohort_checkpoint_missing")
+        checkpoint, self._checkpoint = self._checkpoint, None
+        self._transaction_sealed = False
+        try:
+            for snapshot in checkpoint.backbone:
+                self._restore_entry(snapshot)
+            for snapshot in checkpoint.mtp:
+                self._restore_entry(snapshot)
+            self._binding = self._make_binding()
+        except BaseException:
+            self.poison("native_mtp_cohort_rollback_failed")
+            raise
+
+    def filter(self, keep: Sequence[int]):
+        if self._checkpoint is not None:
+            raise RuntimeError("native_mtp_cohort_filter_during_transaction")
+        if len(set(keep)) != len(keep) or any(
+            index < 0 or index >= self.size for index in keep
+        ):
+            raise ValueError("native_mtp_cohort_filter_indices_invalid")
+        self.bind_before_mutation()
+        try:
+            partition = self._partition(keep)
+        except BaseException:
+            self.poison("native_mtp_cohort_filter_failed")
+            raise
+        self.backbone, self.mtp, self.uids = partition
+        self._size = len(keep)
+        self._binding = self._make_binding()
+
+    def split(self, keep: Sequence[int]):
+        """Move selected rows into a new owner; neither owner shares a cache."""
+
+        if self._checkpoint is not None:
+            raise RuntimeError("native_mtp_cohort_split_during_transaction")
+        keep = tuple(keep)
+        if len(set(keep)) != len(keep) or any(
+            index < 0 or index >= self.size for index in keep
+        ):
+            raise ValueError("native_mtp_cohort_split_indices_invalid")
+        self.bind_before_mutation()
+        try:
+            selected = self._from_partition(keep)
+            remaining = tuple(
+                index for index in range(self.size) if index not in set(keep)
+            )
+            remaining_partition = self._partition(remaining)
+        except BaseException:
+            self.poison("native_mtp_cohort_split_failed")
+            raise
+        self.backbone, self.mtp, self.uids = remaining_partition
+        self._size = len(remaining)
+        self._binding = self._make_binding()
+        return selected
+
+    @staticmethod
+    def _gather_batch_rows(value, indices):
+        """Select row indices on-device while preserving every trailing axis."""
+
+        if value is None:
+            return None
+        return mx.take(value, indices, axis=0)
+
+    @staticmethod
+    def _partition_entry(entry, indices):
+        """Device-side whole-cohort partition; never extract host rows."""
+
+        indices = mx.array(indices, dtype=mx.int32)
+        clone = copy.copy(entry)
+        if isinstance(entry, ArraysCache):
+            clone.cache = [
+                _NativeMTPCohortCache._gather_batch_rows(value, indices)
+                for value in entry.cache
+            ]
+            clone.left_padding = _NativeMTPCohortCache._gather_batch_rows(
+                entry.left_padding, indices
+            )
+            clone.lengths = _NativeMTPCohortCache._gather_batch_rows(
+                entry.lengths, indices
+            )
+            return clone
+        clone.keys = _NativeMTPCohortCache._gather_batch_rows(entry.keys, indices)
+        clone.values = _NativeMTPCohortCache._gather_batch_rows(entry.values, indices)
+        clone.offset = _NativeMTPCohortCache._gather_batch_rows(entry.offset, indices)
+        clone.left_padding = _NativeMTPCohortCache._gather_batch_rows(
+            entry.left_padding, indices
+        )
+        clone._right_padding = None
+        return clone
+
+    def _partition(self, indices):
+        if not indices:
+            return [], [], ()
+        return (
+            [self._partition_entry(entry, indices) for entry in self.backbone],
+            [self._partition_entry(entry, indices) for entry in self.mtp],
+            tuple(self.uids[index] for index in indices),
+        )
+
+    @classmethod
+    def _from_merged(cls, model, backbone, mtp, uids):
+        owner = object.__new__(cls)
+        owner.model = model
+        owner._poisoned_reason = None
+        owner._checkpoint = None
+        owner._transaction_sealed = False
+        owner._size = len(uids)
+        owner.uids = tuple(uids)
+        owner.backbone = backbone
+        owner.mtp = mtp
+        owner._binding = owner._make_binding()
+        return owner
+
+    def _from_partition(self, indices):
+        return self._from_merged(self.model, *self._partition(indices))
+
+    def join(self, other):
+        if not isinstance(other, type(self)) or other.model is not self.model:
+            raise ValueError("native_mtp_cohort_join_model_mismatch")
+        if self._checkpoint is not None or other._checkpoint is not None:
+            raise RuntimeError("native_mtp_cohort_join_during_transaction")
+        self.bind_before_mutation()
+        other.bind_before_mutation()
+        if self.size == 0:
+            self.backbone, self.mtp, self.uids = other.backbone, other.mtp, other.uids
+            self._size = other.size
+            self._binding = self._make_binding()
+            other.poison("native_mtp_cohort_moved")
+            return
+        if other.size == 0:
+            other.poison("native_mtp_cohort_moved")
+            return
+        try:
+            staged_backbone = [copy.copy(entry) for entry in self.backbone]
+            staged_mtp = [copy.copy(entry) for entry in self.mtp]
+            for own, incoming in zip(
+                staged_backbone + staged_mtp, other.backbone + other.mtp
+            ):
+                own.extend(incoming)
+            staged_uids = self.uids + other.uids
+            if len(set(staged_uids)) != len(staged_uids):
+                raise ValueError("native_mtp_cohort_join_uid_collision")
+        except BaseException:
+            self.poison("native_mtp_cohort_join_failed")
+            other.poison("native_mtp_cohort_join_failed")
+            raise
+        self.backbone, self.mtp, self.uids = staged_backbone, staged_mtp, staged_uids
+        self._size += other.size
+        self._binding = self._make_binding()
+        other.poison("native_mtp_cohort_moved")
+
+    def poison(self, reason):
+        self._checkpoint = None
+        self._transaction_sealed = False
+        self._poisoned_reason = reason
+
+
 def _validate_receipt_against_record(receipt, record):
     if (
         not isinstance(receipt, GenerationForwardPositionReceipt)
@@ -802,9 +1591,7 @@ class NativeMTPSparseBootstrap:
                 return None
             previous_position = position
         if any(
-            isinstance(token_id, bool)
-            or not isinstance(token_id, int)
-            or token_id < 0
+            isinstance(token_id, bool) or not isinstance(token_id, int) or token_id < 0
             for token_id in (*token_ids, *successors)
         ):
             return None
@@ -1930,63 +2717,6 @@ def mtp_generate_step(
     request = None
     sparse_claim = None
 
-    def _next_rng_key():
-        nonlocal rng_key
-        keys = mx.random.split(rng_key)
-        rng_key = keys[0]
-        return keys[1]
-
-    def _sample(logprobs):
-        if sampling_config.stochastic:
-            return mx.random.categorical(logprobs, key=_next_rng_key())
-        if sampler is None:
-            return mx.argmax(logprobs, axis=-1)
-        return sampler(logprobs)
-
-    def _reported_logprobs(logits, tokens):
-        if logits.ndim == 1:
-            logits = logits[None]
-        if logits_processors:
-            for processor in logits_processors:
-                logits = processor(tokens, logits)
-        return (logits - mx.logsumexp(logits, axis=-1, keepdims=True)).squeeze(0)
-
-    def _sampling_distribution(reported_logprobs):
-        logprobs = reported_logprobs[None]
-        if sampling_config.top_p < 1:
-            logprobs = apply_top_p(logprobs, sampling_config.top_p)
-        if sampling_config.min_p > 0:
-            keep = sampling_config.min_tokens_to_keep
-            vocab_size = logprobs.shape[-1]
-            if keep > vocab_size:
-                raise ValueError(
-                    "native MTP min_tokens_to_keep cannot exceed vocabulary size"
-                )
-            if keep < vocab_size:
-                # apply_min_p's multi-token branch passes a Python bool to
-                # put_along_axis, which newer MLX releases reject.  Preserve
-                # the standard filter exactly by restoring the requested top
-                # tokens with array-valued replacements.
-                unfiltered = logprobs
-                logprobs = apply_min_p(logprobs, sampling_config.min_p)
-                if keep > 1:
-                    top_indices = mx.argpartition(unfiltered, kth=-keep, axis=-1)[
-                        ..., -keep:
-                    ]
-                    top_values = mx.take_along_axis(unfiltered, top_indices, axis=-1)
-                    logprobs = mx.put_along_axis(
-                        logprobs, top_indices, top_values, axis=-1
-                    )
-        if sampling_config.top_k > 0:
-            if sampling_config.top_k >= logprobs.shape[-1]:
-                raise ValueError(
-                    "native MTP top_k must be smaller than vocabulary size"
-                )
-            logprobs = apply_top_k(logprobs, sampling_config.top_k)
-        if sampling_config.stochastic:
-            logprobs = logprobs / sampling_config.temperature
-        return (logprobs - mx.logsumexp(logprobs, axis=-1, keepdims=True)).squeeze(0)
-
     def _target_call(
         input_tokens,
         phase,
@@ -2081,27 +2811,17 @@ def mtp_generate_step(
                 mtp_tokens=request.state.mtp_tokens + next_tokens.size,
             )
             _assert_target_mtp_alignment()
-            draft_reported_logprobs = _reported_logprobs(
+            draft_reported_logprobs = sampling_state.reported_logprobs(
                 logits.squeeze(0), token_history
             )
-            draft_logprobs = _sampling_distribution(draft_reported_logprobs)
-            draft_token = _sample(draft_logprobs)
+            draft_logprobs = sampling_state.sampling_distribution(
+                draft_reported_logprobs
+            )
+            draft_token = sampling_state.sample(draft_logprobs)
         mx.eval(draft_token, draft_logprobs)
         if telemetry is not None:
             telemetry["mtp_drafts"] += 1
         return draft_token.reshape(-1), draft_logprobs
-
-    def _residual_sample(target_logprobs, draft_logprobs):
-        target_probs = mx.exp(target_logprobs)
-        draft_probs = mx.exp(draft_logprobs)
-        residual = mx.maximum(target_probs - draft_probs, 0)
-        normalizer = mx.sum(residual)
-        residual_logprobs = mx.where(
-            normalizer > 0,
-            mx.log(residual / normalizer),
-            target_logprobs,
-        )
-        return _sample(residual_logprobs), residual_logprobs
 
     finish_reason = "generator_closed"
     generated = 0
@@ -2123,10 +2843,11 @@ def mtp_generate_step(
                 mtp_bypass_reason=None,
             )
         eos_token_ids = frozenset(eos_token_ids or ())
-        rng_key = mx.random.key(
-            sampling_config.seed
-            if sampling_config.seed is not None
-            else (time.time_ns() & ((1 << 63) - 1))
+        sampling_state = _NativeMTPSamplingState(
+            sampling_config,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            seed=sampling_config.seed,
         )
         if max_tokens == 0:
             finish_reason = "length"
@@ -2206,11 +2927,15 @@ def mtp_generate_step(
                     )
                 # Match generate_step: processors see only the final step.
                 history = remaining.astype(mx.uint32)
-                current_logprobs = _reported_logprobs(
+                current_logprobs = sampling_state.reported_logprobs(
                     initial_logits[:, -1, :].squeeze(0), history
                 )
-                current_sampling_logprobs = _sampling_distribution(current_logprobs)
-                current_token = _sample(current_sampling_logprobs).reshape(-1)
+                current_sampling_logprobs = sampling_state.sampling_distribution(
+                    current_logprobs
+                )
+                current_token = sampling_state.sample(
+                    current_sampling_logprobs
+                ).reshape(-1)
             current_hidden = initial_hidden[:, -1:, :]
         else:
             selected_count = len(sparse_claim.selected_token_ids)
@@ -2238,9 +2963,7 @@ def mtp_generate_step(
                         pair_start = pair_end
                         mx.clear_cache()
                 mx.eval(
-                    tuple(
-                        record.hidden_rows for record in sparse_claim.records
-                    ),
+                    tuple(record.hidden_rows for record in sparse_claim.records),
                     sparse_claim.final_target_logits,
                     [entry.state for entry in request.backbone],
                     [entry.state for entry in request.mtp],
@@ -2248,12 +2971,16 @@ def mtp_generate_step(
                 history = mx.array(
                     [sparse_claim.selected_token_ids[-1]], dtype=mx.uint32
                 )
-                current_logprobs = _reported_logprobs(
+                current_logprobs = sampling_state.reported_logprobs(
                     sparse_claim.final_target_logits[:, -1, :].squeeze(0),
                     history,
                 )
-                current_sampling_logprobs = _sampling_distribution(current_logprobs)
-                current_token = _sample(current_sampling_logprobs).reshape(-1)
+                current_sampling_logprobs = sampling_state.sampling_distribution(
+                    current_logprobs
+                )
+                current_token = sampling_state.sample(
+                    current_sampling_logprobs
+                ).reshape(-1)
             current_hidden = sparse_claim.final_target_hidden
         mx.eval(current_token, current_logprobs)
         if sparse_bootstrap is not None:
@@ -2309,10 +3036,12 @@ def mtp_generate_step(
                     backbone_tokens=request.state.backbone_tokens + 2,
                     mtp_tokens=request.state.mtp_tokens,
                 )
-                verify_logprobs = _reported_logprobs(
+                verify_logprobs = sampling_state.reported_logprobs(
                     verify_logits[:, 0, :].squeeze(0), history
                 )
-                verify_sampling_logprobs = _sampling_distribution(verify_logprobs)
+                verify_sampling_logprobs = sampling_state.sampling_distribution(
+                    verify_logprobs
+                )
 
             if sampling_config.stochastic:
                 draft_id = draft_token.item()
@@ -2322,18 +3051,24 @@ def mtp_generate_step(
                     ),
                     1.0,
                 )
-                accepted = mx.random.uniform(key=_next_rng_key()) < acceptance
+                accepted = (
+                    mx.random.uniform(key=sampling_state.next_rng_key()) < acceptance
+                )
                 mx.eval(accepted)
                 accepted = bool(accepted.item())
                 replacement_token = replacement_logprobs = None
                 if not accepted:
-                    replacement_token, replacement_logprobs = _residual_sample(
-                        verify_sampling_logprobs, draft_logprobs
+                    replacement_token, replacement_logprobs = (
+                        sampling_state.residual_sample(
+                            verify_sampling_logprobs, draft_logprobs
+                        )
                     )
                     replacement_token = replacement_token.reshape(-1)
                     mx.eval(replacement_token, replacement_logprobs)
             else:
-                replacement_token = _sample(verify_sampling_logprobs).reshape(-1)
+                replacement_token = sampling_state.sample(
+                    verify_sampling_logprobs
+                ).reshape(-1)
                 mx.eval(replacement_token)
                 accepted = replacement_token.item() == draft_token.item()
                 replacement_logprobs = verify_sampling_logprobs
@@ -2360,11 +3095,13 @@ def mtp_generate_step(
                 # Bonus processing begins only after the accepted draft has
                 # crossed its yield/resume boundary.
                 bonus_history = mx.concatenate([history, draft_token])
-                bonus_logprobs = _reported_logprobs(
+                bonus_logprobs = sampling_state.reported_logprobs(
                     verify_logits[:, 1, :].squeeze(0), bonus_history
                 )
-                bonus_sampling_logprobs = _sampling_distribution(bonus_logprobs)
-                bonus_token = _sample(bonus_sampling_logprobs).reshape(-1)
+                bonus_sampling_logprobs = sampling_state.sampling_distribution(
+                    bonus_logprobs
+                )
+                bonus_token = sampling_state.sample(bonus_sampling_logprobs).reshape(-1)
                 mx.eval(bonus_token, bonus_logprobs)
                 next_history = mx.concatenate([bonus_history, bonus_token])
                 generated += 1
@@ -2545,7 +3282,9 @@ def stream_generate(
             prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
         prompt = mx.array(prompt)
 
-    prompt_tokens = prompt.size if sparse_prompt_tokens is None else sparse_prompt_tokens
+    prompt_tokens = (
+        prompt.size if sparse_prompt_tokens is None else sparse_prompt_tokens
+    )
 
     detokenizer = tokenizer.detokenizer
 
