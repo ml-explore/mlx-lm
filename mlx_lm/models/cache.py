@@ -600,6 +600,8 @@ class ArraysCache(_BaseCache):
 
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
+        self.capture_states = False
+        self._history = []
         if left_padding:
             self.left_padding = mx.array(left_padding)
 
@@ -722,6 +724,37 @@ class ArraysCache(_BaseCache):
 
     def empty(self):
         return self.cache[0] is None
+
+    def is_trimmable(self):
+        return True
+
+    def store_history(self, conv_input, state_per_t):
+        """Store per-token states from a batched forward for O(1) rollback."""
+        self._conv_input = conv_input
+        self._state_per_t = state_per_t
+
+    def append_history(self, delta_state, conv_state):
+        """Append the state after a single-token forward (sequential rollback)."""
+        self._history.append((delta_state, conv_state))
+
+    def trim(self, amount):
+        if amount <= 0:
+            return amount
+        if getattr(self, "_state_per_t", None) is not None:
+            T = self._state_per_t.shape[1]
+            n = T - 1 - amount
+            if 0 <= n < T:
+                self.cache[1] = self._state_per_t[:, n]
+                self.cache[0] = mx.contiguous(self._conv_input[:, n + 1 : n + 4, :])
+            self._state_per_t = None
+            self._conv_input = None
+            return amount
+        if self._history:
+            for _ in range(min(amount, len(self._history))):
+                self._history.pop()
+            if self._history:
+                self.cache[1], self.cache[0] = self._history[-1]
+        return amount
 
     @property
     def nbytes(self):

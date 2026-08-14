@@ -14,7 +14,7 @@ from .base import (
     create_ssm_mask,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, gated_delta_update_per_t
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
@@ -181,21 +181,31 @@ class GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+        capture = getattr(cache, "capture_states", False)
+        if capture and S > 1 and mask is None:
+            out, state, state_per_t = gated_delta_update_per_t(
+                q, k, v, a, b, self.A_log, self.dt_bias, state
+            )
+        else:
+            out, state = gated_delta_update(
+                q,
+                k,
+                v,
+                a,
+                b,
+                self.A_log,
+                self.dt_bias,
+                state,
+                mask,
+                use_kernel=not self.training,
+            )
 
         if cache is not None:
             cache[1] = state
+            if capture and S > 1 and mask is None:
+                cache.store_history(mx.contiguous(conv_input), state_per_t)
+            elif capture:
+                cache.append_history(state, cache[0])
             cache.advance(S)
 
         out = self.norm(out, z)

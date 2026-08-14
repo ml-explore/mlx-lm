@@ -517,6 +517,12 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
+    # Enable per-token state capture so recurrent (DeltaNet) caches can roll
+    # back in O(1) during speculative decoding.
+    for c in model_cache + draft_cache:
+        if isinstance(c, ArraysCache):
+            c.capture_states = True
+
     if not cache.can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(

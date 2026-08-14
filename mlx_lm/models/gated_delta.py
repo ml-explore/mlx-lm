@@ -10,7 +10,7 @@ def compute_g(A_log, a, dt_bias):
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
-def _make_gated_delta_kernel(has_mask=False, vectorized=False):
+def _make_gated_delta_kernel(has_mask=False, vectorized=False, return_per_tok=False):
     if not mx.metal.is_available():
         return None
     mask_source = "mask[b_idx * T + t]" if has_mask else "true"
@@ -26,6 +26,17 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
         g_setup = "auto g_ = g + b_idx * T * Hv;"
         g_access = "g_[hv_idx]"
         g_advance = "g_ += Hv;"
+
+    per_tok_source = (
+        """
+      auto p_state = state_per_t + (b_idx * T + t) * (Hv * Dv * Dk) + hv_idx * (Dv * Dk) + dv_idx * Dk;
+      for (int i = 0; i < n_per_t; ++i) {
+        p_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+      }
+    """
+        if return_per_tok
+        else ""
+    )
 
     source = f"""
         auto n = thread_position_in_grid.z;
@@ -84,6 +95,7 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
           }} else {{
             y[dv_idx] = static_cast<InT>(0);
           }}
+          {per_tok_source}
           // Increment data pointers to next time step
           q_ += Hk * Dk;
           k_ += Hk * Dk;
@@ -110,12 +122,13 @@ def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     return mx.fast.metal_kernel(
         name=f"gated_delta_step{suffix}",
         input_names=inputs,
-        output_names=["y", "state_out"],
+        output_names=["y", "state_out"] + (["state_per_t"] if return_per_tok else []),
         source=source,
     )
 
 
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
+_gated_delta_kernel_per_t = _make_gated_delta_kernel(has_mask=False, vectorized=False, return_per_tok=True)
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
@@ -281,3 +294,41 @@ def gated_delta_update(
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
+
+
+def gated_delta_update_per_t(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    a: mx.array,
+    b: mx.array,
+    A_log: mx.array,
+    dt_bias: mx.array,
+    state: Optional[mx.array] = None,
+) -> Tuple[mx.array, mx.array, mx.array]:
+    """Like :func:`gated_delta_update` but also returns the recurrent state after
+    every timestep, ``state_per_t`` of shape ``[B, T, Hv, Dv, Dk]``, enabling O(1)
+    rollback of the recurrent state (used by speculative decoding)."""
+    beta = mx.sigmoid(b)
+    g = compute_g(A_log, a, dt_bias)
+    if state is None:
+        B, _, Hk, Dk = q.shape
+        Hv, Dv = v.shape[-2:]
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    B, T, Hk, Dk = k.shape
+    Hv, Dv = v.shape[2:]
+    return _gated_delta_kernel_per_t(
+        inputs=[q, k, v, g, beta, state, T],
+        template=[
+            ("InT", q.dtype),
+            ("StT", state.dtype),
+            ("Dk", Dk),
+            ("Dv", Dv),
+            ("Hk", Hk),
+            ("Hv", Hv),
+        ],
+        grid=(32, Dv, B * Hv),
+        threadgroup=(32, 4, 1),
+        output_shapes=[(B, T, Hv, Dv), state.shape, (B, T, Hv, Dv, Dk)],
+        output_dtypes=[q.dtype, state.dtype, state.dtype],
+    )
