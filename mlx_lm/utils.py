@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -59,13 +60,13 @@ MAX_FILE_SIZE_GB = 5
 
 
 def _parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
     split = 0
     for xi in x:
         if not (xi.isdigit() or xi == "."):
             break
         split += 1
-    digits = float(x[:split])
+    digits = Decimal(x[:split])
     size = (x[split:]).strip().upper()
     return int(digits * sizes[size])
 
