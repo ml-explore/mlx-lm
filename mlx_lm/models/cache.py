@@ -629,6 +629,23 @@ class ArraysCache(_BaseCache):
     def state(self, v):
         self.cache = v
 
+    def _sync_metadata(self):
+        # Tie left_padding/lengths into the state graph so the next forward
+        # pass evaluates them (mirroring BatchRotatingKVCache's guard on
+        # left_padding/offset). They are rewritten on every filter/extend but
+        # nothing in the decode graph reads them, so left lazy their graphs
+        # accumulate across membership changes and pin buffers for the
+        # lifetime of the batch.
+        deps = tuple(a for a in (self.left_padding, self.lengths) if a is not None)
+        if not deps:
+            return
+        # Staple every entry so the guard holds as long as the model reads
+        # any part of its state before overwriting it; a single-entry staple
+        # would be silently dropped by a blind write to that entry.
+        self.cache = [
+            mx.depends(c, deps) if c is not None else None for c in self.cache
+        ]
+
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
@@ -638,6 +655,7 @@ class ArraysCache(_BaseCache):
             self.left_padding = self.left_padding[batch_indices]
         if self.lengths is not None:
             self.lengths = self.lengths[batch_indices]
+        self._sync_metadata()
 
     def extend(self, other):
         """
@@ -669,6 +687,7 @@ class ArraysCache(_BaseCache):
         self.cache = [cat(c, o) for c, o in zip(self.cache, other.cache)]
         self.left_padding = cat(self.left_padding, other.left_padding)
         self.lengths = cat(self.lengths, other.lengths)
+        self._sync_metadata()
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
@@ -962,6 +981,10 @@ class BatchKVCache(_BaseCache):
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
+
+        # Make sure left_padding and offset are evaluated
+        self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
+
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):

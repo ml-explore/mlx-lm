@@ -4,6 +4,7 @@ import copy
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 
@@ -767,6 +768,159 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+
+def _pending_edges(*arrays):
+    """Count pending lazy-graph edges. An evaluated array serializes with
+    zero ``->`` edges in ``mx.export_to_dot`` output; any pending
+    computation serializes with at least one."""
+    arrays = [a for a in arrays if a is not None]
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "graph.dot")
+        mx.export_to_dot(path, *arrays)
+        with open(path, encoding="utf-8") as f:
+            return f.read().count("->")
+
+
+class TestBatchCacheMetadataSync(unittest.TestCase):
+    """Batch cache metadata (offset/left_padding/lengths) is rewritten on
+    every decode step and membership change but never read by the decode
+    forward graph, so left lazy its graphs accumulate and pin buffers for
+    the lifetime of the batch (Metal buffer handles grow until the
+    per-process resource limit aborts the process). These tests assert the
+    metadata is tied into the state graph via mx.depends — mirroring the
+    guard BatchRotatingKVCache already has — so the next forward pass
+    evaluates it. The churn tests first self-check the edge-counting
+    instrument on a deliberately lazy sentinel, so a change in
+    ``export_to_dot``'s output format cannot silently make them vacuous."""
+
+    def _assert_instrument_works(self):
+        self.assertGreater(_pending_edges(mx.zeros((3,)) + 1), 0)
+
+    def test_batch_kv_update_ties_metadata_into_keys(self):
+        cache = BatchKVCache([1, 3, 0])
+        k = mx.zeros((3, 2, 4, 8))
+        with mock.patch.object(mx, "depends", wraps=mx.depends) as depends:
+            keys, values = cache.update_and_fetch(k, k)
+        deps = [a for call in depends.call_args_list for a in call.args[1]]
+        self.assertTrue(any(a is cache.offset for a in deps))
+        self.assertTrue(any(a is cache.left_padding for a in deps))
+        mx.eval(keys, values)
+        self.assertEqual(keys.shape, (3, 2, 4, 8))
+        self.assertEqual(cache.offset.tolist(), [3, 1, 4])
+
+    def test_arrays_cache_filter_extend_values(self):
+        cache = ArraysCache(1, left_padding=[0, 1, 2])
+        cache.lengths = mx.array([3, 4, 5])
+        cache[0] = mx.zeros((3, 4))
+        cache.filter(mx.array([1, 2]))
+        self.assertEqual(cache.left_padding.tolist(), [1, 2])
+        self.assertEqual(cache.lengths.tolist(), [4, 5])
+        self.assertEqual(cache[0].shape, (2, 4))
+
+        other = ArraysCache(1, left_padding=[7])
+        other.lengths = mx.array([9])
+        other[0] = mx.zeros((1, 4))
+        cache.extend(other)
+        self.assertEqual(cache.left_padding.tolist(), [1, 2, 7])
+        self.assertEqual(cache.lengths.tolist(), [4, 5, 9])
+        self.assertEqual(cache[0].shape, (3, 4))
+
+    def _churn_arrays_cache(self, blind_entry, read_entry, cycles=16):
+        """Join/leave churn where the layer overwrites one state entry
+        WITHOUT reading it (a blind reset) and reads the other — the case
+        the staple-every-entry design exists for. A guard on only the
+        blind-written entry is silently dropped each cycle."""
+        cache = ArraysCache(2, left_padding=[0, 1, 2])
+        cache.lengths = mx.array([3, 4, 5])
+        cache[0] = mx.zeros((3, 4))
+        cache[1] = mx.zeros((3, 2))
+        mx.eval(cache[0], cache[1])
+        shapes = {0: (3, 4), 1: (3, 2)}
+
+        for _ in range(cycles):
+            other = ArraysCache(2, left_padding=[0])
+            other.lengths = mx.array([6])
+            other[0] = mx.zeros((1, 4))
+            other[1] = mx.zeros((1, 2))
+            cache.extend(other)
+            cache.filter(mx.array([1, 2, 3], mx.int32))
+            # forward pass: one entry blind-reset, the other read-then-written
+            cache[blind_entry] = mx.zeros(shapes[blind_entry])
+            cache[read_entry] = cache[read_entry] * 1
+            mx.eval(cache[blind_entry], cache[read_entry])
+
+        # A correct guard leaves the metadata fully materialized (0 pending
+        # edges); without it this measures in the hundreds.
+        self.assertEqual(_pending_edges(cache.left_padding, cache.lengths), 0)
+
+    def test_arrays_cache_metadata_bounded_when_first_entry_blind_written(self):
+        self._assert_instrument_works()
+        self._churn_arrays_cache(blind_entry=0, read_entry=1)
+
+    def test_arrays_cache_metadata_bounded_when_last_entry_blind_written(self):
+        self._assert_instrument_works()
+        self._churn_arrays_cache(blind_entry=1, read_entry=0)
+
+    def test_arrays_cache_extend_alone_bounds_metadata(self):
+        """extend() must carry the guard by itself — a guard wired only into
+        filter() would be masked by any churn that interleaves the two."""
+        self._assert_instrument_works()
+        cache = ArraysCache(1, left_padding=[0])
+        cache.lengths = mx.array([4])
+        cache[0] = mx.zeros((1, 4))
+        mx.eval(cache[0])
+        for _ in range(16):
+            other = ArraysCache(1, left_padding=[1])
+            other.lengths = mx.array([5])
+            other[0] = mx.zeros((1, 4))
+            cache.extend(other)
+            cache[0] = cache[0] * 1
+            mx.eval(cache[0])
+        self.assertEqual(_pending_edges(cache.left_padding, cache.lengths), 0)
+
+    def test_batch_kv_metadata_graph_stays_bounded_under_churn(self):
+        """Continuous-batching pattern: join (extend), leave (filter), decode
+        step — evaluating only the forward outputs. The metadata graph must
+        stay bounded instead of growing per membership change. 32 cycles so
+        a guard that fires once and then latches off is also caught."""
+        self._assert_instrument_works()
+        layers = []
+        for _ in range(2):
+            c = BatchKVCache([0] * 3)
+            k = mx.zeros((3, 2, 8, 4), mx.float16)
+            c.update_and_fetch(k, k)
+            layers.append(c)
+        mx.eval(*[c.keys for c in layers])
+
+        for _ in range(32):
+            for c in layers:
+                o = BatchKVCache([0])
+                k = mx.zeros((1, 2, 8, 4), mx.float16)
+                o.update_and_fetch(k, k)
+                c.extend(o)
+                c.filter(mx.array([1, 2, 3], mx.int32))
+            step = mx.zeros((3, 2, 1, 4), mx.float16)
+            outs = [c.update_and_fetch(step, step)[0] for c in layers]
+            mx.eval(*outs)
+
+        # A correct guard leaves the metadata fully materialized (0 pending
+        # edges); without it this measures in the hundreds.
+        for c in layers:
+            self.assertEqual(_pending_edges(c.offset, c.left_padding), 0)
+
+    def test_arrays_cache_without_metadata_filter(self):
+        cache = ArraysCache(1)
+        cache[0] = mx.zeros((2, 4))
+        cache.filter(mx.array([0]))
+        self.assertEqual(cache[0].shape, (1, 4))
+
+    def test_arrays_cache_filter_with_unfilled_state(self):
+        cache = ArraysCache(2, left_padding=[0, 1])
+        cache.lengths = mx.array([3, 4])
+        cache.filter(mx.array([1]))
+        self.assertEqual(cache.left_padding.tolist(), [1])
+        self.assertEqual(cache.lengths.tolist(), [4])
 
 
 if __name__ == "__main__":
