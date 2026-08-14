@@ -149,6 +149,26 @@ mlx_lm.fuse --model <path_to_model>
 This will by default load the adapters from `adapters/`, and save the fused
 model in the path `fused_model/`. All of these are configurable.
 
+### Verify a fused checkpoint (optional)
+
+For supported local, non-quantized LoRA artifacts,
+[AdapterProof](https://github.com/FU-max-boop/adapterproof) can independently
+check declared target coverage, compare the saved fused tensors with the base
+model and adapter, and write a JSON verification report:
+
+```shell
+adapterproof verify \
+    --base <path_to_local_base_model> \
+    --adapter <path_to_adapters> \
+    --fused <path_to_fused_model> \
+    --certificate adapterproof-certificate.json
+```
+
+AdapterProof is an optional third-party tool, not an MLX LM dependency. Its
+v0.1 contract covers local, non-quantized `LoRALinear` artifacts and does not
+verify generation quality or GGUF output. Check its compatibility
+documentation before use.
+
 To upload a fused model, supply the `--upload-repo` and `--hf-path` arguments
 to `mlx_lm.fuse`. The latter is the repo name of the original model, which is
 useful for the sake of attribution and model versioning.
