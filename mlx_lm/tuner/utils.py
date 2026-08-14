@@ -137,14 +137,23 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
         )
     weights = mx.load(str(adapter_path / "adapters.safetensors"))
     params = dict(tree_flatten(model.parameters()))
+    if fine_tune_type == "full":
+        allowed = params
+    else:
+        adapter_leaves = {"lora_a", "lora_b", "m"}
+        allowed = {
+            name: shape
+            for name, shape in params.items()
+            if name.rsplit(".", 1)[-1] in adapter_leaves
+        }
     errors = []
     for name, w in weights.items():
-        if name not in params:
-            errors.append(f"  {name}: not a parameter in the model")
-        elif w.shape != params[name].shape:
+        if name not in allowed:
+            errors.append(f"  {name}: not an adapter parameter in the model")
+        elif w.shape != allowed[name].shape:
             errors.append(
                 f"  {name}: adapter shape {tuple(w.shape)} does not match "
-                f"model parameter shape {tuple(params[name].shape)}"
+                f"model parameter shape {tuple(allowed[name].shape)}"
             )
     if errors:
         raise ValueError(

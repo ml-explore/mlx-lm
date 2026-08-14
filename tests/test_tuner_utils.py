@@ -149,6 +149,42 @@ class TestLoadAdapters(unittest.TestCase):
         model = load_adapters(TinyModel(), path)
         self.assertIsInstance(model, nn.Module)
 
+    def test_base_weight_tensor_rejected(self):
+        path = _make_adapter(
+            {
+                "layers.0.proj.lora_a": mx.zeros((4, 2)),
+                "layers.0.proj.lora_b": mx.zeros((2, 3)),
+                "layers.0.proj.linear.weight": mx.full((3, 4), 42.0),
+            }
+        )
+        with self.assertRaises(ValueError) as cm:
+            load_adapters(TinyModel(), path)
+        self.assertIn("linear.weight", str(cm.exception))
+
+    def test_valid_dora_adapter_loads(self):
+        path = Path(tempfile.mkdtemp())
+        config = {
+            "fine_tune_type": "dora",
+            "num_layers": 1,
+            "lora_parameters": {
+                "keys": ["proj"],
+                "rank": 2,
+                "scale": 1.0,
+                "dropout": 0.0,
+            },
+        }
+        (path / "adapter_config.json").write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(path / "adapters.safetensors"),
+            {
+                "layers.0.proj.lora_a": mx.zeros((4, 2)),
+                "layers.0.proj.lora_b": mx.zeros((2, 3)),
+                "layers.0.proj.m": mx.zeros((3,)),
+            },
+        )
+        model = load_adapters(TinyModel(), path)
+        self.assertIsInstance(model, nn.Module)
+
 
 if __name__ == "__main__":
     unittest.main()
