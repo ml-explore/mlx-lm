@@ -689,14 +689,21 @@ class ArraysCache(_BaseCache):
             self.left_padding -= N
 
     def make_mask(self, N: int):
+        # Combine the constraints instead of prioritizing left padding: after ``merge`` the
+        # cache carries ``left_padding = [0] * B`` (an array, not ``None``), and returning the
+        # all-true left-padding mask here silently discarded the ``lengths`` (right-padding)
+        # mask during chunked prefill — pad tokens then updated the recurrent state of every
+        # sequence whose final partial chunk was co-scheduled with longer ones, corrupting
+        # batched generation for hybrid (SSM/gated-delta) models.
+        mask = None
         if self.left_padding is not None:
             pos = mx.arange(N)
-            return pos >= self.left_padding[:, None]
-        elif self.lengths is not None:
+            mask = pos >= self.left_padding[:, None]
+        if self.lengths is not None:
             pos = mx.arange(N)
-            return pos < self.lengths[:, None]
-        else:
-            return None
+            right = pos < self.lengths[:, None]
+            mask = right if mask is None else (mask & right)
+        return mask
 
     @classmethod
     def merge(cls, caches):
@@ -1023,12 +1030,14 @@ class BatchKVCache(_BaseCache):
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
 
-        # Shift left to reduce padding
+        # Shift left to reduce padding. Only when keys exist: on an empty cache there is
+        # nothing to shift, and decrementing ``_idx`` below zero produced a zero-length
+        # causal mask (``arange(offset + N)`` with a negative offset) that later crashed
+        # attention with a broadcast error.
         min_left_pad = self.left_padding.min().item()
-        if min_left_pad > 0:
-            if self.keys is not None:
-                self.keys = self.keys[..., min_left_pad:, :]
-                self.values = self.values[..., min_left_pad:, :]
+        if min_left_pad > 0 and self.keys is not None:
+            self.keys = self.keys[..., min_left_pad:, :]
+            self.values = self.values[..., min_left_pad:, :]
             self._idx -= min_left_pad
             self.left_padding -= min_left_pad
 

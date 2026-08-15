@@ -769,5 +769,54 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(mask, expected))
 
 
+class TestHybridBatchCache(unittest.TestCase):
+    """Regression tests for batched generation with hybrid (SSM / gated-delta) caches."""
+
+    def test_arrays_cache_mask_combines_lengths_and_left_padding(self):
+        # After ``ArraysCache.merge`` the cache carries ``left_padding = [0] * B`` (an
+        # array, not None). ``make_mask`` used to return only the left-padding mask in
+        # that state, silently dropping the ``lengths`` (right-padding) mask set by
+        # ``prepare`` during chunked prefill — so pad tokens updated the recurrent state
+        # and corrupted batched generation for hybrid models.
+        caches = [ArraysCache(size=1) for _ in range(3)]
+        merged = ArraysCache.merge(caches)
+        self.assertIsNotNone(merged.left_padding)
+
+        merged.prepare(lengths=[4, 2, 1])
+        mask = merged.make_mask(4)
+        expected = mx.array(
+            [
+                [True, True, True, True],
+                [True, True, False, False],
+                [True, False, False, False],
+            ]
+        )
+        self.assertIsNotNone(mask)
+        self.assertTrue(mx.array_equal(mask, expected))
+
+        # Both constraints together: skip left-padded positions AND right-padded tail.
+        merged.left_padding = mx.array([1, 0, 0])
+        mask = merged.make_mask(4)
+        expected = mx.array(
+            [
+                [False, True, True, True],
+                [True, True, False, False],
+                [True, False, False, False],
+            ]
+        )
+        self.assertTrue(mx.array_equal(mask, expected))
+
+    def test_batch_kv_cache_filter_empty(self):
+        # Filtering an empty BatchKVCache with nonzero left padding used to decrement
+        # ``_idx`` below zero; the next ``make_mask`` then built a zero-length causal
+        # mask (``arange(offset + N)`` with a negative offset) which crashed attention
+        # with a broadcast error.
+        c = BatchKVCache(left_padding=[2, 1])
+        c.filter([1])
+        self.assertEqual(c._idx, 0)
+        mask = c.make_mask(1)
+        self.assertEqual(mask.shape[-1], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
