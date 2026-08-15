@@ -1301,7 +1301,14 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
             choice[key_name] = {"role": "assistant"}
-            if text:
+            if not self.stream:
+                # `content` stays present and nullable, the way the schema has
+                # it. A model that stops while still inside a reasoning block
+                # leaves `text` empty, and dropping the key makes a client raise
+                # KeyError instead of reading an empty answer. Streaming deltas
+                # are left alone: omitting fields between chunks is normal there.
+                choice[key_name]["content"] = text if text else None
+            elif text:
                 choice[key_name]["content"] = text
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
