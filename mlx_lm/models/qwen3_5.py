@@ -346,11 +346,15 @@ class TextModel(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
+        # The Conv1D layout is the only reliable signal that a checkpoint is
+        # still in raw HF form and therefore needs the RMSNorm +1 conversion.
+        # MTP tensor presence is not: an already-converted checkpoint may keep
+        # its MTP head, and shifting its norms a second time silently destroys
+        # the model (gamma 0.94 -> 1.94 -> generation becomes noise, with no
+        # error raised anywhere).
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
@@ -366,7 +370,7 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
+            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights

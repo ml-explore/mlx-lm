@@ -647,7 +647,9 @@ class TestModels(unittest.TestCase):
             "max_position_embeddings": 64,
         }
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        mlx_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
 
         for model_type, hf_mtp_key in (
             ("qwen3_5", "mtp.fc.weights"),
@@ -663,22 +665,37 @@ class TestModels(unittest.TestCase):
             model = module.Model(args)
 
             base = mx.arange(8, dtype=mx.float32)
+            raw_conv = mx.zeros((4, 1, 3), dtype=mx.float32)
 
-            # Simulate convert sanitize on HF-style keys.
+            # Raw HF Conv1D layout is what proves the norm weights are still
+            # zero-centered and need the +1 conversion.
             converted = model.sanitize(
                 {
                     hf_norm_key: base,
+                    hf_conv_key: raw_conv,
                     hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
             self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
+            self.assertEqual(converted[mlx_conv_key].shape, (4, 3, 1))
             self.assertFalse(any("mtp." in k for k in converted))
 
             # Simulate load sanitize on already-converted keys.
             loaded = model.sanitize(converted)
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
+            )
+
+            # A converted checkpoint that still ships its MTP head must not be
+            # mistaken for a raw one. This is the case that reaches users: such
+            # a checkpoint loads without error and generates noise, because the
+            # norms get shifted a second time.
+            with_mtp = dict(converted)
+            with_mtp[hf_mtp_key] = mx.zeros((1,), dtype=mx.float32)
+            reloaded = model.sanitize(with_mtp)
+            self.assertTrue(
+                mx.array_equal(reloaded[mlx_norm_key], converted[mlx_norm_key])
             )
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
