@@ -197,6 +197,15 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+        # literal backticks inside a Python-style string are content, not delimiters
+        test_case = (
+            "<function=search>"
+            "<parameter=tags>['use `code` here']</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["tags"], ["use `code` here"])
+
     def test_qwen3_coder_multiline_string_params(self):
         tools = [
             {

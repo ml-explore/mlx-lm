@@ -113,13 +113,19 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             or param_type.startswith("list")
         ):
             try:
-                param_value = _normalize_backtick_strings(param_value)
                 # Qwen sometimes emits literal control characters, such as
                 # newlines in source-code strings. Accept them while parsing
                 # model-generated JSON; valid JSON is unaffected.
                 return json.loads(param_value, strict=False)
             except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
+                try:
+                    return ast.literal_eval(param_value)
+                except (SyntaxError, ValueError):
+                    param_value = _normalize_backtick_strings(param_value)
+                    try:
+                        return json.loads(param_value, strict=False)
+                    except json.JSONDecodeError:
+                        return ast.literal_eval(param_value)
 
         return ast.literal_eval(param_value)
 
