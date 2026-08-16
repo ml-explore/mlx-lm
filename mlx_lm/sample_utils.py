@@ -213,7 +213,9 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
         token selected based on the top-p criterion.
     """
     # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L449-L460
-    probs = mx.exp(logprobs)
+    # softmax instead of exp: identical when the input is true logprobs, but
+    # also correct on raw (unnormalized) logits since softmax is shift-invariant.
+    probs = mx.softmax(logprobs, axis=-1)
     # sort in ascending order
     sorted_indices = mx.argsort(logprobs, axis=-1)
     sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
