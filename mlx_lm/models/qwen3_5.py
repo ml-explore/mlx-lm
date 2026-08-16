@@ -21,6 +21,59 @@ from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
 
+_FUSED_CONV_SRC = r"""
+  uint c = thread_position_in_grid.x;
+  const device T* sp = state;          // (K-1, C)
+  const device T* xp = x;              // (1, 1, C)
+  const device T* wp = w;              // (C, K)
+  float s0 = (float)sp[c];
+  float s1 = (float)sp[Cc + c];
+  float s2 = (float)sp[2 * Cc + c];
+  float s3 = (float)xp[c];
+  float acc = (float)wp[c * 4] * s0 + (float)wp[c * 4 + 1] * s1
+            + (float)wp[c * 4 + 2] * s2 + (float)wp[c * 4 + 3] * s3;
+  T y = (T)acc;
+  T ax = metal::abs(y);
+  T yy = T(1.0) / (T(1.0) + metal::exp(ax));
+  T sg = (y < 0) ? yy : T(1.0) - yy;
+  out[c] = y * sg;
+  new_state[c] = (T)s1;
+  new_state[Cc + c] = (T)s2;
+  new_state[2 * Cc + c] = (T)s3;
+"""
+
+_FUSED_CONV_HEADER = r"""
+#include <metal_stdlib>
+#include <metal_math>
+using namespace metal;
+"""
+
+_fused_conv_kernels = {}
+
+# Decode-path fused conv toggle (stock path always available as fallback).
+_USE_FUSED_CONV = True
+
+
+def _fused_conv_silu(state, x, w_flat):
+    C = state.shape[-1]
+    if C not in _fused_conv_kernels:
+        _fused_conv_kernels[C] = mx.fast.metal_kernel(
+            name=f"fused_conv_silu_{C}",
+            input_names=["state", "x", "w"],
+            output_names=["new_state", "out"],
+            source=_FUSED_CONV_SRC.replace("Cc", str(C)),
+            header=_FUSED_CONV_HEADER,
+        )
+    kernel = _fused_conv_kernels[C]
+    return kernel(
+        inputs=[state, x, w_flat],
+        output_shapes=[state.shape, (1, 1, C)],
+        output_dtypes=[state.dtype, state.dtype],
+        grid=(C, 1, 1),
+        threadgroup=(min(C, 1024), 1, 1),
+        template=[("T", state.dtype)],
+    )
+
 
 @dataclass
 class TextModelArgs(BaseModelArgs):
@@ -129,6 +182,23 @@ class GatedDeltaNet(nn.Module):
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
         self.sharding_group = None
+        self._conv_w_flat = None
+
+    def _fused_conv_step(self, conv_state, qkv):
+        """Fused conv-state append + depthwise conv + silu for decode (S==1).
+
+        One kernel replaces concatenate -> contiguous -> conv1d -> silu.
+        Bit-identical to the stock path (fp32 conv accumulation, single bf16
+        round, MLX's stabilized sigmoid in bf16 arithmetic).
+        """
+        if self._conv_w_flat is None:
+            w = self.conv1d.weight  # (C, K, 1) depthwise
+            self._conv_w_flat = mx.contiguous(w.reshape(self.conv_dim, -1))
+            mx.eval(self._conv_w_flat)
+        new_state, conv_out = _fused_conv_silu(
+            conv_state, qkv, self._conv_w_flat
+        )
+        return new_state, conv_out
 
     def __call__(
         self,
@@ -154,18 +224,28 @@ class GatedDeltaNet(nn.Module):
                 dtype=inputs.dtype,
             )
 
-        if mask is not None:
-            qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
+        if (
+            _USE_FUSED_CONV
+            and S == 1
+            and cache is not None
+            and cache[0] is not None
+            and getattr(cache, "lengths", None) is None
+            and mask is None
+        ):
+            cache[0], conv_out = self._fused_conv_step(conv_state, qkv)
+        else:
+            if mask is not None:
+                qkv = mx.where(mask[..., None], qkv, 0)
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
+            if cache is not None:
+                n_keep = self.conv_kernel_size - 1
+                if cache.lengths is not None:
+                    ends = mx.clip(cache.lengths, 0, S)
+                    positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                    cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+                else:
+                    cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
             t.reshape(B, S, h, d)
