@@ -373,6 +373,21 @@ class ModelProvider:
 
         model_key = (model_path, adapter_path, draft_model_path)
         if self.model_key != model_key:
+            if self.is_distributed and self.model_key is not None:
+                # Dynamic model switching is rank-divergent in distributed
+                # mode: the requested path may exist on one rank only, so one
+                # rank fails fast while the other enters sharded_load /
+                # generation collectives. Their all_sums then pair with the
+                # failed rank's idle heartbeats, receive work requests pile up
+                # and jaccl dies with `Recv failed with error code -12`
+                # (ENOMEM from ibv_post_recv). Raising here is symmetric on
+                # every rank (the request is broadcast before load), so the
+                # lockstep survives and the client gets a clean error.
+                raise ValueError(
+                    "Distributed server cannot switch models per request; "
+                    f"serving {self.model_key[0]!r}. Request that exact id "
+                    "or 'default_model'."
+                )
             self._load(*model_key)
 
         return self.model, self.tokenizer
