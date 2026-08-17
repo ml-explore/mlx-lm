@@ -1125,6 +1125,23 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
+        # Normalize aliases of the served model to 'default_model'. Clients
+        # that echo the id advertised by /v1/models (or a resolved path) must
+        # not be rejected by the distributed model-switch guard: the resolved
+        # path is rank-local, but this normalization runs on rank 0 before
+        # the request is broadcast, so every rank sees the canonical id.
+        _cli_model = self.response_generator.cli_args.model
+        if _cli_model and self.requested_model != "default_model":
+            try:
+                _same = self.requested_model == _cli_model or (
+                    Path(self.requested_model).exists()
+                    and Path(self.requested_model).resolve()
+                    == Path(_cli_model).resolve()
+                )
+            except OSError:
+                _same = False
+            if _same:
+                self.requested_model = "default_model"
         self.requested_draft_model = self.body.get("draft_model", "default_model")
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
@@ -1664,7 +1681,11 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.response_generator.cli_args.model:
             model_path = Path(self.response_generator.cli_args.model)
             if model_path.exists():
-                model_id = str(model_path.resolve())
+                # Advertise the CLI string itself: it is the canonical id the
+                # distributed model-switch guard accepts. A resolved path is
+                # rank-local (e.g. per-node volume names) and would be
+                # rejected when a client echoes it back.
+                model_id = self.response_generator.cli_args.model
                 models.append(
                     {
                         "id": model_id,
