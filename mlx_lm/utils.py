@@ -15,10 +15,12 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Tuple,
     Type,
     Union,
+    overload,
 )
 
 import mlx.core as mx
@@ -479,6 +481,32 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
     )
 
 
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    return_config: Literal[False] = ...,
+    revision: Optional[str] = ...,
+    trust_remote_code: bool = ...,
+) -> Tuple[nn.Module, TokenizerWrapper]: ...
+
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = ...,
+    model_config: Optional[Dict[str, Any]] = ...,
+    adapter_path: Optional[str] = ...,
+    lazy: bool = ...,
+    return_config: Literal[True] = ...,
+    revision: Optional[str] = ...,
+    trust_remote_code: bool = ...,
+) -> Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]: ...
+
+
 def load(
     path_or_hf_repo: str,
     tokenizer_config: Optional[Dict[str, Any]] = None,
@@ -512,8 +540,8 @@ def load(
             executing a custom Python file specified in their config.
             Default: ``False``.
     Returns:
-        Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
-            A tuple containing the loaded model, tokenizer and, if requested, the model config.
+        Tuple[nn.Module, TokenizerWrapper]: A tuple containing the loaded model and
+            tokenizer, with the model config appended when ``return_config`` is ``True``.
 
     Raises:
         FileNotFoundError: If config file or safetensors are not found.
