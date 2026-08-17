@@ -1,10 +1,12 @@
 # Copyright © 2024 Apple Inc.
 
+import argparse
 import http
 import io
 import json
 import threading
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -14,6 +16,7 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    ModelProvider,
     Response,
     ResponseGenerator,
     SamplingArguments,
@@ -732,6 +735,29 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class TestModelProvider(unittest.TestCase):
+    """Regression test for https://github.com/ml-explore/mlx-lm/issues/1745"""
+
+    def test_load_resolves_adapter_for_default_model(self):
+        cli_args = argparse.Namespace(
+            model="mlx-community/base-model",
+            adapter_path="/path/to/adapters",
+            draft_model=None,
+            trust_remote_code=False,
+            use_default_chat_template=False,
+            chat_template=None,
+            pipeline=False,
+        )
+        provider = ModelProvider(cli_args)
+
+        with patch.object(provider, "_load") as mock_load:
+            provider.load("default_model")
+
+        mock_load.assert_called_once_with(
+            "mlx-community/base-model", "/path/to/adapters", None
+        )
 
 
 class TestMakeSampler(unittest.TestCase):
