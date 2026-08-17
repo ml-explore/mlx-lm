@@ -982,7 +982,7 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
+    save_model(dst_path, model, donate_model=donate_model)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 
