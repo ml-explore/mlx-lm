@@ -1080,8 +1080,15 @@ class BatchKVCache(_BaseCache):
     def extract(self, idx):
         cache = KVCache()
         padding = self.left_padding[idx].item()
-        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
-        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
+        # Pending (un-finalized) right padding must not leak into the
+        # extracted cache: those trailing positions are pad garbage, and
+        # counting them corrupts both content and the offset bookkeeping of
+        # any prompt-cache entry stored from a segment boundary.
+        end = self._idx
+        if self._right_padding is not None:
+            end -= int(self._right_padding[idx].item())
+        cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding:end])
+        cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding:end])
         cache.offset = cache.keys.shape[2]
         return cache
 
@@ -1426,8 +1433,17 @@ class BatchRotatingKVCache(_BaseCache):
             cache.keys = mx.roll(cache.keys, -self._idx, axis=2)
             cache.values = mx.roll(cache.values, -self._idx, axis=2)
             cache._idx = self.max_size
-        cache.keys = mx.contiguous(cache.keys[:, :, padding : cache._idx])
-        cache.values = mx.contiguous(cache.values[:, :, padding : cache._idx])
+        # Pending (un-finalized) right padding must not leak into the
+        # extracted cache; see BatchKVCache.extract. _lengths holds the
+        # per-sequence true end offsets while a right-padded chunk is in
+        # flight, so the pad amount is offset - _lengths clamped at 0.
+        end = cache._idx
+        if self._lengths is not None:
+            pad = max(0, int((self.offset - self._lengths).tolist()[idx]))
+            end -= pad
+            offset -= pad
+        cache.keys = mx.contiguous(cache.keys[:, :, padding:end])
+        cache.values = mx.contiguous(cache.values[:, :, padding:end])
         cache.offset = offset
         cache._idx = cache.keys.shape[2]
         return cache

@@ -769,5 +769,77 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(mask, expected))
 
 
+class TestBatchCacheExtract(unittest.TestCase):
+    """Regression test: extract() from a batch that has pending
+    (un-finalized) right padding must not leak the padding into the
+    extracted cache.
+
+    mlx_lm.server hits this path when it stores a prompt-cache entry at a
+    segment boundary while a mixed-length batched prefill is in flight:
+    between update_and_fetch() on a right-padded chunk and finalize(), the
+    batch buffer holds pad cells and per-sequence bookkeeping that
+    finalize() has not yet reconciled. An extract() in that window used to
+    return a cache containing the pad cells, with an offset that counted
+    them. Restoring such an entry later desynchronizes cache length vs.
+    attention-mask width by exactly the pad amount (broadcast errors in
+    attention, hung generation).
+
+    The constants mirror the production incident this was root-caused
+    from: four concurrent requests sharing a 52-token cached prompt
+    prefix, with per-request remainders of 270/280/272/271 tokens, so
+    sequence 0 carries 10 tokens of right padding.
+    """
+
+    def _restored_prefix_cache(self, cls, **kwargs):
+        # A single-sequence cache holding a 52-token prefix, built the way
+        # the server produces one: fill with more tokens (92), then trim
+        # back (by 40), as fetch_nearest_cache() does when it restores a
+        # stored entry to the shared-prefix point. Key contents are
+        # arange() so positions are identifiable when debugging.
+        c = cls(**kwargs)
+        k = mx.broadcast_to(
+            mx.arange(92, dtype=mx.float32).reshape(1, 1, 92, 1), (1, 2, 92, 4)
+        )
+        c.update_and_fetch(k, k)
+        c.trim(40)
+        return c
+
+    def test_extract_with_pending_right_padding(self):
+        # Both patched classes: the plain batch cache and the rotating
+        # (sliding-window) one. max_size=1024 keeps the rotating cache
+        # un-rotated, matching the production state (total length < window).
+        for batch_cls, single_cls, kwargs in (
+            (BatchKVCache, KVCache, {}),
+            (BatchRotatingKVCache, RotatingKVCache, {"max_size": 1024}),
+        ):
+            singles = [
+                self._restored_prefix_cache(single_cls, **kwargs) for _ in range(4)
+            ]
+            batch = batch_cls.merge(singles)
+
+            # One batched prefill chunk of the four remainders, padded to
+            # the longest (280): sequence 0 has 270 real tokens + 10 pad.
+            lengths = [270, 280, 272, 271]
+            S = max(lengths)
+            batch.prepare(lengths=lengths, right_padding=[S - l for l in lengths])
+            k = mx.random.normal((4, 2, S, 4))
+            batch.update_and_fetch(k, k)
+
+            # Extract in the pre-finalize window. Sequence 0 holds
+            # 52 (prefix) + 270 (real remainder) = 322 tokens; without the
+            # fix both assertions see 332 (322 + 10 pad) for both classes.
+            extracted = batch.extract(0)
+            self.assertEqual(extracted.keys.shape[2], 52 + 270)
+            self.assertEqual(extracted.offset, 52 + 270)
+
+            # After finalize() the padding is reconciled; extract() must
+            # give the same answer (this path was already correct, and
+            # pins that the fix did not change it).
+            batch.finalize()
+            extracted = batch.extract(0)
+            self.assertEqual(extracted.keys.shape[2], 52 + 270)
+            self.assertEqual(extracted.offset, 52 + 270)
+
+
 if __name__ == "__main__":
     unittest.main()
