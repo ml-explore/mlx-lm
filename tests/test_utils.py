@@ -59,6 +59,17 @@ class TestUtils(unittest.TestCase):
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
 
+    def test_parse_size(self):
+        self.assertEqual(utils._parse_size("1024"), 1024)
+        self.assertEqual(utils._parse_size("20G"), 20_000_000_000)
+        self.assertEqual(utils._parse_size("512M"), 512_000_000)
+        self.assertEqual(utils._parse_size("4.1MB"), 4_100_000)
+        self.assertEqual(utils._parse_size("4.1M"), 4_100_000)
+        self.assertEqual(utils._parse_size("4.1GB"), 4_100_000_000)
+        self.assertEqual(utils._parse_size("8.2MB"), 8_200_000)
+        self.assertEqual(utils._parse_size("16.9GB"), 16_900_000_000)
+        self.assertEqual(utils._parse_size("2.7GB"), 2_700_000_000)
+
     def test_quantize(self):
         from mlx_lm.models import llama
 
