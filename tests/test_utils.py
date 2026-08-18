@@ -2,9 +2,11 @@
 
 import json
 import os
+import struct
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,6 +60,32 @@ class TestUtils(unittest.TestCase):
         gb = sum(p.nbytes for _, p in weights) // 2**30
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
+
+    def test_save_declares_mlx_norm_convention(self):
+        class Tokenizer:
+            def save_pretrained(self, path):
+                pass
+
+        source_path = Path(self.test_dir) / "source"
+        source_path.mkdir()
+        output_path = Path(self.test_dir) / "saved_model"
+
+        with mock.patch("mlx_lm.utils.create_model_card"):
+            utils.save(
+                output_path,
+                source_path,
+                nn.Linear(2, 2),
+                Tokenizer(),
+                {"model_type": "llama"},
+            )
+
+        with open(output_path / "config.json") as f:
+            self.assertEqual(json.load(f)["norm_convention"], "mlx")
+
+        with open(output_path / "model.safetensors", "rb") as f:
+            header_size = struct.unpack("<Q", f.read(8))[0]
+            metadata = json.loads(f.read(header_size))["__metadata__"]
+        self.assertEqual(metadata["norm_convention"], "mlx")
 
     def test_parse_size(self):
         self.assertEqual(utils._parse_size("1024"), 1024)

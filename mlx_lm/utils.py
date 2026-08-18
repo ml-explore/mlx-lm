@@ -57,6 +57,7 @@ MODEL_REMAPPING = {
 }
 
 MAX_FILE_SIZE_GB = 5
+MLX_NORM_CONVENTION = "mlx"
 
 
 def _parse_size(x):
@@ -797,7 +798,15 @@ def save_model(
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 
-        mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
+        mx.save_safetensors(
+            str(shard_path),
+            shard,
+            metadata={
+                "format": "mlx",
+                # Norm weights are already in MLX runtime form.
+                "norm_convention": MLX_NORM_CONVENTION,
+            },
+        )
 
         for weight_name in shard.keys():
             index_data["weight_map"][weight_name] = shard_name
@@ -981,6 +990,9 @@ def save(
         src_path = hf_repo_to_path(hf_repo)
     else:
         hf_repo = None
+
+    # Converted weights are already in MLX runtime form.
+    config["norm_convention"] = MLX_NORM_CONVENTION
 
     dst_path = Path(dst_path)
     save_model(dst_path, model, donate_model=donate_model)
