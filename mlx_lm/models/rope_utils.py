@@ -232,6 +232,46 @@ class ProportionalRoPE(nn.Module):
         )
 
 
+class DynamicNTKScalingRoPE(nn.Module):
+
+    def __init__(
+        self,
+        dims: int,
+        max_position_embeddings: int,
+        traditional: bool,
+        base: float,
+        factor: float,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.max_position_embeddings = max_position_embeddings
+        self.traditional = traditional
+        self.base = base
+        self.factor = factor
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.dims}, traditional={self.traditional}, "
+            f"max_position_embeddings={self.max_position_embeddings}, "
+            f"factor={self.factor}"
+        )
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        # x.shape: [batch, num_heads, seq_len, head_dim]
+        seq_len = max(x.shape[-2] + offset, self.max_position_embeddings)
+        base = self.base * (
+            (self.factor * seq_len / self.max_position_embeddings) - (self.factor - 1)
+        ) ** (self.dims / (self.dims - 2))
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=self.traditional,
+            base=base,
+            scale=1.0,
+            offset=offset,
+        )
+
+
 def initialize_rope(
     dims,
     base,
@@ -249,6 +289,15 @@ def initialize_rope(
     if rope_type in ["default", "linear"]:
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
         return nn.RoPE(dims, traditional=traditional, base=base, scale=scale)
+
+    elif rope_type == "dynamic":
+        return DynamicNTKScalingRoPE(
+            dims=dims,
+            max_position_embeddings=max_position_embeddings,
+            traditional=traditional,
+            base=base,
+            factor=scaling_config["factor"],
+        )
 
     elif rope_type == "llama3":
         return Llama3RoPE(
