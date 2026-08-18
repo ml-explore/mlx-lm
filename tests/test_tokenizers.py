@@ -52,6 +52,12 @@ class TestTokenizers(unittest.TestCase):
         tokens = tokenizer.encode("hello\nworld")
         check(tokens)
 
+        # Without a BOS in front, the first token carries the leading
+        # whitespace of the text and the detokenizer has to keep it.
+        for text in ["  leading spaces", " one leading space", " ", "\n indented"]:
+            tokens = tokenizer.encode(text, add_special_tokens=False)
+            check(tokens)
+
     def test_tokenizers(self):
         tokenizer_repos = [
             ("mlx-community/Qwen1.5-0.5B-Chat-4bit", BPEStreamingDetokenizer),

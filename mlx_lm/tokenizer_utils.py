@@ -133,13 +133,19 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self._unflushed = b""
         self.text = ""
         self.tokens = []
+        self._trim_pending = self.trim_space
 
     def _try_flush(self, force=False):
         text = self._unflushed.replace(self._sep, b" ").decode("utf-8", "replace")
         if not force and text.endswith("\ufffd"):
             return
-        if not self.text and self.trim_space and text and text[0] == " ":
-            text = text[1:]
+        if text and self._trim_pending:
+            # Only the first space of the sequence is trimmed. Keying this off
+            # an empty self.text would trim a second one when the first chunk
+            # is a lone separator.
+            self._trim_pending = False
+            if text[0] == " ":
+                text = text[1:]
         self.text += text
         self._unflushed = b""
 
@@ -157,8 +163,8 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
 class BPEStreamingDetokenizer(StreamingDetokenizer):
     """A streaming detokenizer for OpenAI style BPE models.
 
-    It adds tokens to the text if the next token starts with a space similar to
-    the SPM detokenizer.
+    The byte level BPE encoding is lossless, so tokens are flushed as soon as
+    they decode to complete utf-8.
     """
 
     _byte_decoder = None
@@ -191,15 +197,6 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
                 barr.extend(bytes(c, "utf-8"))
         return barr.decode("utf-8", "replace")
 
-    def _maybe_trim_space(self, current_text):
-        if len(current_text) == 0:
-            return current_text
-        elif current_text[0] != " ":
-            return current_text
-        elif not self.text:
-            return current_text[1:]
-        return current_text
-
     def add_token(self, token):
         self.tokens.append(token)
         v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
@@ -207,19 +204,15 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         text = self._decode_bytes(self._unflushed)
 
         # For multi-byte utf-8 wait until they are complete
-        # For single spaces wait until the next token to clean it if needed
-        if not text.endswith("\ufffd") and not (
-            len(v) == 1 and self._byte_decoder.get(v[0]) == 32
-        ):
-            self.text += self._maybe_trim_space(text)
+        if not text.endswith("\ufffd"):
+            self.text += text
             self._unflushed = ""
 
     def finalize(self):
-        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
+        self.text += bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
             "utf-8",
             "replace",
         )
-        self.text += self._maybe_trim_space(current_text)
         self._unflushed = ""
 
     @classmethod
