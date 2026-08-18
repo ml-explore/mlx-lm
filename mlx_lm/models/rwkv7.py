@@ -436,7 +436,14 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
-        for k, v in weights.items():
+        for k, v in list(weights.items()):
+            if k.endswith(".attn.x_x"):
+                prefix = k.removesuffix("x_x")
+                for name, value in zip(
+                    ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g"), v
+                ):
+                    weights[f"{prefix}{name}"] = value[None, None, :]
+                del weights[k]
             if "k_k" in k or "k_a" in k or "g_norm" in k:
                 weights[k] = weights[k].reshape(
                     self.args.hidden_size // self.args.head_dim, self.args.head_dim

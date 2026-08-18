@@ -628,6 +628,77 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_rwkv7_cached_generation_matches_full_prompt(self):
+        from mlx_lm.models import rwkv7
+
+        args = rwkv7.ModelArgs(
+            model_type="rwkv7",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            norm_eps=1e-5,
+            head_dim=32,
+            num_hidden_layers=2,
+            a_low_rank_dim=16,
+            v_low_rank_dim=16,
+            gate_low_rank_dim=16,
+            decay_low_rank_dim=16,
+        )
+        model = rwkv7.Model(args)
+        inputs = mx.array([[1, 2, 3, 4], [5, 6, 7, 8]])
+
+        full_logits = model(inputs)
+        cache = model.make_cache()
+        cached_logits = mx.concatenate(
+            [
+                model(inputs[:, :2], cache=cache),
+                model(inputs[:, 2:3], cache=cache),
+                model(inputs[:, 3:], cache=cache),
+            ],
+            axis=1,
+        )
+        mx.eval(full_logits, cached_logits)
+
+        self.assertTrue(mx.allclose(full_logits, cached_logits, rtol=1e-5, atol=1e-5))
+        for layer_cache in cache:
+            self.assertEqual(layer_cache[0].shape, (2, 1, args.hidden_size))
+            self.assertEqual(
+                layer_cache[1].shape,
+                (
+                    2,
+                    args.hidden_size // args.head_dim,
+                    args.head_dim,
+                    args.head_dim,
+                ),
+            )
+            self.assertEqual(layer_cache[2].shape, (2, 1, args.hidden_size))
+
+    def test_rwkv7_sanitize_migrates_legacy_time_mix_weights(self):
+        from mlx_lm.models import rwkv7
+
+        args = rwkv7.ModelArgs(
+            model_type="rwkv7",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            norm_eps=1e-5,
+            head_dim=32,
+            num_hidden_layers=2,
+            a_low_rank_dim=16,
+            v_low_rank_dim=16,
+            gate_low_rank_dim=16,
+            decay_low_rank_dim=16,
+        )
+        legacy_time_mix = mx.arange(6 * args.hidden_size).reshape(6, args.hidden_size)
+        weights = {"model.layers.0.attn.x_x": legacy_time_mix}
+        weights = rwkv7.Model(args).sanitize(weights)
+
+        self.assertNotIn("model.layers.0.attn.x_x", weights)
+        for index, name in enumerate(("x_r", "x_w", "x_k", "x_v", "x_a", "x_g")):
+            key = f"model.layers.0.attn.{name}"
+            self.assertEqual(weights[key].shape, (1, 1, args.hidden_size))
+            self.assertTrue(mx.array_equal(weights[key][0, 0], legacy_time_mix[index]))
+
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
             "hidden_size": 8,
