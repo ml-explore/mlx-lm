@@ -145,6 +145,8 @@ class BailingSwitchGLU(nn.Module):
         self.down_proj = _switch_linear(args, hidden_dim, dim)
 
     def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        if self.training:
+            indices = mx.stop_gradient(indices)
         x = mx.expand_dims(x, (-2, -3))
         up = self.up_proj(x, indices)
         gate = self.gate_proj(x, indices)
@@ -459,7 +461,11 @@ class BailingKDA(nn.Module):
                 ),
                 dtype=mx.float32,
             )
-        if mx.default_device() == mx.gpu and mx.metal.is_available():
+        if (
+            not self.training
+            and mx.default_device() == mx.gpu
+            and mx.metal.is_available()
+        ):
             output, state = gated_delta_kernel(q, k, v, decay, beta, state, mask)
         else:
             output, state = gated_delta_ops(q, k, v, decay, beta, state, mask)

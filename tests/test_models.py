@@ -432,6 +432,7 @@ class TestModels(unittest.TestCase):
             quantization_config=None,
         )
         model = bailing_moe_v3.Model(args)
+        model.eval()
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -442,6 +443,7 @@ class TestModels(unittest.TestCase):
             gated_attention_proj_granularity_type="head_wise",
         )
         flash_model = bailing_moe_v3.Model(flash_args)
+        flash_model.eval()
         self.assertIsInstance(flash_model.layers[3].attention.q_proj, nn.Linear)
         self.model_test_runner(
             flash_model,
