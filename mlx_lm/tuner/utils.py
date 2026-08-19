@@ -35,6 +35,43 @@ def build_schedule(schedule_config: Dict):
         return bound_schedule_fn
 
 
+_LORA_REQUIRED_KEYS = ("rank", "scale", "dropout")
+
+
+def _validate_lora_parameters(config: Dict):
+    """Raise a clear, actionable error for a malformed ``lora_parameters``.
+
+    Without this, a missing key surfaces many frames deep inside
+    ``to_lora`` as a bare ``KeyError: 'scale'`` with no indication of what
+    the caller should do about it.
+    """
+    missing = [k for k in _LORA_REQUIRED_KEYS if k not in config]
+    if not missing:
+        return
+    if "scale" in missing and "alpha" in config:
+        # The single most common way to hit this: config was written for
+        # PEFT/other tools, which use an alpha/rank convention. mlx-lm's
+        # `scale` is instead used directly as the LoRA output multiplier
+        # (see LoRALinear, default 20.0), so alpha cannot simply be
+        # renamed to scale -- it must be converted.
+        rank = config.get("rank", "rank")
+        raise ValueError(
+            "lora_parameters is missing the required 'scale' key, but has "
+            f"'alpha': {config['alpha']!r} instead. mlx-lm's LoRA 'scale' "
+            "is used directly as the LoRA output multiplier, unlike the "
+            "alpha/rank convention used by PEFT and similar tools -- "
+            "'alpha' cannot simply be renamed to 'scale'. If this config "
+            "was written for PEFT, set 'scale' to alpha / rank (here: "
+            f"{config['alpha']} / {rank}), not to alpha itself."
+        )
+    raise ValueError(
+        "lora_parameters is missing required key(s): "
+        f"{', '.join(missing)}. Expected keys: "
+        f"{', '.join(_LORA_REQUIRED_KEYS)} (optionally 'keys' to select "
+        "which layers to adapt)."
+    )
+
+
 def linear_to_lora_layers(
     model: nn.Module,
     num_layers: int,
@@ -53,6 +90,7 @@ def linear_to_lora_layers(
         use_dora (bool): If True, uses DoRA instead of LoRA.
           Default: ``False``
     """
+    _validate_lora_parameters(config)
 
     def to_lora(layer):
         if not use_dora and hasattr(layer, "to_lora"):

@@ -1,6 +1,5 @@
 # Copyright © 2023-2024 Apple Inc.
 
-import sys
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -13,8 +12,11 @@ from .base import BaseModelArgs, create_attention_mask
 try:
     import hf_olmo
 except ImportError:
-    print("To run olmo install ai2-olmo: pip install ai2-olmo")
-    sys.exit(1)
+    # A library import must never terminate the host process (server,
+    # notebook, etc.) -- raise a catchable, actionable error instead.
+    raise ImportError(
+        "To run olmo install ai2-olmo: pip install ai2-olmo"
+    ) from None
 
 
 @dataclass

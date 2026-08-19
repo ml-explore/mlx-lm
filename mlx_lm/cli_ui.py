@@ -5,8 +5,22 @@ import shutil
 import sys
 from contextlib import contextmanager
 from functools import lru_cache
+from pathlib import Path
 
 import mlx.core as mx
+
+try:
+    # readline is what makes input() honor the \x01 / \x02 "invisible
+    # width" markers used below, and it also gives mlx_lm.chat history
+    # (Up/Down) and basic line editing for free. It ships with CPython on
+    # macOS/Linux but is absent on some platforms (e.g. stock Windows), so
+    # everything that touches it is optional.
+    import readline
+except ImportError:  # pragma: no cover - platform dependent
+    readline = None
+
+_CHAT_HISTORY_FILE = Path.home() / ".cache" / "mlx_lm" / "chat_history"
+_CHAT_HISTORY_LENGTH = 1000
 from rich.box import ROUNDED
 from rich.console import Console
 from rich.panel import Panel
@@ -108,6 +122,31 @@ def print_lora_run_header(console: Console, args) -> None:
         ("max seq", f"{args.max_seq_length:,}"),
     ]
     print_header_panel(console, "mlx_lm.lora", rows)
+
+
+def _load_chat_history() -> None:
+    """Load persisted chat history into readline, if available."""
+    if readline is None:
+        return
+    readline.set_history_length(_CHAT_HISTORY_LENGTH)
+    try:
+        readline.read_history_file(_CHAT_HISTORY_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # Corrupt or unreadable history file -- don't block chat over it.
+        pass
+
+
+def _save_chat_history() -> None:
+    """Persist readline's in-memory history back to disk."""
+    if readline is None:
+        return
+    try:
+        _CHAT_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(_CHAT_HISTORY_FILE)
+    except OSError:
+        pass
 
 
 def corridor_input(console: Console) -> str:
@@ -259,6 +298,7 @@ class ChatUI:
 
     def __enter__(self):
         if self._rank == 0:
+            _load_chat_history()
             rows = [("model", str(self._args.model))]
             if self._args.adapter_path:
                 rows.append(("adapter", str(self._args.adapter_path)))
@@ -273,6 +313,8 @@ class ChatUI:
         return self
 
     def __exit__(self, *exc):
+        if self._rank == 0:
+            _save_chat_history()
         return False
 
     def prompt(self) -> str:

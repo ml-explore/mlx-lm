@@ -1,10 +1,12 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import ipaddress
 import json
 import logging
 import pickle
 import platform
+import secrets
 import socket
 import time
 import uuid
@@ -48,6 +50,32 @@ from .utils import _parse_size, load, sharded_load
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+def is_loopback_host(host: str) -> bool:
+    """
+    Return True if `host` only ever binds the server to this machine.
+
+    Anything else (0.0.0.0, ::, a LAN/public IP, a hostname, ...) is
+    treated as a remote binding, since it can accept connections from
+    other machines.
+    """
+    if host in ("localhost",):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not a literal IP (e.g. a hostname). Resolve it and only trust it
+        # as loopback if every address it resolves to is loopback -- a
+        # hostname that could resolve to a non-loopback address is not
+        # safe to treat as local-only.
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return False
+        return bool(infos) and all(
+            ipaddress.ip_address(info[4][0]).is_loopback for info in infos
+        )
 
 
 class ToolCallFormatter:
@@ -303,6 +331,19 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def _register_model_alias(self, model_path):
+        """
+        Let a short name -- the basename of a loaded model's path -- resolve
+        to the already-loaded model instead of falling through to a remote
+        Hub lookup. E.g. after `--model /path/to/qwen3.5-4bit`, a request
+        for `"model": "qwen3.5-4bit"` should be served locally rather than
+        failing with a 404 from the HuggingFace API. A no-op for a bare HF
+        repo id with no `/` in it, since it's already its own basename.
+        """
+        alias = Path(model_path).name
+        if alias and alias != model_path:
+            self._model_map[alias] = model_path
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -348,12 +389,17 @@ class ModelProvider:
                     "Draft model tokenizer does not match model tokenizer. "
                     "Speculative decoding may not work as expected."
                 )
+            self._register_model_alias(draft_model_path)
 
         # Compute batchability
         is_batchable = draft_model is None
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+
+        # Let a request use this model's basename as shorthand for its full
+        # path/repo id on subsequent requests.
+        self._register_model_alias(model_path)
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -367,8 +413,24 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        # `_adapter_map` is keyed by the same alias as `_model_map` (e.g.
+        # "default_model"), so it must be resolved against the *original*
+        # model_path before model_path itself is rewritten to the real
+        # path below -- otherwise the lookup key no longer matches
+        # anything in `_adapter_map` and a CLI-provided --adapter-path is
+        # silently dropped.
+        #
+        # Only consult the map when the caller didn't already provide an
+        # explicit adapter_path. `dict.get(key, default)` only falls back
+        # to `default` when `key` is *absent* -- since "default_model" is
+        # always present in `_adapter_map` (possibly mapped to None), using
+        # `.get(model_path, adapter_path)` here would silently overwrite an
+        # explicit per-request adapter (e.g. `{"model": "default_model",
+        # "adapters": "/some/adapter"}`) with whatever `--adapter-path` the
+        # server started with, which is exactly backwards.
+        if adapter_path is None:
+            adapter_path = self._adapter_map.get(model_path)
         model_path = self._model_map.get(model_path, model_path)
-        adapter_path = self._adapter_map.get(model_path, adapter_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
@@ -1047,10 +1109,36 @@ class APIHandler(BaseHTTPRequestHandler):
         self._set_completion_headers(204)
         self.end_headers()
 
+    def _check_auth(self) -> bool:
+        """
+        Enforce the API key, if one is configured.
+
+        Returns True if the request may proceed. Otherwise it has already
+        written a 401 response and the caller must return immediately.
+        """
+        api_key = self.response_generator.cli_args.api_key
+        if not api_key:
+            return True
+
+        header = self.headers.get("Authorization", "")
+        scheme, _, token = header.partition(" ")
+        authorized = scheme == "Bearer" and secrets.compare_digest(token, api_key)
+        if not authorized:
+            self._set_completion_headers(401)
+            self.send_header("WWW-Authenticate", "Bearer")
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({"error": "Invalid or missing API key"}).encode()
+            )
+        return authorized
+
     def do_POST(self):
         """
         Respond to a POST request from a client.
         """
+        if not self._check_auth():
+            return
+
         request_factories = {
             "/v1/completions": self.handle_text_completions,
             "/v1/chat/completions": self.handle_chat_completions,
@@ -1198,6 +1286,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("chat_template_kwargs", dict, optional=True)
 
         if self.logit_bias is not None:
             try:
@@ -1371,7 +1460,23 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            if isinstance(e, FileNotFoundError):
+                # The requested model/adapter/draft-model genuinely
+                # doesn't exist -- this is the only case that is actually
+                # a missing resource.
+                status = 404
+            elif isinstance(e, (ValueError, TypeError, KeyError)):
+                # Invalid request/configuration data (e.g. an unsupported
+                # sampling parameter or a malformed chat_template_kwargs)
+                # is a client error, not a missing resource.
+                status = 400
+            else:
+                # An unexpected failure during generation (e.g. a runtime
+                # error while running the model) is a server error and
+                # should not be silently mislabeled as 404.
+                logging.error(f"Unexpected error during generation: {e}", exc_info=True)
+                status = 500
+            self._set_completion_headers(status)
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
@@ -1514,6 +1619,33 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+        except Exception as e:
+            # A failure partway through generation must never leave the
+            # client waiting indefinitely for bytes that are never coming.
+            logging.error(f"Error while streaming generation: {e}", exc_info=True)
+            try:
+                if self.stream:
+                    # Headers (200) were already flushed when the stream
+                    # started, so we can't change the status now -- but we
+                    # can still terminate the SSE stream cleanly instead of
+                    # just dropping the socket, since some clients only
+                    # stop waiting on an explicit `[DONE]`.
+                    err_resp = {
+                        "error": {"message": str(e), "type": type(e).__name__}
+                    }
+                    self.wfile.write(f"data: {json.dumps(err_resp)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                else:
+                    # Headers for the non-streaming response are buffered
+                    # and only flushed once the body is ready, so nothing
+                    # has reached the client yet -- make sure this
+                    # connection is torn down rather than left half-open on
+                    # a keep-alive socket the client is still reading from.
+                    self.close_connection = True
+            except OSError:
+                pass  # client already disconnected
+            raise
         finally:
             ctx.stop()
 
@@ -1587,10 +1719,13 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
-            self.handle_models_request()
-        elif self.path == "/health":
+        if self.path == "/health":
+            # Liveness/readiness probes must stay reachable without a key.
             self.handle_health_check()
+        elif not self._check_auth():
+            return
+        elif self.path.startswith("/v1/models"):
+            self.handle_models_request()
         else:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1745,6 +1880,18 @@ def main():
         help="Allowed origins (default: *)",
     )
     parser.add_argument(
+        "--api-key",
+        type=str,
+        default=None,
+        help=(
+            "Bearer token required in the 'Authorization: Bearer <token>' "
+            "header of every request except /health. Required when --host "
+            "is not a loopback address (e.g. 0.0.0.0), since binding to a "
+            "non-loopback host makes the server reachable from other "
+            "machines. Optional (but recommended) on loopback."
+        ),
+    )
+    parser.add_argument(
         "--draft-model",
         type=str,
         help="A model to be used for speculative decoding.",
@@ -1851,6 +1998,27 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+
+    if not is_loopback_host(args.host) and not args.api_key:
+        parser.error(
+            f"--api-key is required when binding to a non-loopback host "
+            f"({args.host!r}) -- otherwise anyone who can reach this "
+            "machine on the network can select models, adapters, and "
+            "draft models and run generation. Pass --api-key <token>, or "
+            "bind to a loopback address (127.0.0.1, ::1, localhost) if "
+            "this server should only be reachable locally."
+        )
+    if args.api_key and args.allowed_origins == "*":
+        # The wildcard default is fine for a same-machine, unauthenticated
+        # server, but a remote, authenticated deployment shouldn't also
+        # let any website's JavaScript talk to it cross-origin by default.
+        logging.warning(
+            "An --api-key is set; defaulting --allowed-origins to none "
+            "instead of the wildcard '*' default. Pass --allowed-origins "
+            "explicitly to allow specific browser origins."
+        )
+        args.allowed_origins = []
+
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)

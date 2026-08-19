@@ -16,22 +16,31 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Optional,
     Tuple,
     Type,
     Union,
+    overload,
 )
 
 import mlx.core as mx
 import mlx.nn as nn
 
-if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
+_USE_MODELSCOPE = os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true"
+
+if _USE_MODELSCOPE:
     try:
         from modelscope import snapshot_download
     except ImportError:
         raise ImportError("Run `pip install modelscope` to use ModelScope.")
+    # ModelScope's snapshot_download has no local_files_only equivalent, so
+    # the cache-only fast path in `_download` below is gated on the HF
+    # backend and this is never referenced when it's off.
+    LocalEntryNotFoundError = None
 else:
     from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import LocalEntryNotFoundError
 
 # For large models with lots of files
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
@@ -250,6 +259,24 @@ def _download(
 
     if not model_path.exists():
         allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
+        if not _USE_MODELSCOPE:
+            # A fully-cached repo doesn't need the network at all -- avoid
+            # paying a Hub API round-trip (to check for updates) on every
+            # single load() call just to end up serving the same cached
+            # snapshot. Only fall back to the online path when the cache
+            # can't satisfy the request (missing repo, missing revision,
+            # incomplete snapshot, etc).
+            try:
+                return Path(
+                    snapshot_download(
+                        path_or_hf_repo,
+                        revision=revision,
+                        allow_patterns=allow_patterns,
+                        local_files_only=True,
+                    )
+                )
+            except LocalEntryNotFoundError:
+                pass
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -478,6 +505,33 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
     )
+
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[Dict[str, Any]] = None,
+    adapter_path: Optional[str] = None,
+    lazy: bool = False,
+    return_config: Literal[False] = False,
+    revision: Optional[str] = None,
+    trust_remote_code: bool = False,
+) -> Tuple[nn.Module, TokenizerWrapper]: ...
+
+
+@overload
+def load(
+    path_or_hf_repo: str,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    model_config: Optional[Dict[str, Any]] = None,
+    adapter_path: Optional[str] = None,
+    lazy: bool = False,
+    *,
+    return_config: Literal[True],
+    revision: Optional[str] = None,
+    trust_remote_code: bool = False,
+) -> Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]: ...
 
 
 def load(
