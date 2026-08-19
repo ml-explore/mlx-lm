@@ -160,7 +160,13 @@ def main():
         help="Path to a pre-computed sensitivity JSON file.",
     )
     parser.add_argument(
-        "--target-bpw", type=float, default=5.0, help="Target bits per weight."
+        "--target-bpw",
+        type=float,
+        default=5.0,
+        help=(
+            "Target bits per weight. Must be greater than low-bits + "
+            "32 / low-group-size (4.5 with the defaults)."
+        ),
     )
     parser.add_argument("--low-bits", type=int, default=4)
     parser.add_argument("--low-group-size", type=int, default=64)
@@ -188,6 +194,18 @@ def main():
         help="Enable trusting remote code for tokenizer/model loading.",
     )
     args = parser.parse_args()
+
+    if args.low_group_size <= 0:
+        raise ValueError("--low-group-size must be positive.")
+    min_target_bpw = args.low_bits + 32 / args.low_group_size
+    if args.target_bpw <= min_target_bpw:
+        raise ValueError(
+            f"--target-bpw {args.target_bpw} is at or below the minimum "
+            f"({min_target_bpw:.4g}) expressible with --low-bits "
+            f"{args.low_bits} at group size {args.low_group_size}; the result "
+            f"would be uniform {args.low_bits}-bit quantization. Lower "
+            "--low-bits or raise the target."
+        )
 
     group = mx.distributed.init()
     model, tokenizer, config = load(

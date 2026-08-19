@@ -93,7 +93,8 @@ Some important options are:
 
 - `--target-bpw`: The target bits-per-weight. For a given set of quantization
   parameters only certain ranges are possible. For example, with the default
-  parameters a BPW in the range `[4.5, 5.5]` is achievable.
+  parameters the target must be greater than 4.5 BPW, since each 4-bit group
+  also stores a 16-bit scale and bias. Targets up to 5.5 BPW are achievable.
 - `--sensitivities`: A path to a precomputed sensitivities file.
 - `--low-bits`: The number of bits to use for the less sensitive layers.
 - `--high-bits`: The number of bits to use for the more sensitive layers.
