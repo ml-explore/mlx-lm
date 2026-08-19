@@ -89,6 +89,39 @@ def make_bitlinear_kernel():
 _bitlinear_kernel = make_bitlinear_kernel()
 
 
+def _bitlinear_matmul_ops(x, packed_weights, out_features, weight_scale, invert_weight_scales):
+    """
+    Ops-based reference/fallback for the packed-ternary matmul above, used
+    whenever a Metal backend is unavailable (e.g. CPU, CUDA). Slower and
+    less memory-efficient than the Metal kernel (it materializes the
+    unpacked ternary weight matrix), but numerically equivalent: each byte
+    of `packed_weights` holds four 2-bit codes in {0, 1, 2} (bias +1, so
+    ternary value = code - 1) for four different output rows, laid out the
+    same way the kernel reads them -- row ``row_idx`` of the packed matrix,
+    2-bit field ``i``, decodes to output row ``row_idx + i * packed_out_features``.
+    """
+    packed_out_features, in_features = packed_weights.shape
+    if packed_weights.dtype != mx.uint8:
+        # `weight` is a plain module parameter, so generic parameter-dtype
+        # casts (e.g. model.update(tree_map(lambda p: p.astype(t), ...)))
+        # can turn it into a float array of the same small integer values
+        # (0-255) it always holds. mx.right_shift rejects floats outright,
+        # whereas the Metal kernel's C++ `uint8_t w = packed_weights[...]`
+        # narrows a float to the same values implicitly -- normalize here
+        # so this fallback matches that behavior instead of raising.
+        packed_weights = packed_weights.astype(mx.uint8)
+    shifts = mx.array([0, 2, 4, 6], dtype=mx.uint8)
+    # (packed_out_features, 4, in_features), each entry a 2-bit code in {0..3}
+    codes = (packed_weights[:, None, :] >> shifts[None, :, None]) & 3
+    ternary = codes.astype(x.dtype) - 1
+    # -> output row o = row_idx + i * packed_out_features, i.e. `i` is the
+    # slower-varying index once flattened.
+    weight = ternary.transpose(1, 0, 2).reshape(-1, in_features)[:out_features]
+    y = x @ weight.T
+    scale = (1 / weight_scale) if invert_weight_scales else weight_scale
+    return y * scale
+
+
 class BitLinear(nn.Module):
     """
     BitLinear module with memory-efficient weight handling.
@@ -128,23 +161,33 @@ class BitLinear(nn.Module):
 
         dtype = self.weight_scale.dtype
         assert x.dtype == dtype, "Wrong type for input."
-        out = _bitlinear_kernel(
-            inputs=[
+        if mx.metal.is_available():
+            out = _bitlinear_kernel(
+                inputs=[
+                    x,
+                    packed_weights,
+                    self.weight_scale,
+                ],
+                template=[
+                    ("T", dtype),
+                    ("invert_weight_scales", self.invert_weight_scales),
+                    ("in_features", in_features),
+                    ("out_features", out_features),
+                ],
+                grid=(32, total_batch_elements * out_features // 4, 1),
+                threadgroup=(32, 1, 1),  # SIMD width is 32 threads
+                output_shapes=[(total_batch_elements, out_features)],
+                output_dtypes=[dtype],
+            )[0]
+        else:
+            # No Metal back-end (CPU, CUDA, ...) -- fall back to plain ops.
+            out = _bitlinear_matmul_ops(
                 x,
                 packed_weights,
+                out_features,
                 self.weight_scale,
-            ],
-            template=[
-                ("T", dtype),
-                ("invert_weight_scales", self.invert_weight_scales),
-                ("in_features", in_features),
-                ("out_features", out_features),
-            ],
-            grid=(32, total_batch_elements * out_features // 4, 1),
-            threadgroup=(32, 1, 1),  # SIMD width is 32 threads
-            output_shapes=[(total_batch_elements, out_features)],
-            output_dtypes=[dtype],
-        )[0]
+                self.invert_weight_scales,
+            )
 
         if len(original_shape) > 2:
             out = out.reshape(*original_shape[:-1], out_features)

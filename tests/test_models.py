@@ -3228,6 +3228,12 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(out, out_m, atol=1e-4, rtol=1e-4))
         self.assertTrue(mx.allclose(out_state, out_state_m, atol=1e-4, rtol=1e-4))
 
+    @unittest.skipUnless(
+        mx.metal.is_available(),
+        "gated_delta_kernel is a Metal-only custom kernel with no CPU/CUDA "
+        "implementation; gated_delta_update's ops fallback is covered "
+        "instead by test_gated_delta_precision.",
+    )
     def test_gated_delta(self):
         mx.random.seed(0)
         for B in [1, 2]:
@@ -3303,6 +3309,12 @@ class TestModels(unittest.TestCase):
             self.assertTrue(mx.allclose(state_lo, state_ref, rtol=0.05, atol=0.01))
             self.assertTrue(mx.allclose(y_lo, y_ref, rtol=0.05, atol=0.01))
 
+    @unittest.skipUnless(
+        mx.metal.is_available(),
+        "gated_delta_kernel is a Metal-only custom kernel with no CPU/CUDA "
+        "implementation; gated_delta_update's ops fallback is covered "
+        "instead by test_gated_delta_precision.",
+    )
     def test_gated_delta_masked(self):
         B = 1
         T = 3
