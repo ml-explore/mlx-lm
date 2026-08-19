@@ -40,6 +40,7 @@ class ModelArgs(BaseModelArgs):
     shared_expert_intermediate_size: int = 512
     moe_routed_scaling_factor: float = 1.0
     moe_router_logit_softcapping: float = 0.0
+    moe_router_score_func: str = "sigmoid"
 
     def __post_init__(self):
         if self.layer_types is None:
@@ -168,15 +169,23 @@ class MoEGate(nn.Module):
         self.top_k = args.num_experts_per_tok
         self.num_experts = args.num_experts
         self.softcap = args.moe_router_logit_softcapping
+        self.score_func = args.moe_router_score_func
         self.weight = mx.zeros((args.num_experts, args.hidden_size))
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
+
+    def _routing_scores(self, logits: mx.array) -> mx.array:
+        if self.score_func == "sigmoid":
+            return mx.sigmoid(logits)
+        if self.score_func == "sqrtsoftplus":
+            return mx.sqrt(nn.softplus(logits))
+        raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
     def __call__(self, x):
         logits = (x @ self.weight.T).astype(mx.float32)
         if self.softcap > 0.0:
             logits = mx.tanh(logits / self.softcap) * self.softcap
 
-        scores = mx.sigmoid(logits)
+        scores = self._routing_scores(logits)
         scores_for_selection = scores + self.e_score_correction_bias
         inds = mx.argpartition(-scores_for_selection, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
