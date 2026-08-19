@@ -14,15 +14,14 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_kernel, gated_delta_ops
+from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
-from .switch_layers import QuantizedSwitchLinear, SwitchLinear
+from .switch_layers import SwitchGLU
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "bailing_hybrid"
-    architectures: list[str] | None = None
     vocab_size: int = 157184
     hidden_size: int = 1536
     intermediate_size: int = 4608
@@ -30,12 +29,10 @@ class ModelArgs(BaseModelArgs):
     moe_shared_expert_intermediate_size: int = 512
     num_hidden_layers: int = 24
     num_attention_heads: int = 16
-    num_key_value_heads: int = 16
     num_experts: int = 128
     num_experts_per_tok: int = 8
     num_shared_experts: int = 1
     first_k_dense_replace: int = 1
-    num_nextn_predict_layers: int = 0
     n_group: int = 8
     topk_group: int = 4
     routed_scaling_factor: float = 2.5
@@ -45,7 +42,6 @@ class ModelArgs(BaseModelArgs):
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
-    qk_head_dim: int = 192
     v_head_dim: int = 128
     short_conv_kernel_size: int = 4
     kda_lower_bound: float = -5.0
@@ -108,22 +104,6 @@ def _linear(
     return nn.Linear(input_dims, output_dims, bias=False)
 
 
-def _switch_linear(
-    args: ModelArgs, input_dims: int, output_dims: int
-) -> SwitchLinear | QuantizedSwitchLinear:
-    if _uses_fp8(args):
-        return QuantizedSwitchLinear(
-            input_dims,
-            output_dims,
-            args.num_experts,
-            bias=False,
-            group_size=32,
-            bits=8,
-            mode="mxfp8",
-        )
-    return SwitchLinear(input_dims, output_dims, args.num_experts, bias=False)
-
-
 class BailingMLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: int):
         super().__init__()
@@ -133,25 +113,6 @@ class BailingMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
-class BailingSwitchGLU(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        dim = args.hidden_size
-        hidden_dim = args.moe_intermediate_size
-        self.gate_proj = _switch_linear(args, dim, hidden_dim)
-        self.up_proj = _switch_linear(args, dim, hidden_dim)
-        self.down_proj = _switch_linear(args, hidden_dim, dim)
-
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
-        if self.training:
-            indices = mx.stop_gradient(indices)
-        x = mx.expand_dims(x, (-2, -3))
-        up = self.up_proj(x, indices)
-        gate = self.gate_proj(x, indices)
-        x = self.down_proj(swiglu(gate, up), indices)
-        return x.squeeze(-2)
 
 
 def _group_expert_select(
@@ -209,7 +170,18 @@ class BailingSparseMoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.gate = BailingGate(args)
-        self.switch_mlp = BailingSwitchGLU(args)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.num_experts,
+        )
+        if _uses_fp8(args):
+            nn.quantize(
+                self.switch_mlp,
+                group_size=32,
+                bits=8,
+                mode="mxfp8",
+            )
         shared_size = args.moe_shared_expert_intermediate_size * args.num_shared_experts
         self.shared_experts = BailingMLP(args, shared_size)
 
@@ -228,14 +200,14 @@ class BailingMLA(nn.Module):
         self.kv_lora_rank = args.kv_lora_rank
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.qk_rope_head_dim = args.qk_rope_head_dim
-        self.qk_head_dim = args.qk_head_dim
+        self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
         self.scale = self.qk_head_dim**-0.5
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(
                 args.hidden_size,
-                args.num_attention_heads * args.qk_head_dim,
+                args.num_attention_heads * self.qk_head_dim,
                 bias=False,
             )
         else:
@@ -243,7 +215,7 @@ class BailingMLA(nn.Module):
             self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=args.rms_norm_eps)
             self.q_b_proj = nn.Linear(
                 self.q_lora_rank,
-                args.num_attention_heads * args.qk_head_dim,
+                args.num_attention_heads * self.qk_head_dim,
                 bias=False,
             )
         self.kv_a_proj_with_mqa = nn.Linear(
@@ -443,32 +415,20 @@ class BailingKDA(nn.Module):
         q, k = _normalize_kda_qk(q, k, self.head_dim)
 
         raw_gate = self.f_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
-        dt_bias = self.dt_bias.reshape(self.num_heads, self.head_dim)
-        log_decay = self.lower_bound * mx.sigmoid(
-            mx.exp(self.A_log.astype(mx.float32))[None, None, :, None]
-            * (raw_gate.astype(mx.float32) + dt_bias)
-        )
-        decay = mx.exp(log_decay)
-        beta = mx.sigmoid(self.b_proj(x).astype(mx.float32))
         state = None if cache is None else cache[3]
-        if state is None:
-            state = mx.zeros(
-                (
-                    batch,
-                    self.num_heads,
-                    self.head_dim,
-                    self.head_dim,
-                ),
-                dtype=mx.float32,
-            )
-        if (
-            not self.training
-            and mx.default_device() == mx.gpu
-            and mx.metal.is_available()
-        ):
-            output, state = gated_delta_kernel(q, k, v, decay, beta, state, mask)
-        else:
-            output, state = gated_delta_ops(q, k, v, decay, beta, state, mask)
+        output, state = gated_delta_update(
+            q,
+            k,
+            v,
+            raw_gate,
+            self.b_proj(x).astype(mx.float32),
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=state,
+            mask=mask,
+            use_kernel=not self.training,
+            lower_bound=self.lower_bound,
+        )
         if cache is not None:
             cache[3] = state
             cache.advance(length)
@@ -518,15 +478,28 @@ class BailingModel(nn.Module):
             for layer_index in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.linear_index = 0
-        self.attention_index = args.layer_group_size - 1
+        self.linear_index = next(
+            (index for index, layer in enumerate(self.layers) if layer.is_linear), None
+        )
+        self.attention_index = next(
+            (index for index, layer in enumerate(self.layers) if not layer.is_linear),
+            None,
+        )
 
     def __call__(self, inputs: mx.array, cache: Any | None = None) -> mx.array:
         hidden = self.word_embeddings(inputs)
         if cache is None:
             cache = [None] * len(self.layers)
-        attention_mask = create_attention_mask(hidden, cache[self.attention_index])
-        linear_mask = create_ssm_mask(hidden, cache[self.linear_index])
+        attention_mask = (
+            create_attention_mask(hidden, cache[self.attention_index])
+            if self.attention_index is not None
+            else None
+        )
+        linear_mask = (
+            create_ssm_mask(hidden, cache[self.linear_index])
+            if self.linear_index is not None
+            else None
+        )
         for layer, layer_cache in zip(self.layers, cache):
             mask = linear_mask if layer.is_linear else attention_mask
             hidden = layer(hidden, mask=mask, cache=layer_cache)
@@ -540,7 +513,11 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = BailingModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.lm_head = (
+            None
+            if args.tie_word_embeddings
+            else nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        )
 
     @property
     def layers(self):
@@ -548,6 +525,8 @@ class Model(nn.Module):
 
     def __call__(self, inputs: mx.array, cache: Any | None = None) -> mx.array:
         hidden = self.model(inputs, cache)
+        if self.lm_head is None:
+            return self.model.word_embeddings.as_linear(hidden)
         return self.lm_head(hidden)
 
     def make_cache(self):
@@ -573,6 +552,8 @@ class Model(nn.Module):
             )
 
     def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         weights = {
             key: value
             for key, value in weights.items()

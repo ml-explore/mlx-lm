@@ -115,7 +115,6 @@ class TestLora(unittest.TestCase):
         from mlx_lm.models import bailing_moe_v3
 
         args = bailing_moe_v3.ModelArgs(
-            architectures=["BailingMoeV3ForCausalLM"],
             vocab_size=64,
             hidden_size=32,
             intermediate_size=32,
@@ -123,7 +122,6 @@ class TestLora(unittest.TestCase):
             moe_shared_expert_intermediate_size=32,
             num_hidden_layers=4,
             num_attention_heads=1,
-            num_key_value_heads=1,
             num_experts=4,
             num_experts_per_tok=2,
             num_shared_experts=1,
@@ -135,7 +133,6 @@ class TestLora(unittest.TestCase):
             kv_lora_rank=32,
             qk_nope_head_dim=16,
             qk_rope_head_dim=16,
-            qk_head_dim=32,
             v_head_dim=32,
         )
         lora_config = {
@@ -152,7 +149,9 @@ class TestLora(unittest.TestCase):
             )
             model.train()
             q_proj = model.layers[0].attention.q_proj
+            q_a_proj = model.layers[3].attention.q_a_proj
             self.assertIsInstance(q_proj, LoRALinear)
+            self.assertIsInstance(q_a_proj, LoRALinear)
             if quantized:
                 self.assertIsInstance(q_proj.linear, nn.QuantizedLinear)
 
@@ -162,9 +161,12 @@ class TestLora(unittest.TestCase):
             loss, grads = nn.value_and_grad(model, loss_fn)(model, mx.array([[0, 1]]))
             mx.eval(loss, grads)
             self.assertTrue(mx.isfinite(loss).item())
+            flat_grads = tree_flatten(grads)
+            self.assertTrue(flat_grads)
             self.assertTrue(
-                all(mx.all(mx.isfinite(grad)).item() for _, grad in tree_flatten(grads))
+                all(mx.all(mx.isfinite(grad)).item() for _, grad in flat_grads)
             )
+            self.assertTrue(any(mx.any(grad != 0).item() for _, grad in flat_grads))
 
         check_lora_gradients(bailing_moe_v3.Model(args))
         fp8_args = replace(

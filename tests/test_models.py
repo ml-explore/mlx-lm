@@ -407,7 +407,6 @@ class TestModels(unittest.TestCase):
         from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
         args = bailing_moe_v3.ModelArgs(
-            architectures=["BailingMoeV3ForCausalLM"],
             vocab_size=64,
             hidden_size=32,
             intermediate_size=32,
@@ -415,7 +414,6 @@ class TestModels(unittest.TestCase):
             moe_shared_expert_intermediate_size=32,
             num_hidden_layers=4,
             num_attention_heads=1,
-            num_key_value_heads=1,
             num_experts=4,
             num_experts_per_tok=2,
             num_shared_experts=1,
@@ -427,7 +425,6 @@ class TestModels(unittest.TestCase):
             kv_lora_rank=32,
             qk_nope_head_dim=16,
             qk_rope_head_dim=16,
-            qk_head_dim=32,
             v_head_dim=32,
             quantization_config=None,
         )
@@ -451,6 +448,17 @@ class TestModels(unittest.TestCase):
             flash_args.vocab_size,
             flash_args.num_hidden_layers,
         )
+
+        tied_model = bailing_moe_v3.Model(replace(args, tie_word_embeddings=True))
+        self.assertIsNone(tied_model.lm_head)
+        tied_output = tied_model(mx.array([[0, 1]]))
+        mx.eval(tied_output)
+        self.assertEqual(tied_output.shape, (1, 2, args.vocab_size))
+
+        mla_only_model = bailing_moe_v3.Model(replace(args, num_hidden_layers=1))
+        mla_only_output = mla_only_model(mx.array([[0, 1]]))
+        mx.eval(mla_only_output)
+        self.assertEqual(mla_only_output.shape, (1, 2, args.vocab_size))
 
         fp8_args = replace(
             args,
@@ -3310,6 +3318,36 @@ class TestModels(unittest.TestCase):
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_lower_bound(self):
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(1, 2, 2, 4))
+        k = mx.random.normal(shape=(1, 2, 2, 4))
+        v = mx.random.normal(shape=(1, 2, 2, 3))
+        a = mx.random.normal(shape=(1, 2, 2, 4))
+        b = mx.random.normal(shape=(1, 2, 2))
+        A_log = mx.log(mx.array([1.0, 2.0]))[:, None]
+        dt_bias = mx.random.normal(shape=(2, 4))
+        lower_bound = -5.0
+
+        g = mx.exp(
+            lower_bound * mx.sigmoid(mx.exp(A_log) * (a.astype(mx.float32) + dt_bias))
+        )
+        expected, expected_state = gated_delta_ops(q, k, v, g, mx.sigmoid(b))
+        output, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            use_kernel=False,
+            lower_bound=lower_bound,
+        )
+
+        self.assertTrue(mx.allclose(output, expected))
+        self.assertTrue(mx.allclose(state, expected_state))
 
     def test_gated_delta_precision(self):
         mx.random.seed(42)
