@@ -1116,7 +1116,11 @@ class APIHandler(BaseHTTPRequestHandler):
         Returns True if the request may proceed. Otherwise it has already
         written a 401 response and the caller must return immediately.
         """
-        api_key = self.response_generator.cli_args.api_key
+        # getattr, not a direct attribute access: cli_args can be any
+        # object a caller constructs (tests, library embedders, ...), and
+        # the absence of an api_key attribute must mean "no key configured"
+        # rather than crashing every request.
+        api_key = getattr(self.response_generator.cli_args, "api_key", None)
         if not api_key:
             return True
 
