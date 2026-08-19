@@ -25,7 +25,10 @@ import regex as re
 tool_call_start = "<｜DSML｜tool_calls"
 tool_call_end = "</｜DSML｜tool_calls"
 
-_INVOKE = re.compile(r"<｜DSML｜invoke\s+name=(.*?)</｜DSML｜invoke>", re.DOTALL)
+# Lenient invoke close (</｜DSML｜inv…>): DeepSeek-V4 quants systematically
+# truncate </｜DSML｜invoke> to </｜DSML｜inv> (reproducible across 4/5/6-bit),
+# which the strict close tag would otherwise reject.
+_INVOKE = re.compile(r"<｜DSML｜invoke\s+name=(.*?)</｜DSML｜inv[^>]*>", re.DOTALL)
 _PARAM = re.compile(
     r'<｜DSML｜parameter\s+name=(?P<name>"[^"]*"|\'[^\']*\'|[^\s>]+)'
     r'\s+string="(?P<is_str>true|false)"\s*>(?P<val>.*?)</｜DSML｜parameter>',
