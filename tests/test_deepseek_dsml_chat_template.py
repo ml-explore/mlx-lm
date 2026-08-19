@@ -139,6 +139,22 @@ class TestServerCallingConvention(unittest.TestCase):
         self.assertIn("<｜DSML｜tool_calls>", out)
         self.assertIn("get_weather", out)
 
+    def test_tool_call_replay_with_dict_arguments(self):
+        # Agent loops replay their prior tool_calls with `arguments` as a dict,
+        # not the OpenAI JSON string; the template must accept both (it used to
+        # crash in encode_arguments_to_dsml's json.loads).
+        msgs = [
+            {"role": "system", "content": "s", "tools": TOOLS},
+            {"role": "user", "content": "weather in Paris?"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"type": "function", "function": {
+                    "name": "get_weather", "arguments": {"location": "Paris"}}}]},
+            {"role": "tool", "content": "sunny", "tool_call_id": "c1"},
+        ]
+        out = v4.apply_chat_template(msgs, add_generation_prompt=True, enable_thinking=True)
+        self.assertIn("get_weather", out)
+        self.assertIn("Paris", out)
+
     def test_tolerates_injected_unknown_kwargs(self):
         # A jinja template silently ignores unknown template kwargs; the Python
         # equivalent must too, since the server/tokenizer may inject extras.

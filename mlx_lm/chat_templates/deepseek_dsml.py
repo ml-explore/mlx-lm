@@ -81,6 +81,18 @@ tool_calls_template = "<{dsml_token}tool_calls>\n{tool_calls}\n</{dsml_token}too
 tool_output_template = "<tool_result>{content}</tool_result>"
 
 
+def _tool_call_with_str_args(tc: Dict[str, Any]) -> Dict[str, Any]:
+    """``encode_arguments_to_dsml`` ``json.loads()``es ``tc["arguments"]``, i.e.
+    it expects the OpenAI JSON *string* form. Some clients (e.g. agent loops
+    replaying their own prior calls) send ``arguments`` already parsed as a
+    dict; re-serialize those so multi-turn tool-call replay does not crash.
+    """
+    args = tc.get("arguments")
+    if isinstance(args, str):
+        return tc
+    return {**tc, "arguments": to_json(args if args is not None else {})}
+
+
 def render_tools(tools: List[Dict[str, Any]]) -> str:
     return TOOLS_SYSTEM_TEMPLATE.format(
         tool_schemas="\n".join(to_json(t) for t in tools),
@@ -131,7 +143,7 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
                 tool_call_template.format(
                     dsml_token=dsml_token,
                     name=tc["name"],
-                    arguments=encode_arguments_to_dsml(tc),
+                    arguments=encode_arguments_to_dsml(_tool_call_with_str_args(tc)),
                 )
                 for tc in tool_calls_from_openai_format(msg["tool_calls"])
             ]
