@@ -46,6 +46,15 @@ def estimate_sensitivities(
     gradient_accum_dtype: mx.Dtype = mx.float32,
     gradient_checkpoint: bool = False,
 ):
+    """Estimate per-layer sensitivity to quantization.
+
+    Sensitivity = alignment between the gradient and (low_q - high_q) weight
+    difference, averaged over calibration batches.  The gradient computation
+    uses nondeterministic Metal reductions, so repeated calls with identical
+    inputs can produce slightly different values (median ~3%, max ~45%
+    relative difference observed).  The resulting bit allocation is therefore
+    not bit-reproducible across runs even with the same seed.
+    """
     def qdq(w, bits, group_size):
         w, s, b = mx.quantize(w, bits=bits, group_size=group_size)
         return mx.dequantize(w, scales=s, biases=b, bits=bits, group_size=group_size)
@@ -152,7 +161,19 @@ def main():
     parser.add_argument(
         "--mlx-path", default="mlx_model", help="Path to save the model"
     )
-    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=123,
+        help=(
+            "Seed for the calibration sample draw. Fixes which data are"
+            " used but does not guarantee identical output: gradient"
+            " reductions in Metal are nondeterministic, so sensitivity"
+            " scores and the resulting bit allocation can vary between"
+            " runs. For method comparisons, build replicate runs and"
+            " treat the spread as a variance component."
+        ),
+    )
     parser.add_argument(
         "--sensitivities",
         type=str,
