@@ -3,10 +3,12 @@
 import argparse
 import contextlib
 import copy
-import functools
+import inspect
 import json
+import math
 import sys
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
@@ -29,7 +31,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import categorical_sampling, make_sampler, make_sampler_chain
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -45,6 +47,7 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+_CACHE_CLEAR_INTERVAL = 256
 
 
 def str2bool(string):
@@ -210,6 +213,12 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5).",
+    )
     return parser
 
 
@@ -287,12 +296,50 @@ class GenerationResponse:
     finish_reason: Optional[str] = None
 
 
+@dataclass
+class _MTPPromptFinalizePlan:
+    mtp_hidden: Optional[mx.array]
+    mtp_tokens: Optional[mx.array]
+    target_token: Optional[mx.array]
+    last_hidden: Optional[mx.array]
+    num_tokens: int
+
+
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
     for e, c in enumerate(prompt_cache):
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+
+
+def validate_prompt_and_embeddings(model, prompt, input_embeddings):
+    if input_embeddings is not None:
+        if not does_model_support_input_embeddings(model):
+            raise ValueError("Model does not support input embeddings.")
+        elif len(prompt) > 0 and len(prompt) != len(input_embeddings):
+            raise ValueError(
+                f"When providing input_embeddings, their sequence length ({len(input_embeddings)}) "
+                f"must match the sequence length of the prompt ({len(prompt)}), or the "
+                "prompt must be empty."
+            )
+    elif len(prompt) == 0:
+        raise ValueError(
+            "Either input_embeddings or prompt (or both) must be provided."
+        )
+
+
+def _model_supports_mtp(model):
+    # Detect a loaded native MTP head without relying on method presence alone.
+    supported = getattr(model, "supports_mtp", None)
+    if supported is not None:
+        return bool(supported)
+    if not hasattr(model, "mtp_forward") or not hasattr(model, "make_mtp_cache"):
+        return False
+    try:
+        return len(model.make_mtp_cache()) > 0
+    except (AttributeError, TypeError):
+        return False
 
 
 def generate_step(
@@ -342,19 +389,7 @@ def generate_step(
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
     """
-    if input_embeddings is not None:
-        if not does_model_support_input_embeddings(model):
-            raise ValueError("Model does not support input embeddings.")
-        elif len(prompt) > 0 and len(prompt) != len(input_embeddings):
-            raise ValueError(
-                f"When providing input_embeddings, their sequence length ({len(input_embeddings)}) "
-                f"must match the sequence length of the prompt ({len(prompt)}), or the "
-                "prompt must be empty."
-            )
-    elif len(prompt) == 0:
-        raise ValueError(
-            "Either input_embeddings or prompt (or both) must be provided."
-        )
+    validate_prompt_and_embeddings(model, prompt, input_embeddings)
 
     tokens = None
 
@@ -367,7 +402,7 @@ def generate_step(
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
 
-    quantize_cache_fn = functools.partial(
+    quantize_cache_fn = partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
@@ -455,7 +490,7 @@ def generate_step(
         if n == max_tokens:
             break
         yield y.item(), logprobs
-        if n % 256 == 0:
+        if n % _CACHE_CLEAR_INTERVAL == 0:
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
         n += 1
@@ -525,7 +560,7 @@ def speculative_generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    quantize_cache_fn = functools.partial(
+    quantize_cache_fn = partial(
         maybe_quantize_kv_cache,
         quantized_kv_start=quantized_kv_start,
         kv_group_size=kv_group_size,
@@ -645,12 +680,525 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    input_embeddings: Optional[mx.array] = None,
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """A generator that uses the model's native MTP head for speculative decoding.
+
+    Each iteration runs one backbone forward pass over the current token and its
+    pending draft, then one MTP forward pass to propose the next draft.  Up to 2
+    tokens are emitted per backbone step: one always-accepted backbone token and
+    one conditionally-accepted draft token.
+
+    The model must implement ``mtp_forward(hidden, next_tok, mtp_cache)`` and
+    support ``return_hidden=True`` in its ``__call__``.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
+            ``from_draft`` is ``True`` when the token came from the MTP head.
+    """
+    if input_embeddings is not None:
+        raise ValueError(
+            "Native MTP generation does not yet support input_embeddings. "
+            "Use standard generation for embedding or multimodal inputs."
+        )
+    validate_prompt_and_embeddings(model, prompt, input_embeddings)
+
+    if logits_processors:
+        unsafe_processors = [
+            type(processor).__name__
+            for processor in logits_processors
+            if not inspect.isfunction(processor)
+            and not isinstance(processor, partial)
+            and not getattr(processor, "is_stateless", False)
+        ]
+        if unsafe_processors:
+            names = ", ".join(unsafe_processors)
+            raise ValueError(
+                "Native MTP currently supports only stateless logits processors. "
+                "Use plain functions, functools.partial, or set is_stateless=True "
+                f"on a safe callable. Unsupported processor(s): {names}."
+            )
+
+    if not _model_supports_mtp(model):
+        raise ValueError("The model does not have a usable native MTP head.")
+
+    y = prompt.astype(mx.uint32)
+    input_token_count = int(y.size)
+    prev_tokens = None
+    fresh_mtp_cache = model.make_mtp_cache()
+    prompt_state = None
+    cached_token_count = 0
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = fresh_mtp_cache
+    else:
+        n_main = len(model.layers)
+        n_mtp = len(fresh_mtp_cache)
+        if len(prompt_cache) < n_main:
+            raise ValueError(
+                "The supplied prompt_cache has fewer entries than the model backbone."
+            )
+
+        model_cache = list(prompt_cache[:n_main])
+        tail = list(prompt_cache[n_main:])
+        if tail and isinstance(tail[-1], cache.MTPPromptCacheState):
+            prompt_state = tail.pop()
+        mtp_cache = tail
+
+        if mtp_cache and len(mtp_cache) != n_mtp:
+            raise ValueError(
+                "The supplied prompt_cache contains an incompatible number of "
+                "MTP cache entries."
+            )
+
+        model_nonempty = any(not c.empty() for c in model_cache)
+        mtp_nonempty = any(not c.empty() for c in mtp_cache)
+        if not mtp_cache:
+            if model_nonempty:
+                raise ValueError(
+                    "A pre-populated native-MTP prompt_cache must include its "
+                    "MTP cache entries and boundary state."
+                )
+            mtp_cache = fresh_mtp_cache
+            prompt_cache.extend(mtp_cache)
+        elif prompt_state is None and (model_nonempty or mtp_nonempty):
+            raise ValueError(
+                "Legacy native-MTP prompt caches without boundary metadata cannot "
+                "be reused safely. Rebuild the prefix once."
+            )
+
+        if prompt_state is None:
+            if not hasattr(prompt_cache, "append"):
+                raise TypeError(
+                    "prompt_cache must be a mutable sequence for native MTP."
+                )
+            prompt_state = cache.MTPPromptCacheState()
+            prompt_cache.append(prompt_state)
+        elif not prompt_state.empty():
+            cached_token_count = prompt_state.num_tokens
+            if y.size == 0:
+                raise ValueError(
+                    "An exact native-MTP cache hit needs at least one suffix token "
+                    "to resume the one-token-lagged MTP state."
+                )
+
+    _is_greedy = temp == 0
+
+    _filter_chain, _xtc_cell = (
+        make_sampler_chain(
+            top_p,
+            top_k,
+            min_p,
+            min_tokens_to_keep,
+            xtc_probability,
+            xtc_threshold,
+            xtc_special_tokens,
+        )
+        if not _is_greedy
+        else ([], None)
+    )
+
+    quantize_cache_fn = partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    if prompt_state is not None and not prompt_state.empty():
+        with mx.stream(generation_stream):
+            model.mtp_forward(
+                prompt_state.last_hidden,
+                y[:1].reshape(1, 1),
+                mtp_cache,
+            )
+            quantize_cache_fn(mtp_cache)
+            mx.eval([c.state for c in mtp_cache if hasattr(c, "state")])
+        prompt_state.last_hidden = None
+
+    def _process_and_sample(tokens, logits, xtc_draw=None):
+        if logits_processors:
+            logits = logits[None]
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+            logits = logits.squeeze(0)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if _filter_chain:
+            if _xtc_cell is not None:
+                _xtc_cell[0] = xtc_draw  # None = fresh draw; mx.array = shared draw
+            masked = logprobs
+            for f in _filter_chain:
+                masked = f(masked)
+            token = categorical_sampling(masked, temp)
+            # lp_accept must reflect the same filtered distribution as token.
+            scaled = masked / temp
+            lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+        elif _is_greedy:
+            token = mx.argmax(logprobs, axis=-1)
+            lp_accept = logprobs
+        else:
+            token = categorical_sampling(logprobs, temp)
+            scaled = logprobs / temp
+            lp_accept = scaled - mx.logsumexp(scaled, axis=-1, keepdims=True)
+        return token, logprobs, lp_accept
+
+    def _clear_rollback():
+        for c in model_cache:
+            if hasattr(c, "rollback_state"):
+                c.rollback_state = None
+
+    def _rollback_draft():
+        """Restore caches to the state after the confirmed token.
+
+        SSM layers (ArraysCache): restore the conv/ssm snapshot saved by
+        GatedDeltaNet after the confirmed token.
+        Attention layers (KVCache): trim the draft-token entry.
+        """
+        for c in model_cache:
+            if hasattr(c, "rollback_state") and c.rollback_state is not None:
+                conv_snap, ssm_snap = c.rollback_state
+                c[0] = conv_snap
+                c[1] = ssm_snap
+                c.rollback_state = None
+            elif c.is_trimmable():
+                c.trim(1)
+
+    def _step_backbone(y, prev_tokens, n_predict=1, n_confirmed=0, xtc_draw=None):
+        """Run the backbone on ``y`` and return (tokens, logprobs, accept_lps, hidden, prev_tokens)."""
+        with mx.stream(generation_stream):
+            logits, hidden = model(
+                y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed
+            )
+            logits = logits[:, -n_predict:, :]
+            quantize_cache_fn(model_cache)
+            toks, lps, accept_lps = [], [], []
+            for i in range(n_predict):
+                if logits_processors:
+                    prev_tokens = (
+                        mx.concatenate([prev_tokens, y[i : i + 1]])
+                        if prev_tokens is not None
+                        else y[i : i + 1]
+                    )
+                # Pass the shared XTC draw only for position 0 (the verify position).
+                draw = xtc_draw if i == 0 else None
+                tok, lp, alp = _process_and_sample(
+                    prev_tokens, logits[:, i, :].squeeze(0), draw
+                )
+                toks.append(tok)
+                lps.append(lp)
+                accept_lps.append(alp)
+            return (
+                mx.stack(toks),
+                mx.stack(lps),
+                mx.stack(accept_lps),
+                hidden,
+                prev_tokens,
+            )
+
+    def _step_mtp(hidden_last, main_tok, prev_tokens, *, cache_commit=None):
+        """Run the MTP head and return (draft_token, draft_logprobs, draft_accept_lp, xtc_draw).
+
+        cache_commit: (hidden, tok) prepended as a cache-alignment position so that the
+        accepted draft token is committed to mtp_cache in the same batched forward.
+        """
+        if cache_commit is not None:
+            align_h, align_tok = cache_commit
+            hidden_last = mx.concatenate([align_h, hidden_last], axis=1)
+            next_ids = mx.concatenate(
+                [align_tok.reshape(1, 1), main_tok.reshape(1, 1)], axis=1
+            )
+        else:
+            next_ids = main_tok.reshape(1, 1)
+        with mx.stream(generation_stream):
+            mtp_logits = model.mtp_forward(hidden_last, next_ids, mtp_cache)
+            quantize_cache_fn(mtp_cache)
+            mtp_logits = mtp_logits[:, -1, :].squeeze(0)
+            if logits_processors:
+                tokens_for_proc = (
+                    mx.concatenate([prev_tokens, main_tok.reshape(-1)])
+                    if prev_tokens is not None
+                    else main_tok.reshape(-1)
+                )
+            else:
+                tokens_for_proc = prev_tokens
+            # Draw the XTC boolean once here so the verify step can reuse it.
+            xtc_draw = mx.random.uniform() if _xtc_cell is not None else None
+            draft_tok, draft_lp, draft_accept_lp = _process_and_sample(
+                tokens_for_proc, mtp_logits, xtc_draw
+            )
+        return draft_tok, draft_lp, draft_accept_lp, xtc_draw
+
+    finalize_plan = None
+
+    def _sync_prompt_cache():
+        if prompt_cache is None:
+            return
+        n_main = len(model.layers)
+        n_mtp = len(mtp_cache)
+        prompt_cache[:n_main] = model_cache
+        prompt_cache[n_main : n_main + n_mtp] = mtp_cache
+        if prompt_state is not None:
+            if len(prompt_cache) == n_main + n_mtp:
+                prompt_cache.append(prompt_state)
+            else:
+                prompt_cache[n_main + n_mtp] = prompt_state
+                del prompt_cache[n_main + n_mtp + 1 :]
+
+    def _finalize_prompt_cache():
+        nonlocal finalize_plan
+        if prompt_state is None or finalize_plan is None:
+            return
+
+        plan = finalize_plan
+        last_hidden = plan.last_hidden
+        with mx.stream(generation_stream):
+            if plan.mtp_hidden is not None:
+                model.mtp_forward(plan.mtp_hidden, plan.mtp_tokens, mtp_cache)
+                quantize_cache_fn(mtp_cache)
+
+            if plan.target_token is not None:
+                _, hidden = model(
+                    plan.target_token.reshape(1, 1),
+                    cache=model_cache,
+                    return_hidden=True,
+                )
+                last_hidden = hidden[:, -1:, :]
+                quantize_cache_fn(model_cache)
+
+            if last_hidden is None:
+                raise RuntimeError(
+                    "Native MTP finalization has no boundary hidden state."
+                )
+
+            mx.eval(
+                [c.state for c in model_cache + mtp_cache if hasattr(c, "state")],
+                last_hidden,
+            )
+
+        prompt_state.last_hidden = last_hidden
+        prompt_state.num_tokens = plan.num_tokens
+        _sync_prompt_cache()
+        finalize_plan = None
+
+    def _prefill(y, input_embeddings):
+        # Leave exactly 1 token for _step_backbone so the decode loop starts clean.
+        total = len(input_embeddings) if input_embeddings is not None else y.size
+        while total > 1:
+            n = min(prefill_step_size, total - 1)
+            if input_embeddings is not None:
+                _, hidden = model(
+                    y[:n][None],
+                    cache=model_cache,
+                    return_hidden=True,
+                    input_embeddings=input_embeddings[:n][None],
+                )
+                input_embeddings = input_embeddings[n:]
+            else:
+                _, hidden = model(y[:n][None], cache=model_cache, return_hidden=True)
+            model.mtp_forward(hidden, y[1 : n + 1][None], mtp_cache)
+            quantize_cache_fn(mtp_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache + mtp_cache if hasattr(c, "state")])
+            y = y[n:]
+            total -= n
+            mx.clear_cache()
+        return y
+
+    with mx.stream(generation_stream):
+        y = _prefill(y, input_embeddings)
+
+    ntoks = 0
+    last_cache_block = 0
+    draft_tok = draft_lp = draft_accept_lp = draft_xtc_draw = None
+
+    try:
+        while max_tokens < 0 or ntoks < max_tokens:
+            if draft_tok is None:
+                # No pending draft: run backbone only, then generate first draft.
+                toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
+                    y, prev_tokens, n_predict=1
+                )
+                mx.eval(toks)
+                main_tok, main_lp = toks[0], lps[0]
+                hidden_at_main = hidden[:, -1:, :]
+                ntoks += 1
+                finalize_plan = _MTPPromptFinalizePlan(
+                    mtp_hidden=hidden_at_main,
+                    mtp_tokens=main_tok.reshape(1, 1),
+                    target_token=main_tok,
+                    last_hidden=None,
+                    num_tokens=cached_token_count + input_token_count + ntoks,
+                )
+                yield main_tok.item(), main_lp, False
+                if max_tokens >= 0 and ntoks >= max_tokens:
+                    return
+                finalize_plan = None
+                draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
+                    hidden_at_main, main_tok, prev_tokens
+                )
+                mx.eval(draft_tok)
+                y = mx.array([main_tok.item()], mx.uint32)
+            else:
+                # Verify draft: run backbone over [y, draft_tok].
+                # n_confirmed=1 causes GatedDeltaNet to snapshot its SSM/conv state
+                # after the confirmed token y, enabling exact rollback on rejection.
+                y_with_draft = mx.concatenate(
+                    [y, mx.array([draft_tok.item()], mx.uint32)]
+                )
+                toks, lps, accept_lps, hidden, prev_tokens = _step_backbone(
+                    y_with_draft,
+                    prev_tokens,
+                    n_predict=2,
+                    n_confirmed=1,
+                    xtc_draw=draft_xtc_draw,
+                )
+                u = mx.random.uniform()
+                mx.eval(toks, draft_tok, u)
+
+                verify_pred, bonus_tok = toks[0], toks[1]
+                verify_lp, bonus_lp = lps[0], lps[1]
+                verify_accept_lp = accept_lps[0]
+                draft_tok_id = draft_tok.item()
+
+                if _is_greedy:
+                    accept = verify_pred.item() == draft_tok_id
+                else:
+                    # Probabilistic acceptance: min(1, p_target/p_draft).
+                    log_accept = (
+                        verify_accept_lp[draft_tok_id] - draft_accept_lp[draft_tok_id]
+                    ).item()
+                    accept = log_accept >= 0 or u.item() < math.exp(log_accept)
+
+                hidden_at_confirmed = hidden[:, 0:1, :]
+                hidden_at_draft = hidden[:, 1:2, :]
+
+                if accept:
+                    _clear_rollback()
+                    accepted_draft = draft_tok
+                    ntoks += 1
+                    finalize_plan = _MTPPromptFinalizePlan(
+                        mtp_hidden=hidden_at_confirmed,
+                        mtp_tokens=accepted_draft.reshape(1, 1),
+                        target_token=None,
+                        last_hidden=hidden_at_draft,
+                        num_tokens=cached_token_count + input_token_count + ntoks,
+                    )
+                    yield draft_tok_id, verify_lp, True
+                    if max_tokens >= 0 and ntoks >= max_tokens:
+                        return
+
+                    ntoks += 1
+                    finalize_plan = _MTPPromptFinalizePlan(
+                        mtp_hidden=mx.concatenate(
+                            [hidden_at_confirmed, hidden_at_draft], axis=1
+                        ),
+                        mtp_tokens=mx.concatenate(
+                            [
+                                accepted_draft.reshape(1, 1),
+                                bonus_tok.reshape(1, 1),
+                            ],
+                            axis=1,
+                        ),
+                        target_token=bonus_tok,
+                        last_hidden=None,
+                        num_tokens=cached_token_count + input_token_count + ntoks,
+                    )
+                    yield bonus_tok.item(), bonus_lp, False
+                    if max_tokens >= 0 and ntoks >= max_tokens:
+                        return
+
+                    finalize_plan = None
+                    # Next draft: one batched forward aligns the cache for the
+                    # accepted draft token and generates the next draft together.
+                    draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
+                        hidden_at_draft,
+                        bonus_tok,
+                        prev_tokens,
+                        cache_commit=(hidden_at_confirmed, accepted_draft),
+                    )
+                    mx.eval(draft_tok)
+                    y = mx.array([bonus_tok.item()], mx.uint32)
+                else:
+                    _rollback_draft()
+                    if logits_processors and prev_tokens is not None:
+                        prev_tokens = prev_tokens[:-1]  # discard rejected draft token
+                    verify_tok_id = verify_pred.item()
+                    if not _is_greedy:
+                        # Sample from residual distribution max(p_target - p_draft, 0) / Z.
+                        p_target = mx.exp(verify_accept_lp)
+                        p_draft = mx.exp(draft_accept_lp)
+                        residual = mx.maximum(p_target - p_draft, 0.0)
+                        z = residual.sum(keepdims=True)
+                        dist = mx.where(z > 0, residual, p_target)
+                        verify_tok_id = mx.random.categorical(
+                            mx.log(dist).reshape(1, -1)
+                        ).item()
+
+                    verify_tok = mx.array(verify_tok_id, mx.uint32)
+                    ntoks += 1
+                    finalize_plan = _MTPPromptFinalizePlan(
+                        mtp_hidden=hidden_at_confirmed,
+                        mtp_tokens=verify_tok.reshape(1, 1),
+                        target_token=verify_tok,
+                        last_hidden=None,
+                        num_tokens=cached_token_count + input_token_count + ntoks,
+                    )
+                    yield verify_tok_id, verify_lp, False
+                    if max_tokens >= 0 and ntoks >= max_tokens:
+                        return
+
+                    finalize_plan = None
+                    # Next draft from MTP at y's hidden state.
+                    draft_tok, draft_lp, draft_accept_lp, draft_xtc_draw = _step_mtp(
+                        hidden_at_confirmed,
+                        verify_tok,
+                        prev_tokens,
+                    )
+                    mx.eval(draft_tok)
+                    y = mx.array([verify_tok_id], mx.uint32)
+            block = ntoks // _CACHE_CLEAR_INTERVAL
+            if block > last_cache_block:
+                mx.clear_cache()
+                last_cache_block = block
+    finally:
+        _finalize_prompt_cache()
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    mtp: bool = False,
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    top_k: int = 0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: List[int] = [],
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -666,6 +1214,8 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        mtp (bool): Use native Multi-Token Prediction for speculative
+          decoding. Requires a model with an MTP head. Default: ``False``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -689,33 +1239,72 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if draft_model is not None:
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        token_generator = speculative_generate_step(
+            prompt, model, draft_model, **kwargs
+        )
+    elif mtp and _model_supports_mtp(model):
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("prompt_progress_callback", None)
+        kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("sampler", None)  # mtp_generate_step does not accept sampler=
+        token_generator = mtp_generate_step(
+            prompt,
+            model,
+            temp=temp,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            min_tokens_to_keep=min_tokens_to_keep,
+            xtc_probability=xtc_probability,
+            xtc_threshold=xtc_threshold,
+            xtc_special_tokens=xtc_special_tokens,
+            **kwargs,
+        )
+    else:
+        if mtp:
+            warnings.warn(
+                "--mtp flag ignored: model does not have an MTP head. "
+                "Falling back to standard generation.",
+                stacklevel=2,
+            )
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
         )
-    else:
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
     with wired_limit(model, [generation_stream]):
-        tic = time.perf_counter()
-        for n, (token, logprobs, from_draft) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+        try:
+            tic = time.perf_counter()
+            for n, (token, logprobs, from_draft) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
-            detokenizer.add_token(token)
-            if (n + 1) == max_tokens:
-                break
+                detokenizer.add_token(token)
+                if (n + 1) == max_tokens:
+                    break
 
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    from_draft=from_draft,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -726,22 +1315,14 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason=(
+                    "stop" if token in tokenizer.eos_token_ids else "length"
+                ),
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
+        finally:
+            close = getattr(token_generator, "close", None)
+            if close is not None:
+                close()
 
 
 def generate(
@@ -2181,6 +2762,15 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        mtp=args.mtp,
+        temp=args.temp,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        min_p=args.min_p,
+        min_tokens_to_keep=args.min_tokens_to_keep,
+        xtc_probability=args.xtc_probability,
+        xtc_threshold=args.xtc_threshold,
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
     if not args.verbose:
         print(response)

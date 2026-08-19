@@ -36,11 +36,12 @@ from .generate import (
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
+    _model_supports_mtp,
     make_stop_matcher,
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import LRUPromptCache, MTPPromptCacheState, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -378,6 +379,10 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+def _xtc_special_tokens(tokenizer):
+    return tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+
+
 def _make_sampler(args, tokenizer):
     return make_sampler(
         args.sampling.temperature,
@@ -386,7 +391,7 @@ def _make_sampler(args, tokenizer):
         min_p=args.sampling.min_p,
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
-        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
+        xtc_special_tokens=_xtc_special_tokens(tokenizer),
     )
 
 
@@ -746,7 +751,12 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    # Native MTP is currently single-sequence only. Keep routing
+                    # deterministic instead of racing a best-effort queue check.
+                    mtp_active = getattr(self.cli_args, "mtp", False) and (
+                        _model_supports_mtp(model)
+                    )
+                    if not self._is_batchable(args) or mtp_active:
                         self._serve_single((rqueue, request, args))
                         continue
 
@@ -910,6 +920,24 @@ class ResponseGenerator:
             cache, rest = self.prompt_cache.fetch_nearest_cache(
                 self.model_provider.model_key, prompt
             )
+            mtp_active = getattr(self.cli_args, "mtp", False) and (
+                _model_supports_mtp(model)
+            )
+            # A reusable native-MTP entry contains target caches, the MTP-head
+            # caches, and one boundary record holding the final target hidden state.
+            # Exact hits have no suffix token with which to resume the lagged MTP
+            # state, so they are rebuilt rather than replayed unsafely.
+            if mtp_active and cache is not None:
+                expected = len(model.layers) + len(model.make_mtp_cache()) + 1
+                valid_mtp_cache = (
+                    len(cache) == expected
+                    and isinstance(cache[-1], MTPPromptCacheState)
+                    and not cache[-1].empty()
+                    and len(rest) > 0
+                )
+                if not valid_mtp_cache:
+                    cache = None
+                    rest = prompt
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
@@ -931,6 +959,14 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                mtp=getattr(self.cli_args, "mtp", False),
+                temp=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                top_k=args.sampling.top_k,
+                min_p=args.sampling.min_p,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=_xtc_special_tokens(tokenizer),
             ):
                 finish_reason = gen.finish_reason
 
@@ -1849,6 +1885,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
     args = parser.parse_args()
     if mx.metal.is_available():
