@@ -413,7 +413,7 @@ class TestModels(unittest.TestCase):
             moe_intermediate_size=32,
             moe_shared_expert_intermediate_size=32,
             num_hidden_layers=4,
-            num_attention_heads=1,
+            num_attention_heads=2,
             num_experts=4,
             num_experts_per_tok=2,
             num_shared_experts=1,
@@ -456,9 +456,24 @@ class TestModels(unittest.TestCase):
         self.assertEqual(tied_output.shape, (1, 2, args.vocab_size))
 
         mla_only_model = bailing_moe_v3.Model(replace(args, num_hidden_layers=1))
-        mla_only_output = mla_only_model(mx.array([[0, 1]]))
-        mx.eval(mla_only_output)
-        self.assertEqual(mla_only_output.shape, (1, 2, args.vocab_size))
+        tokens = mx.array([[0, 1, 2, 3]])
+        full_output = mla_only_model(tokens)
+        cache = mla_only_model.make_cache()
+        cached_output = mx.concatenate(
+            [
+                mla_only_model(tokens[:, :1], cache=cache),
+                mla_only_model(tokens[:, 1:3], cache=cache),
+                mla_only_model(tokens[:, 3:], cache=cache),
+            ],
+            axis=1,
+        )
+
+        self.assertEqual(cache[0].offset, tokens.shape[1])
+        self.assertEqual(cache[0].keys.shape[-1], args.kv_lora_rank)
+        self.assertEqual(cache[0].values.shape[-1], args.qk_rope_head_dim)
+
+        mx.eval(full_output, cached_output)
+        self.assertTrue(mx.allclose(full_output, cached_output, rtol=1e-4, atol=1e-4))
 
         fp8_args = replace(
             args,

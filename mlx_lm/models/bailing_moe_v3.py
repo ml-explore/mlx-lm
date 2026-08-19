@@ -15,6 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -224,10 +225,11 @@ class BailingMLA(nn.Module):
             bias=False,
         )
         self.kv_a_layernorm = nn.RMSNorm(args.kv_lora_rank, eps=args.rms_norm_eps)
-        self.kv_b_proj = nn.Linear(
-            args.kv_lora_rank,
-            args.num_attention_heads * (args.qk_nope_head_dim + args.v_head_dim),
-            bias=False,
+        self.embed_q = MultiLinear(
+            args.qk_nope_head_dim, args.kv_lora_rank, args.num_attention_heads
+        )
+        self.unembed_out = MultiLinear(
+            args.kv_lora_rank, args.v_head_dim, args.num_attention_heads
         )
         self.gated_attention_proj_granularity_type = (
             args.gated_attention_proj_granularity_type
@@ -282,14 +284,7 @@ class BailingMLA(nn.Module):
 
         compressed = self.kv_a_proj_with_mqa(x)
         compressed, k_rope = mx.split(compressed, [self.kv_lora_rank], axis=-1)
-        kv = self.kv_b_proj(self.kv_a_layernorm(compressed))
-        kv = kv.reshape(
-            batch,
-            length,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        ).transpose(0, 2, 1, 3)
-        k_nope, values = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
+        kv_latent = self.kv_a_layernorm(compressed)
         k_rope = k_rope.reshape(batch, length, 1, self.qk_rope_head_dim).transpose(
             0, 2, 1, 3
         )
@@ -297,23 +292,37 @@ class BailingMLA(nn.Module):
         offset = cache.offset if cache is not None else 0
         q_rope = self.rope(q_rope, offset=offset)
         k_rope = self.rope(k_rope, offset=offset)
-        k_rope = mx.broadcast_to(
-            k_rope, (batch, self.num_heads, length, self.qk_rope_head_dim)
-        )
-        queries = mx.concatenate([q_nope, q_rope], axis=-1)
-        keys = mx.concatenate([k_nope, k_rope], axis=-1)
 
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
         if cache is not None:
-            keys, values = cache.update_and_fetch(keys, values)
+            kv_latent, k_rope = cache.update_and_fetch(kv_latent, k_rope)
+
+        pe_scores = (q_rope * self.scale) @ k_rope.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if length == 1:
+            q_nope = self.embed_q(q_nope)
+            keys = values = kv_latent
+        else:
+            keys = self.embed_q(kv_latent, transpose=False)
+            values = self.unembed_out(kv_latent)
 
         output = scaled_dot_product_attention(
-            queries,
+            q_nope,
             keys,
             values,
             cache=cache,
             scale=self.scale,
-            mask=mask,
+            mask=pe_scores,
         )
+        if length == 1:
+            output = self.unembed_out(output)
+
         output = output.transpose(0, 2, 1, 3)
         if self.g_proj is not None:
             gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
@@ -491,7 +500,9 @@ class BailingModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
         attention_mask = (
-            create_attention_mask(hidden, cache[self.attention_index])
+            create_attention_mask(
+                hidden, cache[self.attention_index], return_array=True
+            )
             if self.attention_index is not None
             else None
         )
@@ -591,6 +602,26 @@ class Model(nn.Module):
                     weights[f"{prefix}.switch_mlp.{projection}.{suffix}"] = mx.stack(
                         expert_weights
                     )
+
+        for layer_index in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{layer_index}.attention"
+            kv_b_key = f"{prefix}.kv_b_proj.weight"
+            if kv_b_key not in weights:
+                continue
+            num_heads = self.args.num_attention_heads
+            head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+            if f"{prefix}.kv_b_proj.scales" in weights:
+                raise ValueError(
+                    "Quantized Bailing V3 kv_b_proj weights are not supported"
+                )
+            value = weights.pop(kv_b_key)
+            value = value.reshape(num_heads, head_dim, -1)
+            wk = mx.contiguous(
+                value[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+            )
+            wv = mx.contiguous(value[:, self.args.qk_nope_head_dim :, :])
+            weights[f"{prefix}.embed_q.weight"] = wk
+            weights[f"{prefix}.unembed_out.weight"] = wv
 
         for key, value in list(weights.items()):
             if "_conv1d.weight" in key and value.shape[-1] != 1:
