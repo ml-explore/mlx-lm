@@ -189,9 +189,7 @@ class MuseGlimmerModel(nn.Module):
         self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.embed_eps = args.rms_norm_eps
-        self.layers = [
-            DecoderLayer(args, i) for i in range(args.num_hidden_layers)
-        ]
+        self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.window = args.sliding_window
 
@@ -245,11 +243,11 @@ class Model(nn.Module):
                 continue
             # Meta/MLX nest the text tower under language_model.*
             if k.startswith("language_model.model."):
-                k = "model." + k[len("language_model.model."):]
+                k = "model." + k[len("language_model.model.") :]
             elif k.startswith("language_model.lm_head."):
-                k = "lm_head." + k[len("language_model.lm_head."):]
+                k = "lm_head." + k[len("language_model.lm_head.") :]
             elif k.startswith("model.language_model."):
-                k = "model." + k[len("model.language_model."):]
+                k = "model." + k[len("model.language_model.") :]
             out[k] = v
         return out
 
@@ -269,7 +267,9 @@ class Model(nn.Module):
         caches = []
         for lt in self.args.layer_types:
             if lt == "sliding_attention":
-                caches.append(RotatingKVCache(max_size=self.args.sliding_window, keep=0))
+                caches.append(
+                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
+                )
             else:
                 caches.append(KVCache())
         return caches
