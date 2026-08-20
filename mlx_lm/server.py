@@ -1745,6 +1745,26 @@ class APIHandler(BaseHTTPRequestHandler):
         self.wfile.write('{"status": "ok"}'.encode())
         self.wfile.flush()
 
+    @staticmethod
+    def _context_length(config_path) -> Optional[int]:
+        """
+        Best-effort model context length from config.json.
+
+        Checks top-level `max_position_embeddings` first, falling back to
+        a nested `text_config` (e.g. Qwen3.5/3.6 and other configs that
+        wrap the text model's own config), so clients can size
+        `max_tokens` off of it instead of hardcoding per-model defaults.
+        Returns None if it can't be determined.
+        """
+        try:
+            with open(config_path, "r") as fid:
+                config = json.load(fid)
+        except (OSError, json.JSONDecodeError):
+            return None
+        return config.get("max_position_embeddings") or config.get(
+            "text_config", {}
+        ).get("max_position_embeddings")
+
     def handle_models_request(self):
         """
         Handle a GET request for the /v1/models endpoint.
@@ -1781,6 +1801,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 "id": repo.repo_id,
                 "object": "model",
                 "created": self.created,
+                "context_length": self._context_length(
+                    repo.refs["main"].snapshot_path / "config.json"
+                ),
             }
             for repo in downloaded_models
         ]
@@ -1794,6 +1817,9 @@ class APIHandler(BaseHTTPRequestHandler):
                         "id": model_id,
                         "object": "model",
                         "created": self.created,
+                        "context_length": self._context_length(
+                            model_path / "config.json"
+                        ),
                     }
                 )
 

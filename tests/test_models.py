@@ -10,7 +10,14 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    BatchKVCache,
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -1535,6 +1542,48 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gemma3_text_make_cache_respects_max_kv_size(self):
+        from mlx_lm.models import gemma3_text
+
+        args = gemma3_text.ModelArgs(
+            model_type="gemma3_text",
+            hidden_size=128,
+            num_hidden_layers=12,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            rms_norm_eps=1e-4,
+            num_key_value_heads=1,
+            sliding_window=1024,
+            sliding_window_pattern=6,
+        )
+        model = gemma3_text.Model(args)
+
+        # No max_kv_size -> sliding layers keep the model's own window and
+        # stay untrimmable past it, exactly as before.
+        default_cache = make_prompt_cache(model)
+        sliding = [c for c in default_cache if isinstance(c, RotatingKVCache)]
+        self.assertTrue(sliding)
+        self.assertTrue(all(c.max_size == 1024 for c in sliding))
+
+        # A smaller max_kv_size must cap the sliding-window RotatingKVCache
+        # layers instead of being silently ignored (#118) -- otherwise the
+        # cache becomes untrimmable past the model's hardcoded
+        # sliding_window regardless of what was requested.
+        capped_cache = make_prompt_cache(model, max_kv_size=128)
+        capped_sliding = [c for c in capped_cache if isinstance(c, RotatingKVCache)]
+        self.assertTrue(all(c.max_size == 128 for c in capped_sliding))
+
+        # A larger max_kv_size can't exceed what the model was trained
+        # with -- capping is one-directional.
+        larger_cache = make_prompt_cache(model, max_kv_size=4096)
+        larger_sliding = [c for c in larger_cache if isinstance(c, RotatingKVCache)]
+        self.assertTrue(all(c.max_size == 1024 for c in larger_sliding))
+
+        # The plain KVCache layers (global attention) are untouched either way.
+        for cache in (default_cache, capped_cache, larger_cache):
+            self.assertTrue(any(isinstance(c, KVCache) for c in cache))
 
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text
@@ -3348,6 +3397,129 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+    def test_gemma3n_batch_cache_matches_plain_cache(self):
+        from mlx_lm.models import gemma3n
+
+        config = {
+            "model_type": "gemma3n",
+            "num_hidden_layers": 4,
+            "vocab_size": 1000,
+            "text_config": {
+                "model_type": "gemma3n",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 1000,
+                "sliding_window": 8,
+                "max_position_embeddings": 1000,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                "hidden_size_per_layer_input": 256,
+                "altup_num_inputs": 4,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 8,
+            },
+        }
+
+        def to_batch(c):
+            if type(c) is KVCache:
+                return BatchKVCache([0])
+            if isinstance(c, RotatingKVCache):
+                return BatchRotatingKVCache(c.max_size, [0])
+            if isinstance(c, CacheList):
+                return CacheList(*(to_batch(x) for x in c.caches))
+            return c
+
+        model = gemma3n.Model(gemma3n.ModelArgs.from_dict(config))
+        mx.random.seed(0)
+        prompt = mx.array([[5, 12, 47, 3, 99, 1, 200, 4]])
+
+        logits_plain = model(prompt, cache=model.make_cache())
+
+        batch_cache = [to_batch(c) for c in model.make_cache()]
+        logits_batch = model(prompt, cache=batch_cache)
+
+        # A batch cache's offset is an mx.array mutated in place by
+        # update_and_fetch, unlike a plain cache's Python-int offset --
+        # Gemma3nAttention must apply the queries' RoPE with that offset
+        # *before* update_and_fetch runs, or every query position silently
+        # shifts by the prompt length once batched (see #1699).
+        self.assertTrue(mx.allclose(logits_plain, logits_batch, rtol=1e-4, atol=1e-4))
+
+    def test_gemma3n_shared_layer_batch_cache_state_unpack(self):
+        from mlx_lm.models import gemma3n
+
+        # num_kv_shared_layers=2 out of 4 layers means at least one layer
+        # takes the `is_kv_shared_layer` branch, which reads `cache.state`
+        # directly -- a 4-tuple (k, v, offset, left_padding) for batch
+        # caches vs. a 2-tuple for plain caches (see #1699).
+        config = {
+            "model_type": "gemma3n",
+            "num_hidden_layers": 4,
+            "vocab_size": 1000,
+            "text_config": {
+                "model_type": "gemma3n",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 1000,
+                "sliding_window": 8,
+                "max_position_embeddings": 1000,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                "hidden_size_per_layer_input": 128,
+                "altup_num_inputs": 4,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 4,
+            },
+        }
+
+        def to_batch(c):
+            if type(c) is KVCache:
+                return BatchKVCache([0])
+            if isinstance(c, RotatingKVCache):
+                return BatchRotatingKVCache(c.max_size, [0])
+            if isinstance(c, CacheList):
+                return CacheList(*(to_batch(x) for x in c.caches))
+            return c
+
+        model = gemma3n.Model(gemma3n.ModelArgs.from_dict(config))
+        batch_cache = [to_batch(c) for c in model.make_cache()]
+        # Must not raise ValueError: too many values to unpack.
+        model(mx.array([[1, 2, 3]]), cache=batch_cache)
 
 
 if __name__ == "__main__":

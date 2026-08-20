@@ -244,7 +244,16 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
-    def make_cache(self):
+    def make_cache(self, max_kv_size=None):
+        # The sliding-window layers' RotatingKVCache is normally sized from
+        # the model's own config (e.g. 1024 for gemma-3-4b), which silently
+        # overrides a smaller --max-kv-size / max_kv_size request and makes
+        # the cache untrimmable past that hardcoded size regardless of what
+        # was asked for. Cap it at max_kv_size when one is given.
+        sliding_size = self.args.sliding_window
+        if max_kv_size is not None:
+            sliding_size = min(sliding_size, max_kv_size)
+
         caches = []
         for i in range(self.args.num_hidden_layers):
             if (
@@ -253,5 +262,5 @@ class Model(nn.Module):
             ):
                 caches.append(KVCache())
             else:
-                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
+                caches.append(RotatingKVCache(max_size=sliding_size))
         return caches

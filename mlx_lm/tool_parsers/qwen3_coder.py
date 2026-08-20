@@ -54,9 +54,30 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
         or param_type.startswith("short")
         or param_type.startswith("unsigned")
     ):
-        return int(param_value)
+        # The model sometimes emits a float-formatted integer (e.g. "140.0"
+        # for a `limit: integer` parameter). Mirror the float branch below
+        # and coerce tolerantly instead of raising -- and if the value
+        # isn't numeric at all, fall back to the raw string rather than
+        # crashing the request; downstream schema validation is better
+        # placed than this parser to surface a genuine type mismatch.
+        try:
+            return int(param_value)
+        except ValueError:
+            pass
+        try:
+            float_param_value = float(param_value)
+        except ValueError:
+            return param_value
+        return (
+            int(float_param_value)
+            if float_param_value.is_integer()
+            else float_param_value
+        )
     elif param_type.startswith("num") or param_type.startswith("float"):
-        float_param_value = float(param_value)
+        try:
+            float_param_value = float(param_value)
+        except ValueError:
+            return param_value
         int_param_value = int(float_param_value)
         return (
             float_param_value
@@ -66,6 +87,13 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
     elif param_type in _bool_types:
         return param_value.lower() == "true"
     else:
+        # Neither json.loads nor ast.literal_eval can be trusted to
+        # succeed on arbitrary model output (a free-text argument that
+        # merely starts with what looks like a number or a brace, a
+        # timestamp, malformed/truncated JSON, ...). Falling through to
+        # the raw string on failure keeps a single bad parameter from
+        # crashing the whole request instead of just failing to convert
+        # its type.
         if (
             param_type in _obj_types
             or param_type.startswith("dict")
@@ -74,9 +102,15 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             try:
                 return json.loads(param_value)
             except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
+                try:
+                    return ast.literal_eval(param_value)
+                except (ValueError, SyntaxError):
+                    return param_value
 
-        return ast.literal_eval(param_value)
+        try:
+            return ast.literal_eval(param_value)
+        except (ValueError, SyntaxError):
+            return param_value
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):

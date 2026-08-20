@@ -197,6 +197,70 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_malformed_params_degrade_instead_of_crashing(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filePath": {"type": "string"},
+                            "limit": {"type": "integer"},
+                            "when": {"type": "string"},
+                            "payload": {"type": "object"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # #1627: a float-formatted integer ("140.0") must coerce instead of
+        # raising ValueError from a bare int(param_value).
+        test_case = (
+            "<function=read>"
+            "<parameter=filePath>/x/y.py</parameter>"
+            "<parameter=limit>140.0</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["limit"], 140)
+
+        # A genuinely non-numeric value for an integer-typed parameter must
+        # fall back to the raw string rather than crash the request.
+        test_case = (
+            "<function=read>"
+            "<parameter=filePath>/x/y.py</parameter>"
+            "<parameter=limit>not-a-number</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["limit"], "not-a-number")
+
+        # #1236 / #1604: a value that looks like it might be a Python/JSON
+        # literal but isn't (an ISO 8601 timestamp, an unparseable blob)
+        # must fall back to the raw string instead of raising
+        # SyntaxError/ValueError out of ast.literal_eval.
+        test_case = (
+            "<function=read>"
+            "<parameter=filePath>/x/y.py</parameter>"
+            "<parameter=when>2026-01-15T10:00:00Z</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["when"], "2026-01-15T10:00:00Z")
+
+        blob = "not json, not a python literal { [ ,,,"
+        test_case = (
+            "<function=read>"
+            "<parameter=filePath>/x/y.py</parameter>"
+            f"<parameter=payload>{blob}</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["payload"], blob)
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'

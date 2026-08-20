@@ -368,6 +368,18 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+        self.assertIn("context_length", model)
+
+        # context_length lets clients size max_tokens without hardcoding
+        # per-model defaults (#1183); look up this test's own model
+        # specifically (the cache may hold other models too, in any
+        # order) and check it against its real max_position_embeddings.
+        qwen = next(
+            m
+            for m in response_body["data"]
+            if m["id"] == "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+        )
+        self.assertEqual(qwen["context_length"], 32768)
 
 
 class TestServerWithDraftModel(unittest.TestCase):

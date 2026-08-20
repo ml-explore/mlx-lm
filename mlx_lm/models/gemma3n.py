@@ -126,12 +126,17 @@ class Gemma3nAttention(nn.Module):
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
+        queries = queries.transpose(0, 2, 1, 3)
 
         offset = 0
         if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
+            # For shared layers, retrieve KV from the designated cache
+            # layer. cache.state is a 4-tuple (k, v, offset, left_padding)
+            # for batch caches, vs. a 2-tuple for plain caches -- take
+            # only the first two so this works for both.
+            keys, values = cache.state[:2]
             offset = cache.offset
+            queries = self.rope(queries, offset=offset)
 
         else:
             if cache is not None:
@@ -145,11 +150,17 @@ class Gemma3nAttention(nn.Module):
             values = self.v_norm(values)
             values = values.transpose(0, 2, 1, 3)
 
+            # RoPE the queries with the same (pre-update) offset used for
+            # the keys, and do it BEFORE update_and_fetch: batch caches
+            # keep their offset as an mx.array that update_and_fetch
+            # mutates in place, so a Python variable bound to it earlier
+            # would otherwise silently reflect the post-update value by
+            # the time it's used below, shifting every query position by
+            # the prompt length and degenerating generation.
+            queries = self.rope(queries, offset=offset)
+
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
-
-        queries = queries.transpose(0, 2, 1, 3)
-        queries = self.rope(queries, offset=offset)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask

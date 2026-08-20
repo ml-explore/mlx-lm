@@ -27,11 +27,21 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     head_dim: int
-    rope_theta: float
     tie_word_embeddings: bool
     max_position_embeddings: int
     norm_topk_prob: bool
+    rope_theta: float = 10000.0
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_parameters: Optional[Dict[str, Union[float, str]]] = None
+
+    def __post_init__(self):
+        # transformers >= 5 nests the rope config under `rope_parameters`
+        # instead of top-level `rope_theta`/`rope_scaling` (e.g.
+        # Qwen3MoeConfig().to_dict() has no top-level `rope_theta` at all
+        # anymore). Lift it here so both config shapes load correctly.
+        if self.rope_parameters:
+            self.rope_theta = self.rope_parameters.get("rope_theta", self.rope_theta)
+            self.rope_scaling = self.rope_parameters
 
 
 class Attention(nn.Module):
