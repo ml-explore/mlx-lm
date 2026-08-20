@@ -44,6 +44,8 @@ class ModelArgs(BaseModelArgs):
     layer_types: Optional[List[str]] = None
     layer_rope_theta: Optional[List[float]] = None
     tie_word_embeddings: bool = False
+    final_logit_softcapping: float = 20.0
+    output_multiplier: float = 0.19611613513818404
 
     @classmethod
     def from_dict(cls, params):
@@ -232,8 +234,12 @@ class Model(nn.Module):
     def __call__(self, inputs: mx.array, cache=None):
         out = self.model(inputs, cache=cache)
         if self.tie_word_embeddings:
-            return self.model.embed_tokens.as_linear(out)
-        return self.lm_head(out)
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        out = out * self.args.output_multiplier
+        cap = self.args.final_logit_softcapping
+        return mx.tanh(out / cap) * cap
 
     def sanitize(self, weights):
         out = {}
