@@ -12,7 +12,7 @@ from typing import Any
 
 import regex as re
 
-_func_name_regex = re.compile(r"^(.*?)<arg_key>", re.DOTALL)
+_func_name_regex = re.compile(r"^(.*?)\s*<arg_key>", re.DOTALL)
 _func_arg_regex = re.compile(
     r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
     re.DOTALL,
