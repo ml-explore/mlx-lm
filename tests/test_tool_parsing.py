@@ -313,6 +313,33 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
+    def test_mistral_json_list_tool_call(self):
+        test_case = '[{"name": "calculator", "arguments": {"expression": "2+3"}}]'
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "name": "calculator",
+                "arguments": {"expression": "2+3"},
+            }
+        ]
+        self.assertEqual(tool_calls, expected)
+
+    def test_mistral_json_list_tool_call_with_string_arguments(self):
+        test_case = (
+            '[{"name": "calculator", '
+            '"arguments": "{\\"expression\\": \\"2+3\\"}", '
+            '"id": "abcdefghi"}]'
+        )
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "id": "abcdefghi",
+                "name": "calculator",
+                "arguments": {"expression": "2+3"},
+            }
+        ]
+        self.assertEqual(tool_calls, expected)
+
     def test_minimax_m2(self):
         test_case = (
             '<invoke name="search">\n'
