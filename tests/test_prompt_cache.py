@@ -530,6 +530,22 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
 
+    def test_batch_rotating_kv_cache_meta_state_rotated_round_trip(self):
+        """meta_state stringifies every field, so `rotated` round-trips as
+        "True"/"False". Reading it back with bool() makes both truthy, so a
+        cache that had not rotated is marked rotated on reload."""
+        for rotated in (False, True):
+            cache = BatchRotatingKVCache(max_size=8, left_padding=[0])
+            cache.rotated = rotated
+
+            restored = BatchRotatingKVCache(max_size=1, left_padding=[0])
+            restored.meta_state = cache.meta_state
+
+            self.assertEqual(restored.rotated, rotated)
+            self.assertIsInstance(restored.rotated, bool)
+            self.assertEqual(restored.max_size, cache.max_size)
+            self.assertEqual(restored._idx, cache._idx)
+
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
         mask = cache.make_mask(4)
