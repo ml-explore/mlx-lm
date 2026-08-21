@@ -276,28 +276,28 @@ class TimeBudget:
 
 def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits, max_kv_size=None):
     """
-    Raise if any KV cache entry cannot be quantized.
+    Warn when only some KV cache entries can be quantized, and raise when none
+    can, because the request then has no effect.
 
     Converting an empty cache is free, so this tries the real conversion and
     reports the reason the cache gives.
     """
-    total = 0
+    quantizable = 0
     unsupported = Counter()
     for c in cache:
         if isinstance(c, CacheList):
             # maybe_quantize_kv_cache does not descend into CacheList, and must
             # not: deepseek_v32 and longcat_flash read the fetched entries
             # directly and fail on a quantized cache.
-            total += 1
             unsupported[(type(c).__name__, "nested KV caches are not quantized")] += 1
             continue
         if not hasattr(c, "to_quantized"):
             # Non-KV state, e.g. the ArraysCache of a Mamba layer, is not
             # affected by --kv-bits.
             continue
-        total += 1
         try:
             c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+            quantizable += 1
         except NotImplementedError as e:
             unsupported[(type(c).__name__, str(e))] += 1
 
@@ -307,14 +307,24 @@ def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits, max_kv_size=None)
     summary = ", ".join(
         f"{n} x {name} ({reason})" for (name, reason), n in sorted(unsupported.items())
     )
+    skipped = sum(unsupported.values())
+    total = quantizable + skipped
+
+    if quantizable:
+        logging.warning(
+            f"--kv-bits {kv_bits} applies to {quantizable} of {total} cache "
+            f"entries. {skipped} will stay unquantized: {summary}. On "
+            "sliding-window architectures these hold window-bounded state, while "
+            "the quantized entries grow with the context."
+        )
+        return
+
     hint = "Serve without --kv-bits"
     if max_kv_size is not None:
         hint += ", or without --max-kv-size, which builds a RotatingKVCache"
     raise ValueError(
-        f"--kv-bits {kv_bits} was requested but {sum(unsupported.values())} of "
-        f"{total} cache layers cannot be quantized: {summary}. Serving with only "
-        "the remaining layers quantized would ignore part of the request without "
-        f"reporting it. {hint}."
+        f"--kv-bits {kv_bits} cannot be applied to any of the {total} cache "
+        f"entries: {summary}. Serving would ignore the request entirely. {hint}."
     )
 
 
@@ -402,7 +412,7 @@ class ModelProvider:
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
 
-        # Fail at load, not part-way through a request.
+        # Report the split at load, not part-way through a request.
         if self.cli_args.kv_bits is not None:
             probe_cache = make_prompt_cache(
                 model, max_kv_size=self.cli_args.max_kv_size

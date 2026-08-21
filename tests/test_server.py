@@ -531,14 +531,14 @@ class TestServerWithDraftModel(unittest.TestCase):
 
 
 class TestKVCacheQuantizable(unittest.TestCase):
-    def test_rejects_partly_quantizable_cache(self):
-        # Gemma 4 layout: the sliding-window layers cannot convert, so most of
-        # the request would be dropped without saying so (#1573).
+    def test_warns_and_serves_hybrid_cache(self):
+        # Gemma 4 layout: the sliding-window layers are window-bounded, while
+        # the layers that do convert grow with the context. Warn, do not refuse.
         cache = [KVCache()] + [RotatingKVCache(max_size=512) for _ in range(4)]
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertLogs(level="WARNING") as logs:
             _check_kv_cache_quantizable(cache, 64, 8)
-        message = str(ctx.exception)
-        self.assertIn("4 of 5", message)
+        message = "\n".join(logs.output)
+        self.assertIn("1 of 5", message)
         self.assertIn("RotatingKVCache", message)
 
     def test_rejects_when_nothing_can_be_quantized(self):
@@ -547,7 +547,7 @@ class TestKVCacheQuantizable(unittest.TestCase):
             _check_kv_cache_quantizable(cache, 64, 8)
         message = str(ctx.exception)
         self.assertIn("RotatingKVCache", message)
-        self.assertIn("2 of 2", message)
+        self.assertIn("any of the 2 cache entries", message)
         # The reason comes from the cache, not from a guess about the flag.
         self.assertNotIn("--max-kv-size", message)
 
@@ -563,8 +563,9 @@ class TestKVCacheQuantizable(unittest.TestCase):
         _check_kv_cache_quantizable([KVCache() for _ in range(4)], 64, 8)
 
     def test_ignores_non_kv_state(self):
-        # Recurrent state is not a KV cache, so this must be accepted.
-        _check_kv_cache_quantizable([KVCache(), ArraysCache(size=2)], 64, 8)
+        # Recurrent state is not a KV cache, so this must not warn.
+        with self.assertNoLogs(level="WARNING"):
+            _check_kv_cache_quantizable([KVCache(), ArraysCache(size=2)], 64, 8)
 
     def test_rejects_max_kv_size_cache(self):
         # max_kv_size builds RotatingKVCache(keep=4) for every layer, so
@@ -586,7 +587,7 @@ class TestKVQuantizationStartupRefusal(unittest.TestCase):
 
     def test_generation_thread_records_the_error(self):
         def load_default():
-            raise ValueError("cannot be applied to any of the 24 cache layers")
+            raise ValueError("cannot be applied to any of the 24 cache entries")
 
         provider = self._provider(8)
         provider.load_default = load_default
@@ -595,10 +596,10 @@ class TestKVQuantizationStartupRefusal(unittest.TestCase):
 
         self.assertTrue(generator.startup_complete.wait(timeout=30))
         self.assertIsInstance(generator.startup_error, ValueError)
-        self.assertIn("cache layers", str(generator.startup_error))
+        self.assertIn("cache entries", str(generator.startup_error))
 
     def test_run_exits_when_startup_was_refused(self):
-        error = ValueError("cannot be applied to any of the 24 cache layers")
+        error = ValueError("cannot be applied to any of the 24 cache entries")
         generator = types.SimpleNamespace(
             startup_complete=threading.Event(), startup_error=error
         )
@@ -611,7 +612,7 @@ class TestKVQuantizationStartupRefusal(unittest.TestCase):
                         run("127.0.0.1", 0, self._provider(8))
 
         self.assertEqual(ctx.exception.code, 1)
-        self.assertIn("cache layers", "\n".join(logs.output))
+        self.assertIn("cache entries", "\n".join(logs.output))
         serve.assert_not_called()
 
     def test_run_does_not_wait_without_kv_bits(self):
