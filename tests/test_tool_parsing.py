@@ -9,6 +9,7 @@ from mlx_lm.tool_parsers import (
     kimi_k2,
     longcat,
     minimax_m2,
+    minimax_m3,
     mistral,
     pythonic,
     qwen3_coder,
@@ -36,6 +37,15 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
                 minimax_m2,
+            ),
+            (
+                ']<]minimax[>[<tool_call>'
+                ']<]minimax[>[<invoke name="multiply">'
+                ']<]minimax[>[<a>12234585]<]minimax[>[</a>'
+                ']<]minimax[>[<b>48838483920]<]minimax[>[</b>'
+                ']<]minimax[>[</invoke>'
+                ']<]minimax[>[</tool_call>',
+                minimax_m3,
             ),
             (
                 "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
@@ -106,6 +116,14 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
                 minimax_m2,
+            ),
+            (
+                ']<]minimax[>[<tool_call>'
+                ']<]minimax[>[<invoke name="get_current_temperature">'
+                ']<]minimax[>[<location>London]<]minimax[>[</location>'
+                ']<]minimax[>[</invoke>'
+                ']<]minimax[>[</tool_call>',
+                minimax_m3,
             ),
             (
                 "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
@@ -328,6 +346,102 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_minimax_m3(self):
+        # Multiple tool calls in a single <tool_call> block (M3 wraps all
+        # invokes in one wrapper per its chat template instructions).
+        test_case = (
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="search">'
+            ']<]minimax[>[<query>weather]<]minimax[>[</query>'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[<invoke name="read_file">'
+            ']<]minimax[>[<path>/tmp/test.txt]<]minimax[>[</path>'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        expected = [
+            {"name": "search", "arguments": {"query": "weather"}},
+            {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+        ]
+        tool_calls = minimax_m3.parse_tool_call(test_case, None)
+        self.assertEqual(expected, tool_calls)
+
+        # Nested array of objects (mapping renders <key>val</key>;
+        # iterable renders <item>...</item> per M3's to_xml macro).
+        test_case = (
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="filter">'
+            ']<]minimax[>[<rules>'
+            ']<]minimax[>[<item>'
+            ']<]minimax[>[<field>city]<]minimax[>[</field>'
+            ']<]minimax[>[<value>Paris]<]minimax[>[</value>'
+            ']<]minimax[>[</item>'
+            ']<]minimax[>[<item>'
+            ']<]minimax[>[<field>year]<]minimax[>[</field>'
+            ']<]minimax[>[<value>2026]<]minimax[>[</value>'
+            ']<]minimax[>[</item>'
+            ']<]minimax[>[</rules>'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        expected = {
+            "name": "filter",
+            "arguments": {
+                "rules": [
+                    {"field": "city", "value": "Paris"},
+                    {"field": "year", "value": 2026},
+                ]
+            },
+        }
+        tool_call = minimax_m3.parse_tool_call(test_case, None)
+        self.assertEqual(expected, tool_call)
+
+        # Conversational prefix before the tool call (model often emits a
+        # short "I'll do X..." sentence before the <tool_call> wrapper).
+        test_case = (
+            "I'll look up the current time for you."
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="get_time">'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        expected = {"name": "get_time", "arguments": {}}
+        tool_call = minimax_m3.parse_tool_call(test_case, None)
+        self.assertEqual(expected, tool_call)
+
+        # No tool call in the text should raise ValueError.
+        with self.assertRaises(ValueError):
+            minimax_m3.parse_tool_call("just plain text, no tool call", None)
+
+        # Malformed argument XML must NOT silently become {} — that reaches
+        # OpenAI-compat clients as arguments: "{}", fails tool validation
+        # with no reason, and any narration the model emitted alongside the
+        # call stands as a phantom success. The parser surfaces an explicit
+        # __parse_error__ payload instead so the calling harness/model can
+        # see why and retry (observed in production agent loops).
+        test_case = (
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="exec">'
+            ']<]minimax[>[<command>ls & rm <oops'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        tool_call = minimax_m3.parse_tool_call(test_case, None)
+        self.assertEqual("exec", tool_call["name"])
+        self.assertIn("__parse_error__", tool_call["arguments"])
+
+        # Top-level non-object arguments (bare <item> list) also surface
+        # __parse_error__ — OpenAI arguments must be an object.
+        test_case = (
+            ']<]minimax[>[<tool_call>'
+            ']<]minimax[>[<invoke name="exec">'
+            ']<]minimax[>[<item>a]<]minimax[>[</item>'
+            ']<]minimax[>[</invoke>'
+            ']<]minimax[>[</tool_call>'
+        )
+        tool_call = minimax_m3.parse_tool_call(test_case, None)
+        self.assertIn("__parse_error__", tool_call["arguments"])
 
 
 if __name__ == "__main__":
