@@ -6,6 +6,7 @@ import logging
 import pickle
 import platform
 import socket
+import sys
 import time
 import uuid
 import warnings
@@ -15,7 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from typing import (
     Any,
     Callable,
@@ -489,6 +490,10 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
+        # A rejected configuration surfaces on the generation thread. Record it
+        # so the failure does not leave the server up with a dead thread.
+        self.startup_error = None
+        self.startup_complete = Event()
         self._generation_thread = Thread(target=self._generate)
         self._generation_thread.start()
 
@@ -693,8 +698,14 @@ class ResponseGenerator:
         # synchronization messages.
         generation_stream = mx.default_stream(mx.default_device())
 
-        # Load the default model if it is given
-        self.model_provider.load_default()
+        # The load has to happen on this thread: MLX streams are thread-local.
+        try:
+            self.model_provider.load_default()
+        except ValueError as e:
+            self.startup_error = e
+            return
+        finally:
+            self.startup_complete.set()
 
         current_model = None
         current_sampling = None
@@ -1783,6 +1794,14 @@ def run(
     group = mx.distributed.init()
     prompt_cache = LRUPromptCache(model_provider.cli_args.prompt_cache_size)
     response_generator = ResponseGenerator(model_provider, prompt_cache)
+
+    if model_provider.cli_args.kv_bits is not None:
+        # A rejected request has to end the process. The generation thread
+        # cannot exit on its own, so requests would hang instead of failing.
+        response_generator.startup_complete.wait()
+        if response_generator.startup_error is not None:
+            logging.error(str(response_generator.startup_error))
+            sys.exit(1)
     if group.rank() == 0:
         _run_http_server(host, port, response_generator)
     else:

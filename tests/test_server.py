@@ -6,6 +6,7 @@ import json
 import threading
 import types
 import unittest
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -26,6 +27,7 @@ from mlx_lm.server import (
     SamplingArguments,
     _check_kv_cache_quantizable,
     _make_sampler,
+    run,
 )
 from mlx_lm.utils import load
 
@@ -572,6 +574,58 @@ class TestKVCacheQuantizable(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             _check_kv_cache_quantizable(cache, 64, 8, max_kv_size=32)
         self.assertIn("--max-kv-size", str(ctx.exception))
+
+
+class TestKVQuantizationStartupRefusal(unittest.TestCase):
+    """The refusal has to end the process, not just the generation thread."""
+
+    def _provider(self, kv_bits):
+        return types.SimpleNamespace(
+            cli_args=types.SimpleNamespace(kv_bits=kv_bits, prompt_cache_size=1)
+        )
+
+    def test_generation_thread_records_the_error(self):
+        def load_default():
+            raise ValueError("cannot be applied to any of the 24 cache layers")
+
+        provider = self._provider(8)
+        provider.load_default = load_default
+        generator = ResponseGenerator(provider, LRUPromptCache(1))
+        self.addCleanup(generator.join)
+
+        self.assertTrue(generator.startup_complete.wait(timeout=30))
+        self.assertIsInstance(generator.startup_error, ValueError)
+        self.assertIn("cache layers", str(generator.startup_error))
+
+    def test_run_exits_when_startup_was_refused(self):
+        error = ValueError("cannot be applied to any of the 24 cache layers")
+        generator = types.SimpleNamespace(
+            startup_complete=threading.Event(), startup_error=error
+        )
+        generator.startup_complete.set()
+
+        with patch("mlx_lm.server.ResponseGenerator", return_value=generator):
+            with patch("mlx_lm.server._run_http_server") as serve:
+                with self.assertLogs(level="ERROR") as logs:
+                    with self.assertRaises(SystemExit) as ctx:
+                        run("127.0.0.1", 0, self._provider(8))
+
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("cache layers", "\n".join(logs.output))
+        serve.assert_not_called()
+
+    def test_run_does_not_wait_without_kv_bits(self):
+        # Nothing to validate, so startup must not block on the model load.
+        generator = types.SimpleNamespace(
+            startup_complete=threading.Event(), startup_error=None
+        )
+
+        with patch("mlx_lm.server.ResponseGenerator", return_value=generator):
+            with patch("mlx_lm.server._run_http_server") as serve:
+                run("127.0.0.1", 0, self._provider(None))
+
+        serve.assert_called_once()
+        self.assertFalse(generator.startup_complete.is_set())
 
 
 class TestServerWithKVCacheQuantization(unittest.TestCase):
