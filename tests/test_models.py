@@ -536,6 +536,108 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gemma3n_shared_kv_layers(self):
+        from mlx_lm.models import gemma3n
+        from mlx_lm.models.cache import BatchKVCache, BatchRotatingKVCache
+
+        config = {
+            "model_type": "gemma3n",
+            "text_config": {
+                "model_type": "gemma3n",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 1000,
+                "num_key_value_heads": 2,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 1000,
+                "sliding_window": 8,
+                "max_position_embeddings": 1000,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.5, 0.5, 0.5, 0.5],
+                "hidden_size_per_layer_input": 256,
+                "altup_num_inputs": 4,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 8,
+            },
+        }
+        model = gemma3n.Model(gemma3n.ModelArgs.from_dict(config))
+        mx.eval(model.parameters())
+
+        T = 12
+        tokens = mx.random.randint(0, 999, (1, T))
+
+        # The shared KV layers should rotate the queries with the right
+        # positions: prefill in one shot matches token-by-token decoding
+        cache = model.make_cache()
+        expected = model(tokens, cache=cache)
+        cache = model.make_cache()
+        out = mx.concatenate(
+            [model(tokens[:, t : t + 1], cache=cache) for t in range(T)], axis=1
+        )
+        self.assertTrue(mx.allclose(expected, out, rtol=1e-4, atol=1e-4))
+
+        def make_batch_cache(left_padding):
+            return [
+                (
+                    BatchKVCache(left_padding)
+                    if type(c) is KVCache
+                    else BatchRotatingKVCache(c.max_size, left_padding)
+                )
+                for c in model.make_cache()
+            ]
+
+        # Batched caches (used by batch_generate and the server) with B=1
+        # match the non-batched result
+        cache = make_batch_cache([0])
+        out = model(tokens, cache=cache)
+        self.assertTrue(mx.allclose(expected, out, rtol=1e-4, atol=1e-4))
+
+        # A left-padded batch matches individual runs, with enough decode
+        # steps to rotate the sliding window caches
+        n_decode = 8
+        seq_a = mx.random.randint(0, 999, (1, T + n_decode))
+        seq_b = mx.random.randint(0, 999, (1, T - 5 + n_decode))
+
+        expected = []
+        for seq, plen in ((seq_a, T), (seq_b, T - 5)):
+            cache = model.make_cache()
+            logits = [model(seq[:, :plen], cache=cache)[:, -1:]]
+            for t in range(plen, seq.shape[1]):
+                logits.append(model(seq[:, t : t + 1], cache=cache))
+            expected.append(mx.concatenate(logits, axis=1))
+
+        cache = make_batch_cache([0, 5])
+        batch_prompt = mx.concatenate(
+            [
+                seq_a[:, :T],
+                mx.concatenate(
+                    [mx.zeros((1, 5), seq_b.dtype), seq_b[:, : T - 5]], axis=1
+                ),
+            ],
+            axis=0,
+        )
+        logits = [model(batch_prompt, cache=cache)[:, -1:]]
+        for i in range(n_decode):
+            step = mx.concatenate([seq_a[:, T + i], seq_b[:, T - 5 + i]])[:, None]
+            logits.append(model(step, cache=cache))
+        out = mx.concatenate(logits, axis=1)
+        for b in range(2):
+            self.assertTrue(mx.allclose(expected[b][0], out[b], rtol=1e-4, atol=1e-4))
+
     def test_mixtral(self):
         from mlx_lm.models import mixtral
 

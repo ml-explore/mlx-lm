@@ -126,16 +126,20 @@ class Gemma3nAttention(nn.Module):
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
+        queries = queries.transpose(0, 2, 1, 3)
 
-        offset = 0
         if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.state
-            offset = cache.offset
-
+            # For shared layers, retrieve KV from the designated cache layer.
+            # That cache was already updated earlier in this forward pass, so
+            # its offset is ahead of the current tokens by L.
+            keys, values = cache.state[:2]
+            queries = self.rope(queries, offset=cache.offset - L)
         else:
-            if cache is not None:
-                offset = cache.offset
+            offset = cache.offset if cache is not None else 0
+            # Apply RoPE before updating the cache since batched caches
+            # advance their (array) offset in-place in update_and_fetch
+            queries = self.rope(queries, offset=offset)
+
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
@@ -147,9 +151,6 @@ class Gemma3nAttention(nn.Module):
 
             if cache is not None:
                 keys, values = cache.update_and_fetch(keys, values)
-
-        queries = queries.transpose(0, 2, 1, 3)
-        queries = self.rope(queries, offset=offset)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
