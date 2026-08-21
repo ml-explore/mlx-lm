@@ -9,6 +9,7 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
+from ..cli_ui import rprint
 from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from ..utils import get_total_parameters
 from .dora import DoRAEmbedding, DoRALinear
@@ -134,7 +135,32 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
             config.lora_parameters,
             use_dora=(fine_tune_type == "dora"),
         )
-    model.load_weights(str(adapter_path / "adapters.safetensors"), strict=False)
+    weights = mx.load(str(adapter_path / "adapters.safetensors"))
+    params = dict(tree_flatten(model.parameters()))
+    if fine_tune_type == "full":
+        allowed = params
+    else:
+        adapter_leaves = {"lora_a", "lora_b", "m"}
+        allowed = {
+            name: shape
+            for name, shape in params.items()
+            if name.rsplit(".", 1)[-1] in adapter_leaves
+        }
+    errors = []
+    for name, w in weights.items():
+        if name not in allowed:
+            errors.append(f"  {name}: not an adapter parameter in the model")
+        elif w.shape != allowed[name].shape:
+            errors.append(
+                f"  {name}: adapter shape {tuple(w.shape)} does not match "
+                f"model parameter shape {tuple(allowed[name].shape)}"
+            )
+    if errors:
+        raise ValueError(
+            f"Adapter at {adapter_path} contains incompatible tensors:\n"
+            + "\n".join(errors)
+        )
+    model.load_weights(list(weights.items()), strict=False)
     return model
 
 
@@ -162,7 +188,7 @@ def print_trainable_parameters(model):
     trainable_p = (
         sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
     )
-    print(
+    rprint(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "
         f"({trainable_p:.3f}M/{total_p:.3f}M)"
     )

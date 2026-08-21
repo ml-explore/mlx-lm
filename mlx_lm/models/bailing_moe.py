@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -47,11 +48,6 @@ class ModelArgs(BaseModelArgs):
     topk_group: int = 4
     moe_shared_expert_intermediate_size: Optional[int] = None
     moe_router_enable_shared_expert: bool = True
-
-
-@partial(mx.compile, shapeless=True)
-def swiglu(gate, up):
-    return nn.silu(gate) * up
 
 
 @partial(mx.compile, shapeless=True)

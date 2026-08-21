@@ -20,6 +20,7 @@ from .utils import (
 def mixed_quant_predicate_builder(
     recipe: str, model: nn.Module, group_size: int = 64
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
+    mode = "affine"
     high_bits = 6
 
     if recipe == "mixed_2_6":
@@ -65,13 +66,13 @@ def mixed_quant_predicate_builder(
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "lm_head" in path:
-            return {"group_size": group_size, "bits": high_bits}
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
 
-        return {"group_size": group_size, "bits": low_bits}
+        return {"group_size": group_size, "bits": low_bits, "mode": mode}
 
     return mixed_quant_predicate
 
@@ -85,8 +86,8 @@ def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
     quantize: bool = False,
-    q_group_size: int = 64,
-    q_bits: int = 4,
+    q_group_size: Optional[int] = None,
+    q_bits: Optional[int] = None,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
@@ -114,15 +115,22 @@ def convert(
         return_config=True,
         tokenizer_config={"trust_remote_code": trust_remote_code},
         lazy=True,
+        trust_remote_code=trust_remote_code,
     )
 
     if isinstance(quant_predicate, str):
+        if q_mode != "affine":
+            raise ValueError(f"Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
-            quant_predicate, model, q_group_size
+            quant_predicate,
+            model,
+            q_group_size,
         )
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
+    if dtype is None and (text_config := config.get("text_config", None)):
+        dtype = text_config.get("dtype", None)
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
         dtype = getattr(mx, dtype)

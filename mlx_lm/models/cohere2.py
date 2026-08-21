@@ -6,6 +6,7 @@ from typing import Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 
@@ -106,7 +107,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
     def __call__(self, x):
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):

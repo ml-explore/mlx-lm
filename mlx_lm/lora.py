@@ -11,7 +11,9 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import numpy as np
 import yaml
+from tqdm import tqdm
 
+from .cli_ui import make_console, print_lora_run_header, rprint
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
@@ -21,7 +23,7 @@ from .tuner.utils import (
     load_adapters,
     print_trainable_parameters,
 )
-from .utils import load, save_config
+from .utils import _parse_size, load, save_config
 
 yaml_loader = yaml.SafeLoader
 yaml_loader.add_implicit_resolver(
@@ -69,11 +71,13 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
+    "clear_cache_threshold": 0,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
     "report_to": None,
     "project_name": None,
+    "trust_remote_code": False,
 }
 
 
@@ -191,6 +195,12 @@ def build_parser():
         default=None,
     )
     parser.add_argument(
+        "--clear-cache-threshold",
+        type=_parse_size,
+        default=0,
+        help="Clear the allocator cache between steps if it grows too large.",
+    )
+    parser.add_argument(
         "--report-to",
         type=str,
         default=None,
@@ -203,6 +213,11 @@ def build_parser():
         help="Project name for logging. Defaults to the name of the root directory.",
     )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     return parser
 
 
@@ -239,9 +254,11 @@ def train_model(
 
     # Resume from weights if provided
     if args.resume_adapter_file is not None:
-        print(f"Loading fine-tuned weights from {args.resume_adapter_file}")
+        rprint(f"Loading fine-tuned weights from {args.resume_adapter_file}")
         model.load_weights(args.resume_adapter_file, strict=False)
 
+    if mx.distributed.init().rank() == 0:
+        print_lora_run_header(make_console(), args)
     print_trainable_parameters(model)
 
     adapter_path = Path(args.adapter_path)
@@ -296,17 +313,25 @@ def train_model(
 
 
 def evaluate_model(args, model: nn.Module, test_set):
+    rank = mx.distributed.init().rank()
+    n_batches = len(test_set) // args.batch_size
+    if args.test_batches != -1:
+        n_batches = min(n_batches, args.test_batches)
+    pbar = tqdm(total=n_batches, desc="Calculating loss...") if rank == 0 else None
     test_loss = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,
+        progress_callback=pbar.update if pbar else None,
     )
+    if pbar is not None:
+        pbar.close()
 
     test_ppl = math.exp(test_loss)
 
-    print(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
+    rprint(f"Test loss {test_loss:.3f}, Test ppl {test_ppl:.3f}.")
 
 
 def run(args, training_callback: TrainingCallback = None):
@@ -318,10 +343,14 @@ def run(args, training_callback: TrainingCallback = None):
         config=vars(args),
     )
 
-    print("Loading pretrained model")
-    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
+    rprint("Loading pretrained model")
+    model, tokenizer = load(
+        args.model,
+        tokenizer_config={"trust_remote_code": args.trust_remote_code},
+        trust_remote_code=args.trust_remote_code,
+    )
 
-    print("Loading datasets")
+    rprint("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)
 
     if args.test and not args.train:
@@ -330,13 +359,13 @@ def run(args, training_callback: TrainingCallback = None):
             load_adapters(model, args.adapter_path)
 
     elif args.train:
-        print("Training")
+        rprint("Training")
         train_model(args, model, train_set, valid_set, training_callback)
     else:
         raise ValueError("Must provide at least one of --train or --test")
 
     if args.test:
-        print("Testing")
+        rprint("Testing")
         evaluate_model(args, model, test_set)
 
 
@@ -347,7 +376,7 @@ def main():
     config = args.config
     args = vars(args)
     if config:
-        print("Loading configuration file", config)
+        rprint("Loading configuration file", config)
         with open(config, "r") as file:
             config = yaml.load(file, yaml_loader)
         # Prefer parameters from command-line arguments

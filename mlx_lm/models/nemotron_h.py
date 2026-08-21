@@ -7,13 +7,14 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
     scaled_dot_product_attention,
 )
-from .cache import KVCache, MambaCache
+from .cache import ArraysCache, KVCache
 from .ssm import ssm_update
 from .switch_layers import SwitchMLP
 
@@ -35,15 +36,16 @@ class ModelArgs(BaseModelArgs):
     ssm_state_size: int
     conv_kernel: int
     n_groups: int
-    time_step_limit: Tuple[float, float]
     mlp_bias: bool
     layer_norm_epsilon: float
     use_bias: bool
     use_conv_bias: bool
-    hybrid_override_pattern: List[str]
+    hybrid_override_pattern: Optional[List[str]] = None
+    layers_block_type: Optional[List[str]] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     moe_shared_expert_intermediate_size: Optional[int] = None
+    moe_latent_size: Optional[int] = None
     n_group: Optional[int] = None
     n_routed_experts: Optional[int] = None
     n_shared_experts: Optional[int] = None
@@ -51,6 +53,24 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: Optional[int] = None
     norm_topk_prob: Optional[bool] = None
     routed_scaling_factor: Optional[float] = None
+    time_step_limit: Optional[Tuple[float, float]] = None
+    time_step_min: Optional[float] = None
+    time_step_max: Optional[float] = None
+
+    # Map from layers_block_type names to single-char pattern codes
+    _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
+
+    def __post_init__(self):
+        if self.time_step_limit is None:
+            self.time_step_limit = (0.0, float("inf"))
+
+        # Normalize to hybrid_override_pattern (single-char list)
+        if self.hybrid_override_pattern is None and self.layers_block_type is not None:
+            self.hybrid_override_pattern = [
+                self._block_type_to_char[t] for t in self.layers_block_type
+            ]
+        if self.hybrid_override_pattern is not None:
+            self.num_hidden_layers = len(self.hybrid_override_pattern)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -62,7 +82,7 @@ class MambaRMSNormGated(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array = None) -> mx.array:
         if gate is not None:
-            x = x * nn.silu(gate)
+            x = swiglu(gate, x)
         x = mx.unflatten(x, axis=-1, shape=(-1, self.group_size))
         x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
         return self.weight * x.flatten(-2)
@@ -111,9 +131,15 @@ class NemotronHMamba2Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
 
-    def _apply_conv(
-        self, conv_input: mx.array, cache: Optional[MambaCache] = None
+    def _conv(
+        self,
+        conv_input: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
+
         if cache is not None:
             if cache[0] is None:
                 conv_state = mx.zeros(
@@ -123,11 +149,19 @@ class NemotronHMamba2Mixer(nn.Module):
             else:
                 conv_state = cache[0]
             padded_input = mx.concatenate([conv_state, conv_input], axis=1)
-            cache[0] = padded_input[:, -(self.conv_kernel_size - 1) :, :]
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                t = padded_input.shape[1]
+                ends = mx.clip(cache.lengths, 0, t - n_keep)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
+            else:
+                cache[0] = padded_input[:, -n_keep:, :]
         else:
             padded_input = mx.pad(
                 conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
             )
+
         conv_output = self.conv1d(padded_input)
         return nn.silu(conv_output)
 
@@ -137,8 +171,8 @@ class NemotronHMamba2Mixer(nn.Module):
         B: mx.array,
         C: mx.array,
         dt: mx.array,
-        state: Optional[mx.array],
-        mask: Optional[mx.array] = None,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -147,6 +181,11 @@ class NemotronHMamba2Mixer(nn.Module):
         )
         B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        if cache:
+            state = cache[1]
+            lengths = cache.lengths
+        else:
+            state, lengths = None, None
 
         y, state = ssm_update(
             hidden_states,
@@ -160,14 +199,16 @@ class NemotronHMamba2Mixer(nn.Module):
             self.time_step_limit,
             mask,
         )
+        if cache:
+            cache[1] = state
 
-        return y.reshape(batch_size, seq_len, self.intermediate_size), state
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
         self,
         hidden_states: mx.array,
         mask: Optional[mx.array],
-        cache: Optional[MambaCache] = None,
+        cache: Optional[ArraysCache] = None,
     ) -> mx.array:
 
         projected = self.in_proj(hidden_states)
@@ -177,11 +218,7 @@ class NemotronHMamba2Mixer(nn.Module):
             [self.intermediate_size, self.intermediate_size + self.conv_dim],
             axis=-1,
         )
-        if mask is not None:
-            conv_input = mx.where(mask[..., None], conv_input, 0)
-
-        conv_output = self._apply_conv(conv_input, cache)
-
+        conv_output = self._conv(conv_input, cache, mask)
         hidden_states_ssm, B, C = mx.split(
             conv_output,
             [
@@ -190,10 +227,9 @@ class NemotronHMamba2Mixer(nn.Module):
             ],
             axis=-1,
         )
-        state = cache[1] if cache else None
-        y, state = self._ssm(hidden_states_ssm, B, C, dt, state, mask)
+        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
         if cache:
-            cache[1] = state
+            cache.advance(y.shape[1])
         y = self.norm(y, gate)
         return self.out_proj(y)
 
@@ -338,8 +374,16 @@ class NemotronHMoE(nn.Module):
         super().__init__()
         self.config = config
         self.num_experts_per_tok = config.num_experts_per_tok
+        self.moe_latent_size = config.moe_latent_size
+
+        # When latent projection is used, experts operate on the latent dim
+        expert_input_dim = (
+            config.moe_latent_size
+            if config.moe_latent_size is not None
+            else config.hidden_size
+        )
         self.switch_mlp = SwitchMLP(
-            config.hidden_size,
+            expert_input_dim,
             config.moe_intermediate_size,
             config.n_routed_experts,
             activation=nn.ReLU2(),
@@ -352,12 +396,30 @@ class NemotronHMoE(nn.Module):
                 config, intermediate_size=intermediate_size
             )
 
+        # Latent projection layers for dimensionality reduction before/after experts
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = nn.Linear(
+                config.hidden_size, config.moe_latent_size, bias=config.mlp_bias
+            )
+            self.fc2_latent_proj = nn.Linear(
+                config.moe_latent_size, config.hidden_size, bias=config.mlp_bias
+            )
+
     def __call__(self, x):
+        residuals = x
         inds, scores = self.gate(x)
+
+        if self.moe_latent_size is not None:
+            x = self.fc1_latent_proj(x)
+
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+        if self.moe_latent_size is not None:
+            y = self.fc2_latent_proj(y)
+
         if self.config.n_shared_experts is not None:
-            y = y + self.shared_experts(x)
+            y = y + self.shared_experts(residuals)
 
         return y
 
@@ -468,12 +530,13 @@ class Model(nn.Module):
         caches = []
         for l in self.layers:
             if l.block_type == "M":
-                caches.append(MambaCache())
+                caches.append(ArraysCache(size=2))
             elif l.block_type == "*":
                 caches.append(KVCache())
         return caches
 
     def sanitize(self, weights):
+        weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)

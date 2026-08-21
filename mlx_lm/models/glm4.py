@@ -6,6 +6,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
@@ -38,7 +39,7 @@ class Glm4MLP(nn.Module):
     def __call__(self, x) -> mx.array:
         x = self.gate_up_proj(x)
         gate, up_states = mx.split(x, 2, axis=-1)
-        return self.down_proj(nn.silu(gate) * up_states)
+        return self.down_proj(swiglu(gate, up_states))
 
 
 class Glm4Attention(nn.Module):

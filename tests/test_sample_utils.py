@@ -116,6 +116,71 @@ class TestSampleUtils(unittest.TestCase):
         new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
         self.assertTrue(mx.allclose(new_probs, probs))
 
+        # Test that the threshold is computed per row in a batch
+        probs = mx.array([[0.6, 0.25, 0.1, 0.05], [0.9, 0.05, 0.03, 0.02]])
+        batched = mx.softmax(apply_xtc(mx.log(probs), 1, 0.2, []), -1)
+        for i in range(probs.shape[0]):
+            alone = mx.softmax(apply_xtc(mx.log(probs[i : i + 1]), 1, 0.2, []), -1)
+            self.assertTrue(mx.allclose(batched[i : i + 1], alone))
+
+    def test_presence_penalty(self):
+        from mlx_lm.sample_utils import make_presence_penalty
+
+        # Token appears multiple times - penalty applied once
+        tokens = mx.array([0, 0, 0, 1, 1])
+        logits = mx.zeros((1, 4))
+        processor = make_presence_penalty(0.5, context_size=5)
+        result = processor(tokens, logits)
+        # Token 0 appears 3 times, token 1 appears 2 times - both penalized once
+        self.assertAlmostEqual(result[0, 0].item(), -0.5)
+        self.assertAlmostEqual(result[0, 1].item(), -0.5)
+        # Tokens not in context not penalized
+        self.assertAlmostEqual(result[0, 2].item(), 0.0)
+        self.assertAlmostEqual(result[0, 3].item(), 0.0)
+
+    def test_frequency_penalty(self):
+        from mlx_lm.sample_utils import make_frequency_penalty
+
+        # Token appears multiple times - penalty applied proportionally
+        tokens = mx.array([0, 0, 0, 1, 1])
+        logits = mx.zeros((1, 4))
+        processor = make_frequency_penalty(0.5, context_size=5)
+        result = processor(tokens, logits)
+        # Token 0 appears 3 times -> 3 * 0.5 = 1.5 penalty
+        self.assertAlmostEqual(result[0, 0].item(), -1.5)
+        # Token 1 appears 2 times -> 2 * 0.5 = 1.0 penalty
+        self.assertAlmostEqual(result[0, 1].item(), -1.0)
+        # Tokens not in context not penalized
+        self.assertAlmostEqual(result[0, 2].item(), 0.0)
+        self.assertAlmostEqual(result[0, 3].item(), 0.0)
+
+    def test_make_logits_processors(self):
+        from mlx_lm.sample_utils import make_logits_processors
+
+        # Create processors with all three penalty types
+        tokens = mx.array([0, 0, 0, 1, 1])
+        # Use non-zero logits so repetition penalty has effect
+        logits = mx.array([[1.0, 0.5, 0.0, -0.5]])
+        processors = make_logits_processors(
+            repetition_penalty=1.5,
+            repetition_context_size=5,
+            presence_penalty=0.5,
+            presence_context_size=5,
+            frequency_penalty=0.25,
+            frequency_context_size=5,
+        )
+        # Apply all processors
+        for processor in processors:
+            logits = processor(tokens, logits)
+        # Token 0 (appears 3x): 1.0/1.5 - 0.5 - 0.75 = -0.5833
+        # Token 1 (appears 2x): 0.5/1.5 - 0.5 - 0.5 = -0.6667
+        # Token 2 (not in context): 0.0 (no penalty)
+        # Token 3 (not in context): -0.5 (no penalty)
+        self.assertAlmostEqual(logits[0, 0].item(), -0.5833, places=4)
+        self.assertAlmostEqual(logits[0, 1].item(), -0.6667, places=4)
+        self.assertAlmostEqual(logits[0, 2].item(), 0.0, places=4)
+        self.assertAlmostEqual(logits[0, 3].item(), -0.5, places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

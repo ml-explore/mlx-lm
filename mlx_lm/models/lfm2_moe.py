@@ -5,6 +5,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -34,11 +35,15 @@ class ModelArgs(BaseModelArgs):
     norm_eps: float
     conv_bias: bool
     conv_L_cache: int
-    rope_theta: float
+    rope_theta: float = 1000000.0
+    routed_scaling_factor: float = 1.0
+    rope_parameters: Optional[dict] = None
     full_attn_idxs: Optional[List[int]] = None
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
+        if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
+            self.rope_theta = self.rope_parameters["rope_theta"]
         if self.full_attn_idxs is None:
             self.full_attn_idxs = [
                 i
@@ -139,17 +144,28 @@ class ShortConv(nn.Module):
         Bx = B * x
         if mask is not None:
             Bx = mx.where(mask[..., None], Bx, 0)
-        state = None
-        if cache is not None:
-            state = cache[0]
-        if state is None:
-            state = mx.zeros(
-                (Bx.shape[0], self.L_cache - 1, self.args.hidden_size), dtype=Bx.dtype
-            )
 
-        Bx = mx.concatenate([state, Bx], axis=-2)
         if cache is not None:
-            cache[0] = Bx[:, -(self.L_cache - 1) :]
+            if cache[0] is None:
+                state = mx.zeros(
+                    (Bx.shape[0], self.L_cache - 1, self.args.hidden_size),
+                    dtype=Bx.dtype,
+                )
+            else:
+                state = cache[0]
+            Bx = mx.concatenate([state, Bx], axis=1)
+            n_keep = self.L_cache - 1
+            t = x.shape[1]
+            if cache.lengths is not None:
+                ends = mx.clip(cache.lengths, 0, t)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(Bx, positions, axis=1)
+            else:
+                cache[0] = Bx[:, -n_keep:, :]
+            cache.advance(t)
+        else:
+            Bx = mx.pad(Bx, [(0, 0), (self.L_cache - 1, 0), (0, 0)])
+
         conv_out = self.conv(Bx)
 
         y = C * conv_out
@@ -168,7 +184,7 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Lfm2MoeSparseMoeBlock(nn.Module):
@@ -181,6 +197,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
         self.norm_topk_prob = args.norm_topk_prob
         self.use_expert_bias = args.use_expert_bias
+        self.routed_scaling_factor = args.routed_scaling_factor
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
@@ -191,18 +208,23 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         self,
         x: mx.array,
     ):
-        gates = self.gate(x).astype(mx.float32)
-        gates = mx.softmax(gates, axis=-1)
-
-        if self.use_expert_bias:
-            gates += self.expert_bias
+        # Sigmoid-gated routing (matches the HF Transformers Lfm2Moe reference):
+        # the expert_bias is used only to select the top-k experts; the routing
+        # weights are gathered from the unbiased sigmoid scores and then scaled by
+        # routed_scaling_factor.
+        routing_weights = mx.sigmoid(self.gate(x))
 
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        if self.use_expert_bias:
+            scores_for_routing = routing_weights.astype(mx.float32) + self.expert_bias
+            inds = mx.argpartition(scores_for_routing, kth=-k, axis=-1)[..., -k:]
+        else:
+            inds = mx.argpartition(routing_weights, kth=-k, axis=-1)[..., -k:]
 
-        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = mx.take_along_axis(routing_weights, inds, axis=-1)
         if self.norm_topk_prob:
-            scores /= mx.sum(scores, axis=-1, keepdims=True) + 1e-20
+            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-6)
+        scores = scores * self.routed_scaling_factor
         scores = scores.astype(x.dtype)
 
         y = self.switch_mlp(x, inds)

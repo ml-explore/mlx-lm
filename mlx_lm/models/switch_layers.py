@@ -6,6 +6,8 @@ from functools import partial
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
+
 
 def _gather_sort(x, indices):
     *_, M = indices.shape
@@ -147,17 +149,12 @@ class SwitchLinear(nn.Module):
         return ql
 
 
-@partial(mx.compile, shapeless=True)
-def swiglu(x, gate):
-    return nn.silu(gate) * x
-
-
 class SwiGLU(nn.Module):
     def __init__(self):
         super().__init__()
 
     def __call__(self, x, gate):
-        return swiglu(x, gate)
+        return swiglu(gate, x)
 
 
 class SwitchGLU(nn.Module):

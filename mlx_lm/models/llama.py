@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -117,7 +118,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=mlp_bias)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):

@@ -1,10 +1,12 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
@@ -30,6 +32,55 @@ class ModelArgs(BaseModelArgs):
     scoring_func: str = "sigmoid"
     head_dim: Optional[int] = None
     use_qk_norm: bool = True
+
+
+@lru_cache
+def sharded_rms_norm(group):
+    @mx.compile
+    def _cast_square_sum(x):
+        return x.astype(mx.float32).square().sum(-1, keepdims=True)
+
+    @mx.compile
+    def _normalize(x, norm2, w, eps):
+        norm2 = mx.distributed.all_sum(norm2, group=group)
+        norm = mx.rsqrt(norm2 / (x.shape[-1] * group.size()) + eps)
+        return (x.astype(mx.float32) * norm * w).astype(x.dtype)
+
+    # Split the compile so that x upcasting doesn't break the compile and we
+    # have 2 kernels generated 1 for f(x) = square(upcast(x)) and another
+    # g(x) = downcast(upcast(x) * norm * w)
+    def _inner_sharded_rms_norm(x, w, eps):
+        return _normalize(x, _cast_square_sum(x), w, eps)
+
+    return _inner_sharded_rms_norm
+
+
+class ShardedRMSNorm(nn.Module):
+    def __init__(
+        self, dims: int, eps: float = 1e-5, group: Optional[mx.distributed.Group] = None
+    ):
+        super().__init__()
+        group = group or mx.distributed.init()
+        self.weight = mx.ones((dims // group.size(),))
+        self.group = group
+        self.eps = eps
+
+    def _extra_repr(self):
+        return f"{self.weight.shape[0] * self.group.size()}, eps={self.eps}"
+
+    def __call__(self, x):
+        return sharded_rms_norm(self.group)(x, self["weight"], self.eps)
+
+    @classmethod
+    def from_rms_norm(
+        cls, norm_module, *, group: Optional[mx.distributed.Group] = None
+    ):
+        sn = cls(norm_module.weight.shape[0], norm_module.eps, group=group)
+        sn.weight = mx.contiguous(
+            mx.split(norm_module.weight, group.size(), axis=-1)[group.rank()]
+        )
+
+        return sn
 
 
 class MiniMaxAttention(nn.Module):
@@ -118,8 +169,12 @@ class MiniMaxSparseMoeBlock(nn.Module):
             args.hidden_size, args.intermediate_size, args.num_local_experts
         )
         self.e_score_correction_bias = mx.zeros((args.num_local_experts,))
+        self.sharding_group = None
 
     def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         gates = self.gate(x.astype(mx.float32))
 
         scores = mx.sigmoid(gates)
@@ -135,6 +190,10 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
         return y
 
 
@@ -218,7 +277,8 @@ class Model(nn.Module):
         """Dequantize FP8 weights and restructure MoE experts."""
 
         def dequant(weight, scale_inv):
-            dtype = weight.dtype
+            dtype = mx.bfloat16
+            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
             bs = 128  # block size
             m, n = weight.shape
             pad_bottom = (-m) % bs
@@ -265,6 +325,53 @@ class Model(nn.Module):
                     ] = mx.stack(to_join)
 
         return weights
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        rank = group.rank()
+        for layer in self.model.layers:
+            # Shard the self attention
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            if layer.self_attn.use_qk_norm:
+                layer.self_attn.q_norm = ShardedRMSNorm.from_rms_norm(
+                    layer.self_attn.q_norm, group=group
+                )
+                layer.self_attn.k_norm = ShardedRMSNorm.from_rms_norm(
+                    layer.self_attn.k_norm, group=group
+                )
+
+            layer.self_attn.num_attention_heads //= N
+            layer.self_attn.num_key_value_heads //= N
+
+            # Shard the MLP
+            shard_inplace(
+                layer.block_sparse_moe.switch_mlp.gate_proj,
+                "all-to-sharded",
+                group=group,
+            )
+            shard_inplace(
+                layer.block_sparse_moe.switch_mlp.down_proj,
+                "sharded-to-all",
+                group=group,
+            )
+            shard_inplace(
+                layer.block_sparse_moe.switch_mlp.up_proj,
+                "all-to-sharded",
+                group=group,
+            )
+            layer.block_sparse_moe.sharding_group = group
 
     @property
     def layers(self):

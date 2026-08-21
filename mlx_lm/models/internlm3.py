@@ -6,7 +6,9 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -100,19 +102,12 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=qkv_bias)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=qkv_bias)
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None
-            and args.rope_scaling["rope_type"] == "linear"
-            else 2.0
-        )
-
-        self.rope = DynamicNTKScalingRoPE(
+        self.rope = initialize_rope(
             head_dim,
-            max_position_embeddings=args.max_position_embeddings,
-            traditional=args.rope_traditional,
             base=args.rope_theta,
-            scale=rope_scale,
+            traditional=args.rope_traditional,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
@@ -154,7 +149,7 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(dim, hidden_dim, bias=bias)
 
     def __call__(self, x) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class TransformerBlock(nn.Module):
@@ -180,7 +175,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class InternLM2Model(nn.Module):
+class InternLM3Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         assert args.vocab_size > 0
@@ -212,7 +207,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = InternLM2Model(args)
+        self.model = InternLM3Model(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 

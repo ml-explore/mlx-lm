@@ -107,6 +107,11 @@ def main():
         help="Path to model or Hugging Face model ID",
     )
     parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading from Hugging Face.",
+    )
+    parser.add_argument(
         "--batch-size", type=int, default=8, help="Batch size for evaluation"
     )
     parser.add_argument(
@@ -139,7 +144,12 @@ def main():
 
     # Load model
     print(f"Loading model from {args.model}...")
-    model, tokenizer = load(args.model)
+    tokenizer_config = {"trust_remote_code": args.trust_remote_code}
+    model, tokenizer = load(
+        args.model,
+        tokenizer_config=tokenizer_config,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     # Count parameters
     total_params = get_total_parameters(model)

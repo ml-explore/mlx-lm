@@ -9,8 +9,16 @@ import unittest
 import mlx.core as mx
 import requests
 
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    SamplingArguments,
+    _make_sampler,
+)
 from mlx_lm.utils import load
 
 
@@ -19,7 +27,7 @@ class DummyModelProvider:
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
-        self.cache_types = set([KVCache])
+        self.is_batchable = True
 
         # Add draft model support
         self.draft_model = None
@@ -41,6 +49,13 @@ class DummyModelProvider:
                 "max_tokens": 512,
                 "chat_template_args": {},
                 "model": None,
+                "decode_concurrency": 32,
+                "prompt_concurrency": 8,
+                "prefill_step_size": 2048,
+                "prompt_cache_size": 10,
+                "prompt_cache_bytes": 1 << 63,
+                "prompt_cache_total_bytes": None,
+                "allowed_origins": ["*"],
             },
         )
 
@@ -53,6 +68,134 @@ class DummyModelProvider:
     def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
+
+    def load_default(self):
+        return self.load("default_model", None, "default_model")
+
+
+class MockCache:
+    def __init__(self, value, is_trimmable: bool = True):
+        self.value = value
+        self._is_trimmable = is_trimmable
+
+    @property
+    def nbytes(self):
+        return len(self.value)
+
+    def __eq__(self, other):
+        return other.value == self.value
+
+    def is_trimmable(self):
+        return self._is_trimmable
+
+    def trim(self, n):
+        assert self._is_trimmable
+        return n
+
+
+class TestTextStateMachine(unittest.TestCase):
+    """Test the TextStateMachine buffering and stripping behavior."""
+
+    def test_strips_control_sequences(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, s = sm.flush(state)
+        full = text + rest
+        self.assertEqual(full, "hi body bye")
+
+    def test_back_to_back_tool_calls(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, s = sm.flush(state)
+        full = t1 + t2 + rest
+        self.assertEqual(full, "call1call2")
+
+    def test_partial_match_buffered_then_flushed(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        # First enter tool state
+        state = sm.make_state()
+        state, text, s = sm.step(state, "<tool_call>body</")
+        self.assertEqual(s, "tool")
+        # 'body' is emitted, '</' is buffered (partial match of '</tool_call>')
+        self.assertEqual(text, "body")
+        # flush releases the buffered text
+        state, rest, s = sm.flush(state)
+        self.assertEqual(rest, "</")
+
+    def test_discard_drops_buffer(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello ST")
+        self.assertEqual(text, "hello ")
+        # discard drops the buffered 'ST'
+        state, s = sm.discard(state)
+        self.assertEqual(s, "normal")
+
+    def test_stop_words_stripped(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello STOP world")
+        state, rest, s = sm.flush(state)
+        self.assertEqual(text + rest, "hello  world")
+
+    def test_reasoning_to_tool_transition(self):
+        # A tool call started inside a reasoning block must enter "tool".
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning"), ("<tool>", "tool")],
+                "reasoning": [("</think>", "normal"), ("<tool>", "tool")],
+                "tool": [("</tool>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, _, s = sm.step(state, "<think>hmm")
+        self.assertEqual(s, "reasoning")
+        state, _, s = sm.step(state, "<tool>")
+        self.assertEqual(s, "tool")
+        state, _, s = sm.step(state, "</tool>")
+        self.assertEqual(s, "normal")
+
+    def test_empty_end_marker_stays_in_tool_on_discard(self):
+        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool";
+        # discard on stop must preserve the state so the tool call is flushed.
+        sm = TextStateMachine(
+            {
+                "normal": [("[TOOL_CALLS]", "tool")],
+                "tool": [],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "[TOOL_CALLS]f[ARGS]{}")
+        self.assertEqual(s, "tool")
+        self.assertEqual(text, "f[ARGS]{}")
+        state, s = sm.discard(state)
+        self.assertEqual(s, "tool")
 
 
 class TestServer(unittest.TestCase):
@@ -178,6 +321,40 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_make_state_machine_empty_tool_call_end(self):
+        class FakeTokenizer:
+            has_thinking = False
+            has_tool_calling = True
+            tool_call_start = "[TOOL_CALLS]"
+            tool_call_end = ""
+            tool_call_start_tokens = (100,)
+            tool_call_end_tokens = ()
+            eos_token_ids = [2]
+
+            def convert_ids_to_tokens(self, t):
+                return f"<eos{t}>"
+
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        stop_matcher, text_sm = self.response_generator._make_state_machine(
+            ("fake-empty-end", None, None),
+            FakeTokenizer(),
+            stop_words=[],
+        )
+
+        # Verify the text state machine strips tool call markers
+        text_state = text_sm.make_state()
+        text_state, clean_text, s = text_sm.step(text_state, "hello[TOOL_CALLS]body")
+        self.assertEqual(s, "tool")
+        # 'hello' is before the match, 'body' flows through (no tool_call_end)
+        self.assertEqual(clean_text, "hellobody")
+
+        # Verify EOS stops via the stop matcher
+        stop_state = stop_matcher.make_state()
+        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
+        self.assertTrue(matched)
+
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
         response = requests.get(url)
@@ -190,18 +367,6 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
-
-    def test_sequence_overlap(self):
-        from mlx_lm.server import sequence_overlap
-
-        self.assertTrue(sequence_overlap([1], [1]))
-        self.assertTrue(sequence_overlap([1, 2], [1, 2]))
-        self.assertTrue(sequence_overlap([1, 3], [3, 4]))
-        self.assertTrue(sequence_overlap([1, 2, 3], [2, 3]))
-
-        self.assertFalse(sequence_overlap([1], [2]))
-        self.assertFalse(sequence_overlap([1, 2], [3, 4]))
-        self.assertFalse(sequence_overlap([1, 2, 3], [4, 1, 2, 3]))
 
 
 class TestServerWithDraftModel(unittest.TestCase):
@@ -352,7 +517,6 @@ class TestServerWithDraftModel(unittest.TestCase):
 
 
 class TestKeepalive(unittest.TestCase):
-
     def test_keepalive_callback(self):
         """Test keepalive callback sends SSE comments and handles errors"""
         from unittest.mock import Mock
@@ -402,7 +566,6 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
-
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 
@@ -421,18 +584,23 @@ class TestLRUPromptCache(unittest.TestCase):
         c[0].update_and_fetch(*get_kv(24))
         cache.insert_cache(model, t, c)
 
+        # Fetching a cache that is strictly a prefix doesn't remove it from the
+        # lru cache
         tokens = tokens + [20] * 5
         c, t = cache.fetch_nearest_cache(model, tokens)
         k, v = c[0].state
         self.assertTrue((k == v).all().item())
         self.assertTrue((k.flatten() == mx.arange(24)).all().item())
         self.assertEqual(t, [20] * 5)
-        self.assertEqual(len(cache._lru), 0)
+        self.assertEqual(len(cache), 1)
 
+        # Inserting a trimmable cache with shared prefix removes the prefixes
         tokens = tokens + [30] * 3
         c[0].update_and_fetch(*get_kv(8))
         cache.insert_cache(model, tokens, c)
+        self.assertEqual(len(cache), 1)
 
+        # Fetching a cache with a shared prefix doesn't remove it either
         tokens = tokens[:26] + [40] * 8
         c, t = cache.fetch_nearest_cache(model, tokens)
         k, v = c[0].state
@@ -441,37 +609,155 @@ class TestLRUPromptCache(unittest.TestCase):
             (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
         )
         self.assertEqual(t, [40] * 8)
-        self.assertEqual(len(cache._lru), 1)
+        self.assertEqual(len(cache), 1)
+
+        # Inserting a diverged cache actually creates another entry
+        c[0].update_and_fetch(*get_kv(8))
+        cache.insert_cache(model, tokens, c)
+        self.assertEqual(len(cache), 2)
 
     def test_lru(self):
         cache = LRUPromptCache(max_size=2)
         model = ("test", None, None)
-        cache.insert_cache(model, [1, 2], ["test1"])
-        cache.insert_cache(model, [1, 2], ["test1"])
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
+        cache.insert_cache(model, [2, 3], [MockCache("test2")])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, ["test1"])
+        self.assertEqual(c, [MockCache("test1")])
         self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, ["test1"])
-        self.assertEqual(t, [])
-        c, t = cache.fetch_nearest_cache(model, [1, 2])
-        self.assertEqual(c, None)
-        self.assertEqual(t, [1, 2])
+        c, t = cache.fetch_nearest_cache(model, [1])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [1])
+        c, t = cache.fetch_nearest_cache(model, [1, 3, 4])
+        self.assertEqual(c, [MockCache("test1")])
+        self.assertEqual(t, [3, 4])
+        c, t = cache.fetch_nearest_cache(model, [2, 3, 4])
+        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(t, [4])
+        c, t = cache.fetch_nearest_cache(model, [2, 4, 5])
+        self.assertEqual(c, [MockCache("test2")])
+        self.assertEqual(t, [4, 5])
 
-        cache.insert_cache(model, [1, 2], ["test1"])
-        cache.insert_cache(model, [2, 3], ["test2"])
-        cache.insert_cache(model, [3, 4], ["test3"])
+        cache.insert_cache(model, [1, 2], [MockCache("test1")])
+        cache.insert_cache(model, [2, 3], [MockCache("test2")])
+        cache.insert_cache(model, [3, 4], [MockCache("test3")])
 
         c, t = cache.fetch_nearest_cache(model, [1, 2])
         self.assertEqual(c, None)
         self.assertEqual(t, [1, 2])
         c, t = cache.fetch_nearest_cache(model, [2, 3])
-        self.assertEqual(c, ["test2"])
+        self.assertEqual(c, [MockCache("test2")])
         self.assertEqual(t, [])
         c, t = cache.fetch_nearest_cache(model, [3, 4])
-        self.assertEqual(c, ["test3"])
+        self.assertEqual(c, [MockCache("test3")])
         self.assertEqual(t, [])
+
+        cache.insert_cache(model, [4, 5], [MockCache("test4")], cache_type="user")
+        c, t = cache.fetch_nearest_cache(model, [2, 3])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [2, 3])
+        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(c, [MockCache("test3")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [4, 5])
+        self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(t, [])
+
+        cache.insert_cache(model, [5, 6], [MockCache("test5")])
+        cache.insert_cache(model, [6, 7], [MockCache("test6")])
+        c, t = cache.fetch_nearest_cache(model, [5, 6])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [5, 6])
+        c, t = cache.fetch_nearest_cache(model, [6, 7])
+        self.assertEqual(c, [MockCache("test6")])
+        self.assertEqual(t, [])
+        c, t = cache.fetch_nearest_cache(model, [4, 5])
+        self.assertEqual(c, [MockCache("test4")])
+        self.assertEqual(t, [])
+
+    def test_insert_trimmable_cache_removes_immediate_prefix(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("ab")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 2)
+
+        cache.insert_cache(model, [1, 2, 3], [MockCache("abc")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 3)
+
+    def test_insert_empty_tokens_does_not_self_destruct(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        self.assertEqual(len(cache), 1)
+        self.assertEqual(cache.nbytes, 4)
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNotNone(c)
+        self.assertEqual(t, [])
+
+    def test_fetch_empty_tokens_after_root_eviction(self):
+        cache = LRUPromptCache(max_size=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [], [MockCache("root")])
+        cache.insert_cache(model, [1], [MockCache("a")])
+
+        c, t = cache.fetch_nearest_cache(model, [])
+        self.assertIsNone(c)
+        self.assertEqual(t, [])
+
+    def test_lru_bytes(self):
+        cache = LRUPromptCache(max_size=100, max_bytes=10)
+        model = ("test", None, None)
+
+        cache.insert_cache(model, [1, 2], [MockCache("aaa")])
+        cache.insert_cache(model, [3, 4], [MockCache("bbb")])
+        cache.insert_cache(model, [4, 5], [MockCache("ccc")])
+        cache.insert_cache(model, [6, 7], [MockCache("ddd")])
+
+        self.assertEqual(len(cache), 3)
+        self.assertEqual(cache.nbytes, 9)
+
+        cache.trim_to(n_bytes=7)
+        self.assertEqual(len(cache), 2)
+        self.assertEqual(cache.nbytes, 6)
+
+        c, t = cache.fetch_nearest_cache(model, [1, 2])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [1, 2])
+        c, t = cache.fetch_nearest_cache(model, [3, 4])
+        self.assertEqual(c, None)
+        self.assertEqual(t, [3, 4])
+
+
+class TestMakeSampler(unittest.TestCase):
+    def test_xtc_special_tokens(self):
+        class FakeTokenizer:
+            eos_token_ids = [0, 1, 9]
+
+            def encode(self, text, add_special_tokens=False):
+                return [3]
+
+        sampling = SamplingArguments(
+            temperature=0.6,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            xtc_probability=1.0,
+            xtc_threshold=0.1,
+        )
+        args = type("obj", (object,), {"sampling": sampling})
+        sampler = _make_sampler(args, FakeTokenizer())
+        logits = mx.log(
+            mx.array([[0.4, 0.2, 0.1, 0.1, 0.05, 0.05, 0.03, 0.03, 0.02, 0.02]])
+        )
+        token = sampler(logits)
+        mx.eval(token)
+        self.assertEqual(token.shape, (1,))
 
 
 if __name__ == "__main__":

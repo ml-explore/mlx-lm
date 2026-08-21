@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
@@ -260,7 +261,7 @@ class DeepseekV2MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def __call__(self, x):
-        down_proj = self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
         return down_proj
 
 

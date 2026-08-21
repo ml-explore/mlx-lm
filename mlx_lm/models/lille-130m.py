@@ -6,6 +6,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
@@ -87,7 +88,7 @@ class Lille130mMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         h = self.norm(x)
-        return self.down_proj(nn.silu(self.gate_proj(h)) * self.up_proj(h))
+        return self.down_proj(swiglu(self.gate_proj(h), self.up_proj(h)))
 
 
 class Lille130Block(nn.Module):

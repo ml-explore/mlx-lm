@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
 
@@ -89,7 +90,7 @@ class MLP(nn.Module):
     def __call__(self, x):
         a1 = self.w1(x)
         a2 = self.w2(x)
-        return self.c_proj(a1 * nn.silu(a2))
+        return self.c_proj(swiglu(a2, a1))
 
 
 class TransformerBlock(nn.Module):

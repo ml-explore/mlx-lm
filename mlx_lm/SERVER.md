@@ -72,11 +72,23 @@ curl localhost:8080/v1/chat/completions \
 - `min_p`: (Optional) A float specifying the min-p sampling parameter.
   Defaults to `0.0` (disabled).
 
-- `repetition_penalty`: (Optional) Applies a penalty to repeated tokens.
-  Defaults to `1.0`.
+- `repetition_penalty`: (Optional) Applies a multiplicative penalty to repeated
+  tokens. Defaults to `0.0` (disabled).
 
 - `repetition_context_size`: (Optional) The size of the context window for
   applying repetition penalty. Defaults to `20`.
+
+- `presence_penalty`: (Optional) Applies an additive penalty to tokens
+  that appeared before. Defaults to `0.0` (disabled).
+
+- `presence_context_size`: (Optional) The size of the context window for
+  applying presence penalty. Defaults to `20`.
+
+- `frequency_penalty`: (Optional) Applies an additive penalty proportional to
+  how many times a token appeared previously. Defaults to `0.0` (disabled).
+
+- `frequency_context_size`: (Optional) The size of the context window for
+  applying frequency penalty. Defaults to `20`.
 
 - `logit_bias`: (Optional) A dictionary mapping token IDs to their bias
   values. Defaults to `None`.

@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -47,13 +48,130 @@ MODEL_REMAPPING = {
     "llava": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "joyai_llm_flash": "deepseek_v3",
     "kimi_k2": "deepseek_v3",
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
 }
 
 MAX_FILE_SIZE_GB = 5
+
+
+def _parse_size(x):
+    sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
+    split = 0
+    for xi in x:
+        if not (xi.isdigit() or xi == "."):
+            break
+        split += 1
+    digits = Decimal(x[:split])
+    size = (x[split:]).strip().upper()
+    return int(digits * sizes[size])
+
+
+def _unpack_awq_weights(qweight: mx.array) -> mx.array:
+    bits = 4
+    pack_factor = 32 // bits
+    out_features, packed_in = qweight.shape
+    in_features = packed_in * pack_factor
+    mask = (1 << bits) - 1  # e.g., 0xF for 4-bit
+    shifts = mx.array([0, 4, 1, 5, 2, 6, 3, 7]) * bits
+    unpacked = (qweight[..., None] >> shifts) & mask
+    return unpacked.reshape(out_features, in_features)
+
+
+def _transform_awq_weights(
+    weights: Dict[str, mx.array],
+    quantization_config: Dict[str, Any],
+) -> Tuple[Dict[str, mx.array], Dict[str, Any]]:
+    bits = quantization_config.get("bits", 4)
+    if bits != 4:
+        raise ValueError(f"Only {bits=} is supported for AutoAWQ/GPTQ models.")
+    group_size = quantization_config.get("group_size", 128)
+
+    new_weights = {}
+
+    for key in list(weights.keys()):
+        if key.endswith(".g_idx"):
+            raise ValueError(
+                f"Found {key} in weights. Models with non-contiguous group indices "
+                "(g_idx) are not currently supported. Please use a model without g_idx "
+                "or re-quantize the model using mlx_lm.convert."
+            )
+
+        if key.endswith(".qweight"):
+            prefix = key[:-8]  # Remove ".qweight"
+
+            qweight = weights[f"{prefix}.qweight"]
+            scales_key = f"{prefix}.scales"
+            qzeros_key = f"{prefix}.qzeros"
+
+            scales = weights[scales_key]
+
+            # AutoAWQ stores qweight as [in_features, out_features // pack_factor]
+            # MLX expects [out_features, in_features // pack_factor]
+            # We need to unpack, transpose, and repack
+
+            pack_factor = 32 // bits
+            in_features, packed_out = qweight.shape
+            out_features = packed_out * pack_factor
+            n_groups = in_features // group_size
+
+            # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
+            unpacked_weight = _unpack_awq_weights(qweight)
+            # Transpose to MLX format: [out_features, in_features]
+            unpacked_weight = unpacked_weight.T
+
+            # Repack for MLX: [out_features, in_features] -> [out_features, in_features // pack_factor]
+            packed_in = in_features // pack_factor
+            repacked = unpacked_weight.reshape(out_features, packed_in, pack_factor)
+            shifts = mx.arange(pack_factor) * bits
+            weight = (
+                (repacked.astype(mx.uint32) << shifts).sum(axis=-1).astype(mx.uint32)
+            )
+
+            scales = mx.contiguous(scales.T)
+
+            # Handle qzeros if present (asymmetric quantization)
+            if qzeros_key in weights:
+                qzeros = weights[qzeros_key]
+                # qzeros shape: [n_groups, out_features // pack_factor]
+                # Unpack to get [n_groups, out_features]
+                unpacked_zeros = _unpack_awq_weights(qzeros)
+                # Transpose to [out_features, n_groups]
+                unpacked_zeros = unpacked_zeros.T
+
+                # Compute biases: MLX dequant = weight * scale + bias
+                # AWQ dequant = (weight - zero) * scale
+                # So: bias = -zero * scale
+                biases = -unpacked_zeros.astype(mx.float32) * scales
+            else:
+                # Symmetric quantization - zeros are implicitly 2^(bits-1)
+                zero_point = 1 << (bits - 1)  # e.g., 8 for 4-bit
+                biases = mx.full(scales.shape, -zero_point, dtype=mx.float32) * scales
+
+            new_weights[f"{prefix}.weight"] = weight
+            new_weights[f"{prefix}.scales"] = scales
+            new_weights[f"{prefix}.biases"] = biases.astype(scales.dtype)
+            model_dtype = scales.dtype
+
+        elif not any(
+            key.endswith(suffix) for suffix in [".qweight", ".qzeros", ".scales"]
+        ):
+            new_weights[key] = weights[key]
+
+    for k, w in new_weights.items():
+        if mx.issubdtype(w.dtype, mx.floating):
+            new_weights[k] = w.astype(model_dtype)
+
+    mlx_quantization = {
+        "group_size": group_size,
+        "bits": bits,
+    }
+
+    return new_weights, mlx_quantization
 
 
 def _get_classes(config: dict):
@@ -99,6 +217,19 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+DEFAULT_ALLOW_PATTERNS = [
+    "*.json",
+    "model*.safetensors",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
@@ -118,17 +249,7 @@ def _download(
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        allow_patterns = allow_patterns or [
-            "*.json",
-            "model*.safetensors",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ]
+        allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -141,7 +262,16 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    # Restrict to the same patterns that `_download` fetches so the snapshot
+    # completeness check does not fail on files that were never downloaded
+    # (e.g. `.gitattributes`), which would raise an IncompleteSnapshotError.
+    return Path(
+        snapshot_download(
+            hf_repo,
+            local_files_only=True,
+            allow_patterns=DEFAULT_ALLOW_PATTERNS,
+        )
+    )
 
 
 def load_config(model_path: Path) -> dict:
@@ -169,6 +299,7 @@ def load_model(
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    trust_remote_code: bool = False,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -185,13 +316,18 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        trust_remote_code (bool): If ``True``, allow executing a custom model
+            architecture file specified by the config's ``model_file`` key.
+            Default: ``False``.
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
-        ValueError: If the model class or args class are not found or cannot be instantiated.
+        ValueError: If the model class or args class are not found or cannot be
+            instantiated, or if the config requests a custom ``model_file`` and
+            ``trust_remote_code`` is not enabled.
     """
     config = load_config(model_path)
     if model_config is not None:
@@ -200,16 +336,37 @@ def load_model(
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:
-        logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
     weights = {}
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_args_class = get_model_classes(config=config)
+    if (model_file := config.get("model_file")) is not None:
+        if not trust_remote_code:
+            raise ValueError(
+                f"The model at {model_path} requires importing and running a "
+                f"custom module ({model_file!r}) to build its architecture. This "
+                "is disabled by default. Pass trust_remote_code=True if you "
+                "trust this model."
+            )
+        spec = importlib.util.spec_from_file_location(
+            "custom_model",
+            model_path / model_file,
+        )
+        arch = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arch)
+        model_class, model_args_class = arch.Model, arch.ModelArgs
+    else:
+        model_class, model_args_class = get_model_classes(config=config)
+
+    if "quantization_config" not in config:
+        text_config = config.get("text_config", {})
+        if "quantization_config" in text_config:
+            config["quantization_config"] = text_config["quantization_config"]
 
     model_args = model_args_class.from_dict(config)
+
     model = model_class(model_args)
 
     if hasattr(model, "sanitize"):
@@ -248,17 +405,48 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            if quantization_config.get("format") == "nvfp4-pack-quantized":
+                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            else:
+                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method in ("awq", "gptq"):
+            # Transform AutoAWQ/GPTQ packed weights to MLX format
+            weights, quantization = _transform_awq_weights(weights, quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
 
+    if config.get("quantize_activations", False):
+
+        def _maybe_qq(m):
+            if isinstance(m, nn.QuantizedLinear):
+                if m.mode not in ("nvfp4", "mxfp8"):
+                    raise ValueError(
+                        "Mode ({m.mode}) does not support activation quantization"
+                    )
+                if m.get("bias", False):
+                    raise ValueError(
+                        "Linear layer with bias does not support activation quantization"
+                    )
+                out_dims, in_dims = m.weight.shape
+                in_dims *= 32 // m.bits
+                return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
+            else:
+                return m
+
+        leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
+
+        model.update_modules(leaves)
+
+    model.eval()
     model.load_weights(list(weights.items()), strict=strict)
 
     if not lazy:
         mx.eval(model.parameters())
 
-    model.eval()
     return model, config
 
 
@@ -286,7 +474,9 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         ],
     )
     return _load_tokenizer(
-        model_path, tokenizer_config_extra, eos_token_ids=eos_token_ids
+        model_path,
+        tokenizer_config_extra,
+        eos_token_ids=eos_token_ids,
     )
 
 
@@ -298,6 +488,7 @@ def load(
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
+    trust_remote_code: bool = False,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -318,6 +509,9 @@ def load(
             when needed. Default: ``False``
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        trust_remote_code (bool): If ``True``, allow loading models that require
+            executing a custom Python file specified in their config.
+            Default: ``False``.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -328,7 +522,12 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy, model_config=model_config)
+    model, config = load_model(
+        model_path,
+        lazy,
+        model_config=model_config,
+        trust_remote_code=trust_remote_code,
+    )
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -347,6 +546,9 @@ def sharded_load(
     pipeline_group: Optional[mx.distributed.Group] = None,
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
+    *,
+    tokenizer_config: Optional[Dict[str, Any]] = None,
+    trust_remote_code: bool = False,
 ):
     # Get model path with everything but weight safetensors
     model_path = _download(
@@ -365,9 +567,11 @@ def sharded_load(
 
     # Lazy load model to figure out what type of sharding we can do and which
     # weights we need to download.
-    model, config = load_model(model_path, lazy=True, strict=False)
+    model, config = load_model(
+        model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
+    )
 
-    has_pipelining = hasattr(model.model, "pipeline")
+    has_pipelining = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_tensor_parallel = hasattr(model, "shard")
 
     if pipeline_group is not None and not has_pipelining:
@@ -411,10 +615,12 @@ def sharded_load(
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
-        {"trust_remote_code": True},
+        tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
     )
-    model, _ = load_model(model_path, lazy=True, strict=False)
+    model, _ = load_model(
+        model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
+    )
     if tensor_group is not None:
         model.shard(tensor_group)
     if pipeline_group is not None:
@@ -777,7 +983,7 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
+    save_model(dst_path, model, donate_model=donate_model)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 

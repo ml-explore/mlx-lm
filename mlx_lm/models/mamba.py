@@ -6,8 +6,9 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs
-from .cache import MambaCache
+from .cache import ArraysCache
 
 
 @dataclass
@@ -62,10 +63,6 @@ class MambaBlock(nn.Module):
         self.time_step_rank = int(args.time_step_rank)
         self.use_conv_bias = args.use_conv_bias
         self.use_bcdt_rms = args.use_bcdt_rms
-        if self.use_bcdt_rms:
-            self.mixer_norm = lambda x: mx.fast.rms_norm(
-                x, mx.ones(x.shape[-1], x.dtype), eps=args.mixer_rms_eps
-            )
 
         self.in_proj = nn.Linear(
             self.hidden_size, self.intermediate_size * 2, bias=args.use_bias
@@ -102,16 +99,16 @@ class MambaBlock(nn.Module):
     def ssm_step(self, x, A, state=None):
         D = self.D
         deltaBC = self.x_proj(x)
-        delta, B, C = map(
-            self.mixer_norm if self.use_bcdt_rms else lambda x: x,
-            mx.split(
-                deltaBC,
-                [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
-                axis=-1,
-            ),
+        delta, B, C = mx.split(
+            deltaBC,
+            [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
+            axis=-1,
         )
         if self.use_bcdt_rms:
-            delta, B, C = map(self.mixer_norm, (delta, B, C))
+            eps = self.args.mixer_rms_eps
+            delta = mx.fast.rms_norm(delta, weight=None, eps=eps)
+            B = mx.fast.rms_norm(B, weight=None, eps=eps)
+            C = mx.fast.rms_norm(C, weight=None, eps=eps)
         delta = nn.softplus(self.dt_proj(delta))
         new_state = mx.expand_dims(delta * x, -1) * mx.expand_dims(B, 1)
         if state is not None:
@@ -139,7 +136,7 @@ class MambaBlock(nn.Module):
             y_t, current_state = self.ssm_step(x[:, t], A, current_state)
             y.append(y_t)
         y = mx.stack(y, axis=1)
-        z = self.out_proj(nn.silu(z) * y)
+        z = self.out_proj(swiglu(z, y))
         return z, (new_conv_cache, current_state)
 
     def __call__(self, x, cache):
@@ -152,7 +149,7 @@ class MambaBlock(nn.Module):
             x, conv_cache, state_cache
         )
 
-        if isinstance(cache, MambaCache):
+        if isinstance(cache, ArraysCache):
             cache[0] = new_conv_cache
             cache[1] = new_state_cache
 
@@ -207,7 +204,7 @@ class Model(nn.Module):
         return logits
 
     def make_cache(self):
-        return [MambaCache() for _ in range(len(self.layers))]
+        return [ArraysCache(size=2) for _ in range(len(self.layers))]
 
     @property
     def layers(self):

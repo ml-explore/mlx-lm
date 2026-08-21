@@ -8,11 +8,13 @@ To run, first start the server:
 
 Then run this script.
 """
+import json
+
 from openai import OpenAI
 
 client = OpenAI(base_url="http://localhost:8080/v1", api_key="not-needed")
 
-model = "mlx-community/qwen3-4b-4bit-DWQ"
+model = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 messages = [{"role": "user", "content": "What's the weather in Boston?"}]
 
 tools = [

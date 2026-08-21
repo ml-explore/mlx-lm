@@ -10,11 +10,11 @@ MLX LM was developed with contributions from the following individuals:
 - Shunta Saito: Added support for PLaMo models.
 - Gökdeniz Gülmez: Added support for the following architectures: 
 OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1` and 
-`Mamba v2`, Z.ai & THUKEG's `GLM`, `GLM4`, Rednote `dots.llm1`, Baidu's `Ernie4.5 MoE`, 
+`Mamba v2`, Z.ai & THUKEG's `GLM`, `GLM4`, `GLM5 (GLM MoE DSA)`, Rednote `dots.llm1`, Baidu's `Ernie4.5 MoE`, 
 inclusionAI's `Bailing MoE e.g. Ling-family`, `Bailing MoE Linear e.g. Ling-Linear-family`, 
 Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite MoE`, 
 Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's `Apertus`, Nikity's `Lille130m`, 
-Alibaba Qwen's `Qwen3Next`, and Allenai's `OLMoE` and `Olmo 3`; 
+Alibaba Qwen's `Qwen3Next`, Tele-AI's `TeleChat3`, and Allenai's `OLMoE` and `Olmo 3`; 
 Helped add support for the following model architectures: 
 Alibaba Qwen's `Qwen3 & Qwen3MoE)`; Added support for the following training algorithms: 
 `Full Weight Fine-Tuning`, and the `Muon` optimizer; 
@@ -27,3 +27,7 @@ Added support for the following other features:
   Google DeepMind's `Gemma 3`, TII's `Falcon H1` and InterLM's `InternLM 2.5`.
 - Ivan Fioravanti: Added support for the following architectures:
  ServiceNow-AI's `Apriel 1.5`, Tencent's `Hunyuan Dense V1` and `Hunyuan MoE V1`.
+- Tarjei Mandt: Added support for the following architectures: `Step 3.5 Flash`, 
+MoonshotAI's `Kimi K2.5`, Upstage's `Solar Open`, LG AI Research's `K-Exaone MoE`, 
+Meituan's `LongCat Flash Lite` Helped add support for the following model architectures: 
+Z.ai & THUKEG's `GLM5 (GLM MoE DSA)`
