@@ -613,6 +613,15 @@ def load(
         model_path, **(tokenizer_config_extra or {})
     )
 
+    # The streaming detokenizers (SPM/BPE) need a ``vocab`` mapping. Custom
+    # tokenizers (e.g. via ``trust_remote_code``) often expose only ``get_vocab``;
+    # fall back to the correct-by-construction Naive detokenizer instead of
+    # crashing on the missing ``.vocab``.
+    if detokenizer_class is not NaiveStreamingDetokenizer and not hasattr(
+        tokenizer, "vocab"
+    ):
+        detokenizer_class = NaiveStreamingDetokenizer
+
     tokenizer_config = tokenizer.init_kwargs
 
     if chat_template_type := tokenizer_config.get("chat_template_type", False):

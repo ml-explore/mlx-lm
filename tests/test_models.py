@@ -3194,6 +3194,32 @@ class TestModels(unittest.TestCase):
                     "full_attention",
                 ],
             },
+            {
+                # full_attention_interval == num_hidden_layers exercises both
+                # a GDN (linear) cache and a KV cache in one forward.
+                "model_type": "interns2_mobius",
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 8,
+                "num_experts_per_tok": 4,
+                "num_blocks": 2,
+                "moe_intermediate_size": 32,
+                "shared_expert_intermediate_size": 32,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 1000,
+                "rope_theta": 1e7,
+                "partial_rotary_factor": 0.25,
+                "max_position_embeddings": 1000,
+                "full_attention_interval": 4,
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -3258,6 +3284,31 @@ class TestModels(unittest.TestCase):
         step = mx.concatenate(step, axis=1)
 
         self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
+
+    def test_interns2_mobius_router_topk(self):
+        from mlx_lm.models.interns2_mobius import router_topk
+
+        k = 4
+        for rows, n in [(1, 8), (16, 32), (128, 64)]:
+            logits = mx.random.normal(shape=(rows, n))
+            # Duplicate the first columns so tied logits exercise the tie-break.
+            logits = mx.concatenate([logits, logits[:, :4]], axis=-1)
+
+            k_inds, k_scores = router_topk(logits, k, use_kernel=True)
+            o_inds, o_scores = router_topk(logits, k, use_kernel=False)
+
+            # A tie straddling the k-boundary is picked either way (both are
+            # correct), so the index sets can differ; the selected *logit
+            # values* and their softmax weights are the invariant.
+            k_vals = mx.sort(mx.take_along_axis(logits, k_inds, axis=-1), axis=-1)
+            o_vals = mx.sort(mx.take_along_axis(logits, o_inds, axis=-1), axis=-1)
+            self.assertTrue(mx.allclose(k_vals, o_vals, atol=1e-6))
+            self.assertTrue(
+                mx.allclose(
+                    mx.sort(k_scores, axis=-1), mx.sort(o_scores, axis=-1), atol=1e-6
+                )
+            )
+            self.assertEqual(k_inds.dtype, mx.uint32)
 
     def test_ssm(self):
         for batch_size in [1, 2]:

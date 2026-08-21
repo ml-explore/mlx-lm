@@ -235,6 +235,7 @@ DEFAULT_ALLOW_PATTERNS = [
     "model*.safetensors",
     "*.py",
     "tokenizer.model",
+    "*.model",
     "*.tiktoken",
     "tiktoken.model",
     "*.txt",
