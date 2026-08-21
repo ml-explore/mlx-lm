@@ -243,9 +243,9 @@ class InternS2MobiusGatedDeltaNet(nn.Module):
             )
         ]
 
-        # Match the HF kernel's `use_qk_l2norm_in_kernel=True` plus 1/sqrt(d)
-        # query scaling: rms_norm(x) == l2norm(x) * sqrt(d), so these factors
-        # reduce to l2norm(q)/sqrt(d) and l2norm(k).
+        # HF's `use_qk_l2norm_in_kernel` plus 1/sqrt(d) query scaling: since
+        # rms_norm(x) == l2norm(x) * sqrt(d), these reduce to l2norm(q)/sqrt(d)
+        # and l2norm(k).
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
@@ -424,11 +424,8 @@ def _router_topk_kernel(logits: mx.array, k: int) -> tuple[mx.array, mx.array]:
 
 
 def _router_topk_ops(logits: mx.array, k: int) -> tuple[mx.array, mx.array]:
-    idx = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+    idx = mx.argpartition(logits, kth=-k, axis=-1)[..., -k:]
     top = mx.take_along_axis(logits, idx, axis=-1)
-    # Softmax over the selected logits equals renormalising a full softmax,
-    # since softmax is monotonic and so picks the same k. Emitted in the logits'
-    # dtype (see router_topk).
     scores = mx.softmax(top, axis=-1, precise=True).astype(logits.dtype)
     return idx.astype(mx.uint32), scores
 
@@ -436,21 +433,13 @@ def _router_topk_ops(logits: mx.array, k: int) -> tuple[mx.array, mx.array]:
 def router_topk(
     logits: mx.array, k: int, use_kernel: bool = True
 ) -> tuple[mx.array, mx.array]:
-    """Top-k experts and their softmax weights.
+    """Top-k experts and their softmax weights, in one dispatch.
 
-    Replaces an upcast, argpartition over all experts, gather and softmax --
-    four kernels per layer on a decode step that is bound by kernel launches.
     Softmax over the selected logits equals renormalising a softmax over all of
-    them, because softmax is monotonic and so picks the same k.
-
-    Experts tying on the boundary logit may be picked differently than
-    argpartition picks them, which is free to break ties any way it likes.
-    Tied logits carry equal weight, so either choice is as correct.
-
-    The Metal kernel is selected only under the same guard the recurrent layers
-    use (`gated_delta.py`), falling back to pure MLX ops on CUDA/CPU. Scores are
-    emitted in the logits' dtype (bf16 here); HF routes in fp32, a deliberate
-    deviation measured token-identical. A fully `-inf` logit row would yield NaN
+    them, so this fuses the routing softmax into the top-k. The Metal kernel is
+    guarded like the recurrent layers (`gated_delta.py`) and falls back to MLX
+    ops on CUDA/CPU. Scores are emitted in the logits' dtype (bf16); HF routes in
+    fp32, a deviation measured token-identical. A fully `-inf` row would give NaN
     scores, but gate logits are never `-inf` for this model.
     """
     assert logits.ndim == 2, "router_topk expects 2-D [tokens, experts] logits"
@@ -562,12 +551,13 @@ class InternS2MobiusModel(nn.Module):
             for b in range(args.num_blocks)
         ]
         self.norm = InternS2MobiusRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        # A representative cache index per layer type, for building the masks.
-        # None when the config has no layer of that type.
-        self.ssm_idx = next((i for i, l in enumerate(self.layers) if l.is_linear), None)
-        self.fa_idx = next(
-            (i for i, l in enumerate(self.layers) if not l.is_linear), None
-        )
+        # One representative cache of each type builds the two masks. The fixed
+        # indices assume layers alternate as (linear, ..., full) within every
+        # `full_attention_interval` block; assert it rather than mis-mask.
+        self.ssm_idx = 0
+        self.fa_idx = args.full_attention_interval - 1
+        assert self.layers[self.ssm_idx].is_linear
+        assert not self.layers[self.fa_idx].is_linear
 
     def __call__(
         self,
@@ -579,16 +569,8 @@ class InternS2MobiusModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = (
-            create_attention_mask(h, cache[self.fa_idx])
-            if self.fa_idx is not None
-            else None
-        )
-        ssm_mask = (
-            create_ssm_mask(h, cache[self.ssm_idx])
-            if self.ssm_idx is not None
-            else None
-        )
+        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
         for i, (layer, c) in enumerate(zip(self.layers, cache)):
             mask = ssm_mask if layer.is_linear else fa_mask
@@ -696,9 +678,8 @@ class Model(nn.Module):
                         + [e[part][None] for e in extra],
                         axis=0,
                     )
-                    # Materialize per projection so its sources are released
-                    # before the next bank is built; leaving every bank pending
-                    # until the final eval doubles peak memory over the experts.
+                    # Materialize per bank (see stack_gate_up) so sources are
+                    # released before the next bank builds.
                     mx.eval(stacked)
                     weights[f"{prefix}.{name}.{part}"] = stacked
 
