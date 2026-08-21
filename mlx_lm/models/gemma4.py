@@ -86,6 +86,12 @@ class Model(nn.Module):
         return self.language_model.layers
 
     @property
+    def lora_default_keys(self):
+        return [
+            f"language_model.{key}" for key in self.language_model.lora_default_keys
+        ]
+
+    @property
     def quant_predicate(self):
         return self.language_model.quant_predicate
 
