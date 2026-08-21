@@ -9,8 +9,16 @@ import unittest
 import mlx.core as mx
 import requests
 
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
-from mlx_lm.server import APIHandler, LRUPromptCache, ResponseGenerator
+from mlx_lm.server import (
+    APIHandler,
+    LRUPromptCache,
+    Response,
+    ResponseGenerator,
+    SamplingArguments,
+    _make_sampler,
+)
 from mlx_lm.utils import load
 
 
@@ -61,6 +69,9 @@ class DummyModelProvider:
         assert model in ["default_model", "chat_model"]
         return self.model, self.tokenizer
 
+    def load_default(self):
+        return self.load("default_model", None, "default_model")
+
 
 class MockCache:
     def __init__(self, value, is_trimmable: bool = True):
@@ -80,6 +91,111 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class TestTextStateMachine(unittest.TestCase):
+    """Test the TextStateMachine buffering and stripping behavior."""
+
+    def test_strips_control_sequences(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, s = sm.flush(state)
+        full = text + rest
+        self.assertEqual(full, "hi body bye")
+
+    def test_back_to_back_tool_calls(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, s = sm.flush(state)
+        full = t1 + t2 + rest
+        self.assertEqual(full, "call1call2")
+
+    def test_partial_match_buffered_then_flushed(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        # First enter tool state
+        state = sm.make_state()
+        state, text, s = sm.step(state, "<tool_call>body</")
+        self.assertEqual(s, "tool")
+        # 'body' is emitted, '</' is buffered (partial match of '</tool_call>')
+        self.assertEqual(text, "body")
+        # flush releases the buffered text
+        state, rest, s = sm.flush(state)
+        self.assertEqual(rest, "</")
+
+    def test_discard_drops_buffer(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello ST")
+        self.assertEqual(text, "hello ")
+        # discard drops the buffered 'ST'
+        state, s = sm.discard(state)
+        self.assertEqual(s, "normal")
+
+    def test_stop_words_stripped(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("STOP", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "hello STOP world")
+        state, rest, s = sm.flush(state)
+        self.assertEqual(text + rest, "hello  world")
+
+    def test_reasoning_to_tool_transition(self):
+        # A tool call started inside a reasoning block must enter "tool".
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning"), ("<tool>", "tool")],
+                "reasoning": [("</think>", "normal"), ("<tool>", "tool")],
+                "tool": [("</tool>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, _, s = sm.step(state, "<think>hmm")
+        self.assertEqual(s, "reasoning")
+        state, _, s = sm.step(state, "<tool>")
+        self.assertEqual(s, "tool")
+        state, _, s = sm.step(state, "</tool>")
+        self.assertEqual(s, "normal")
+
+    def test_empty_end_marker_stays_in_tool_on_discard(self):
+        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool";
+        # discard on stop must preserve the state so the tool call is flushed.
+        sm = TextStateMachine(
+            {
+                "normal": [("[TOOL_CALLS]", "tool")],
+                "tool": [],
+            }
+        )
+        state = sm.make_state()
+        state, text, s = sm.step(state, "[TOOL_CALLS]f[ARGS]{}")
+        self.assertEqual(s, "tool")
+        self.assertEqual(text, "f[ARGS]{}")
+        state, s = sm.discard(state)
+        self.assertEqual(s, "tool")
 
 
 class TestServer(unittest.TestCase):
@@ -204,6 +320,40 @@ class TestServer(unittest.TestCase):
         response_body = response.text
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+
+    def test_make_state_machine_empty_tool_call_end(self):
+        class FakeTokenizer:
+            has_thinking = False
+            has_tool_calling = True
+            tool_call_start = "[TOOL_CALLS]"
+            tool_call_end = ""
+            tool_call_start_tokens = (100,)
+            tool_call_end_tokens = ()
+            eos_token_ids = [2]
+
+            def convert_ids_to_tokens(self, t):
+                return f"<eos{t}>"
+
+            def encode(self, text, add_special_tokens=False):
+                return []
+
+        stop_matcher, text_sm = self.response_generator._make_state_machine(
+            ("fake-empty-end", None, None),
+            FakeTokenizer(),
+            stop_words=[],
+        )
+
+        # Verify the text state machine strips tool call markers
+        text_state = text_sm.make_state()
+        text_state, clean_text, s = text_sm.step(text_state, "hello[TOOL_CALLS]body")
+        self.assertEqual(s, "tool")
+        # 'hello' is before the match, 'body' flows through (no tool_call_end)
+        self.assertEqual(clean_text, "hellobody")
+
+        # Verify EOS stops via the stop matcher
+        stop_state = stop_matcher.make_state()
+        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
+        self.assertTrue(matched)
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
@@ -582,6 +732,32 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+
+class TestMakeSampler(unittest.TestCase):
+    def test_xtc_special_tokens(self):
+        class FakeTokenizer:
+            eos_token_ids = [0, 1, 9]
+
+            def encode(self, text, add_special_tokens=False):
+                return [3]
+
+        sampling = SamplingArguments(
+            temperature=0.6,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            xtc_probability=1.0,
+            xtc_threshold=0.1,
+        )
+        args = type("obj", (object,), {"sampling": sampling})
+        sampler = _make_sampler(args, FakeTokenizer())
+        logits = mx.log(
+            mx.array([[0.4, 0.2, 0.1, 0.1, 0.05, 0.05, 0.03, 0.03, 0.02, 0.02]])
+        )
+        token = sampler(logits)
+        mx.eval(token)
+        self.assertEqual(token.shape, (1,))
 
 
 if __name__ == "__main__":

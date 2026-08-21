@@ -2,10 +2,11 @@
 import copy
 import importlib
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_map
+from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
@@ -339,6 +340,37 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_quantized_sdpa_gqa_batched_mask(self):
+        # Regression test: quantized SDPA with grouped-query attention and a
+        # batched (B >= 2) padding mask used to crash with a broadcast error
+        # because the mask lacked the n_repeats axis introduced by the GQA
+        # reshape of the scores.
+        B, n_q_heads, n_kv_heads, L, D = 2, 8, 2, 16, 32
+
+        cache = KVCache()
+        k = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        v = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        k_up, v_up = cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+        qk_up, qv_up = quant_cache.state
+
+        q = 1e-1 * mx.random.normal(shape=(B, n_q_heads, L, D))
+
+        # Batched padding mask, shape (B, 1, L, L), as produced by BatchKVCache.
+        mask = mx.ones((B, 1, L, L), dtype=mx.bool_)
+        mask[1, :, :, L // 2 :] = False
+
+        out = scaled_dot_product_attention(
+            q, k_up, v_up, cache=cache, mask=mask, scale=1.0
+        )
+        qout = scaled_dot_product_attention(
+            q, qk_up, qv_up, cache=quant_cache, mask=mask, scale=1.0
+        )
+        mx.eval(out, qout)
+        self.assertEqual(qout.shape, (B, n_q_heads, L, D))
+        self.assertTrue(mx.all(mx.isfinite(qout)).item())
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
@@ -615,7 +647,9 @@ class TestModels(unittest.TestCase):
             "max_position_embeddings": 64,
         }
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        mlx_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
 
         for model_type, hf_mtp_key in (
             ("qwen3_5", "mtp.fc.weights"),
@@ -631,20 +665,27 @@ class TestModels(unittest.TestCase):
             model = module.Model(args)
 
             base = mx.arange(8, dtype=mx.float32)
+            raw_conv = mx.zeros((4, 1, 3), dtype=mx.float32)
 
-            # Simulate convert sanitize on HF-style keys.
+            # Raw HF Conv1D layout is the reliable signal that RMSNorm weights
+            # are still zero-centered and need the MLX +1 conversion.
             converted = model.sanitize(
                 {
                     hf_norm_key: base,
+                    hf_conv_key: raw_conv,
                     hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
             self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
+            self.assertEqual(converted[mlx_conv_key].shape, (4, 3, 1))
             self.assertFalse(any("mtp." in k for k in converted))
 
-            # Simulate load sanitize on already-converted keys.
-            loaded = model.sanitize(converted)
+            # MTP can also be present in an already-converted checkpoint. It
+            # must be dropped without shifting converted norm weights again.
+            loaded = model.sanitize(
+                {**converted, hf_mtp_key: mx.zeros((1,), dtype=mx.float32)}
+            )
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
@@ -1185,6 +1226,40 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_falcon_mamba_bcdt_normalization(self):
+        from mlx_lm.models import mamba
+
+        args = mamba.ModelArgs(
+            model_type="falcon_mamba",
+            vocab_size=32,
+            use_bias=False,
+            use_conv_bias=True,
+            conv_kernel=4,
+            hidden_size=4,
+            num_hidden_layers=1,
+            state_size=2,
+            intermediate_size=8,
+            time_step_rank=2,
+        )
+        block = mamba.MambaBlock(args)
+
+        x = mx.ones((1, args.intermediate_size))
+        A = -mx.ones((args.intermediate_size, args.state_size))
+
+        with (
+            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
+            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
+        ):
+            y, state = block.ssm_step(x, A)
+
+        mx.eval(y, state)
+        self.assertEqual(rms_norm.call_count, 3)
+        for call in rms_norm.call_args_list:
+            self.assertIsNone(call.kwargs["weight"])
+        self.assertEqual(ones.call_count, 0)
+        self.assertEqual(y.shape, (1, args.intermediate_size))
+        self.assertEqual(state.shape, (1, args.intermediate_size, args.state_size))
+
     def test_falcon_h1(self):
         from mlx_lm.models import falcon_h1
 
@@ -1546,6 +1621,78 @@ class TestModels(unittest.TestCase):
         self.assertTrue(
             mx.allclose(logits, mx.ones((1, 1, 4), dtype=mx.float32) * 32.0)
         )
+
+    def test_gemma4_kv_shared_layers_omit_kv_projections(self):
+        """KV-shared layers must not create k_proj/v_proj/k_norm/v_norm so that
+        models saved without redundant weights (e.g. via transformers
+        save_pretrained) can be loaded with strict=True."""
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=128,
+            num_hidden_layers=10,
+            intermediate_size=256,
+            num_attention_heads=4,
+            head_dim=32,
+            global_head_dim=64,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            vocab_size_per_layer_input=1000,
+            num_key_value_heads=1,
+            num_kv_shared_layers=4,
+            hidden_size_per_layer_input=32,
+            sliding_window=8,
+            sliding_window_pattern=5,
+            final_logit_softcapping=30.0,
+            layer_types=[
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                },
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                },
+            },
+        )
+        model = gemma4_text.Model(args)
+
+        # Non-shared layers (0-5) should have KV projections
+        for i in range(6):
+            attn = model.model.layers[i].self_attn
+            self.assertTrue(attn.has_kv)
+            self.assertTrue(hasattr(attn, "k_proj"))
+            self.assertTrue(hasattr(attn, "k_norm"))
+
+        # Shared layers (6-9) should NOT have KV projections
+        for i in range(6, 10):
+            attn = model.model.layers[i].self_attn
+            self.assertFalse(attn.has_kv)
+            self.assertFalse(hasattr(attn, "k_proj"))
+            self.assertFalse(hasattr(attn, "k_norm"))
+            self.assertFalse(hasattr(attn, "v_proj"))
+
+        # Verify the model can load weights that omit shared-layer KV params
+        weights = dict(tree_flatten(model.parameters()))
+        kv_keys = [
+            k for k in weights if "k_proj" in k or "v_proj" in k or "k_norm" in k
+        ]
+        for k in kv_keys:
+            # All KV keys should belong to non-shared layers (0-5)
+            layer_idx = int(k.split("layers.")[1].split(".")[0])
+            self.assertLess(layer_idx, 6)
 
     def test_gemma4_input_embeddings_reconstruct_per_layer_inputs(self):
         from mlx_lm.models import gemma4_text
@@ -2273,6 +2420,49 @@ class TestModels(unittest.TestCase):
                     "block_auto_adjust_ff_dim": True,
                     "layer_types": ["full_attention", "", "full_attention", ""],
                     "rope_theta": 1000,
+                },
+            },
+            {
+                "model_type": "laguna",
+                "vocab_size": 10_000,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 4,
+                "partial_rotary_factor": 0.5,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 128,
+                "shared_expert_intermediate_size": 128,
+                "moe_routed_scaling_factor": 2.5,
+                "moe_router_score_func": "sqrtsoftplus",
+                "layer_types": [
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+                "num_attention_heads_per_layer": [4, 4, 4, 4],
+                "rope_parameters": {
+                    "full_attention": {
+                        "rope_type": "yarn",
+                        "rope_theta": 500000.0,
+                        "factor": 8.0,
+                        "original_max_position_embeddings": 4096,
+                        "beta_slow": 1.0,
+                        "beta_fast": 32.0,
+                        "partial_rotary_factor": 0.5,
+                    },
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 1.0,
+                    },
                 },
             },
             {

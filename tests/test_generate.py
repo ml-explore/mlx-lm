@@ -9,7 +9,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
-    SequenceStateMachine,
+    StopSequenceMatcher,
     batch_generate,
     generate,
     generate_step,
@@ -402,6 +402,42 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
         self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
 
+    def test_batch_generate_processor_tokens_match_prompt_on_first_step(self):
+        prompt = self.tokenizer.encode("hello")
+        seen = []
+
+        def processor(tokens, logits):
+            seen.append(tokens)
+            return logits
+
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            logits_processors=[processor],
+        )
+        batch_gen.insert([prompt])
+        batch_gen.next_generated()
+
+        self.assertTrue(hasattr(seen[0], "shape"))
+        self.assertEqual(seen[0].tolist(), prompt)
+
+    def test_batch_generate_function_with_logits_processors(self):
+        """Test that batch_generate function with logits_processors produces correct results."""
+        logit_bias = {0: 2000.0, 1: -2000.0}
+        processors = make_logits_processors(logit_bias)
+
+        prompts = [self.tokenizer.encode("hello")]
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=1,
+            logits_processors=processors,
+        )
+        self.assertEqual(len(response.texts), 1)
+        generated_token = self.tokenizer.encode(response.texts[0])[0]
+        self.assertEqual(generated_token, 0)
+
     def test_batch_generate_with_samplers(self):
         """Test that batch_generate with logits_processors produces correct results."""
         batch_gen = BatchGenerator(
@@ -434,17 +470,17 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
-    def test_batch_generate_with_state_machines(self):
-        """Test that batch_generate with per-sequence state_machines stops on different tokens."""
+    def test_batch_generate_with_stop_matchers(self):
+        """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
         batch_gen = BatchGenerator(
             self.model,
             max_tokens=10,
         )
         prompt = self.tokenizer.encode("hello")
 
-        sm_0 = SequenceStateMachine({"normal": [([0], None)]}, initial="normal")
-        sm_1 = SequenceStateMachine({"normal": [([1], None)]}, initial="normal")
-        sm_2 = SequenceStateMachine({"normal": [([2], None)]}, initial="normal")
+        sm_0 = StopSequenceMatcher([[0]])
+        sm_1 = StopSequenceMatcher([[1]])
+        sm_2 = StopSequenceMatcher([[2]])
 
         processor_0 = make_logits_processors({0: 2000.0})
         processor_1 = make_logits_processors({1: 2000.0})
@@ -453,7 +489,7 @@ class TestGenerate(unittest.TestCase):
         uid0, uid1, uid2 = batch_gen.insert(
             [prompt, prompt, prompt],
             logits_processors=[processor_0, processor_1, processor_2],
-            state_machines=[sm_0, sm_1, sm_2],
+            stop_matchers=[sm_0, sm_1, sm_2],
         )
 
         responses = batch_gen.next_generated()
@@ -465,9 +501,6 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid0].finish_reason, "stop")
         self.assertEqual(responses[uid1].finish_reason, "stop")
         self.assertEqual(responses[uid2].finish_reason, "stop")
-        self.assertEqual(responses[uid0].match_sequence, (0,))
-        self.assertEqual(responses[uid1].match_sequence, (1,))
-        self.assertEqual(responses[uid2].match_sequence, (2,))
 
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
@@ -769,6 +802,47 @@ class TestGenerate(unittest.TestCase):
             if r.finish_reason is not None:
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
+
+    def test_batch_generate_return_logprobs(self):
+        """Test that batch_generate returns per-token logprobs when requested."""
+        prompts = [
+            self.tokenizer.encode("hello"),
+            self.tokenizer.encode("write a poem"),
+        ]
+        max_tokens = 5
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=max_tokens,
+            return_logprobs=True,
+            return_token_ids=True,
+        )
+
+        # Check that logprobs and token_ids are returned
+        self.assertIsNotNone(response.logprobs)
+        self.assertIsNotNone(response.token_ids)
+        self.assertEqual(len(response.logprobs), len(prompts))
+        self.assertEqual(len(response.token_ids), len(prompts))
+
+        for i in range(len(prompts)):
+            # token_ids and logprobs should have same length
+            self.assertEqual(len(response.token_ids[i]), len(response.logprobs[i]))
+            # logprobs should be non-positive (log-probabilities)
+            for lp in response.logprobs[i]:
+                self.assertLessEqual(lp, 0.0)
+
+    def test_batch_generate_no_logprobs_by_default(self):
+        """Test that batch_generate does not return logprobs by default."""
+        prompts = [self.tokenizer.encode("hello")]
+        response = batch_generate(
+            self.model,
+            self.tokenizer,
+            prompts,
+            max_tokens=3,
+        )
+        self.assertIsNone(response.logprobs)
+        self.assertIsNone(response.token_ids)
 
 
 if __name__ == "__main__":

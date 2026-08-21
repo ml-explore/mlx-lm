@@ -113,7 +113,7 @@ class TestDatasets(unittest.TestCase):
 
     def test_hf(self):
         hf_args = {
-            "path": "billsum",
+            "path": "FiscalNote/billsum",
             "prompt_feature": "text",
             "completion_feature": "summary",
             "train_split": "train[:2%]",

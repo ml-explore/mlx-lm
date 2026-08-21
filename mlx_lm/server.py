@@ -9,7 +9,6 @@ import socket
 import time
 import uuid
 import warnings
-from collections import deque
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,14 +34,13 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
-    SequenceStateMachine,
-    generation_stream,
+    StopSequenceMatcher,
+    TextStateMachine,
+    make_stop_matcher,
+    make_text_state_machine,
     stream_generate,
 )
-from .models.cache import (
-    LRUPromptCache,
-    make_prompt_cache,
-)
+from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -78,7 +76,14 @@ class ToolCallFormatter:
 
         result = []
         for tool_text in tool_calls:
-            parsed = self._tool_parser(tool_text, self._tools)
+            try:
+                parsed = self._tool_parser(tool_text, self._tools)
+            except (ValueError, json.JSONDecodeError) as e:
+                logging.warning(
+                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
+                    f"tool text was likely truncated mid-generation."
+                )
+                continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
@@ -205,7 +210,8 @@ class GenerationContext:
     has_thinking: bool
     tool_parser: Callable[[str, Any], Dict]
 
-    sequences: Dict[Tuple[int], str]
+    text_sm: TextStateMachine
+    initial_state: str
 
     prompt: List[int]
     prompt_cache_count: int = -1
@@ -220,8 +226,6 @@ class GenerationContext:
 class Response:
     text: str
     token: int
-    state: str
-    match: Tuple[int]
     logprob: float
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
@@ -256,8 +260,7 @@ class TimeBudget:
         self._loops += 1
         self._time_spent += time.time() - self._start
         if self._loops % self._sync_frequency == 0:
-            with mx.stream(generation_stream):
-                loop_time = mx.distributed.all_sum(self._time_spent).item()
+            loop_time = mx.distributed.all_sum(self._time_spent).item()
             avg_loop_time = loop_time / (
                 mx.distributed.init().size() * self._sync_frequency
             )
@@ -285,94 +288,92 @@ class ModelProvider:
         )
         self.is_distributed = group.size() > 1
 
-        # Preload the default model if it is provided
-        self.default_model_map = {}
-        if self.cli_args.model is not None:
-            self.default_model_map[self.cli_args.model] = "default_model"
-            self.load(self.cli_args.model, draft_model_path="default_model")
+        # Maps model and adapter paths the actual paths to be used. Used to
+        # map 'default_model' to the provided model by cli argument but could
+        # be used for more in the future.
+        self._model_map = {}
+        self._adapter_map = {}
+        self._draft_model_map = {}
+        self._model_map["default_model"] = self.cli_args.model
+        self._adapter_map["default_model"] = self.cli_args.adapter_path
+        self._draft_model_map["default_model"] = self.cli_args.draft_model
 
-    # Added in adapter_path to load dynamically
-    def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self.default_model_map.get(model_path, model_path)
-        if self.model_key == (model_path, adapter_path, draft_model_path):
-            return self.model, self.tokenizer
+        # Build the tokenizer config for later use in load
+        self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
+        if cli_args.chat_template:
+            self._tokenizer_config["chat_template"] = cli_args.chat_template
+
+    def _load(self, model_path, adapter_path=None, draft_model_path=None):
+        if self.is_distributed and (
+            adapter_path is not None or draft_model_path is not None
+        ):
+            raise ValueError(
+                "Loading with adapters or draft models not supported in distributed mode"
+            )
 
         # Remove the old model if it exists.
+        self.model_key = None
         self.model = None
         self.tokenizer = None
-        self.model_key = None
         self.draft_model = None
 
-        # Building tokenizer_config
-        tokenizer_config = {
-            "trust_remote_code": True if self.cli_args.trust_remote_code else None
-        }
-        if self.cli_args.chat_template:
-            tokenizer_config["chat_template"] = self.cli_args.chat_template
-
-        if model_path == "default_model":
-            if self.cli_args.model is None:
-                raise ValueError(
-                    "A model path has to be given as a CLI "
-                    "argument or in the HTTP request"
-                )
-            adapter_path = adapter_path or self.cli_args.adapter_path
-            # TODO: Generalize distributed load
-            if self.is_distributed:
-                model, tokenizer = sharded_load(
-                    self.cli_args.model, self.pipeline_group, self.tensor_group
-                )
-            else:
-                model, tokenizer = load(
-                    self.cli_args.model,
-                    adapter_path=adapter_path,
-                    tokenizer_config=tokenizer_config,
-                )
+        # Load the model and tokenizer
+        if self.is_distributed:
+            model, tokenizer = sharded_load(
+                model_path,
+                pipeline_group=self.pipeline_group,
+                tensor_group=self.tensor_group,
+                tokenizer_config=self._tokenizer_config,
+                trust_remote_code=self.cli_args.trust_remote_code,
+            )
         else:
-            # TODO: Generalize distributed load
-            if self.is_distributed:
-                model, tokenizer = sharded_load(
-                    model_path, self.pipeline_group, self.tensor_group
-                )
-            else:
-                model, tokenizer = load(
-                    model_path,
-                    adapter_path=adapter_path,
-                    tokenizer_config=tokenizer_config,
-                )
+            model, tokenizer = load(
+                model_path,
+                adapter_path=adapter_path,
+                tokenizer_config=self._tokenizer_config,
+                trust_remote_code=self.cli_args.trust_remote_code,
+            )
 
+        # Use the default chat template if needed
         if self.cli_args.use_default_chat_template:
             if tokenizer.chat_template is None:
                 tokenizer.chat_template = tokenizer.default_chat_template
 
-        self.model_key = (model_path, adapter_path, draft_model_path)
-        self.model = model
-        self.tokenizer = tokenizer
-
-        def validate_draft_tokenizer(draft_tokenizer):
-            # Check if tokenizers are compatible
+        # Load the draft model for speculative decoding
+        draft_model = None
+        if draft_model_path is not None:
+            draft_model, draft_tokenizer = load(draft_model_path)
             if draft_tokenizer.vocab_size != tokenizer.vocab_size:
                 logging.warning(
                     "Draft model tokenizer does not match model tokenizer. "
                     "Speculative decoding may not work as expected."
                 )
 
-        # Load draft model if specified
-        if (
-            draft_model_path == "default_model"
-            and self.cli_args.draft_model is not None
-        ):
-            self.draft_model, draft_tokenizer = load(self.cli_args.draft_model)
-            validate_draft_tokenizer(draft_tokenizer)
+        # Compute batchability
+        is_batchable = draft_model is None
+        is_batchable = is_batchable and all(
+            hasattr(c, "merge") for c in make_prompt_cache(model)
+        )
 
-        elif draft_model_path is not None and draft_model_path != "default_model":
-            self.draft_model, draft_tokenizer = load(draft_model_path)
-            validate_draft_tokenizer(draft_tokenizer)
+        # Update the member variables
+        self.model_key = (model_path, adapter_path, draft_model_path)
+        self.model = model
+        self.tokenizer = tokenizer
+        self.draft_model = draft_model
+        self.is_batchable = is_batchable
 
-        if self.draft_model is None:
-            self.is_batchable = all(
-                hasattr(c, "merge") for c in make_prompt_cache(self.model)
-            )
+    def load_default(self):
+        if self._model_map["default_model"] is not None:
+            self.load("default_model", None, "default_model")
+
+    def load(self, model_path, adapter_path=None, draft_model_path=None):
+        adapter_path = self._adapter_map.get(model_path, adapter_path)
+        model_path = self._model_map.get(model_path, model_path)
+        draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
+
+        model_key = (model_path, adapter_path, draft_model_path)
+        if self.model_key != model_key:
+            self._load(*model_key)
 
         return self.model, self.tokenizer
 
@@ -385,10 +386,7 @@ def _make_sampler(args, tokenizer):
         min_p=args.sampling.min_p,
         xtc_probability=args.sampling.xtc_probability,
         xtc_threshold=args.sampling.xtc_threshold,
-        xtc_special_tokens=[
-            tokenizer.eos_token_id,
-            tokenizer.encode("\n"),
-        ],
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
     )
 
 
@@ -466,22 +464,21 @@ class ResponseGenerator:
         if not self._is_distributed:
             return obj
 
-        with mx.stream(generation_stream):
-            if self._rank == 0:
-                if obj is None:
-                    mx.eval(mx.distributed.all_sum(0))
-                    return None
-                data = mx.array(pickle.dumps(obj))
-                mx.eval(mx.distributed.all_sum(data.size))
-                mx.eval(mx.distributed.all_sum(data))
-                return obj
-            else:
-                size = mx.distributed.all_sum(0).item()
-                if size == 0:
-                    return None
-                data = mx.zeros(size, dtype=mx.uint8)
-                data = mx.distributed.all_sum(data)
-                return pickle.loads(data)
+        if self._rank == 0:
+            if obj is None:
+                mx.eval(mx.distributed.all_sum(0))
+                return None
+            data = mx.array(pickle.dumps(obj))
+            mx.eval(mx.distributed.all_sum(data.size))
+            mx.eval(mx.distributed.all_sum(data))
+            return obj
+        else:
+            size = mx.distributed.all_sum(0).item()
+            if size == 0:
+                return None
+            data = mx.zeros(size, dtype=mx.uint8)
+            data = mx.distributed.all_sum(data)
+            return pickle.loads(data)
 
     def _share_request(self, request):
         if not self._is_distributed:
@@ -550,12 +547,10 @@ class ResponseGenerator:
         # Choose the initial state among only reasoning or normal
         initial_state = "normal"
         if tokenizer.has_thinking:
-            for i in range(-1, -len(prompt), -1):
-                if prompt[i] == tokenizer.think_start_id:
-                    initial_state = "reasoning"
-                    break
-                if prompt[i] == tokenizer.think_end_id:
-                    break
+            think_start = tokenizer.rfind_think_start(prompt)
+            think_end = tokenizer.rfind_think_end(prompt)
+            if think_start > think_end:
+                initial_state = "reasoning"
 
         # It is not a user message so no segmentation needed.
         if messages[-1]["role"] != "user":
@@ -590,10 +585,9 @@ class ResponseGenerator:
         # tokens)
         tail_start = len(prompt)
         if tokenizer.has_thinking:
-            for i in range(1, min(11, len(prompt) - sys_end), 1):
-                if prompt[-i] == tokenizer.think_start_id:
-                    tail_start = len(prompt) - i
-                    break
+            think_start = tokenizer.rfind_think_start(prompt, start=tail_start - 11)
+            if think_start >= 0:
+                tail_start = think_start
 
         # Finalize the segments and return
         if sys_end < tail_start:
@@ -608,72 +602,34 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state
 
-    def _make_state_machine(
-        self, model_key, tokenizer, stop_words, initial_state="normal"
-    ):
-        """Make a new SequenceStateMachine or fetch it if we 've made it before.
-
-        Return also a dictionary that maps the token sequences in the state
-        machine to their strings.
-        """
-        cache_key = (model_key, tuple(stop_words), initial_state)
+    def _make_state_machine(self, model_key, tokenizer, stop_words):
+        """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
+        cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        # Will hold the state machine transitions and the sequences map to
-        # strings.
-        transitions = {}
-        sequences = {}
+        stop_matcher = make_stop_matcher(tokenizer, stop_words)
+        text_sm = make_text_state_machine(tokenizer, stop_words)
 
-        # Add all the stop sequences
-        common_stops = []
-        for t in tokenizer.eos_token_ids:
-            sequences[(t,)] = tokenizer.convert_ids_to_tokens(t)
-            common_stops.append(((t,), None))
-        for w in stop_words:
-            t = tuple(tokenizer.encode(w, add_special_tokens=False))
-            sequences[t] = w
-            common_stops.append((t, None))
-
-        # From normal to stop
-        transitions["normal"] = list(common_stops)
-
-        # Reasoning related transitions
-        if tokenizer.has_thinking:
-            ts = tokenizer.think_start_id
-            te = tokenizer.think_end_id
-            transitions["normal"].append(((ts,), "reasoning"))
-            transitions["reasoning"] = [((te,), "normal")]
-            transitions["reasoning"].extend(common_stops)
-            sequences[(ts,)] = tokenizer.convert_ids_to_tokens(ts)
-            sequences[(te,)] = tokenizer.convert_ids_to_tokens(te)
-
-        # Tool calling relating transitions
-        if tokenizer.has_tool_calling:
-            ts = tuple(
-                tokenizer.encode(tokenizer.tool_call_start, add_special_tokens=False)
-            )
-            te = tuple(
-                tokenizer.encode(tokenizer.tool_call_end, add_special_tokens=False)
-            )
-            transitions["normal"].append((ts, "tool"))
-            transitions["tool"] = [(te, "normal")]
-            transitions["tool"].extend(common_stops)
-            sequences[ts] = tokenizer.tool_call_start
-            sequences[te] = tokenizer.tool_call_end
-
-        sm = SequenceStateMachine(transitions, initial=initial_state)
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (sm, sequences)
+        self._state_machine_cache[cache_key] = (stop_matcher, text_sm)
 
-        return sm, sequences
+        return stop_matcher, text_sm
 
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
 
     def _generate(self):
+        # Local thread stream that we 'll pass to the BatchGenerator to make
+        # sure that all generation runs in the same stream as the
+        # synchronization messages.
+        generation_stream = mx.default_stream(mx.default_device())
+
+        # Load the default model if it is given
+        self.model_provider.load_default()
+
         current_model = None
         current_sampling = None
         current_tokenizer = None
@@ -722,11 +678,10 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    sm, sequences = self._make_state_machine(
+                    stop_matcher, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         tokenizer,
                         args.stop_words,
-                        initial_state,
                     )
 
                     self._log_cache_stats()
@@ -747,7 +702,8 @@ class ResponseGenerator:
                         has_tool_calling=tokenizer.has_tool_calling,
                         has_thinking=tokenizer.has_thinking,
                         tool_parser=tokenizer.tool_parser,
-                        sequences=sequences,
+                        text_sm=text_sm,
+                        initial_state=initial_state,
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
                     )
@@ -760,7 +716,7 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        state_machines=[sm],
+                        stop_matchers=[stop_matcher],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -803,6 +759,7 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
                     continue
@@ -860,13 +817,23 @@ class ResponseGenerator:
 
                     for r in gen_responses:
                         result = batch_results[r.uid]
-                        result["detokenizer"].add_token(r.token)
+
+                        # Don't decode the final stop token
+                        if r.finish_reason == "stop":
+                            result["detokenizer"].finalize()
+                            text = result["detokenizer"].last_segment
+                        elif r.finish_reason == "length":
+                            result["detokenizer"].add_token(r.token)
+                            result["detokenizer"].finalize()
+                            text = result["detokenizer"].last_segment
+                        else:
+                            result["detokenizer"].add_token(r.token)
+                            text = result["detokenizer"].last_segment
+
                         result["rqueue"].put(
                             Response(
-                                result["detokenizer"].last_segment,
+                                text,
                                 r.token,
-                                r.current_state,
-                                r.match_sequence,
                                 r.logprobs[r.token].item(),
                                 r.finish_reason,
                                 _format_top_logprobs(
@@ -892,12 +859,11 @@ class ResponseGenerator:
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
-                    with mx.stream(generation_stream):
-                        batch_generator.remove(uids_to_remove)
-                        for uid in uids_to_remove:
-                            # It may have already been removed during
-                            # generation
-                            batch_results.pop(uid, None)
+                    batch_generator.remove(uids_to_remove)
+                    for uid in uids_to_remove:
+                        # It may have already been removed during
+                        # generation
+                        batch_results.pop(uid, None)
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -914,20 +880,19 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            sm, sequences = self._make_state_machine(
+            stop_matcher, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
-                initial_state=initial_state,
             )
-            sm_state = sm.make_state()
 
             # Start the generation context
             ctx = GenerationContext(
                 has_thinking=tokenizer.has_thinking,
                 has_tool_calling=tokenizer.has_tool_calling,
                 tool_parser=tokenizer.tool_parser,
-                sequences=sequences,
+                text_sm=text_sm,
+                initial_state=initial_state,
                 prompt=prompt,
             )
             rqueue.put(ctx)
@@ -953,6 +918,7 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
+            stop_state = stop_matcher.make_state()
             for gen in stream_generate(
                 model=model,
                 tokenizer=tokenizer,
@@ -967,15 +933,18 @@ class ResponseGenerator:
                 prefill_step_size=self.cli_args.prefill_step_size,
             ):
                 finish_reason = gen.finish_reason
-                sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
-                if match_sequence is not None and current_state is None:
+
+                # Token-level stop word detection
+                stop_state, matched = StopSequenceMatcher.match(
+                    stop_state, stop_matcher._trie, gen.token
+                )
+                if matched:
                     finish_reason = "stop"
+
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
-                        current_state,
-                        match_sequence,
                         gen.logprobs[gen.token].item(),
                         finish_reason,
                         _format_top_logprobs(
@@ -1025,25 +994,11 @@ class ResponseGenerator:
                     continue
                 yield response
 
-        def _process_control_tokens(ctx, token_stream):
-            buffer_size = max(len(s) for s in ctx.sequences)
-            buffered_stream = deque()
-
-            for tok in token_stream:
-                buffered_stream.append(tok)
-                if tok.match is not None:
-                    for _ in tok.match:
-                        buffered_stream.pop()
-                if len(buffered_stream) >= buffer_size:
-                    yield buffered_stream.popleft()
-            while len(buffered_stream) > 0:
-                yield buffered_stream.popleft()
-
         ctx = response_queue.get()
         if isinstance(ctx, Exception):
             raise ctx
 
-        return ctx, _process_control_tokens(ctx, _inner())
+        return ctx, _inner()
 
     @property
     def cli_args(self):
@@ -1178,7 +1133,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.frequency_penalty = self.body.get("frequency_penalty", 0.0)
         self.frequency_context_size = self.body.get("frequency_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
-        self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
+        self.xtc_threshold = self.body.get("xtc_threshold", 0.1)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
@@ -1433,8 +1388,11 @@ class APIHandler(BaseHTTPRequestHandler):
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
+        # Initialize the text state machine
+        sm_state = ctx.text_sm.make_state(ctx.initial_state)
+
         # Variables to save the generated text, tokens, logprobs, tools etc
-        prev_state = None
+        prev_state = ctx.initial_state
         finish_reason = "stop"
         reasoning_text = ""
         made_tool_call = False
@@ -1449,18 +1407,32 @@ class APIHandler(BaseHTTPRequestHandler):
             for gen in response:
                 logging.debug(gen.text)
 
-                # Collect the text according to our current state and state
-                # transitions. Reasoning or tool or normal text.
-                if gen.state == "reasoning":
-                    reasoning_text += gen.text
-                elif gen.state == "tool":
-                    tool_text += gen.text
-                elif gen.state == "normal":
+                # Advance the text state machine to strip control sequences
+                if gen.finish_reason == "stop":
+                    sm_state, current_state = TextStateMachine.discard(sm_state)
+                    clean_text = ""
+                elif gen.finish_reason == "length":
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
+                    clean_text += flushed
+                else:
+                    sm_state, clean_text, current_state = TextStateMachine.step(
+                        sm_state, gen.text
+                    )
+
+                # Collect the clean text by state: reasoning, tool, or normal
+                if current_state == "reasoning":
+                    reasoning_text += clean_text
+                elif current_state == "tool":
+                    tool_text += clean_text
+                elif current_state == "normal":
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
                         tool_text = ""
                         made_tool_call = True
-                    text += gen.text
+                    text += clean_text
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1471,7 +1443,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if (
                     self.stream
-                    and gen.state != "tool"
+                    and current_state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
                     resp = self.generate_response(
@@ -1489,7 +1461,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
 
-                prev_state = gen.state
+                prev_state = current_state
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)

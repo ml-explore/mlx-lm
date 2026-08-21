@@ -222,6 +222,59 @@ class TestToolParsing(unittest.TestCase):
             {"query": "hello world", "limit": 10, "verbose": False},
         )
 
+        # Multiple tool calls in a single block (no delimiter between them)
+        test_case = (
+            'call:glob{pattern:<|"|>README*.md<|"|>}'
+            'call:glob{pattern:<|"|>CONTRIBUTING.md<|"|>}'
+        )
+        tool_calls = gemma4.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "glob")
+        self.assertEqual(tool_calls[0]["arguments"], {"pattern": "README*.md"})
+        self.assertEqual(tool_calls[1]["name"], "glob")
+        self.assertEqual(tool_calls[1]["arguments"], {"pattern": "CONTRIBUTING.md"})
+
+        # Multiple tool calls with nested args
+        test_case = (
+            'call:search{query:<|"|>weather<|"|>,limit:5}'
+            'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
+        )
+        tool_calls = gemma4.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "search")
+        self.assertEqual(
+            tool_calls[0]["arguments"],
+            {"query": "weather", "limit": 5},
+        )
+        self.assertEqual(tool_calls[1]["name"], "configure")
+        self.assertEqual(
+            tool_calls[1]["arguments"],
+            {"settings": {"enabled": True, "name": "test"}},
+        )
+
+        # Hyphenated function name (e.g. manim-video)
+        test_case = (
+            'call:manim-video{mode:<|"|>plan<|"|>,prompt:<|"|>explain KV caching<|"|>}'
+        )
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "manim-video")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"mode": "plan", "prompt": "explain KV caching"},
+        )
+
+        # Braces inside a string argument (e.g. code snippets or markdown in content)
+        test_case = (
+            'call:skill_manage{action:<|"|>create<|"|>,'
+            'content:<|"|>use a dict like {key: value} in your code<|"|>}'
+        )
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "skill_manage")
+        self.assertEqual(tool_call["arguments"]["action"], "create")
+        self.assertIn("{", tool_call["arguments"]["content"])
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
@@ -259,6 +312,22 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_minimax_m2(self):
+        test_case = (
+            '<invoke name="search">\n'
+            '<parameter name="query">weather</parameter>\n'
+            "</invoke>\n"
+            '<invoke name="read_file">\n'
+            '<parameter name="path">/tmp/test.txt</parameter>\n'
+            "</invoke>"
+        )
+        expected = [
+            {"name": "search", "arguments": {"query": "weather"}},
+            {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+        ]
+        tool_calls = minimax_m2.parse_tool_call(test_case, None)
+        self.assertEqual(expected, tool_calls)
 
 
 if __name__ == "__main__":
