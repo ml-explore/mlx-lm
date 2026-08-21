@@ -674,50 +674,51 @@ class ResponseGenerator:
                         prompt, segments, segment_types, initial_state = self._tokenize(
                             current_tokenizer, request, args
                         )
+
+                        stop_matcher, text_sm = self._make_state_machine(
+                            self.model_provider.model_key,
+                            tokenizer,
+                            args.stop_words,
+                        )
+
+                        self._log_cache_stats()
+                        cache, rest = self.prompt_cache.fetch_nearest_cache(
+                            current_model_key, prompt
+                        )
+                        prompt_cache_count = len(prompt) - len(rest)
+                        N = prompt_cache_count
+                        while N > 0:
+                            if N >= len(segments[0]):
+                                N -= len(segments.pop(0))
+                                segment_types.pop(0)
+                            else:
+                                segments[0] = segments[0][N:]
+                                break
+
+                        ctx = GenerationContext(
+                            has_tool_calling=tokenizer.has_tool_calling,
+                            has_thinking=tokenizer.has_thinking,
+                            tool_parser=tokenizer.tool_parser,
+                            text_sm=text_sm,
+                            initial_state=initial_state,
+                            prompt=prompt,
+                            prompt_cache_count=prompt_cache_count,
+                        )
+
+                        (uid,) = batch_generator.insert_segments(
+                            segments=[segments],
+                            max_tokens=[args.max_tokens],
+                            caches=[cache],
+                            all_tokens=[prompt[:prompt_cache_count]],
+                            samplers=[_make_sampler(args, tokenizer)],
+                            logits_processors=[_make_logits_processors(args)],
+                            stop_matchers=[stop_matcher],
+                        )
                     except Exception as e:
                         rqueue.put(e)
                         continue
 
-                    stop_matcher, text_sm = self._make_state_machine(
-                        self.model_provider.model_key,
-                        tokenizer,
-                        args.stop_words,
-                    )
-
-                    self._log_cache_stats()
-                    cache, rest = self.prompt_cache.fetch_nearest_cache(
-                        current_model_key, prompt
-                    )
-                    prompt_cache_count = len(prompt) - len(rest)
-                    N = prompt_cache_count
-                    while N > 0:
-                        if N >= len(segments[0]):
-                            N -= len(segments.pop(0))
-                            segment_types.pop(0)
-                        else:
-                            segments[0] = segments[0][N:]
-                            break
-
-                    ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        has_thinking=tokenizer.has_thinking,
-                        tool_parser=tokenizer.tool_parser,
-                        text_sm=text_sm,
-                        initial_state=initial_state,
-                        prompt=prompt,
-                        prompt_cache_count=prompt_cache_count,
-                    )
                     rqueue.put(ctx)
-
-                    (uid,) = batch_generator.insert_segments(
-                        segments=[segments],
-                        max_tokens=[args.max_tokens],
-                        caches=[cache],
-                        all_tokens=[prompt[:prompt_cache_count]],
-                        samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
-                        stop_matchers=[stop_matcher],
-                    )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
@@ -773,97 +774,121 @@ class ResponseGenerator:
 
             # No request so serve from the current batch
             elif batch_generator is not None:
-                if len(batch_results) == 0:
-                    if drain_batch:
-                        current_model = None
-                        current_sampling = None
-                        current_tokenizer = None
-                        current_model_key = None
-                        batch_generator.close()
-                        batch_generator = None
-                        drain_batch = False
-                    continue
+                try:
+                    if len(batch_results) == 0:
+                        if drain_batch:
+                            current_model = None
+                            current_sampling = None
+                            current_tokenizer = None
+                            current_model_key = None
+                            batch_generator.close()
+                            batch_generator = None
+                            drain_batch = False
+                        continue
 
-                uids_to_remove = []
-                for _ in self._time_budget:
-                    prompt_responses, gen_responses = batch_generator.next()
-                    if not prompt_responses and not gen_responses:
-                        break
+                    uids_to_remove = []
+                    for _ in self._time_budget:
+                        prompt_responses, gen_responses = batch_generator.next()
+                        if not prompt_responses and not gen_responses:
+                            break
 
-                    # Progress report for prompt processing
-                    for r in prompt_responses:
-                        result = batch_results[r.uid]
-                        result["rqueue"].put(r.progress)
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
+                        # Progress report for prompt processing
+                        for r in prompt_responses:
+                            result = batch_results[r.uid]
+                            result["rqueue"].put(r.progress)
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
 
-                    # Save the caches at end of segments
-                    eos_ids = [
-                        r.uid
-                        for r in prompt_responses
-                        if r.end_of_segment
-                        and not r.end_of_prompt
-                        and batch_results[r.uid]["segment_types"]
-                    ]
-                    caches = batch_generator.extract_cache(eos_ids)
-                    for uid, (cache, cache_key) in caches.items():
-                        self.prompt_cache.insert_cache(
-                            self.model_provider.model_key,
-                            cache_key[:],
-                            cache,
-                            cache_type=batch_results[uid]["segment_types"].pop(),
-                        )
-                    del caches
-
-                    for r in gen_responses:
-                        result = batch_results[r.uid]
-
-                        # Don't decode the final stop token
-                        if r.finish_reason == "stop":
-                            result["detokenizer"].finalize()
-                            text = result["detokenizer"].last_segment
-                        elif r.finish_reason == "length":
-                            result["detokenizer"].add_token(r.token)
-                            result["detokenizer"].finalize()
-                            text = result["detokenizer"].last_segment
-                        else:
-                            result["detokenizer"].add_token(r.token)
-                            text = result["detokenizer"].last_segment
-
-                        result["rqueue"].put(
-                            Response(
-                                text,
-                                r.token,
-                                r.logprobs[r.token].item(),
-                                r.finish_reason,
-                                _format_top_logprobs(
-                                    r.logprobs,
-                                    result["top_logprobs"],
-                                    current_tokenizer,
-                                ),
-                            )
-                        )
-
-                        if r.finish_reason is not None:
-                            result["rqueue"].put(None)
+                        # Save the caches at end of segments
+                        eos_ids = [
+                            r.uid
+                            for r in prompt_responses
+                            if r.end_of_segment
+                            and not r.end_of_prompt
+                            and batch_results[r.uid]["segment_types"]
+                        ]
+                        caches = batch_generator.extract_cache(eos_ids)
+                        for uid, (cache, cache_key) in caches.items():
                             self.prompt_cache.insert_cache(
-                                current_model_key,
-                                r.all_tokens[:],
-                                r.prompt_cache,
-                                cache_type="assistant",
+                                self.model_provider.model_key,
+                                cache_key[:],
+                                cache,
+                                cache_type=batch_results[uid]["segment_types"].pop(),
                             )
-                            del batch_results[r.uid]
+                        del caches
 
-                        if result["ctx"]._should_stop:
-                            uids_to_remove.append(r.uid)
+                        for r in gen_responses:
+                            result = batch_results[r.uid]
 
-                uids_to_remove = self._share_object(uids_to_remove)
-                if uids_to_remove:
-                    batch_generator.remove(uids_to_remove)
-                    for uid in uids_to_remove:
-                        # It may have already been removed during
-                        # generation
-                        batch_results.pop(uid, None)
+                            # Don't decode the final stop token
+                            if r.finish_reason == "stop":
+                                result["detokenizer"].finalize()
+                                text = result["detokenizer"].last_segment
+                            elif r.finish_reason == "length":
+                                result["detokenizer"].add_token(r.token)
+                                result["detokenizer"].finalize()
+                                text = result["detokenizer"].last_segment
+                            else:
+                                result["detokenizer"].add_token(r.token)
+                                text = result["detokenizer"].last_segment
+
+                            result["rqueue"].put(
+                                Response(
+                                    text,
+                                    r.token,
+                                    r.logprobs[r.token].item(),
+                                    r.finish_reason,
+                                    _format_top_logprobs(
+                                        r.logprobs,
+                                        result["top_logprobs"],
+                                        current_tokenizer,
+                                    ),
+                                )
+                            )
+
+                            if r.finish_reason is not None:
+                                result["rqueue"].put(None)
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                )
+                                del batch_results[r.uid]
+
+                            if result["ctx"]._should_stop:
+                                uids_to_remove.append(r.uid)
+
+                    uids_to_remove = self._share_object(uids_to_remove)
+                    if uids_to_remove:
+                        batch_generator.remove(uids_to_remove)
+                        for uid in uids_to_remove:
+                            # It may have already been removed during
+                            # generation
+                            batch_results.pop(uid, None)
+                except Exception as e:
+                    # An uncaught exception here used to kill the generation
+                    # thread while the HTTP threads kept accepting requests
+                    # that could never be answered. Fail the in-flight
+                    # requests and keep serving; queued requests are retried
+                    # with a fresh batch generator.
+                    logging.exception(
+                        "Generation batch failed. Failing the in-flight "
+                        "requests and continuing to serve."
+                    )
+                    for result in batch_results.values():
+                        result["rqueue"].put(e)
+                    batch_results = {}
+                    try:
+                        batch_generator.close()
+                    except Exception:
+                        logging.exception("Failed to close the batch generator.")
+                    batch_generator = None
+                    current_model = None
+                    current_sampling = None
+                    current_tokenizer = None
+                    current_model_key = None
+                    drain_batch = False
 
     def _serve_single(self, request):
         rqueue, request, args = request
@@ -978,6 +1003,11 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
+        if not self._generation_thread.is_alive():
+            raise RuntimeError(
+                "The generation thread is not running. The server needs to "
+                "be restarted."
+            )
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
 

@@ -213,6 +213,36 @@ class TestGenerate(unittest.TestCase):
                 self.assertTrue(mx.allclose(blp, lp))
                 break
 
+    def test_batch_extend_mixed_logits_processors(self):
+        # Regression test for a sequence without logits processors entering
+        # the prompt batch alone, which left a None placeholder behind. A
+        # sequence with processors joining a step later produced a mixed
+        # [None, [...]] list, and when both moved to generation in the same
+        # step, GenerationBatch._step raised
+        # "TypeError: 'NoneType' object is not iterable".
+        filler = self.tokenizer.encode("hello " * 40)
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=4,
+            prefill_batch_size=2,
+            prefill_step_size=8,
+        )
+        procs = make_logits_processors(repetition_penalty=1.5)
+
+        # 20 tokens prefill as 8 + 8 + 3; the 15-token sequence inserted one
+        # step later prefills as 8 + 6 so both finish on the same step.
+        (uid_a,) = gen.insert([filler[:20]], logits_processors=[[]])
+        gen.next()
+        (uid_b,) = gen.insert([filler[:15]], logits_processors=[procs])
+
+        finished = set()
+        for _ in range(100):
+            _, gen_responses = gen.next()
+            finished.update(r.uid for r in gen_responses if r.finish_reason is not None)
+            if {uid_a, uid_b} <= finished:
+                break
+        self.assertEqual(finished, {uid_a, uid_b})
+
     def test_many_batches(self):
 
         prompts = [

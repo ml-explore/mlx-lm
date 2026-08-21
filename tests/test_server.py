@@ -5,15 +5,20 @@ import io
 import json
 import threading
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine
+from mlx_lm.generate import BatchGenerator, TextStateMachine
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
+    CompletionRequest,
+    GenerationArguments,
+    LogitsProcessorArguments,
     LRUPromptCache,
+    ModelDescription,
     Response,
     ResponseGenerator,
     SamplingArguments,
@@ -563,6 +568,74 @@ class TestKeepalive(unittest.TestCase):
             keepalive_callback(3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
+
+
+class TestResponseGeneratorResilience(unittest.TestCase):
+
+    @staticmethod
+    def _make_request():
+        request = CompletionRequest(
+            request_type="chat",
+            prompt="",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=None,
+            role_mapping=None,
+        )
+        args = GenerationArguments(
+            model=ModelDescription(model="default_model", draft=None, adapter=None),
+            sampling=SamplingArguments(
+                temperature=0.0,
+                top_p=1.0,
+                top_k=0,
+                min_p=0.0,
+                xtc_probability=0.0,
+                xtc_threshold=0.0,
+            ),
+            logits=LogitsProcessorArguments(
+                logit_bias=None,
+                repetition_penalty=None,
+                repetition_context_size=20,
+                presence_penalty=None,
+                presence_context_size=20,
+                frequency_penalty=None,
+                frequency_context_size=20,
+            ),
+            stop_words=[],
+            max_tokens=4,
+            num_draft_tokens=0,
+            logprobs=False,
+            top_logprobs=0,
+            seed=None,
+            chat_template_kwargs=None,
+        )
+        return request, args
+
+    def test_generation_thread_survives_batch_exception(self):
+        # Regression test: an uncaught exception in the generation loop used
+        # to kill the generation thread while the HTTP server kept accepting
+        # requests that could never be answered.
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        try:
+            request, args = self._make_request()
+
+            with mock.patch.object(
+                BatchGenerator, "next", side_effect=RuntimeError("boom")
+            ):
+                _, responses = response_generator.generate(request, args)
+                with self.assertRaises(RuntimeError):
+                    for _ in responses:
+                        pass
+
+            # The generation thread must survive and keep serving
+            self.assertTrue(response_generator._generation_thread.is_alive())
+
+            request, args = self._make_request()
+            _, responses = response_generator.generate(request, args)
+            responses = list(responses)
+            self.assertTrue(len(responses) > 0)
+            self.assertEqual(responses[-1].finish_reason, "length")
+        finally:
+            response_generator.stop_and_join()
 
 
 class TestLRUPromptCache(unittest.TestCase):
