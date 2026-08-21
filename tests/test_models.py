@@ -2439,6 +2439,7 @@ class TestModels(unittest.TestCase):
                 "moe_intermediate_size": 128,
                 "shared_expert_intermediate_size": 128,
                 "moe_routed_scaling_factor": 2.5,
+                "moe_router_score_func": "sqrtsoftplus",
                 "layer_types": [
                     "full_attention",
                     "sliding_attention",
