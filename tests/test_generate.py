@@ -16,7 +16,13 @@ from mlx_lm.generate import (
     maybe_quantize_kv_cache,
     stream_generate,
 )
-from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    CacheList,
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+)
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -819,6 +825,54 @@ class TestGenerate(unittest.TestCase):
 
         self.assertIsInstance(prompt_cache[0], CacheList)
         self.assertIs(prompt_cache[0].caches[1], inner)
+
+    def test_maybe_quantize_kv_cache_hybrid(self):
+        # A Gemma 4 style hybrid cache. RotatingKVCache has no quantized
+        # variant, so it must be left alone instead of aborting the request.
+        full = KVCache()
+        rotating = RotatingKVCache(max_size=8)
+        keys = mx.zeros((1, 1, 4, 64))
+        values = mx.zeros((1, 1, 4, 64))
+        full.update_and_fetch(keys, values)
+        rotating.update_and_fetch(keys, values)
+
+        prompt_cache = [full, rotating]
+        maybe_quantize_kv_cache(
+            prompt_cache, quantized_kv_start=0, kv_group_size=32, kv_bits=4
+        )
+
+        self.assertIsInstance(prompt_cache[0], QuantizedKVCache)
+        self.assertIsInstance(prompt_cache[1], RotatingKVCache)
+
+    def test_generate_step_with_hybrid_cache_and_kv_bits(self):
+        # maybe_quantize_kv_cache runs on every step, so a cache that cannot
+        # convert would abort mid-request, not at the start.
+        prompt_cache = [
+            KVCache() if i % 2 else RotatingKVCache(max_size=512)
+            for i in range(len(self.model.layers))
+        ]
+        prompt = mx.array(self.tokenizer.encode("hello"))
+
+        tokens = [
+            token
+            for token, _ in zip(
+                generate_step(
+                    prompt,
+                    self.model,
+                    prompt_cache=prompt_cache,
+                    kv_bits=8,
+                    quantized_kv_start=0,
+                ),
+                range(5),
+            )
+        ]
+
+        self.assertEqual(len(tokens), 5)
+        quantized = [c for c in prompt_cache if isinstance(c, QuantizedKVCache)]
+        rotating = [c for c in prompt_cache if isinstance(c, RotatingKVCache)]
+        self.assertEqual(len(quantized) + len(rotating), len(prompt_cache))
+        self.assertTrue(quantized)
+        self.assertTrue(rotating)
 
     def test_batch_generate_return_logprobs(self):
         """Test that batch_generate returns per-token logprobs when requested."""
