@@ -146,6 +146,23 @@ class _BaseCache:
     def is_trimmable(self):
         return False
 
+    def trim(self, n):
+        """
+        Trim ``n`` tokens off of the cache.
+
+        Any subclass that overrides ``is_trimmable()`` to return ``True``
+        must also override this method. Callers are expected to guard calls
+        to ``trim`` with ``is_trimmable()``, so reaching this default
+        implementation means that invariant was broken by a cache
+        subclass -- fail loudly instead of raising a generic
+        ``AttributeError`` deeper in the call stack.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement trim() but reports "
+            "is_trimmable() == True. is_trimmable() must be overridden to "
+            "return False, or trim() must be implemented, for this class."
+        )
+
     def size(self):
         """
         Return the size (i.e. sequence length) of the cache.
