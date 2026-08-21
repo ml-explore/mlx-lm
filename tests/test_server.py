@@ -5,6 +5,8 @@ import io
 import json
 import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import mlx.core as mx
 import requests
@@ -14,12 +16,66 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    ModelProvider,
     Response,
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
 )
 from mlx_lm.utils import load
+
+
+class TestModelProvider(unittest.TestCase):
+    @staticmethod
+    def make_provider(model):
+        provider = ModelProvider.__new__(ModelProvider)
+        provider.cli_args = SimpleNamespace(
+            trust_remote_code=False,
+            use_default_chat_template=False,
+        )
+        provider.is_distributed = False
+        provider.model_key = None
+        provider.model = model
+        provider.tokenizer = object() if model is not None else None
+        provider.draft_model = None
+        provider._tokenizer_config = {}
+        return provider
+
+    def test_model_swap_clears_cache_before_loading_replacement(self):
+        provider = self.make_provider(object())
+        replacement_model = object()
+        replacement_tokenizer = SimpleNamespace(chat_template="template")
+
+        with (
+            patch("mlx_lm.server.mx.clear_cache") as clear_cache,
+            patch("mlx_lm.server.make_prompt_cache", return_value=[]),
+        ):
+
+            def load_replacement(*args, **kwargs):
+                clear_cache.assert_called_once_with()
+                self.assertIsNone(provider.model)
+                self.assertIsNone(provider.tokenizer)
+                return replacement_model, replacement_tokenizer
+
+            with patch("mlx_lm.server.load", side_effect=load_replacement):
+                provider._load("replacement")
+
+        self.assertIs(provider.model, replacement_model)
+        self.assertIs(provider.tokenizer, replacement_tokenizer)
+
+    def test_initial_model_load_does_not_clear_cache(self):
+        provider = self.make_provider(None)
+        model = object()
+        tokenizer = SimpleNamespace(chat_template="template")
+
+        with (
+            patch("mlx_lm.server.mx.clear_cache") as clear_cache,
+            patch("mlx_lm.server.load", return_value=(model, tokenizer)),
+            patch("mlx_lm.server.make_prompt_cache", return_value=[]),
+        ):
+            provider._load("model")
+
+        clear_cache.assert_not_called()
 
 
 class DummyModelProvider:

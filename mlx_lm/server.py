@@ -312,10 +312,14 @@ class ModelProvider:
             )
 
         # Remove the old model if it exists.
+        had_loaded_model = self.model is not None or self.draft_model is not None
         self.model_key = None
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        if had_loaded_model:
+            # Return buffers from the previous model before allocating its replacement.
+            mx.clear_cache()
 
         # Load the model and tokenizer
         if self.is_distributed:
