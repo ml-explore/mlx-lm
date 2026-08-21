@@ -722,6 +722,26 @@ class TestModels(unittest.TestCase):
                 )
             )
 
+        # A length mismatch must be rejected, not silently misaligned.
+        with self.assertRaises(ValueError):
+            next(
+                generate_step(
+                    inputs[0],
+                    model,
+                    position_ids=image_positions[..., :3],
+                )
+            )
+
+        # A malformed shape must be rejected too.
+        with self.assertRaises(ValueError):
+            next(
+                generate_step(
+                    inputs[0],
+                    model,
+                    position_ids=mx.zeros((2, 1, 5), dtype=mx.int32),
+                )
+            )
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 

@@ -383,6 +383,16 @@ def generate_step(
                 "position_ids must have shape (3, L) or (3, 1, L), got "
                 f"{position_ids.shape}."
             )
+        # A length mismatch would silently misalign the per-chunk slicing
+        # below, which is the exact failure mode explicit positions exist to
+        # remove. Check it against the same sequence input_embeddings is
+        # checked against.
+        seq_len = len(input_embeddings) if input_embeddings is not None else len(prompt)
+        if position_ids.shape[-1] != seq_len:
+            raise ValueError(
+                f"position_ids sequence length ({position_ids.shape[-1]}) must "
+                f"match the sequence length of the prompt ({seq_len})."
+            )
         next_position = int(position_ids.max()) + 1
 
     tokens = None
