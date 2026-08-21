@@ -367,8 +367,8 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self._model_map.get(model_path, model_path)
         adapter_path = self._adapter_map.get(model_path, adapter_path)
+        model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
