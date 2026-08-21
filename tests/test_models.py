@@ -589,6 +589,21 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, rope_utils.MRoPE))
 
+        # An mrope_section paired with a SCALING scheme must keep that scheme:
+        # M-RoPE here does not implement scaling, so intercepting these would
+        # silently drop it.
+        for scaled in ("linear", "llama3", "yarn"):
+            cfg = {"rope_type": scaled, "factor": 2.0, "mrope_section": [6, 5, 5]}
+            if scaled == "yarn":
+                cfg["original_max_position_embeddings"] = 2048
+            scaled_rope = rope_utils.initialize_rope(
+                32, base=100.0, traditional=False, scaling_config=cfg
+            )
+            self.assertFalse(
+                isinstance(scaled_rope, rope_utils.MRoPE),
+                f"{scaled} scaling must not be intercepted by M-RoPE",
+            )
+
         # A config with no mrope_section keeps the plain fused RoPE.
         plain = rope_utils.initialize_rope(32, base=100.0, traditional=False)
         self.assertTrue(isinstance(plain, nn.RoPE))

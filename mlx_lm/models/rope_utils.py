@@ -367,8 +367,14 @@ def initialize_rope(
     # M-RoPE is signalled by the presence of `mrope_section`, not by the rope
     # "type": Qwen3-VL / Qwen3.5 configs still report their type as "default"
     # while carrying an mrope_section, so keying off the type alone misses them.
+    #
+    # Restricted to the unscaled types on purpose. A config that pairs an
+    # mrope_section with a scaling scheme (linear/yarn/llama3/longrope) still
+    # needs that scheme applied, and this class does not implement it -- falling
+    # through preserves today's behaviour rather than silently dropping the
+    # scaling.
     mrope_section = (scaling_config or {}).get("mrope_section")
-    if mrope_section or rope_type == "mrope":
+    if rope_type in ("default", "mrope") and (mrope_section or rope_type == "mrope"):
         assert (
             mrope_section is not None and len(mrope_section) == 3
         ), f"MRoPE currently only supports 3 sections, got {mrope_section}."
