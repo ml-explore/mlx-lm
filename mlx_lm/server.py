@@ -9,6 +9,7 @@ import socket
 import time
 import uuid
 import warnings
+from collections import Counter
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,6 +34,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
@@ -40,7 +42,7 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import CacheList, LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -271,6 +273,50 @@ class TimeBudget:
         raise StopIteration()
 
 
+def _check_kv_cache_quantizable(cache, kv_group_size, kv_bits, max_kv_size=None):
+    """
+    Raise if any KV cache entry cannot be quantized.
+
+    Converting an empty cache is free, so this tries the real conversion and
+    reports the reason the cache gives.
+    """
+    total = 0
+    unsupported = Counter()
+    for c in cache:
+        if isinstance(c, CacheList):
+            # maybe_quantize_kv_cache does not descend into CacheList, and must
+            # not: deepseek_v32 and longcat_flash read the fetched entries
+            # directly and fail on a quantized cache.
+            total += 1
+            unsupported[(type(c).__name__, "nested KV caches are not quantized")] += 1
+            continue
+        if not hasattr(c, "to_quantized"):
+            # Non-KV state, e.g. the ArraysCache of a Mamba layer, is not
+            # affected by --kv-bits.
+            continue
+        total += 1
+        try:
+            c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+        except NotImplementedError as e:
+            unsupported[(type(c).__name__, str(e))] += 1
+
+    if not unsupported:
+        return
+
+    summary = ", ".join(
+        f"{n} x {name} ({reason})" for (name, reason), n in sorted(unsupported.items())
+    )
+    hint = "Serve without --kv-bits"
+    if max_kv_size is not None:
+        hint += ", or without --max-kv-size, which builds a RotatingKVCache"
+    raise ValueError(
+        f"--kv-bits {kv_bits} was requested but {sum(unsupported.values())} of "
+        f"{total} cache layers cannot be quantized: {summary}. Serving with only "
+        "the remaining layers quantized would ignore part of the request without "
+        f"reporting it. {hint}."
+    )
+
+
 class ModelProvider:
     def __init__(self, cli_args: argparse.Namespace):
         """Load models on demand and persist them across the whole process."""
@@ -354,6 +400,22 @@ class ModelProvider:
         is_batchable = is_batchable and all(
             hasattr(c, "merge") for c in make_prompt_cache(model)
         )
+
+        # Fail at load, not part-way through a request.
+        if self.cli_args.kv_bits is not None:
+            probe_cache = make_prompt_cache(
+                model, max_kv_size=self.cli_args.max_kv_size
+            )
+            if draft_model is not None:
+                probe_cache += make_prompt_cache(
+                    draft_model, max_kv_size=self.cli_args.max_kv_size
+                )
+            _check_kv_cache_quantizable(
+                probe_cache,
+                self.cli_args.kv_group_size,
+                self.cli_args.kv_bits,
+                max_kv_size=self.cli_args.max_kv_size,
+            )
 
         # Update the member variables
         self.model_key = (model_path, adapter_path, draft_model_path)
@@ -619,9 +681,8 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
-        # The batched generator uses BatchKVCache, which has no quantized
-        # variant yet, so route through the single-sequence path (which does
-        # support KV quantization) whenever --kv-bits is requested.
+        # BatchGenerator takes no kv_bits, so route through the single-sequence
+        # path, which can quantize.
         if self.cli_args.kv_bits is not None:
             return False
         return self.model_provider.is_batchable and args.seed is None
@@ -1881,9 +1942,9 @@ def main():
     parser.add_argument(
         "--quantized-kv-start",
         type=int,
-        default=5000,
+        default=DEFAULT_QUANTIZED_KV_START,
         help="When --kv-bits is set, begin quantizing the KV cache after "
-        "this many tokens (default: 5000).",
+        f"this many tokens (default: {DEFAULT_QUANTIZED_KV_START}).",
     )
     parser.add_argument(
         "--max-kv-size",

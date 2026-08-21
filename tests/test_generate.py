@@ -13,9 +13,10 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    maybe_quantize_kv_cache,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, CacheList, KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -802,6 +803,22 @@ class TestGenerate(unittest.TestCase):
             if r.finish_reason is not None:
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, KVCache)
+
+    def test_maybe_quantize_kv_cache_leaves_nested_caches_alone(self):
+        # CacheList must stay untouched: deepseek_v32 and longcat_flash read the
+        # fetched entries directly and fail on a quantized cache.
+        keys = mx.zeros((1, 1, 4, 64))
+        values = mx.zeros((1, 1, 4, 64))
+        inner = KVCache()
+        inner.update_and_fetch(keys, values)
+        prompt_cache = [CacheList(ArraysCache(size=2), inner)]
+
+        maybe_quantize_kv_cache(
+            prompt_cache, quantized_kv_start=0, kv_group_size=32, kv_bits=4
+        )
+
+        self.assertIsInstance(prompt_cache[0], CacheList)
+        self.assertIs(prompt_cache[0].caches[1], inner)
 
     def test_batch_generate_return_logprobs(self):
         """Test that batch_generate returns per-token logprobs when requested."""
