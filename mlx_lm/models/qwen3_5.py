@@ -231,11 +231,16 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if self.is_linear:
+            # Linear-attention (Gated DeltaNet) layers carry no rotary
+            # embedding, so positions are irrelevant to them.
             r = self.linear_attn(self.input_layernorm(x), mask, cache)
         else:
-            r = self.self_attn(self.input_layernorm(x), mask, cache)
+            r = self.self_attn(
+                self.input_layernorm(x), mask, cache, position_ids=position_ids
+            )
         h = x + r
         out = h + self.mlp(self.post_attention_layernorm(h))
         return out
@@ -269,6 +274,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -294,7 +300,9 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
 
         for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, position_ids=position_ids
+            )
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -330,8 +338,14 @@ class TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        out = self.model(
+            inputs,
+            cache,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
+        )
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
@@ -415,9 +429,13 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
         )
 
     @property

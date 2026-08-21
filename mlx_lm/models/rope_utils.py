@@ -272,6 +272,84 @@ class DynamicNTKScalingRoPE(nn.Module):
         )
 
 
+class MRoPE(nn.Module):
+    """Multimodal RoPE (M-RoPE), as used by the Qwen2-VL / Qwen3-VL family.
+
+    Standard RoPE derives a token's rotation angle from a single scalar
+    position. M-RoPE derives it from a 3-vector ``(t, h, w)`` -- temporal,
+    height and width -- so that image patches carry their grid coordinates
+    instead of their flattened index.
+
+    For text-only input all three components equal the sequence index, and
+    M-RoPE reduces exactly to 1-D RoPE. That is why text generation is
+    unaffected by which of the two is used, and why this class falls back to
+    the fused ``nn.RoPE`` kernel whenever ``position_ids`` is ``None``: the
+    text path keeps its current speed and stays bit-identical.
+
+    The two only diverge when image or video tokens are present, which is the
+    case when embeddings produced by a vision encoder are supplied through the
+    ``input_embeddings`` argument of ``generate_step``.
+
+    Args:
+        dims (int): Number of feature dimensions to rotate. Any remaining
+          dimensions are passed through unchanged (partial rotary).
+        base (float): Base for the exponential frequency scaling.
+        mrope_section (list[int]): Per-axis frequency budget ``[t, h, w]``.
+        traditional (bool): Traditional (interleaved-pair) rotation. Only
+          used on the ``position_ids is None`` fallback path.
+    """
+
+    def __init__(
+        self,
+        dims: int,
+        base: float = 10000.0,
+        mrope_section: Optional[List[int]] = None,
+        traditional: bool = False,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.mrope_section = list(mrope_section or [])
+        # Fallback used for text-only input; keeps the fused Metal kernel.
+        self._rope = nn.RoPE(dims, traditional=traditional, base=base)
+
+        half = dims // 2
+        self._inv_freq = base ** (-mx.arange(0, half, dtype=mx.float32) / half)
+        # selector[i] says which of (t, h, w) supplies the position for
+        # frequency i. Qwen interleaves them as t,h,w,t,h,w,... over the span
+        # covered by mrope_section, with the tail falling back to t.
+        selector = [0] * half
+        for axis, start in enumerate((1, 2), start=1):
+            for i in range(start, min(self.mrope_section[axis] * 3, half), 3):
+                selector[i] = axis
+        self._selector = mx.array(selector, dtype=mx.int32)
+
+    def __call__(
+        self,
+        x: mx.array,
+        offset: int = 0,
+        position_ids: Optional[mx.array] = None,
+    ) -> mx.array:
+        if position_ids is None:
+            # Text-only: identical to the behaviour before this class existed.
+            return self._rope(x, offset=offset)
+
+        # position_ids: (3, B, L) -> per-frequency positions (B, L, dims // 2)
+        freqs = mx.take(position_ids, self._selector, axis=0).transpose(1, 2, 0)
+        freqs = freqs.astype(mx.float32) * self._inv_freq
+        emb = mx.concatenate([freqs, freqs], axis=-1)
+        cos = mx.expand_dims(mx.cos(emb), axis=1).astype(x.dtype)
+        sin = mx.expand_dims(mx.sin(emb), axis=1).astype(x.dtype)
+
+        # Partial rotary: rotate the leading `dims` features, pass the rest on.
+        rot, passthrough = x[..., : self.dims], x[..., self.dims :]
+        half = self.dims // 2
+        rotated = mx.concatenate([-rot[..., half:], rot[..., :half]], axis=-1)
+        out = rot * cos + rotated * sin
+        if passthrough.shape[-1] > 0:
+            out = mx.concatenate([out, passthrough], axis=-1)
+        return out
+
+
 def initialize_rope(
     dims,
     base,
@@ -285,6 +363,21 @@ def initialize_rope(
         )
     else:
         rope_type = "default"
+
+    # M-RoPE is signalled by the presence of `mrope_section`, not by the rope
+    # "type": Qwen3-VL / Qwen3.5 configs still report their type as "default"
+    # while carrying an mrope_section, so keying off the type alone misses them.
+    mrope_section = (scaling_config or {}).get("mrope_section")
+    if mrope_section or rope_type == "mrope":
+        assert (
+            mrope_section is not None and len(mrope_section) == 3
+        ), f"MRoPE currently only supports 3 sections, got {mrope_section}."
+        return MRoPE(
+            dims,
+            base=base,
+            mrope_section=mrope_section,
+            traditional=traditional,
+        )
 
     if rope_type in ["default", "linear"]:
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
@@ -347,11 +440,5 @@ def initialize_rope(
             base=base,
             factor=scaling_config.get("factor", 1.0),
         )
-    elif rope_type == "mrope":
-        mrope_section = scaling_config.get("mrope_section", [])
-        assert (
-            len(mrope_section) == 3
-        ), f"MRoPE currently only supports 3 sections, got {len(mrope_section)}."
-        return nn.RoPE(dims, traditional=traditional, base=base)
     else:
         raise ValueError(f"Unsupported RoPE type {rope_type}")
