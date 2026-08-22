@@ -2151,6 +2151,36 @@ def main():
     else:
         prompt = tokenizer.encode(prompt)
 
+    # Diffusion models (e.g. DiffusionGemma) denoise a fixed token canvas rather
+    # than emit tokens autoregressively — dispatch to the model's own generator
+    # instead of the token-by-token loop. Generic: any model exposing
+    # `diffusion_generate` opts in; no model-specific import here.
+    if hasattr(model, "diffusion_stream_generate"):
+        import time
+
+        # Block-diffusion: STREAM each canvas as it commits (watch it generate) instead
+        # of freeze-then-dump. `--max-tokens` drives the canvas count; an EOS in a
+        # committed canvas ends generation.
+        eos_ids = set(getattr(tokenizer, "eos_token_ids", None) or [tokenizer.eos_token_id])
+        gen_kwargs = {"max_tokens": args.max_tokens, "eos_token_ids": eos_ids}
+        tic = time.perf_counter()
+        n_tokens, n_canvases = 0, 0
+        for canvas in model.diffusion_stream_generate(mx.array([prompt]), **gen_kwargs):
+            mx.eval(canvas)
+            n_canvases += 1
+            toks = canvas[0].tolist()
+            n_tokens += len(toks)
+            cut = next((i for i, t in enumerate(toks) if t in eos_ids), len(toks))
+            print(tokenizer.decode(toks[:cut]), end="", flush=True)
+            if cut < len(toks):  # EOS committed in this canvas → done
+                break
+        dt = time.perf_counter() - tic
+        print()
+        if args.verbose:
+            print(f"{'=' * 10}\n{n_tokens} tokens across {n_canvases} canvas(es) in "
+                  f"{dt:.3f}s ({n_tokens / dt:.1f} tok/s)", flush=True)
+        return
+
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
