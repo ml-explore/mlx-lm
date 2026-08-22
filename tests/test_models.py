@@ -10,7 +10,12 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -443,6 +448,41 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gear(self):
+        from mlx_lm.models import gear
+
+        args = gear.ModelArgs(
+            model_type="gear",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=100,
+            layer_types=[
+                "sliding_attention",
+                "conv_mixer",
+                "full_attention",
+                "conv_mixer",
+            ],
+            sliding_window=4,
+            conv_L_cache=3,
+            rope_theta=10000,
+            rope_local_base_freq=1000,
+        )
+        model = gear.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], ArraysCache)
+        self.assertIsInstance(caches[2], KVCache)
+        self.assertIsInstance(caches[3], ArraysCache)
 
     def test_lfm2_moe(self):
         from mlx_lm.models import lfm2_moe
