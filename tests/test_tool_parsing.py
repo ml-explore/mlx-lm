@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 
 from mlx_lm.tool_parsers import (
+    apertus,
     function_gemma,
     gemma4,
     glm47,
@@ -312,6 +313,61 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_apertus(self):
+        # Single tool call
+        test_case = '[{"multiply": {"a": 12234585, "b": 48838483920}}]'
+        tool_calls = apertus.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Multiple tool calls
+        test_case = (
+            '[{"get_weather": {"location": "London"}}, '
+            '{"get_time": {"location": "London"}}]'
+        )
+        tool_calls = apertus.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "get_weather", "arguments": {"location": "London"}},
+            {"name": "get_time", "arguments": {"location": "London"}},
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Nested arguments
+        test_case = (
+            '[{"complex_function": {"nested": {"inner": "value"}, "list": ["a", "b"]}}]'
+        )
+        tool_calls = apertus.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "name": "complex_function",
+                "arguments": {"nested": {"inner": "value"}, "list": ["a", "b"]},
+            }
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Null arguments are normalized so clients receive an empty object
+        test_case = '[{"get_time": null}]'
+        tool_calls = apertus.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "get_time", "arguments": {}}])
+
+        # A bare object rather than an array
+        test_case = '{"get_time": {}}'
+        tool_calls = apertus.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "get_time", "arguments": {}}])
+
+        # Entries which cannot be a tool call are skipped
+        test_case = '[{"get_time": {}}, {}, "junk"]'
+        tool_calls = apertus.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "get_time", "arguments": {}}])
+
+        # Nothing parseable raises, as does a call truncated mid generation
+        with self.assertRaises(ValueError):
+            apertus.parse_tool_call("[]", None)
+        with self.assertRaises(ValueError):
+            apertus.parse_tool_call('[{"get_weather": {"location": "London"}', None)
 
     def test_minimax_m2(self):
         test_case = (
