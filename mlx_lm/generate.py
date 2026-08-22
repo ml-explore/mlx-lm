@@ -1077,6 +1077,9 @@ def make_text_state_machine(tokenizer, stop_words=None):
             [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
         )
 
+    for w in getattr(tokenizer, "structural_markers", None) or ():
+        transitions.setdefault("normal", []).append((w, "normal"))
+
     if stop_words:
         for state_name in set(transitions) | {"normal"}:
             for w in stop_words:

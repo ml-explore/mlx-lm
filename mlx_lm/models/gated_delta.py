@@ -10,6 +10,13 @@ def compute_g(A_log, a, dt_bias):
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
+@partial(mx.compile, shapeless=True)
+def compute_g_safe(A_log, a, dt_bias, lower_bound):
+    return mx.exp(
+        lower_bound * mx.sigmoid(mx.exp(A_log.astype(mx.float32)) * (a + dt_bias))
+    )
+
+
 def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     if not mx.metal.is_available():
         return None
@@ -270,14 +277,27 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    lower_bound: Optional[float] = None,
+    beta_scale: float = 1.0,
 ) -> Tuple[mx.array, mx.array]:
     beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
+    if beta_scale != 1.0:
+        beta = beta * beta_scale
+    if lower_bound is None:
+        g = compute_g(A_log, a, dt_bias)
+    else:
+        g = compute_g_safe(A_log, a, dt_bias, lower_bound)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if (
+        not use_kernel
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or k.shape[-1] < 32
+        or k.shape[-1] % 32 != 0
+    ):
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
