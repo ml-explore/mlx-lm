@@ -10,7 +10,7 @@ import mlx.core as mx
 import requests
 
 from mlx_lm.generate import TextStateMachine
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, PromptTrie
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
@@ -563,6 +563,29 @@ class TestKeepalive(unittest.TestCase):
             keepalive_callback(3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
+
+
+class TestPromptTrie(unittest.TestCase):
+    def test_search_finds_shortest_longer_sequence(self):
+        trie = PromptTrie()
+        model = object()
+        trie.add(model, [1, 2, 3, 4], "long")
+        trie.add(model, [1, 5, 6], "short")
+
+        result = trie.search(model, [1])
+
+        self.assertEqual(result.longer, [1, 5, 6])
+        self.assertEqual(result.common_prefix, 1)
+
+    def test_search_longer_sequence_tie_breaking(self):
+        trie = PromptTrie()
+        model = object()
+        trie.add(model, [1, 2, 3], "first")
+        trie.add(model, [1, 4, 5], "second")
+
+        result = trie.search(model, [1])
+
+        self.assertEqual(result.longer, [1, 4, 5])
 
 
 class TestLRUPromptCache(unittest.TestCase):

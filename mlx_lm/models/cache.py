@@ -1616,15 +1616,28 @@ class PromptTrie:
         common_prefix = index
         if index > 0:
             best = None
-            stack = [(current, [])]
+            # Reuse one path while traversing instead of copying the growing
+            # path for every node. Markers restore it after each child.
+            path = []
+            pop_path = object()
+            stack = [(current, None, False)]
             while stack:
-                current, extra = stack.pop()
+                item = stack.pop()
+                if item is pop_path:
+                    path.pop()
+                    continue
+
+                current, tok, append_token = item
+                if append_token:
+                    path.append(tok)
+
                 if "__value__" in current:
-                    if best is None or len(extra) < len(best):
-                        best = extra
-                elif best is None or len(extra) < len(best):
+                    if best is None or len(path) < len(best):
+                        best = list(path)
+                elif best is None or len(path) < len(best):
                     for tok in current:
-                        stack.append((current[tok], extra + [tok]))
+                        stack.append(pop_path)
+                        stack.append((current[tok], tok, True))
             longer = tokens[:index] + best
         return PromptTrieResult(model, None, shorter, longer, common_prefix)
 
