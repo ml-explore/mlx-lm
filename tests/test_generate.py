@@ -470,6 +470,54 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
+    def test_batch_processors_and_samplers_survive_a_request_without_them(self):
+        """A per-request logits processor (or sampler) must run on every step
+        of a request that follows one which had none. GenerationBatch.filter
+        used to prune the per-sequence lists only ``if any(...)``, so a
+        finished request with an empty entry left it behind and the next
+        request's processor was indexed under the wrong uid: it ran once
+        (the batch's own first step) and never again."""
+        prompt = self.tokenizer.encode("hello")
+
+        def run(batch_gen, uid):
+            n = 0
+            while True:
+                for r in batch_gen.next_generated():
+                    if r.uid == uid:
+                        n += 1
+                        if r.finish_reason is not None:
+                            return n
+
+        # processors: a plain request, then one carrying a processor
+        batch_gen = BatchGenerator(self.model, max_tokens=3)
+        (uid,) = batch_gen.insert([prompt])
+        run(batch_gen, uid)
+        calls = []
+
+        def processor(tokens, logits):
+            calls.append(len(tokens))
+            return logits
+
+        (uid,) = batch_gen.insert([prompt], logits_processors=[[processor]])
+        n_tokens = run(batch_gen, uid)
+        # one call per generated token, plus the step that sampled the token
+        # after the last one returned
+        self.assertEqual(len(calls), n_tokens + 1)
+
+        # samplers: a plain request, then one carrying a sampler
+        batch_gen = BatchGenerator(self.model, max_tokens=3)
+        (uid,) = batch_gen.insert([prompt])
+        run(batch_gen, uid)
+        sampled = []
+
+        def sampler(logprobs):
+            sampled.append(True)
+            return mx.argmax(logprobs, axis=-1)
+
+        (uid,) = batch_gen.insert([prompt], samplers=[sampler])
+        n_tokens = run(batch_gen, uid)
+        self.assertEqual(len(sampled), n_tokens + 1)
+
     def test_batch_generate_with_stop_matchers(self):
         """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
         batch_gen = BatchGenerator(
