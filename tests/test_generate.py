@@ -8,7 +8,9 @@ import mlx.core as mx
 
 from mlx_lm.generate import (
     BatchGenerator,
+    GenerationBatch,
     GenerationResponse,
+    PromptProcessingBatch,
     StopSequenceMatcher,
     batch_generate,
     generate,
@@ -401,6 +403,60 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid0].logprobs[0].item(), 0.0)
         self.assertEqual(responses[uid1].logprobs[1].item(), 0.0)
         self.assertEqual(responses[uid2].logprobs[2].item(), 0.0)
+
+    def test_prompt_processing_batch_extend_mixes_logits_processors(self):
+        """Test PromptProcessingBatch.extend produces a per-slot list with no None entries when merging an unconfigured batch with a processor-equipped batch."""
+        fallback = lambda x: mx.argmax(x, axis=-1)
+        a = PromptProcessingBatch.empty(self.model, fallback)
+        a.uids = [0]
+        a.tokens = [[]]
+        a.samplers = []
+        a.logits_processors = []
+        a.max_tokens = [1]
+        a.stop_matchers = [StopSequenceMatcher()]
+        a.prompt_cache = []
+
+        procs = make_logits_processors({0: 2000.0})
+        b = PromptProcessingBatch.empty(self.model, fallback)
+        b.uids = [1]
+        b.tokens = [[]]
+        b.samplers = []
+        b.logits_processors = [procs]
+        b.max_tokens = [1]
+        b.stop_matchers = [StopSequenceMatcher()]
+        b.prompt_cache = []
+
+        a.extend(b)
+
+        self.assertEqual(len(a.logits_processors), 2)
+        for entry in a.logits_processors:
+            self.assertIsInstance(entry, list)
+
+    def test_generation_batch_filter_resets_empty_per_slot_lists(self):
+        """GenerationBatch.filter must trim samplers/logits_processors even
+        when every slot is empty (any() is False) — otherwise the lists keep
+        stale length, and a subsequent extend() appends new sequences' entries
+        at shifted indices, silently bypassing their processors for one step."""
+        fallback = lambda x: mx.argmax(x, axis=-1)
+        batch = GenerationBatch.empty(self.model, fallback)
+        matcher = StopSequenceMatcher()
+        batch.uids = [0, 1]
+        batch.prompt_cache = []
+        batch.tokens = [[], []]
+        batch.samplers = [None, None]
+        batch.logits_processors = [[], []]
+        batch.max_tokens = [1, 1]
+        batch.stop_matchers = [matcher, matcher]
+        batch._next_tokens = mx.array([0, 0], dtype=mx.uint32)
+        batch._next_logprobs = [None, None]
+        batch._token_context = [[], []]
+        batch._num_tokens = [0, 0]
+        batch._matcher_states = [matcher.make_state(), matcher.make_state()]
+
+        batch.filter([1])
+
+        self.assertEqual(len(batch.samplers), 1)
+        self.assertEqual(len(batch.logits_processors), 1)
 
     def test_batch_generate_processor_tokens_match_prompt_on_first_step(self):
         prompt = self.tokenizer.encode("hello")
