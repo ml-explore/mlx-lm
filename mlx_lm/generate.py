@@ -31,7 +31,11 @@ from .models.cache import (
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
-from .utils import does_model_support_input_embeddings, load
+from .utils import (
+    does_model_support_input_embeddings,
+    does_model_support_position_ids,
+    load,
+)
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -310,6 +314,7 @@ def generate_step(
     quantized_kv_start: int = 0,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
+    position_ids: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -336,6 +341,12 @@ def generate_step(
            when ``kv_bits`` is non-None. Default: ``0``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
+        position_ids (mx.array, optional): Explicit positions of shape
+          ``(3, L)`` or ``(3, 1, L)`` for M-RoPE models. Required only when
+          the prompt contains image or video embeddings, whose positions are
+          grid coordinates rather than sequence indices. Generated tokens
+          continue from one past the largest prompt position.
+          Default: ``None``.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
           conjunction with prompt tokens. Default: ``None``.
 
@@ -355,6 +366,34 @@ def generate_step(
         raise ValueError(
             "Either input_embeddings or prompt (or both) must be provided."
         )
+
+    # M-RoPE positions. Text-only generation leaves this None and keeps the
+    # fused rotary kernel; it is only needed when image/video embeddings are
+    # present, since those carry grid coordinates instead of sequence indices.
+    next_position = None
+    if position_ids is not None:
+        if not does_model_support_position_ids(model):
+            raise ValueError(
+                f"Model {type(model).__name__} does not support position_ids."
+            )
+        if position_ids.ndim == 2:
+            position_ids = position_ids[:, None, :]
+        if position_ids.ndim != 3 or position_ids.shape[0] != 3:
+            raise ValueError(
+                "position_ids must have shape (3, L) or (3, 1, L), got "
+                f"{position_ids.shape}."
+            )
+        # A length mismatch would silently misalign the per-chunk slicing
+        # below, which is the exact failure mode explicit positions exist to
+        # remove. Check it against the same sequence input_embeddings is
+        # checked against.
+        seq_len = len(input_embeddings) if input_embeddings is not None else len(prompt)
+        if position_ids.shape[-1] != seq_len:
+            raise ValueError(
+                f"position_ids sequence length ({position_ids.shape[-1]}) must "
+                f"match the sequence length of the prompt ({seq_len})."
+            )
+        next_position = int(position_ids.max()) + 1
 
     tokens = None
 
@@ -376,7 +415,18 @@ def generate_step(
 
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
-    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+    def _model_call(
+        input_tokens: mx.array,
+        input_embeddings: Optional[mx.array],
+        position_ids: Optional[mx.array] = None,
+    ):
+        if position_ids is not None:
+            return model(
+                input_tokens,
+                cache=prompt_cache,
+                input_embeddings=input_embeddings,
+                position_ids=position_ids,
+            )
         if input_embeddings is not None:
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
@@ -384,7 +434,11 @@ def generate_step(
         else:
             return model(input_tokens, cache=prompt_cache)
 
-    def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
+    def _step(
+        input_tokens: mx.array,
+        input_embeddings: Optional[mx.array] = None,
+        position_ids: Optional[mx.array] = None,
+    ):
         nonlocal tokens
 
         with mx.stream(generation_stream):
@@ -393,6 +447,7 @@ def generate_step(
                 input_embeddings=(
                     input_embeddings[None] if input_embeddings is not None else None
                 ),
+                position_ids=position_ids,
             )
 
             logits = logits[:, -1, :]
@@ -428,6 +483,11 @@ def generate_step(
                     if input_embeddings is not None
                     else None
                 ),
+                position_ids=(
+                    position_ids[..., :n_to_process]
+                    if position_ids is not None
+                    else None
+                ),
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
@@ -439,15 +499,31 @@ def generate_step(
                 if input_embeddings is not None
                 else input_embeddings
             )
+            if position_ids is not None:
+                position_ids = position_ids[..., n_to_process:]
             mx.clear_cache()
 
-        y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+        y, logprobs = _step(
+            input_tokens=prompt,
+            input_embeddings=input_embeddings,
+            position_ids=position_ids,
+        )
+
+    def _decode_positions():
+        # After the prompt, every generated token is ordinary text, so all
+        # three M-RoPE axes advance together -- exactly like 1-D RoPE.
+        nonlocal next_position
+        p = mx.full((3, 1, 1), next_position, dtype=mx.int32)
+        next_position += 1
+        return p
 
     mx.async_eval(y, logprobs)
     n = 0
     while True:
         if n != max_tokens:
-            next_y, next_logprobs = _step(y)
+            next_y, next_logprobs = _step(
+                y, position_ids=None if next_position is None else _decode_positions()
+            )
             mx.async_eval(next_y, next_logprobs)
         if n == 0:
             mx.eval(y)

@@ -123,6 +123,7 @@ class Qwen3NextAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        position_ids: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
 
@@ -142,13 +143,16 @@ class Qwen3NextAttention(nn.Module):
             0, 2, 1, 3
         )
 
+        # `position_ids` is only ever non-None for M-RoPE models being fed
+        # image/video embeddings; every other path keeps the fused kernel.
+        rope_kwargs = {} if position_ids is None else {"position_ids": position_ids}
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            queries = self.rope(queries, offset=cache.offset, **rope_kwargs)
+            keys = self.rope(keys, offset=cache.offset, **rope_kwargs)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            queries = self.rope(queries, **rope_kwargs)
+            keys = self.rope(keys, **rope_kwargs)
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
