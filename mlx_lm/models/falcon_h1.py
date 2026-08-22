@@ -471,9 +471,9 @@ class Model(nn.Module):
                 param *= args.embedding_multiplier
             elif name.endswith("lm_head.weight"):
                 param *= args.lm_head_multiplier
-            elif name.endswith("q_proj.weight") or name.endswith("k_proj.weight"):
+            elif name.endswith("q_proj.weight"):
                 param *= args.attention_in_multiplier
-            elif name.endswith("key_proj.weight"):
+            elif name.endswith("k_proj.weight") or name.endswith("key_proj.weight"):
                 param *= args.attention_in_multiplier * args.key_multiplier
             elif name.endswith("o_proj.weight"):
                 param *= args.attention_out_multiplier
