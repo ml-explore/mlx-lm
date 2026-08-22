@@ -1301,7 +1301,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
             choice[key_name] = {"role": "assistant"}
-            if text:
+            if not self.stream:
+                # The schema requires "content" field to be present
+                choice[key_name]["content"] = text if text else None
+            elif text:
                 choice[key_name]["content"] = text
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
