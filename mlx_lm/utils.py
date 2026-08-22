@@ -54,6 +54,7 @@ MODEL_REMAPPING = {
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "nemotron_h_puzzle": "nemotron_h",
 }
 
 MAX_FILE_SIZE_GB = 5
