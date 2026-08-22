@@ -7,6 +7,7 @@ from mlx_lm.tool_parsers import (
     glm47,
     json_tools,
     kimi_k2,
+    lfm2,
     longcat,
     minimax_m2,
     mistral,
@@ -52,6 +53,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 "[multiply(a=12234585, b=48838483920)]",
                 pythonic,
+            ),
+            (
+                "[multiply(a=12234585, b=48838483920)]",
+                lfm2,
             ),
             (
                 'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
@@ -122,6 +127,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '[get_current_temperature(location="London")]',
                 pythonic,
+            ),
+            (
+                '[get_current_temperature(location="London")]',
+                lfm2,
             ),
             (
                 'get_current_temperature[ARGS]{"location": "London"}',
@@ -312,6 +321,76 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_lfm2(self):
+        # Basic single call (LFM2.5 server failure: basic_tool_call)
+        tool_call = lfm2.parse_tool_call('[get_current_time(location="Paris")]', None)
+        self.assertEqual(
+            tool_call,
+            {"name": "get_current_time", "arguments": {"location": "Paris"}},
+        )
+
+        # multi_tool_choice failure
+        tool_call = lfm2.parse_tool_call(
+            '[get_current_temperature(location="Tokyo")]', None
+        )
+        self.assertEqual(
+            tool_call,
+            {"name": "get_current_temperature", "arguments": {"location": "Tokyo"}},
+        )
+
+        # Dotted function name + nested list-of-dicts argument
+        # (complex_tool_call failure).
+        text = (
+            "[grocery.orderIngredients("
+            "ingredientList=["
+            '{"name": "noodles", "amount": 500, "unit": "grams"}, '
+            '{"name": "ground beef", "amount": 300, "unit": "grams"}, '
+            '{"name": "za\'atar", "amount": 1, "unit": "gram"}'
+            "], "
+            'deliveryAddress="845 Willow Lane, Springfield, IL 62704, United States"'
+            ")]"
+        )
+        tool_call = lfm2.parse_tool_call(text, None)
+        self.assertEqual(tool_call["name"], "grocery.orderIngredients")
+        self.assertEqual(
+            tool_call["arguments"]["deliveryAddress"],
+            "845 Willow Lane, Springfield, IL 62704, United States",
+        )
+        self.assertEqual(len(tool_call["arguments"]["ingredientList"]), 3)
+        self.assertEqual(
+            tool_call["arguments"]["ingredientList"][0],
+            {"name": "noodles", "amount": 500, "unit": "grams"},
+        )
+        self.assertEqual(tool_call["arguments"]["ingredientList"][2]["name"], "za'atar")
+
+        # Multiple calls in one block returns a list
+        tool_calls = lfm2.parse_tool_call(
+            '[get_current_time(location="Paris"), '
+            'get_current_temperature(location="Paris")]',
+            None,
+        )
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "get_current_time")
+        self.assertEqual(tool_calls[1]["name"], "get_current_temperature")
+
+        # JSON-style booleans / null tolerated as fallback
+        tool_call = lfm2.parse_tool_call(
+            "[configure(enabled=true, retries=null, verbose=false)]", None
+        )
+        self.assertEqual(
+            tool_call["arguments"],
+            {"enabled": True, "retries": None, "verbose": False},
+        )
+
+        # Hyphenated names are not valid Python identifiers — must raise.
+        with self.assertRaises(ValueError):
+            lfm2.parse_tool_call('[manim-video(mode="plan")]', None)
+
+        # Non-list payloads are rejected.
+        with self.assertRaises(ValueError):
+            lfm2.parse_tool_call('get_current_time(location="Paris")', None)
 
     def test_minimax_m2(self):
         test_case = (
