@@ -739,11 +739,7 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size. Compare against the number of
-        # *valid* cached tokens (offset - start_position), not self.keys.shape[2]:
-        # the buffer is over-allocated in blocks of `step` and valid tokens are
-        # front-filled at [0:valid], so using the padded buffer size trims away
-        # live tokens (keeping unfilled padding) and corrupts start_position.
+        # Maintain the cache below the chunk size.
         if self.keys is None:
             return
         valid = self.offset - self.start_position
