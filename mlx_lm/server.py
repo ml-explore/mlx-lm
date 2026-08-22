@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Event, Thread
 from typing import (
     Any,
     Callable,
@@ -231,6 +231,10 @@ class Response:
     top_tokens: Tuple[Dict[str, Any]]
 
 
+class GenerationThreadError(RuntimeError):
+    """Raised when the generation thread is no longer available."""
+
+
 class TimeBudget:
     def __init__(self, budget=0.5, iterations=25, sync_frequency=10):
         self._is_distributed = mx.distributed.init().size() > 1
@@ -427,7 +431,8 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_stopped = Event()
+        self._generation_thread = Thread(target=self._run_generation)
         self._generation_thread.start()
 
     def stop_and_join(self):
@@ -436,6 +441,31 @@ class ResponseGenerator:
 
     def join(self):
         self._generation_thread.join()
+
+    def _run_generation(self):
+        try:
+            self._generate()
+        finally:
+            self._generation_stopped.set()
+
+    @property
+    def is_healthy(self):
+        return (
+            not self._stop
+            and not self._generation_stopped.is_set()
+            and self._generation_thread.is_alive()
+        )
+
+    def _get_response(self, response_queue):
+        while True:
+            try:
+                return response_queue.get(timeout=0.1)
+            except QueueEmpty:
+                if not self.is_healthy:
+                    raise GenerationThreadError(
+                        "The generation thread is not running. "
+                        "The server needs to be restarted."
+                    ) from None
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -978,12 +1008,18 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
+        if not self.is_healthy:
+            raise GenerationThreadError(
+                "The generation thread is not running. "
+                "The server needs to be restarted."
+            )
+
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
 
         def _inner():
             while True:
-                response = response_queue.get()
+                response = self._get_response(response_queue)
                 if response is None:
                     break
                 if isinstance(response, Exception):
@@ -994,7 +1030,7 @@ class ResponseGenerator:
                     continue
                 yield response
 
-        ctx = response_queue.get()
+        ctx = self._get_response(response_queue)
         if isinstance(ctx, Exception):
             raise ctx
 
@@ -1042,6 +1078,14 @@ class APIHandler(BaseHTTPRequestHandler):
         self.send_header("Content-type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self._set_cors_headers()
+
+    def _send_json_error(self, status_code, error):
+        response = json.dumps({"error": str(error)}).encode()
+        self._set_completion_headers(status_code)
+        self.send_header("Content-Length", str(len(response)))
+        self.end_headers()
+        self.wfile.write(response)
+        self.wfile.flush()
 
     def do_OPTIONS(self):
         self._set_completion_headers(204)
@@ -1373,10 +1417,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 args,
                 progress_callback=keepalive_callback,
             )
+        except GenerationThreadError as e:
+            self._send_json_error(503, e)
+            return
         except Exception as e:
-            self._set_completion_headers(404)
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            self._send_json_error(404, e)
             return
 
         # Prepare the headers
@@ -1385,7 +1430,6 @@ class APIHandler(BaseHTTPRequestHandler):
             self.end_headers()
             logging.debug("Starting stream:")
         else:
-            self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
         # Tool call formatter
@@ -1513,10 +1557,22 @@ class APIHandler(BaseHTTPRequestHandler):
                     logging.debug(f"Outgoing Response: {response_debug}")
 
                 response_json = json.dumps(resp).encode()
+                self._set_completion_headers(200)
                 self.send_header("Content-Length", str(len(response_json)))
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+        except GenerationThreadError as e:
+            if self.stream:
+                error = json.dumps({"error": str(e)})
+                try:
+                    self.wfile.write(f"data: {error}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                self.close_connection = True
+            else:
+                self._send_json_error(503, e)
         finally:
             ctx.stop()
 
@@ -1603,10 +1659,15 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
-        self._set_completion_headers(200)
+        healthy = self.response_generator.is_healthy
+        status_code = 200 if healthy else 503
+        response = json.dumps({"status": "ok" if healthy else "unhealthy"}).encode()
+
+        self._set_completion_headers(status_code)
+        self.send_header("Content-Length", str(len(response)))
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.write(response)
         self.wfile.flush()
 
     def handle_models_request(self):

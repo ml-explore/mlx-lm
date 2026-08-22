@@ -4,7 +4,10 @@ import http
 import io
 import json
 import threading
+import time
 import unittest
+from queue import Empty
+from unittest import mock
 
 import mlx.core as mx
 import requests
@@ -13,6 +16,8 @@ from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
+    GenerationContext,
+    GenerationThreadError,
     LRUPromptCache,
     Response,
     ResponseGenerator,
@@ -91,6 +96,30 @@ class MockCache:
     def trim(self, n):
         assert self._is_trimmable
         return n
+
+
+class ControlledResponseGenerator(ResponseGenerator):
+    def __init__(self, target):
+        self._target = target
+        cli_args = type(
+            "obj",
+            (object,),
+            {
+                "allowed_origins": ["*"],
+                "model": None,
+                "num_draft_tokens": 0,
+                "max_tokens": 8,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+            },
+        )
+        provider = type("obj", (object,), {"cli_args": cli_args})()
+        super().__init__(provider, LRUPromptCache())
+
+    def _generate(self):
+        self._target(self)
 
 
 class TestTextStateMachine(unittest.TestCase):
@@ -563,6 +592,162 @@ class TestKeepalive(unittest.TestCase):
             keepalive_callback(3072, 4096)
         except Exception as e:
             self.fail(f"Callback should handle BrokenPipeError: {e}")
+
+
+class TestGenerationThreadFailure(unittest.TestCase):
+    def test_pending_and_future_requests_fail_when_thread_dies(self):
+        started = threading.Event()
+        fail = threading.Event()
+
+        def crash(_):
+            started.set()
+            fail.wait()
+            raise RuntimeError("worker exploded")
+
+        with mock.patch("threading.excepthook"):
+            response_generator = ControlledResponseGenerator(crash)
+            errors = []
+            clients = []
+            try:
+                self.assertTrue(started.wait(timeout=2))
+
+                def generate():
+                    try:
+                        response_generator.generate(None, None)
+                    except Exception as e:
+                        errors.append(e)
+
+                clients = [
+                    threading.Thread(target=generate, daemon=True) for _ in range(2)
+                ]
+                for client in clients:
+                    client.start()
+
+                deadline = time.monotonic() + 2
+                while response_generator.requests.qsize() < len(clients):
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.01)
+            finally:
+                fail.set()
+                response_generator._generation_thread.join(timeout=2)
+
+            for client in clients:
+                client.join(timeout=2)
+
+        if any(client.is_alive() for client in clients):
+            while True:
+                try:
+                    response_queue, *_ = response_generator.requests.get_nowait()
+                except Empty:
+                    break
+                response_queue.put(RuntimeError("test cleanup"))
+            for client in clients:
+                client.join(timeout=2)
+
+        self.assertTrue(all(not client.is_alive() for client in clients))
+        self.assertEqual(len(errors), len(clients))
+        self.assertTrue(all(isinstance(e, GenerationThreadError) for e in errors))
+
+        queued_requests = response_generator.requests.qsize()
+        with self.assertRaisesRegex(GenerationThreadError, "needs to be restarted"):
+            response_generator.generate(None, None)
+        self.assertEqual(response_generator.requests.qsize(), queued_requests)
+
+    def test_response_iterator_fails_when_thread_dies(self):
+        context_sent = threading.Event()
+        fail = threading.Event()
+
+        def crash(response_generator):
+            response_queue, *_ = response_generator._next_request(timeout=2)
+            response_queue.put(object())
+            context_sent.set()
+            fail.wait()
+            raise RuntimeError("worker exploded")
+
+        with mock.patch("threading.excepthook"):
+            response_generator = ControlledResponseGenerator(crash)
+            try:
+                _, responses = response_generator.generate(None, None)
+                self.assertTrue(context_sent.wait(timeout=2))
+            finally:
+                fail.set()
+                response_generator._generation_thread.join(timeout=2)
+
+            with self.assertRaisesRegex(GenerationThreadError, "needs to be restarted"):
+                next(responses)
+
+    def test_inflight_http_response_terminates_when_thread_dies(self):
+        payload = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 1,
+        }
+
+        for stream in (False, True):
+            with self.subTest(stream=stream), mock.patch("threading.excepthook"):
+
+                def crash(response_generator):
+                    response_queue, *_ = response_generator._next_request(timeout=5)
+                    response_queue.put(
+                        GenerationContext(
+                            has_tool_calling=False,
+                            has_thinking=False,
+                            tool_parser=lambda *_: {},
+                            text_sm=TextStateMachine(),
+                            initial_state="normal",
+                            prompt=[],
+                        )
+                    )
+                    raise RuntimeError("worker exploded")
+
+                response_generator = ControlledResponseGenerator(crash)
+                httpd = http.server.HTTPServer(
+                    ("localhost", 0),
+                    lambda *args, **kwargs: APIHandler(
+                        response_generator,
+                        *args,
+                        system_fingerprint="test",
+                        **kwargs,
+                    ),
+                )
+                server_thread = threading.Thread(
+                    target=httpd.serve_forever, daemon=True
+                )
+                server_thread.start()
+                base_url = f"http://localhost:{httpd.server_port}"
+
+                try:
+                    health = requests.get(f"{base_url}/health", timeout=2)
+                    self.assertEqual(health.status_code, 200)
+
+                    payload["stream"] = stream
+                    response = requests.post(
+                        f"{base_url}/v1/chat/completions",
+                        json=payload,
+                        timeout=2,
+                    )
+                    if stream:
+                        self.assertEqual(response.status_code, 200)
+                        self.assertIn('data: {"error":', response.text)
+                        self.assertNotIn("[DONE]", response.text)
+                    else:
+                        self.assertEqual(response.status_code, 503)
+                        self.assertIn("needs to be restarted", response.json()["error"])
+
+                    health = requests.get(f"{base_url}/health", timeout=2)
+                    self.assertEqual(health.status_code, 503)
+                    self.assertEqual(health.json(), {"status": "unhealthy"})
+
+                    response = requests.post(
+                        f"{base_url}/v1/chat/completions",
+                        json=payload,
+                        timeout=2,
+                    )
+                    self.assertEqual(response.status_code, 503)
+                finally:
+                    response_generator._generation_thread.join(timeout=2)
+                    httpd.shutdown()
+                    httpd.server_close()
+                    server_thread.join(timeout=1)
 
 
 class TestLRUPromptCache(unittest.TestCase):
