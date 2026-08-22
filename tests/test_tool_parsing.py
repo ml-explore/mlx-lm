@@ -8,6 +8,7 @@ from mlx_lm.tool_parsers import (
     json_tools,
     kimi_k2,
     longcat,
+    minicpm5,
     minimax_m2,
     mistral,
     pythonic,
@@ -36,6 +37,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
                 minimax_m2,
+            ),
+            (
+                '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>',
+                minicpm5,
             ),
             (
                 "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
@@ -106,6 +111,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
                 minimax_m2,
+            ),
+            (
+                '<function name="get_current_temperature"><param name="location">London</param></function>',
+                minicpm5,
             ),
             (
                 "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
@@ -312,6 +321,109 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_minicpm5(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["city"],
+                        "properties": {
+                            "city": {"type": "string"},
+                            "date": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "sum_values",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["nums"],
+                        "properties": {
+                            "nums": {"type": "array"},
+                            "exact": {"type": "boolean"},
+                        },
+                    },
+                },
+            },
+        ]
+
+        # CDATA-wrapped multi-line param
+        test_case = (
+            '<function name="get_weather">'
+            '<param name="city"><![CDATA[Bei\njing]]></param>'
+            '<param name="date">2024-06-27</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "get_weather")
+        self.assertEqual(tool_call["arguments"]["city"], "Bei\njing")
+        self.assertEqual(tool_call["arguments"]["date"], "2024-06-27")
+
+        # Non-string typed params (array, boolean)
+        test_case = (
+            '<function name="sum_values">'
+            '<param name="nums">[1, 2, 3]</param>'
+            '<param name="exact">true</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["nums"], [1, 2, 3])
+        self.assertEqual(tool_call["arguments"]["exact"], True)
+
+        # Body-only form (state machine stripped outer <function> tags)
+        test_case = ' name="get_weather"><param name="city">Tokyo</param>'
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "get_weather")
+        self.assertEqual(tool_call["arguments"]["city"], "Tokyo")
+
+        # Missing required param → ValueError
+        test_case = (
+            '<function name="get_weather"><param name="date">2024-06-27</param></function>'
+        )
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(test_case, tools)
+
+        # Unknown param → ValueError
+        test_case = (
+            '<function name="get_weather"><param name="bogus">x</param></function>'
+        )
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(test_case, tools)
+
+        # Duplicate param → ValueError
+        test_case = (
+            '<function name="get_weather">'
+            '<param name="city">A</param>'
+            '<param name="city">B</param>'
+            "</function>"
+        )
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(test_case, tools)
+
+        # <param> missing name attr → ValueError
+        test_case = (
+            '<function name="get_weather">'
+            "<param>nope</param>"
+            "</function>"
+        )
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(test_case, tools)
+
+        # Single-quoted attributes (both function and param)
+        test_case = (
+            "<function name='get_weather'>"
+            "<param name='city'>Osaka</param>"
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["city"], "Osaka")
 
     def test_minimax_m2(self):
         test_case = (
