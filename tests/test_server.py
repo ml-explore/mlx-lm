@@ -337,7 +337,7 @@ class TestServer(unittest.TestCase):
             def encode(self, text, add_special_tokens=False):
                 return []
 
-        stop_matcher, text_sm = self.response_generator._make_state_machine(
+        stop_sequences, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],
@@ -350,10 +350,8 @@ class TestServer(unittest.TestCase):
         # 'hello' is before the match, 'body' flows through (no tool_call_end)
         self.assertEqual(clean_text, "hellobody")
 
-        # Verify EOS stops via the stop matcher
-        stop_state = stop_matcher.make_state()
-        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
-        self.assertTrue(matched)
+        # Verify EOS stops via a matcher over the stop sequences
+        self.assertTrue(stop_sequences.matcher().advance(2))
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"

@@ -9,14 +9,18 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
-    StopSequenceMatcher,
+    PendingSequence,
+    PromptProcessingBatch,
+    SequencePolicy,
+    StopSequences,
+    _merge_caches,
     batch_generate,
     generate,
     generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
-from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.sample_utils import greedy_sampler, make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
 
@@ -290,9 +294,12 @@ class TestGenerate(unittest.TestCase):
         num_toks = [2, 3, 4, 5]
         uids = gen.insert(prompts, max_tokens=num_toks)
         batch_responses = {uid: [] for uid in uids}
+        finished = {}
         while responses := gen.next_generated():
             for r in responses:
                 batch_responses[r.uid].append(r.token)
+                if r.finish_reason is not None:
+                    finished[r.uid] = r
 
         # Do a test for each prompt the logits are close
         for e, prompt in enumerate(prompts):
@@ -308,6 +315,10 @@ class TestGenerate(unittest.TestCase):
 
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
+
+            # The ledger matches the cache: the prompt, then exactly the tokens
+            # generated for it.
+            self.assertEqual(finished[uids[e]].all_tokens, list(prompt) + batch_tokens)
 
     def test_batch_sliding_window(self):
         prompts = [
@@ -471,16 +482,16 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid2].token, 3)
 
     def test_batch_generate_with_stop_matchers(self):
-        """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
+        """Test that batch_generate with per-sequence stop_sequences stops on different tokens."""
         batch_gen = BatchGenerator(
             self.model,
             max_tokens=10,
         )
         prompt = self.tokenizer.encode("hello")
 
-        sm_0 = StopSequenceMatcher([[0]])
-        sm_1 = StopSequenceMatcher([[1]])
-        sm_2 = StopSequenceMatcher([[2]])
+        ss_0 = StopSequences([[0]])
+        ss_1 = StopSequences([[1]])
+        ss_2 = StopSequences([[2]])
 
         processor_0 = make_logits_processors({0: 2000.0})
         processor_1 = make_logits_processors({1: 2000.0})
@@ -489,7 +500,7 @@ class TestGenerate(unittest.TestCase):
         uid0, uid1, uid2 = batch_gen.insert(
             [prompt, prompt, prompt],
             logits_processors=[processor_0, processor_1, processor_2],
-            stop_matchers=[sm_0, sm_1, sm_2],
+            stop_sequences=[ss_0, ss_1, ss_2],
         )
 
         responses = batch_gen.next_generated()
@@ -721,7 +732,7 @@ class TestGenerate(unittest.TestCase):
         for c in result:
             self.assertGreater(c.offset, 0)
 
-    def test_remove_prompt_batch_updates_currently_processing(self):
+    def test_remove_from_prompt_batch(self):
         prompt_a = self.tokenizer.encode("Write a long story about a cat")
         prompt_b = self.tokenizer.encode("Write a long story about a dog")
 
@@ -743,7 +754,10 @@ class TestGenerate(unittest.TestCase):
 
         gen.remove([uid_a])
 
-        self.assertEqual(len(gen._currently_processing), len(gen._prompt_batch))
+        # The removed sequence is gone from the batch, and the survivor's rows
+        # in the batched caches line up with its sequence again.
+        self.assertEqual(gen._prompt_batch.uids, [uid_b])
+        self.assertEqual(len(gen._prompt_batch.sequences), len(gen._prompt_batch))
 
         found = gen._find_uids([uid_b])
         self.assertIn(uid_b, found)
@@ -768,6 +782,26 @@ class TestGenerate(unittest.TestCase):
                 for cache in r.prompt_cache:
                     self.assertIsInstance(cache, RotatingKVCache)
                     self.assertEqual(cache.max_size, max_kv_size)
+
+    def test_batch_rejects_caches_with_keep_tokens(self):
+        """BatchRotatingKVCache cannot hold keep tokens, so merging must fail
+        rather than silently discard the attention sinks."""
+        caches = [
+            make_prompt_cache(self.model, max_kv_size=32),
+            make_prompt_cache(self.model, max_kv_size=32),
+        ]
+        self.assertEqual(caches[0][0].keep, 4)
+
+        prompt = self.tokenizer.encode("Write a long story about a cat")
+        with self.assertRaises(ValueError) as ctx:
+            batch_generate(
+                self.model,
+                self.tokenizer,
+                [prompt, prompt],
+                max_tokens=2,
+                prompt_caches=caches,
+            )
+        self.assertIn("keep", str(ctx.exception))
 
     def test_batch_max_kv_size_limits_cache_growth(self):
         max_kv_size = 5
@@ -843,6 +877,196 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertIsNone(response.logprobs)
         self.assertIsNone(response.token_ids)
+
+    def test_batch_stats_empty_window(self):
+        """A window that did no work reports zero, not ZeroDivisionError."""
+        batch_gen = BatchGenerator(self.model)
+        with batch_gen.stats() as stats:
+            pass
+
+        self.assertEqual(stats.prompt_tokens, 0)
+        self.assertEqual(stats.prompt_tps, 0.0)
+        self.assertEqual(stats.generation_tokens, 0)
+        self.assertEqual(stats.generation_tps, 0.0)
+
+    def test_batch_stats_windows_nest(self):
+        """Windows snapshot and diff, so an inner one cannot rob an outer one."""
+        batch_gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello there friend")
+
+        batch_gen.insert([prompt])
+        with batch_gen.stats() as outer:
+            for _ in range(4):
+                batch_gen.next()
+            batch_gen.insert([prompt])
+            with batch_gen.stats() as inner:
+                for _ in range(4):
+                    batch_gen.next()
+
+        self.assertGreater(inner.prompt_tokens, 0)
+        self.assertGreater(inner.generation_tokens, 0)
+        self.assertGreaterEqual(outer.prompt_tokens, inner.prompt_tokens)
+        self.assertGreaterEqual(outer.generation_tokens, inner.generation_tokens)
+        # The outer window saw both prompts, the inner one only the second.
+        self.assertGreater(outer.prompt_tokens, inner.prompt_tokens)
+
+    def _pending(self, uid, prompt, tokens=None):
+        """A (sequence, cache) pair for building a prompt batch directly."""
+        sequence = PendingSequence.create(
+            policy=SequencePolicy(
+                uid=uid,
+                sampler=greedy_sampler,
+                stop_sequences=StopSequences(),
+            ),
+            segments=[prompt],
+            tokens=tokens,
+        )
+        return sequence, make_prompt_cache(self.model)
+
+    def _prompt_batch(self, *pending):
+        sequences, caches = zip(*pending)
+        return PromptProcessingBatch(
+            model=self.model,
+            sequences=list(sequences),
+            prompt_cache=_merge_caches(list(caches)),
+        )
+
+    def test_prompt_batch_split_ready_does_not_mutate(self):
+        """The halves own their caches and sequences: filtering or advancing one
+        must not be visible through the other, nor through the batch split."""
+
+        def rows(batch):
+            """Batch width of the first merged cache layer."""
+            c = batch.prompt_cache[0]
+            return 0 if c.keys is None else c.keys.shape[0]
+
+        def steps(batch):
+            return batch.prompt_cache[0]._idx
+
+        def cursors(batch):
+            return [s.cursor for s in batch.sequences]
+
+        def tokens(batch):
+            return [s.tokens for s in batch.sequences]
+
+        batch = self._prompt_batch(
+            self._pending(10, [1, 2, 3]),
+            self._pending(11, list(range(20))),
+            self._pending(12, [7, 8, 9]),
+        )
+        # One prefill step: the two short prompts finish, the long one does not,
+        # so it crosses the split with a non-zero cursor to preserve.
+        batch.prompt([s.take_chunk(8)[0] for s in batch.sequences])
+        self.assertEqual(cursors(batch), [2, 8, 2])
+        self.assertEqual(
+            [s.ready_to_decode for s in batch.sequences], [True, False, True]
+        )
+        before = steps(batch)
+
+        selected, remaining = batch.split_ready()
+
+        # Prefill progress survives the copy. Resetting a cursor here would
+        # silently re-prefill a prompt into a cache that already holds it.
+        self.assertEqual(cursors(selected), [2, 2])
+        self.assertEqual(cursors(remaining), [8])
+        self.assertEqual(cursors(batch), [2, 8, 2])
+
+        # The original is untouched, and each half took its own rows.
+        self.assertEqual(batch.uids, [10, 11, 12])
+        self.assertEqual((rows(batch), steps(batch)), (3, before))
+        self.assertEqual(selected.uids, [10, 12])
+        self.assertEqual(remaining.uids, [11])
+        self.assertEqual(rows(selected), 2)
+        self.assertEqual(rows(remaining), 1)
+        self.assertEqual(tokens(selected), [[1, 2], [7, 8]])
+        self.assertEqual(tokens(remaining), [list(range(8))])
+
+        # Each half owns its caches: prefilling one leaves the others alone.
+        # Each keeps its own step count -- ``filter`` trims the left padding
+        # that became uniform once the ragged rows were separated.
+        selected_steps = steps(selected)
+        remaining.prompt([remaining.sequences[0].take_chunk(4)[0]])
+        self.assertEqual(cursors(remaining), [12])
+        self.assertGreater(steps(remaining), before)
+        self.assertEqual(steps(selected), selected_steps)
+        self.assertEqual((rows(batch), steps(batch)), (3, before))
+        self.assertEqual(cursors(batch), [2, 8, 2])
+        self.assertEqual(tokens(batch), [[1, 2], list(range(8)), [7, 8]])
+
+    def _prompt_stream(self, segments, prefill_step_size, max_ticks=64):
+        """One ``(progress, end_of_segment, end_of_prompt)`` per prompt response,
+        until the prompt is consumed."""
+        gen = BatchGenerator(
+            self.model,
+            max_tokens=1,
+            prefill_batch_size=1,
+            prefill_step_size=prefill_step_size,
+            completion_batch_size=1,
+        )
+        gen.insert_segments([segments])
+
+        stream = []
+        for _ in range(max_ticks):
+            prompt_responses, _ = gen.next()
+            for r in prompt_responses:
+                stream.append((r.progress, r.end_of_segment, r.end_of_prompt))
+            if any(r.end_of_prompt for r in prompt_responses):
+                break
+        else:
+            self.fail("the prompt never finished processing")
+        return stream
+
+    def test_prompt_progress_stream_is_exact(self):
+        """A wrong ``progress`` or misplaced ``end_of_segment`` raises nothing and
+        changes no token, but the server checkpoints its cache on these signals.
+        Totals include the reserved final token, which is never prefilled."""
+        # (segments, prefill_step_size) -> the exact stream.
+        cases = {
+            # A single segment, chunked evenly. 6 prefilled + 1 reserved.
+            ("single", 3): (
+                [[1, 2, 3, 4, 5, 6, 7]],
+                [
+                    ((3, 7), False, False),
+                    ((6, 7), True, False),
+                    ((7, 7), True, True),
+                ],
+            ),
+            # The same prompt in one chunk: step size exceeds the segment.
+            ("single", 16): (
+                [[1, 2, 3, 4, 5, 6, 7]],
+                [
+                    ((6, 7), True, False),
+                    ((7, 7), True, True),
+                ],
+            ),
+            # Multiple segments: chunks never cross a boundary, so a short
+            # trailing piece is its own tick.
+            ("multi", 3): (
+                [[1, 2, 3, 4], [5, 6, 7, 8]],
+                [
+                    ((3, 8), False, False),
+                    ((4, 8), True, False),
+                    ((7, 8), True, False),
+                    ((8, 8), True, True),
+                ],
+            ),
+            ("multi", 16): (
+                [[1, 2, 3, 4], [5, 6, 7, 8]],
+                [
+                    ((4, 8), True, False),
+                    ((7, 8), True, False),
+                    ((8, 8), True, True),
+                ],
+            ),
+            # A prompt of one token: nothing to prefill, it is the reserved
+            # token, so the sequence promotes on the first tick.
+            ("minimal", 3): ([[1]], [((1, 1), True, True)]),
+            ("minimal", 16): ([[1]], [((1, 1), True, True)]),
+        }
+
+        for (shape, step_size), (segments, expected) in cases.items():
+            with self.subTest(shape=shape, prefill_step_size=step_size):
+                self.assertEqual(self._prompt_stream(segments, step_size), expected)
 
 
 if __name__ == "__main__":
