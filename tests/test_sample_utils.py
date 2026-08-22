@@ -202,6 +202,8 @@ class TestSampleUtils(unittest.TestCase):
             b = sampler(logits).item()
             results["seed_reproducible"] = a == b
 
+            mx.clear_streams()
+
         t = threading.Thread(target=worker)
         t.start()
         t.join()
