@@ -592,6 +592,10 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    # Snapshot of (conv_state, ssm_state) saved after processing confirmed tokens
+    # in an MTP draft-verification step. Cleared after each step.
+    rollback_state: Optional[tuple] = None
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.left_padding = None
