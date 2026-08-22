@@ -23,7 +23,7 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 
 from .generate import batch_generate
-from .models.cache import make_prompt_cache
+from .models.cache import can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_sampler
 from .utils import load
 
@@ -96,13 +96,25 @@ class MLXLM(LM):
             self.use_chat_template = self.tokenizer.chat_template is not None
         self._sampler = sampler
 
-    def _process_prompt(self, prompt, step_size: int = 2048):
+    def _process_prompt(self, prompt, step_size: int = 2048, min_split: int = 512):
         prompt = mx.array(prompt)[None]
         cache = make_prompt_cache(self._model)
-        for i in range(0, prompt.shape[1], step_size):
-            logits = self._model(prompt[:, i : i + step_size], cache=cache)
+        length = prompt.shape[1]
+        # When the prompt's final chunk is long, process the final token by
+        # itself. The preceding tokens then only evaluate the cache state so
+        # their logits are never computed, and the vocabulary projection only
+        # runs for the one position whose log probabilities are needed. When
+        # the final chunk is shorter than ``min_split``, the projection costs
+        # less than the extra model call, so the chunk is processed whole.
+        last_len = (
+            1 if (length - 1) % step_size >= min_split else (length - 1) % step_size + 1
+        )
+        rest = prompt[:, : length - last_len]
+        for i in range(0, rest.shape[1], step_size):
+            self._model(rest[:, i : i + step_size], cache=cache)
             mx.eval([c.state for c in cache])
             mx.clear_cache()
+        logits = self._model(prompt[:, length - last_len :], cache=cache)
         logprobs = nn.log_softmax(logits[:, -1, :].astype(mx.float32))
         return logprobs, cache
 
@@ -208,14 +220,18 @@ class MLXLM(LM):
             # If the entire prompt got truncated ignore the question
             if prefix_l == 0:
                 long_completions += 1
-                all_scores.extend([-float("inf")] * len(rs))
-                all_is_greedy.extend([False] * len(rs))
+                scores.extend([-float("inf")] * len(rs))
+                is_greedy.extend([False] * len(rs))
                 continue
 
             # model scoring, returns num_requests x (logp, is_greedy, length).
             logprobs, cache = self._process_prompt(prefix)
             max_idx = mx.argmax(logprobs).item()
 
+            # When the cache is trimmable, score every continuation with the
+            # same cache and rewind it in-between instead of copying it for
+            # each continuation.
+            reuse_cache = can_trim_prompt_cache(cache)
             for s in full_sequences:
                 inputs = s[len(prefix) :]
                 # The logprobs from the last token of the prompt are
@@ -226,8 +242,11 @@ class MLXLM(LM):
                 if len(inputs) == 1:
                     continue
                 score, _, ig = self._score_fn(
-                    mx.array(inputs)[None, :], cache=copy.deepcopy(cache)
+                    mx.array(inputs)[None, :],
+                    cache=cache if reuse_cache else copy.deepcopy(cache),
                 )
+                if reuse_cache:
+                    trim_prompt_cache(cache, len(inputs) - 1)
                 scores[-1] += mx.sum(score).item()
                 is_greedy[-1] &= mx.all(ig).item()
 
