@@ -90,8 +90,14 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
-        if n_repeats > 1 and mask.ndim > 3:
-            mask = mx.expand_dims(mask, -3)
+        if n_repeats > 1 and 3 <= mask.ndim < scores.ndim:
+            if mask.shape[-3] == n_q_heads:
+                # Per-query-head mask (e.g. the absorbed-MLA pe_scores): split
+                # the head axis to match the scores' (n_kv_heads, n_repeats).
+                mask = mx.unflatten(mask, -3, (n_kv_heads, n_repeats))
+            else:
+                # Per-kv-head or broadcast mask: add the repeats axis.
+                mask = mx.expand_dims(mask, -3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:

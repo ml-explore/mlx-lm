@@ -150,7 +150,19 @@ class Glm4MoeLiteAttention(nn.Module):
         if cache is not None:
             kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
 
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        # With a quantized cache the fetched entries are (packed, scales,
+        # biases) tuples.
+        quantized = isinstance(k_pe, (list, tuple))
+        if quantized:
+            pe_scores = mx.quantized_matmul(
+                q_pe * self.scale,
+                *k_pe,
+                transpose=True,
+                group_size=cache.group_size,
+                bits=cache.bits,
+            )
+        else:
+            pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
             pe_scores = mx.where(
                 mask,
@@ -161,11 +173,19 @@ class Glm4MoeLiteAttention(nn.Module):
         if L == 1:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
+            sdpa_cache = cache
         else:
-            k = self.embed_q(kv_latent, transpose=False)
-            v = self.unembed_out(kv_latent)
+            lat = kv_latent
+            if quantized:
+                # Chunked prefill over an already-quantized cache: fall back
+                # to float latents for the absorbed projections.
+                lat = mx.dequantize(*lat, group_size=cache.group_size, bits=cache.bits)
+            k = self.embed_q(lat, transpose=False)
+            v = self.unembed_out(lat)
+            sdpa_cache = None if quantized else cache
+
         output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+            q_nope, k, v, cache=sdpa_cache, scale=self.scale, mask=pe_scores
         )
         if L == 1:
             output = self.unembed_out(output)

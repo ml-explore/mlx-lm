@@ -10,7 +10,12 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    KVCache,
+    QuantizedKVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -3388,6 +3393,128 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+    def test_quantized_sdpa_gqa_float_mask(self):
+        # Float masks under GQA: a per-query-head mask (e.g. the absorbed-MLA
+        # pe_scores) must be unflattened to (B, n_kv_heads, n_repeats, L, S),
+        # while per-kv-head, broadcast and already-full-rank masks must be left
+        # broadcastable. B > 1 so a full-rank mask can't pass by accident.
+        from mlx_lm.models.base import quantized_scaled_dot_product_attention
+
+        group_size, bits = 64, 8
+        # A plain GQA shape, then the absorbed-MLA decode shape: one kv head,
+        # so every query head is a repeat.
+        shapes = ((2, 8, 2, 4, 64, 64), (2, 64, 1, 1, 512, 64))
+        for B, n_q, n_kv, L, S, D in shapes:
+            n_repeats = n_q // n_kv
+            mx.random.seed(0)
+            q = mx.random.normal((B, n_q, L, D))
+            k = mx.random.normal((B, n_kv, S, D))
+            v = mx.random.normal((B, n_kv, S, D))
+            q_k = mx.quantize(k, group_size=group_size, bits=bits)
+            q_v = mx.quantize(v, group_size=group_size, bits=bits)
+
+            kd = mx.repeat(
+                mx.dequantize(*q_k, group_size=group_size, bits=bits), n_repeats, axis=1
+            )
+            vd = mx.repeat(
+                mx.dequantize(*q_v, group_size=group_size, bits=bits), n_repeats, axis=1
+            )
+
+            per_q = 0.1 * mx.random.normal((B, n_q, L, S))
+            masks = {
+                "per query head": per_q,
+                "per kv head": 0.1 * mx.random.normal((B, n_kv, L, S)),
+                "broadcast": 0.1 * mx.random.normal((B, 1, L, S)),
+                "full rank": per_q.reshape(B, n_kv, n_repeats, L, S),
+                "no heads": 0.1 * mx.random.normal((L, S)),
+            }
+            for name, mask in masks.items():
+                with self.subTest(heads=(n_q, n_kv), mask=name):
+                    out = quantized_scaled_dot_product_attention(
+                        q,
+                        q_k,
+                        q_v,
+                        scale=1.0,
+                        mask=mask,
+                        group_size=group_size,
+                        bits=bits,
+                    )
+                    self.assertEqual(out.shape, (B, n_q, L, D))
+
+                    ref_mask = mask
+                    if ref_mask.ndim == 5:
+                        ref_mask = ref_mask.reshape(B, n_q, L, S)
+                    elif ref_mask.ndim == 4 and 1 < ref_mask.shape[-3] < n_q:
+                        ref_mask = mx.repeat(
+                            ref_mask, n_q // ref_mask.shape[-3], axis=-3
+                        )
+                    scores = q @ kd.swapaxes(-1, -2) + ref_mask
+                    ref = mx.softmax(scores, axis=-1, precise=True) @ vd
+                    self.assertTrue(mx.allclose(out, ref, rtol=1e-2, atol=1e-2))
+
+    def test_mla_quantized_cache(self):
+        # Absorbed-MLA attention fetches (packed, scales, biases) tuples from a
+        # quantized cache. Exercise the L == 1 decode path and a multi-token
+        # chunk over an already-quantized cache.
+        from mlx_lm.models import glm4_moe_lite
+
+        args = glm4_moe_lite.ModelArgs.from_dict(
+            {
+                "model_type": "glm4_moe_lite",
+                "vocab_size": 128,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "routed_scaling_factor": 1.0,
+                "kv_lora_rank": 64,
+                "q_lora_rank": 64,
+                "qk_rope_head_dim": 32,
+                "qk_nope_head_dim": 32,
+                "v_head_dim": 32,
+                "topk_method": "noaux_tc",
+                "scoring_func": "sigmoid",
+                "norm_topk_prob": True,
+                "n_group": 1,
+                "topk_group": 1,
+                "num_experts_per_tok": 2,
+                "moe_layer_freq": 1,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 256,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "rope_scaling": None,
+                "attention_bias": False,
+                "partial_rotary_factor": 1.0,
+                "tie_word_embeddings": False,
+                "num_nextn_predict_layers": 1,
+            }
+        )
+        mx.random.seed(0)
+        model = glm4_moe_lite.Model(args)
+        model.eval()
+
+        def run(make_cache):
+            mx.random.seed(1)
+            cache = [make_cache() for _ in range(len(model.layers))]
+            outs = [model(mx.random.randint(0, 128, (1, 17)), cache=cache)[:, -1:]]
+            for _ in range(3):
+                outs.append(model(mx.random.randint(0, 128, (1, 1)), cache=cache))
+            outs.append(model(mx.random.randint(0, 128, (1, 9)), cache=cache))
+            return mx.concatenate(outs, axis=1).astype(mx.float32)
+
+        ref = run(KVCache)
+        out = run(lambda: QuantizedKVCache(group_size=32, bits=8))
+        self.assertEqual(out.shape, ref.shape)
+        self.assertTrue(
+            mx.array_equal(mx.argmax(out, axis=-1), mx.argmax(ref, axis=-1))
+        )
+        self.assertLess(mx.max(mx.abs(out - ref)).item(), 0.1)
 
 
 if __name__ == "__main__":
