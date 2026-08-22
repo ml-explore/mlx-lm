@@ -99,6 +99,35 @@ class TestPromptCache(unittest.TestCase):
             self.assertTrue(mx.array_equal(k, lk))
             self.assertTrue(mx.array_equal(v, lv))
 
+    def test_save_load_batch_rotating_cache(self):
+        cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
+
+        # rotated=False round-trip (regression: bool("False") was True)
+        cache = [BatchRotatingKVCache(max_size=10, left_padding=[0])]
+        cache[0].update_and_fetch(
+            mx.random.uniform(shape=(1, 4, 3, 4)),
+            mx.random.uniform(shape=(1, 4, 3, 4)),
+        )
+        self.assertFalse(cache[0].rotated)
+
+        save_prompt_cache(cache_file, cache)
+        loaded = load_prompt_cache(cache_file)
+        self.assertEqual(cache[0].rotated, loaded[0].rotated)
+        self.assertEqual(cache[0].max_size, loaded[0].max_size)
+
+        # rotated=True round-trip — fill past max_size to trigger rotation
+        cache = [BatchRotatingKVCache(max_size=4, left_padding=[0])]
+        for _ in range(6):
+            cache[0].update_and_fetch(
+                mx.random.uniform(shape=(1, 4, 1, 4)),
+                mx.random.uniform(shape=(1, 4, 1, 4)),
+            )
+        self.assertTrue(cache[0].rotated)
+
+        save_prompt_cache(cache_file, cache)
+        loaded = load_prompt_cache(cache_file)
+        self.assertEqual(cache[0].rotated, loaded[0].rotated)
+
     def test_save_load_mixed_cache(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
 
