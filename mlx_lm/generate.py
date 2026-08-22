@@ -29,7 +29,7 @@ from .models.cache import (
     TokenBuffer,
     load_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import apply_min_p, apply_top_k, apply_top_p, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -645,6 +645,203 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    max_kv_size: Optional[int] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Generator[Tuple[mx.array, mx.array], None, None]:
+    """Self-speculative decoding using a model's Multi-Token-Prediction head.
+
+    The model must expose ``num_nextn_predict_layers > 0`` and a
+    ``predict_next_tokens(hidden_state, token_ids, cache)`` method (see
+    ``mlx_lm.models.hy_v3``). Each step drafts one token with the MTP head and
+    verifies it with a single forward pass of the target model, yielding up to
+    two tokens per target pass.
+
+    Verification is distribution-preserving. The drafted token and the target's
+    own token are drawn from their processed distributions (honoring ``sampler``
+    and ``logits_processors``). By default the draft is accepted only when it
+    matches the target's independent sample -- the same acceptance rule as
+    :func:`speculative_generate_step`, which works with any sampler. When the
+    sampler exposes its parameters (any :func:`make_sampler` output) and no
+    logits processors are active, the higher-acceptance **residual (Leviathan)**
+    rule is used instead: the draft ``x ~ q`` is accepted with probability
+    ``min(1, p(x) / q(x))`` and, on rejection, a token is resampled from the
+    normalized residual ``relu(p - q)``. Both rules emit a token distributed
+    exactly as the target's processed distribution, so temperature / top-p /
+    top-k are respected; a temperature-0 sampler reduces to greedy matching.
+    """
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    logits_processors = logits_processors or []
+
+    # The residual (Leviathan) acceptance rule accepts strictly more often than
+    # plain match sampling while preserving the target distribution, but it needs
+    # the processed draft/target distributions -- reconstructed here from the
+    # sampler's parameters. Fall back to match sampling for temp-0, custom
+    # samplers (no exposed params), XTC (non-deterministic mask), or any active
+    # logits processors.
+    s_temp = getattr(sampler, "temp", None)
+    s_top_p = getattr(sampler, "top_p", 0.0) or 0.0
+    s_top_k = getattr(sampler, "top_k", 0) or 0
+    s_min_p = getattr(sampler, "min_p", 0.0) or 0.0
+    s_min_keep = getattr(sampler, "min_tokens_to_keep", 1) or 1
+    s_xtc = getattr(sampler, "xtc_probability", 0.0) or 0.0
+    use_residual = (
+        s_temp is not None
+        and s_temp > 0.0
+        and s_xtc == 0.0
+        and not logits_processors
+    )
+
+    def _probs(logits):
+        # Reconstruct the categorical distribution make_sampler draws from: mask
+        # temp-1 log-probs (top-p, then min-p, then top-k, matching make_sampler's
+        # order) and apply temperature. Returns a probability row vector [1, V].
+        lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        if 0.0 < s_top_p < 1.0:
+            lp = apply_top_p(lp, s_top_p)
+        if s_min_p > 0.0:
+            lp = apply_min_p(lp, s_min_p, s_min_keep)
+        if s_top_k > 0:
+            lp = apply_top_k(lp, s_top_k)
+        return mx.softmax(lp * (1.0 / s_temp), axis=-1)
+
+    y = prompt.astype(mx.uint32)
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = KVCache()
+    else:
+        model_cache = prompt_cache[:-1]
+        mtp_cache = prompt_cache[-1]
+
+    # Running token history, needed only when logits processors are present
+    # since they are functions of the whole sequence generated so far.
+    history = y if logits_processors else None
+
+    def _sample(logits):
+        # logits: [1, vocab] -> (token: [1] uint32, logprobs: [vocab])
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(history, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs).astype(mx.uint32), logprobs.squeeze(0)
+
+    # Prefill the prompt chunk by chunk, leaving the last token for the
+    # hidden-state pass below.
+    with mx.stream(generation_stream):
+        total = len(y)
+        processed = 0
+        while total - processed > 1:
+            n_to_process = min(prefill_step_size, (total - processed) - 1)
+            model(y[processed : processed + n_to_process][None], cache=model_cache)
+            mx.eval([c.state for c in model_cache])
+            processed += n_to_process
+            mx.clear_cache()
+
+        last_token = y[processed : processed + 1]
+        logits, h_N = model(
+            last_token[None], cache=model_cache, return_hidden_states=True
+        )
+        token, logprobs = _sample(logits[:, -1, :])
+        h_N_last = h_N[:, -1:]
+
+    y = token
+    mx.eval(y, logprobs, h_N_last, [c.state for c in model_cache])
+    yield y.item(), logprobs
+    if logits_processors:
+        history = mx.concatenate([history, y])
+
+    ntoks = 1
+    while max_tokens == -1 or ntoks < max_tokens:
+        with mx.stream(generation_stream):
+            # 1. Draft one token with the MTP head, sampled from its processed
+            #    distribution q.
+            y_arr = y[..., None]
+            logits_mtp = model.predict_next_tokens(h_N_last, y_arr, cache=mtp_cache)
+            mtp_logits = logits_mtp[:, -1, :]
+            draft_token, _ = _sample(mtp_logits)
+
+            # 2. Verify the current + drafted token in a single target pass.
+            target_input = mx.concatenate([y_arr, draft_token[..., None]], axis=-1)
+            logits_target, h_N_target = model(
+                target_input, cache=model_cache, return_hidden_states=True
+            )
+            tgt_logits = logits_target[:, 0, :]
+            emit_lp = tgt_logits - mx.logsumexp(tgt_logits, axis=-1, keepdims=True)
+            if use_residual:
+                q = _probs(mtp_logits)
+                p = _probs(tgt_logits)
+                mx.async_eval(draft_token, q, p, h_N_target)
+            else:
+                verify_token, _ = _sample(tgt_logits)
+                mx.async_eval(draft_token, verify_token, h_N_target)
+
+        if use_residual:
+            # Residual/Leviathan: accept x~q with prob min(1, p(x)/q(x)); on
+            # rejection resample the emitted token from relu(p - q). Either way
+            # the emitted token is distributed exactly as the target's p.
+            mx.eval(draft_token, q, p)
+            x = draft_token.item()
+            accepted = mx.random.uniform().item() < min(
+                1.0, (p[0, x] / q[0, x]).item()
+            )
+            if accepted:
+                emit_token = draft_token
+            else:
+                residual = mx.maximum(p - q, 0.0)
+                if residual.sum().item() > 0.0:
+                    emit_token = mx.random.categorical(
+                        mx.log(residual + 1e-20)
+                    ).astype(mx.uint32)
+                else:  # p already dominated by q everywhere (degenerate)
+                    emit_token, _ = _sample(tgt_logits)
+                mx.eval(emit_token)
+        else:
+            # Match: emit the target's own sample; accept when it equals the
+            # draft. Works with any sampler.
+            mx.eval(draft_token, verify_token)
+            accepted = draft_token.item() == verify_token.item()
+            emit_token = verify_token
+
+        emit_lp = emit_lp.squeeze(0)
+        yield emit_token.item(), emit_lp
+        ntoks += 1
+        if logits_processors:
+            history = mx.concatenate([history, emit_token])
+
+        if accepted:
+            # Bonus token from the second verified position, for free.
+            if max_tokens != -1 and ntoks >= max_tokens:
+                break
+            bonus_token, bonus_lp = _sample(logits_target[:, 1, :])
+            yield bonus_token.item(), bonus_lp
+            ntoks += 1
+            if logits_processors:
+                history = mx.concatenate([history, bonus_token])
+            y = bonus_token
+            h_N_last = h_N_target[:, 1:]
+        else:
+            # Roll back the speculative position from both caches.
+            for c in model_cache:
+                c.trim(1)
+            mtp_cache.trim(1)
+            y = emit_token
+            h_N_last = h_N_target[:, 0:1]
+
+        mx.eval(y, h_N_last, [c.state for c in model_cache], mtp_cache.state)
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
@@ -691,11 +888,18 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+        if getattr(model, "num_nextn_predict_layers", 0) > 0:
+            # Self-speculative decoding via the model's built-in MTP head.
+            token_generator = (
+                (token, logprobs, True)
+                for token, logprobs in mtp_generate_step(prompt, model, **kwargs)
+            )
+        else:
+            token_generator = generate_step(prompt, model, **kwargs)
+            # from_draft always false for non-speculative generation
+            token_generator = (
+                (token, logprobs, False) for token, logprobs in token_generator
+            )
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
