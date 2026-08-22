@@ -623,11 +623,16 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
-        return self.cache
+        # None can not be seralized so return empty array instead
+        left_padding = mx.array([]) if self.left_padding is None else self.left_padding
+        lengths = mx.array([]) if self.lengths is None else self.lengths
+        return self.cache, left_padding, lengths
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        self.cache, left_padding, lengths = v
+        self.left_padding = left_padding if left_padding.size > 0 else None
+        self.lengths = lengths if lengths.size > 0 else None
 
     def filter(self, batch_indices):
         """
