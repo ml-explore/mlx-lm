@@ -17,7 +17,6 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
-from .models import cache
 from .models.cache import (
     ArraysCache,
     BatchKVCache,
@@ -27,7 +26,10 @@ from .models.cache import (
     QuantizedKVCache,
     RotatingKVCache,
     TokenBuffer,
+    can_trim_prompt_cache,
     load_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -360,7 +362,7 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(
+        prompt_cache = make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
         )
@@ -511,13 +513,13 @@ def speculative_generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+        model_cache = make_prompt_cache(model)
+        draft_cache = make_prompt_cache(draft_model)
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
+    if not can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
@@ -578,8 +580,8 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        trim_prompt_cache(model_cache, num_draft - num_accept)
+        trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -1707,7 +1709,7 @@ class BatchGenerator:
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
             if caches[i] is None:
-                caches[i] = cache.make_prompt_cache(self.model, self.max_kv_size)
+                caches[i] = make_prompt_cache(self.model, self.max_kv_size)
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
