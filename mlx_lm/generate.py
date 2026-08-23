@@ -1707,7 +1707,7 @@ class BatchGenerator:
         caches = caches or [None] * len(segments)
         for i in range(len(segments)):
             if caches[i] is None:
-                caches[i] = self._make_new_cache()
+                caches[i] = cache.make_prompt_cache(self.model, self.max_kv_size)
 
         for seq, m, c, at, s, lp, sm in zip(
             segments,
@@ -1729,19 +1729,6 @@ class BatchGenerator:
             self._uid_count += 1
 
         return uids
-
-    def _make_new_cache(self):
-        if self.max_kv_size is None:
-            return cache.make_prompt_cache(self.model)
-
-        return [
-            (
-                RotatingKVCache(max_size=self.max_kv_size)
-                if isinstance(ci, KVCache)
-                else ci
-            )
-            for ci in cache.make_prompt_cache(self.model)
-        ]
 
     def _find_uids(self, uids):
         uids = set(uids)
