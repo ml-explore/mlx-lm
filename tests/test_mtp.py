@@ -140,6 +140,29 @@ class TestMTP(unittest.TestCase):
             f"Token mismatch: std={std_tokens}, mtp={mtp_tokens}",
         )
 
+    def test_mtp_prompt_progress_callback(self):
+        """prompt_progress_callback must fire during prefill and reach
+        (total, total) once the last prompt token has been processed."""
+        prompt = mx.array(list(range(20)), dtype=mx.uint32)
+        calls = []
+
+        def progress_callback(processed: int, total: int) -> None:
+            calls.append((processed, total))
+
+        for _, _, _ in mtp_generate_step(
+            prompt,
+            self.model,
+            max_tokens=1,
+            prefill_step_size=5,
+            prompt_progress_callback=progress_callback,
+        ):
+            pass
+
+        self.assertTrue(len(calls) > 0)
+        total = len(prompt)
+        self.assertTrue(all(t == total for _, t in calls))
+        self.assertEqual(calls[-1], (total, total))
+
     def test_mtp_probabilistic_acceptance_completes(self):
         """mtp_generate_step should complete without errors with a stochastic sampler.
 
