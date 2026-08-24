@@ -588,29 +588,30 @@ class Model(nn.Module):
             scale_name = weight_key.removesuffix("weight") + "scales"
             weights[scale_name] = expanded_scale[:output_dims, : input_dims // 32]
 
-        for layer_index in range(
-            self.args.first_k_dense_replace, self.args.num_hidden_layers
-        ):
-            prefix = f"model.layers.{layer_index}.mlp"
-            for projection in ("gate_proj", "up_proj", "down_proj"):
-                suffixes = ("weight", "scales") if uses_fp8 else ("weight",)
-                for suffix in suffixes:
-                    expert_weights = [
-                        weights.pop(f"{prefix}.experts.{expert}.{projection}.{suffix}")
-                        for expert in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.switch_mlp.{projection}.{suffix}"] = mx.stack(
-                        expert_weights
-                    )
-
+        expert_suffixes = ("weight", "scales") if uses_fp8 else ("weight",)
         for layer_index in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_index}.attention"
-            kv_b_key = f"{prefix}.kv_b_proj.weight"
+            layer_prefix = f"model.layers.{layer_index}"
+            if layer_index >= self.args.first_k_dense_replace:
+                mlp_prefix = f"{layer_prefix}.mlp"
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    for suffix in expert_suffixes:
+                        expert_weights = [
+                            weights.pop(
+                                f"{mlp_prefix}.experts.{expert}.{projection}.{suffix}"
+                            )
+                            for expert in range(self.args.num_experts)
+                        ]
+                        weights[f"{mlp_prefix}.switch_mlp.{projection}.{suffix}"] = (
+                            mx.stack(expert_weights)
+                        )
+
+            attention_prefix = f"{layer_prefix}.attention"
+            kv_b_key = f"{attention_prefix}.kv_b_proj.weight"
             if kv_b_key not in weights:
                 continue
             num_heads = self.args.num_attention_heads
             head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-            if f"{prefix}.kv_b_proj.scales" in weights:
+            if f"{attention_prefix}.kv_b_proj.scales" in weights:
                 raise ValueError(
                     "Quantized Bailing V3 kv_b_proj weights are not supported"
                 )
@@ -620,8 +621,8 @@ class Model(nn.Module):
                 value[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
             )
             wv = mx.contiguous(value[:, self.args.qk_nope_head_dim :, :])
-            weights[f"{prefix}.embed_q.weight"] = wk
-            weights[f"{prefix}.unembed_out.weight"] = wv
+            weights[f"{attention_prefix}.embed_q.weight"] = wk
+            weights[f"{attention_prefix}.unembed_out.weight"] = wv
 
         for key, value in list(weights.items()):
             if "_conv1d.weight" in key and value.shape[-1] != 1:
