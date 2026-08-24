@@ -390,13 +390,19 @@ class TestPromptCache(unittest.TestCase):
             mx.random.normal(shape=(1, 2, 7, 4)), mx.random.normal(shape=(1, 2, 7, 4))
         )
 
+        def compare_keys_and_values(a, b):
+            ka, va = a.keys_and_values()
+            kb, vb = b.keys_and_values()
+            self.assertTrue(mx.array_equal(ka, kb))
+            self.assertTrue(mx.array_equal(va, vb))
+
         merged_cache = CacheList.merge((c1, c2))
         c1_ex = merged_cache.extract(0)
         self.assertTrue(mx.array_equal(c1_ex[0][0], c1[0][0]))
-        self.assertTrue(mx.array_equal(c1_ex[1].state[0], c1[1].state[0]))
+        compare_keys_and_values(c1_ex[1], c1[1])
         c2_ex = merged_cache.extract(1)
         self.assertTrue(mx.array_equal(c2_ex[0][0], c2[0][0]))
-        self.assertTrue(mx.array_equal(c2_ex[1].state[0], c2[1].state[0]))
+        compare_keys_and_values(c2_ex[1], c2[1])
 
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask
@@ -507,7 +513,7 @@ class TestPromptCache(unittest.TestCase):
         cache.filter([0, 1])
 
         # In this case filtering left shifts the cache so it has zero padding
-        self.assertEqual(cache.state[0].shape, (2, 1, 2, 8))
+        self.assertEqual(cache.keys_and_values()[0].shape, (2, 1, 2, 8))
 
         mask = cache.make_mask(1)
         self.assertEqual(mask[0].squeeze().tolist(), [True, True, True])
@@ -625,6 +631,8 @@ class TestPromptCache(unittest.TestCase):
         left_padding = mx.array([1, 2])
         for c, lc in zip(cache, loaded_cache):
             self.assertTrue(mx.array_equal(c.left_padding, left_padding))
+            if isinstance(c, BatchRotatingKVCache):
+                self.assertEqual(c.rotated, lc.rotated)
 
     def test_rotating_cache_updates(self):
         cache = RotatingKVCache(max_size=8)

@@ -608,7 +608,7 @@ class TestLRUPromptCache(unittest.TestCase):
         # lru cache
         tokens = tokens + [20] * 5
         c, t = cache.fetch_nearest_cache(model, tokens)
-        k, v = c[0].state
+        k, v = c[0].keys_and_values()
         self.assertTrue((k == v).all().item())
         self.assertTrue((k.flatten() == mx.arange(24)).all().item())
         self.assertEqual(t, [20] * 5)
@@ -623,7 +623,7 @@ class TestLRUPromptCache(unittest.TestCase):
         # Fetching a cache with a shared prefix doesn't remove it either
         tokens = tokens[:26] + [40] * 8
         c, t = cache.fetch_nearest_cache(model, tokens)
-        k, v = c[0].state
+        k, v = c[0].keys_and_values()
         self.assertTrue((k == v).all().item())
         self.assertTrue(
             (k.flatten() == mx.concatenate([mx.arange(24), mx.arange(2)])).all().item()
