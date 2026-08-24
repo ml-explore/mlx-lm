@@ -54,7 +54,6 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     rope_interleave: bool = True
     tie_word_embeddings: bool = False
-    gated_attention_proj_granularity_type: str | None = None
     quantization_config: dict[str, Any] | None = None
 
 
@@ -231,26 +230,9 @@ class BailingMLA(nn.Module):
         self.unembed_out = MultiLinear(
             args.kv_lora_rank, args.v_head_dim, args.num_attention_heads
         )
-        self.gated_attention_proj_granularity_type = (
-            args.gated_attention_proj_granularity_type
+        self.g_proj = nn.Linear(
+            args.hidden_size, args.num_attention_heads, bias=False
         )
-        if self.gated_attention_proj_granularity_type is None:
-            self.g_proj = None
-        elif self.gated_attention_proj_granularity_type == "head_wise":
-            self.g_proj = nn.Linear(
-                args.hidden_size, args.num_attention_heads, bias=False
-            )
-        elif self.gated_attention_proj_granularity_type == "element_wise":
-            self.g_proj = nn.Linear(
-                args.hidden_size,
-                args.num_attention_heads * args.v_head_dim,
-                bias=False,
-            )
-        else:
-            raise ValueError(
-                "Unsupported gated_attention_proj_granularity_type: "
-                f"{self.gated_attention_proj_granularity_type!r}"
-            )
         self.dense = _linear(
             args,
             args.num_attention_heads * args.v_head_dim,
@@ -324,12 +306,8 @@ class BailingMLA(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3)
-        if self.g_proj is not None:
-            gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
-            if self.gated_attention_proj_granularity_type == "head_wise":
-                output = output * gate[..., None]
-            else:
-                output = output * gate.reshape(output.shape)
+        gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
+        output = output * gate[..., None]
         return self.dense(output.reshape(batch, length, -1))
 
 

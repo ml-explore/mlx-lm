@@ -434,11 +434,7 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-        flash_args = replace(
-            args,
-            q_lora_rank=None,
-            gated_attention_proj_granularity_type="head_wise",
-        )
+        flash_args = replace(args, q_lora_rank=None)
         flash_model = bailing_moe_v3.Model(flash_args)
         flash_model.eval()
         self.assertIsInstance(flash_model.layers[3].attention.q_proj, nn.Linear)
