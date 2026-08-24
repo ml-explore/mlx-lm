@@ -1433,6 +1433,103 @@ def _cfg(d, *path, default=None):
     return d if d != {} else default
 
 
+# ---------------------------------------------------------------------------
+# torch-side compatibility
+#
+# Makes an MLX ESMFold2 a drop-in for esm's EsmFold2Model, so that
+#
+#     result = ESMFold2InputBuilder().fold(model, spi, num_loops=10, ...)
+#
+# works unchanged whether `model` is the CUDA model or this one.
+#
+# esm's ESMFold2InputBuilder.fold() needs exactly four things from a model:
+#   1. `.device`   -- passed to prepare_input() to place the feature tensors
+#   2. `.config`   -- _lm_dropout_context() reads config.lm_encoder.lm_dropout,
+#                     and RAISES if the config exposes neither that nor a
+#                     top-level lm_dropout. fold() defaults lm_dropout=0.3, so
+#                     this is not optional.
+#   3. `__call__(**features, num_loops=..., ...)` taking torch tensors and
+#      returning a dict of torch tensors
+#   4. output keys that decode() reads: sample_atom_coords and plddt are
+#      required; ptm, iptm, pae, distogram_logits, pair_chains_iptm,
+#      residue_index and entity_id are optional (read via .get()).
+#
+# torch is imported lazily so mlx-lm keeps no hard dependency on it.
+# ---------------------------------------------------------------------------
+
+_INT_FEATURE_KEYS = {
+    "token_index",
+    "residue_index",
+    "asym_id",
+    "sym_id",
+    "entity_id",
+    "mol_type",
+    "res_type",
+    "input_ids",
+    "ref_element",
+    "ref_atom_name_chars",
+    "atom_to_token",
+    "distogram_atom_idx",
+    "msa",
+}
+
+# Keys decode() may ask for, beyond the two it requires.
+_OPTIONAL_OUTPUT_KEYS = (
+    "ptm",
+    "iptm",
+    "pae",
+    "distogram_logits",
+    "pair_chains_iptm",
+    "residue_index",
+    "entity_id",
+)
+
+
+class _LMEncoderConfig:
+    """Mutable stand-in for esm's ``config.lm_encoder``."""
+
+    def __init__(self, cfg: dict):
+        section = cfg.get("lm_encoder") or {}
+        self.enabled = section.get("enabled", True)
+        self.lm_dropout = section.get("lm_dropout", 0.0)
+        self.per_loop_lm_dropout = section.get("per_loop_lm_dropout", False)
+
+
+class ESMFold2Config(dict):
+    """The checkpoint config, unchanged as a dict, plus attribute access.
+
+    Subclasses dict so every existing ``config["..."]`` / ``.get()`` inside this
+    module keeps working; adds the attribute surface esm's helpers expect.
+    """
+
+    def __init__(self, cfg: dict):
+        super().__init__(cfg)
+        self.lm_encoder = _LMEncoderConfig(cfg)
+        self.type = cfg.get("type", "release")
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+def _to_mlx(features: dict, dtype):
+    """torch feature tensors -> MLX arrays, keeping index-like keys integral."""
+    out = {}
+    for name, tensor in features.items():
+        if not hasattr(tensor, "detach"):
+            continue
+        arr = mx.array(tensor.detach().cpu().numpy())
+        if name in _INT_FEATURE_KEYS:
+            out[name] = arr.astype(mx.int32)
+        elif arr.dtype == mx.bool_:
+            out[name] = arr
+        else:
+            out[name] = arr.astype(dtype)
+    return out
+
+
 class ESMFold2Model(nn.Module):
     """MLX ESMFold2 (release). Pure-MLX; features in / dict out.
 
@@ -1442,7 +1539,7 @@ class ESMFold2Model(nn.Module):
 
     def __init__(self, config: dict):
         super().__init__()
-        self.config = config
+        self.config = ESMFold2Config(config)
         self._esmc = None  # MLX ESMC encoder; attach AFTER strict weight load
         d_pair = config["d_pair"]
         d_inputs = _cfg(config, "inputs", "d_inputs", default=451)
@@ -1647,6 +1744,129 @@ class ESMFold2Model(nn.Module):
             out.update(self.confidence(feats, z, x_inputs, aux, coords,
                                        num_diffusion_samples=num_diffusion_samples))
         return out
+
+    @property
+    def device(self):
+        """esm's prepare_input() places feature tensors here.
+
+        Featurization is torch-on-CPU; the MLX arrays are built in __call__.
+        """
+        import torch
+
+        return torch.device("cpu")
+
+    def __call__(
+        self,
+        num_loops=None,
+        num_sampling_steps=None,
+        num_diffusion_samples=1,
+        lm_hidden_states=None,
+        **features,
+    ):
+        """torch-in / torch-out forward, matching esm's EsmFold2Model.
+
+        Lets ESMFold2InputBuilder.fold() drive this model unmodified. Unknown
+        kwargs (msa_max_depth, noise_scale, ...) are accepted and ignored where
+        the MLX path has no equivalent, so newer esm releases will not break it.
+        """
+        import numpy as np
+        import torch
+
+        cfg = self.config
+        feats = _to_mlx(
+            {k: v for k, v in features.items() if hasattr(v, "detach")},
+            mx.bfloat16,
+        )
+        out = self.fold(
+            feats,
+            lm_hidden_states=lm_hidden_states,
+            num_loops=num_loops if num_loops is not None else cfg.get("num_loops", 3),
+            num_sampling_steps=(
+                num_sampling_steps
+                if num_sampling_steps is not None
+                else cfg.get("num_sampling_steps", 50)
+            ),
+            num_diffusion_samples=num_diffusion_samples,
+            return_confidence=True,
+        )
+        mx.eval(out["sample_atom_coords"])
+
+        def back(x):
+            return torch.from_numpy(np.asarray(x).astype(np.float32))
+
+        coords = np.asarray(out["sample_atom_coords"]).astype(np.float32)
+        torch_out = {
+            "sample_atom_coords": torch.from_numpy(
+                coords.reshape(-1, coords.shape[-2], coords.shape[-1])
+            ),
+            "plddt": back(out["plddt"]),
+        }
+        for key in _OPTIONAL_OUTPUT_KEYS:
+            if key in out:
+                torch_out[key] = back(out[key])
+        return torch_out
+
+    @classmethod
+    def from_pretrained(
+        cls, repo="biohub/ESMFold2-Fast", dtype=mx.bfloat16, load_esmc=True, device=None
+    ):
+        """Mirror of esm's EsmFold2Model.from_pretrained.
+
+        `device` is accepted and ignored -- MLX has one unified device -- so the
+        same call site works on both backends.
+        """
+        import glob
+        import json
+
+        from huggingface_hub import hf_hub_download, snapshot_download
+
+        cfg = json.load(open(hf_hub_download(repo, "config.json")))
+        model = cls(cfg)
+        weights = sanitize_esmfold2(mx.load(hf_hub_download(repo, "model.safetensors")))
+        weights = {
+            k: (
+                v.astype(dtype)
+                if v.dtype in (mx.float32, mx.float16, mx.bfloat16, mx.float64)
+                else v
+            )
+            for k, v in weights.items()
+        }
+        model.load_weights(list(weights.items()), strict=True)
+        model.set_dtype(dtype)
+        model.eval()
+        mx.eval(model.parameters())
+        del weights
+
+        if load_esmc:
+            from mlx_lm.models import esmc as esmc_mod
+
+            esmc_id = cfg.get("esmc_id", "biohub/ESMC-6B")
+            ecfg = json.load(
+                open(
+                    f"{snapshot_download(esmc_id, allow_patterns=['config.json'])}/config.json"
+                )
+            )
+            enc = esmc_mod.Model(esmc_mod.ModelArgs.from_dict(ecfg))
+            local = snapshot_download(esmc_id, allow_patterns=["*.safetensors"])
+            # cast shard-by-shard: loading fp32 whole then casting peaks ~55 GB
+            w = {}
+            for shard in sorted(glob.glob(f"{local}/*.safetensors")):
+                part = {
+                    k: (
+                        v.astype(dtype)
+                        if v.dtype in (mx.float32, mx.float16, mx.bfloat16, mx.float64)
+                        else v
+                    )
+                    for k, v in mx.load(shard).items()
+                }
+                mx.eval(list(part.values()))
+                w.update(part)
+            enc.load_weights(list(enc.sanitize(w).items()), strict=True)
+            enc.set_dtype(dtype)
+            enc.eval()
+            mx.eval(enc.parameters())
+            model._esmc = enc
+        return model
 
 
 def sanitize_esmfold2(weights: dict) -> dict:
