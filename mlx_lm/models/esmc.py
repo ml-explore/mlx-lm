@@ -148,23 +148,33 @@ class ESMCModel(nn.Module):
         return self.transformer(x, mask, collect)
 
 
-def _attention_mask(attention_mask: Optional[mx.array], dtype) -> Optional[mx.array]:
+def _attention_mask(
+    attention_mask: Optional[mx.array],
+    dtype,
+    sequence_id: Optional[mx.array] = None,
+) -> Optional[mx.array]:
     """Build the additive chain-aware mask matching the reference.
 
-    The reference derives ``sequence_id = attention_mask - 1`` (padding -> -1,
-    real -> 0) and attends where ``sequence_id_i == sequence_id_j``. With no
-    padding this is full attention (mask is None / all-zero).
+    Attention is allowed where ``sequence_id_i == sequence_id_j``. ``sequence_id``
+    may be passed directly -- which is what multi-chain inputs need, since each
+    chain carries its own id -- or derived from ``attention_mask`` as the
+    reference does (``sequence_id = attention_mask - 1``: padding -> -1, real -> 0).
     """
-    if attention_mask is None:
+    if sequence_id is None:
+        if attention_mask is None:
+            return None
+        sid = attention_mask.astype(mx.int32) - 1  # (B, L)
+    else:
+        sid = sequence_id.astype(mx.int32)
+    # Short-circuit only when every token shares one id, i.e. genuinely full
+    # attention. Testing "no padding" instead would wrongly drop the mask for a
+    # multi-chain input, letting chains attend to each other.
+    if bool(mx.all(sid == sid[:, :1]).item()):
         return None
-    if bool(mx.all(attention_mask != 0).item()):
-        return None  # all real tokens -> full attention, no mask needed
-    sid = attention_mask.astype(mx.int32) - 1  # (B, L)
     allowed = sid[:, :, None] == sid[:, None, :]  # (B, L, L)
     neg = mx.array(-1e9, dtype=dtype)  # large additive penalty (fp32-safe)
     add = mx.where(allowed, mx.array(0.0, dtype=dtype), neg)
     return add[:, None, :, :]  # (B, 1, L, L)
-
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -180,13 +190,23 @@ class Model(nn.Module):
             nn.Linear(args.d_model, args.vocab_size),
         ]
 
-    def encode(self, input_ids, attention_mask=None, output_hidden_states=False):
+    def encode(
+        self,
+        input_ids,
+        attention_mask=None,
+        output_hidden_states=False,
+        sequence_id=None,
+    ):
         """Return (last_hidden_state, hidden_states) like the reference encoder.
 
         ``hidden_states`` is a stacked array of shape (n_layers+1, B, L, d_model)
-        when ``output_hidden_states`` else None.
+        when ``output_hidden_states`` else None. ``sequence_id`` gives chain-aware
+        attention for multi-chain inputs; it takes precedence over
+        ``attention_mask``.
         """
-        mask = _attention_mask(attention_mask, self.esmc.embed.weight.dtype)
+        mask = _attention_mask(
+            attention_mask, self.esmc.embed.weight.dtype, sequence_id=sequence_id
+        )
         last, hidden = self.esmc(input_ids, mask, output_hidden_states)
         hs = mx.stack(hidden, axis=0) if output_hidden_states else None
         return last, hs
