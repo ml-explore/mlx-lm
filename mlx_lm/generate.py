@@ -9,7 +9,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -18,13 +17,7 @@ from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
 from .models.cache import (
-    ArraysCache,
-    BatchKVCache,
-    BatchRotatingKVCache,
-    CacheList,
-    KVCache,
     QuantizedKVCache,
-    RotatingKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
     load_prompt_cache,
@@ -42,7 +35,7 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_K = 0
 DEFAULT_XTC_PROBABILITY = 0.0
-DEFAULT_XTC_THRESHOLD = 0.0
+DEFAULT_XTC_THRESHOLD = 0.1
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
@@ -126,7 +119,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.1,
+        default=DEFAULT_XTC_THRESHOLD,
         help="Threshold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
@@ -826,38 +819,6 @@ class BatchStats:
     generation_tps: float = 0
     generation_time: float = 0
     peak_memory: float = 0
-
-
-def _make_cache(model, left_padding, max_kv_size):
-    """
-    Convert a list of regular caches into their corresponding
-    batch-aware caches.
-    """
-
-    def to_batch_cache(c):
-        if type(c) is KVCache:
-            return BatchKVCache(left_padding)
-        elif isinstance(c, ArraysCache):
-            c.left_padding = mx.array(left_padding)
-            return c
-        elif isinstance(c, RotatingKVCache):
-            if c.keep > 0:
-                raise ValueError("RotatingKVCache with keep tokens is not supported.")
-            return BatchRotatingKVCache(c.max_size, left_padding)
-        elif isinstance(c, CacheList):
-            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        if max_kv_size is not None:
-            return [
-                BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
-            ]
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _merge_caches(caches):
