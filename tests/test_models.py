@@ -357,7 +357,7 @@ class TestModels(unittest.TestCase):
         v = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
         k_up, v_up = cache.update_and_fetch(k, v)
         quant_cache = cache.to_quantized(group_size=32, bits=8)
-        qk_up, qv_up = quant_cache.state
+        qk_up, qv_up = quant_cache.keys_and_values()
 
         q = 1e-1 * mx.random.normal(shape=(B, n_q_heads, L, D))
 
