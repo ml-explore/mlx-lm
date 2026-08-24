@@ -424,8 +424,9 @@ def generate_step(
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
+            processed = prompt[:n_to_process]
             _model_call(
-                input_tokens=prompt[:n_to_process][None],
+                input_tokens=processed[None],
                 input_embeddings=(
                     input_embeddings[:n_to_process][None]
                     if input_embeddings is not None
@@ -434,6 +435,12 @@ def generate_step(
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            if logits_processors and len(processed) > 0:
+                tokens = (
+                    mx.concat([tokens, processed])
+                    if tokens is not None
+                    else processed
+                )
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
