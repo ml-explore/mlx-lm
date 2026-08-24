@@ -1147,12 +1147,12 @@ class PromptProcessingBatch:
         if not any(self.samplers):
             self.samplers = [None] * len(self.uids)
         if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
+            self.logits_processors = [[]] * len(self.uids)
         samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
         logits_processors = (
             batch.logits_processors
             if any(batch.logits_processors)
-            else [None] * len(batch.uids)
+            else [[]] * len(batch.uids)
         )
 
         self.uids.extend(batch.uids)
@@ -1473,8 +1473,12 @@ class GenerationBatch:
         self.tokens = [self.tokens[idx] for idx in keep]
         if any(self.samplers):
             self.samplers = [self.samplers[idx] for idx in keep]
+        else:
+            self.samplers = [None] * len(keep)
         if any(self.logits_processors):
             self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        else:
+            self.logits_processors = [[]] * len(keep)
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
