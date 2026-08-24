@@ -109,6 +109,45 @@ class TestLora(unittest.TestCase):
         model.freeze()
         tuner.utils.linear_to_lora_layers(model, num_lora_layers, params)
 
+    def test_gemma4_lora_includes_per_layer_model_projection(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 128,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 32,
+                    "num_hidden_layers": 2,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 16,
+                    "global_head_dim": 16,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention", "full_attention"],
+                    "hidden_size_per_layer_input": 8,
+                    "vocab_size": 128,
+                    "vocab_size_per_layer_input": 128,
+                    "num_kv_shared_layers": 0,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+        model.freeze()
+
+        tuner.utils.linear_to_lora_layers(
+            model,
+            -1,
+            {"rank": 2, "dropout": 0.0, "scale": 1.0},
+        )
+
+        projection = model.language_model.model.per_layer_model_projection
+        self.assertIsInstance(projection, LoRALinear)
+
     def test_lora_embedding(self):
         num_embeddings = 256
         dims = 512

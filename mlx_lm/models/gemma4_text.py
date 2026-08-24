@@ -665,6 +665,12 @@ class Model(nn.Module):
         return self.model.layers
 
     @property
+    def lora_default_keys(self):
+        if self.model.per_layer_model_projection is None:
+            return []
+        return ["model.per_layer_model_projection"]
+
+    @property
     def head_dim(self):
         return self.args.head_dim
 
