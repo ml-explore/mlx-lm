@@ -1632,20 +1632,140 @@ class ESMFold2Model(nn.Module):
         b = delta[:, None] * self.parcae_b_cont
         return a, b
 
-    def compute_lm_hidden_states(self, input_ids):
-        """Single-chain: [cls] + residues + [eos] -> MLX ESMC -> (B, L, n_layers+1, D)."""
+    def compute_lm_hidden_states(
+        self,
+        input_ids,
+        asym_id=None,
+        residue_index=None,
+        mol_type=None,
+        token_mask=None,
+    ):
+        """Run ESMC over protein tokens and scatter the states back, (B, L, n+1, D).
+
+        Mirrors esm's ``compute_lm_hidden_states``. Three things matter and all
+        three are no-ops for a single protein chain, which is why the previous
+        single-chain implementation was fine until nucleic acids and ligands
+        started arriving:
+
+        * Only ``mol_type == 0`` tokens reach the LM. RNA, DNA and ligand tokens
+          are not amino acids; feeding them to ESMC yields garbage embeddings.
+          They get zero hidden states instead.
+        * Atom-tokenized residues (modified residues such as AIB) span several
+          structure tokens but are one LM token, so tokens are collapsed by
+          ``(asym_id, residue_index)`` before the LM and expanded afterwards.
+        * Chains are separated by ``[EOS][BOS]`` and given distinct sequence ids,
+          so attention does not run across a chain boundary.
+
+        When the extra features are omitted the old single-chain path is used.
+        """
         B, L = input_ids.shape
-        ids = input_ids.astype(mx.int32)
-        lm_ids = mx.concatenate(
-            [mx.zeros((B, 1), dtype=mx.int32), ids, mx.full((B, 1), 2, dtype=mx.int32)], axis=1)
-        _, hs = self._esmc.encode(lm_ids, output_hidden_states=True)  # (n+1, B, L+2, D)
-        hs = hs[:, :, 1:1 + L, :]                                      # strip BOS/EOS
-        return hs.transpose(1, 2, 0, 3)                               # (B, L, n+1, D)
+        if mol_type is None or asym_id is None or residue_index is None:
+            ids = input_ids.astype(mx.int32)
+            lm_ids = mx.concatenate(
+                [
+                    mx.zeros((B, 1), dtype=mx.int32),
+                    ids,
+                    mx.full((B, 1), 2, dtype=mx.int32),
+                ],
+                axis=1,
+            )
+            _, hs = self._esmc.encode(lm_ids, output_hidden_states=True)
+            hs = hs[:, :, 1 : 1 + L, :]
+            return hs.transpose(1, 2, 0, 3)
+
+        import numpy as np
+
+        ids_np = np.asarray(input_ids).astype(np.int32)
+        asym_np = np.asarray(asym_id).astype(np.int64)
+        res_np = np.asarray(residue_index).astype(np.int64)
+        mol_np = np.asarray(mol_type).astype(np.int64)
+        tok_np = (
+            np.ones((B, L), bool)
+            if token_mask is None
+            else np.asarray(token_mask).astype(bool)
+        )
+        protein = (mol_np == 0) & tok_np
+
+        BOS, PAD, EOS = 0, 1, 2
+        lm_seqs, expand_maps = [], []
+        for b in range(B):
+            keep = np.nonzero(protein[b])[0]
+            if keep.size == 0:
+                lm_seqs.append(np.array([BOS, EOS], np.int32))
+                expand_maps.append(np.full(L, -1, np.int64))
+                continue
+
+            # Collapse to one LM token per (chain, residue), keeping input order.
+            keys = np.stack([asym_np[b][keep], res_np[b][keep]], 1)
+            _, first, inverse = np.unique(
+                keys, axis=0, return_index=True, return_inverse=True
+            )
+            order = np.argsort(first)
+            remap = np.empty_like(order)
+            remap[order] = np.arange(order.size)
+            inverse = remap[inverse]
+            collapsed = first[order]
+            ids_c = ids_np[b][keep][collapsed]
+            asym_c = asym_np[b][keep][collapsed]
+
+            # [BOS] chain1 [EOS][BOS] chain2 ... [EOS]
+            parts = [np.array([BOS], np.int32)]
+            lm_pos = np.empty(collapsed.size, np.int64)
+            cursor = 1
+            chains = np.unique(asym_c)
+            for i, cid in enumerate(chains):
+                sel = np.nonzero(asym_c == cid)[0]
+                parts.append(ids_c[sel])
+                lm_pos[sel] = np.arange(cursor, cursor + sel.size)
+                cursor += sel.size
+                if i < chains.size - 1:
+                    parts.append(np.array([EOS, BOS], np.int32))
+                    cursor += 2
+            parts.append(np.array([EOS], np.int32))
+            lm_seqs.append(np.concatenate(parts).astype(np.int32))
+
+            emap = np.full(L, -1, np.int64)
+            emap[keep] = lm_pos[inverse]
+            expand_maps.append(emap)
+
+        max_len = max(len(x) for x in lm_seqs)
+        lm_ids_np = np.full((B, max_len), PAD, np.int32)
+        for b, seq in enumerate(lm_seqs):
+            lm_ids_np[b, : len(seq)] = seq
+
+        # One sequence id per chain (BOS starts a new one); PAD gets -1 so it is
+        # excluded from attention entirely.
+        seq_id_np = np.cumsum(lm_ids_np == BOS, axis=1) - 1
+        seq_id_np = np.where(lm_ids_np == PAD, -1, seq_id_np)
+
+        _, hs = self._esmc.encode(
+            mx.array(lm_ids_np),
+            output_hidden_states=True,
+            sequence_id=mx.array(seq_id_np.astype(np.int32)),
+        )
+        hs = hs.transpose(1, 2, 0, 3)  # (B, lm_len, n+1, D)
+
+        n_layers_plus_1, D = hs.shape[2], hs.shape[3]
+        out = mx.zeros((B, L, n_layers_plus_1, D), dtype=hs.dtype)
+        for b in range(B):
+            emap = expand_maps[b]
+            tok = np.nonzero(emap >= 0)[0]
+            if tok.size == 0:
+                continue
+            gathered = mx.take(hs[b], mx.array(emap[tok].astype(np.int32)), axis=0)
+            out[b, mx.array(tok.astype(np.int32))] = gathered
+        return out
 
     def trunk(self, feats, lm_hidden_states=None, z0=None, num_loops=3):
         """Preprocess -> inputs_embedder -> z_init -> loop -> readout/coda. Returns (z, x_inputs, aux)."""
         if lm_hidden_states is None:
-            lm_hidden_states = self.compute_lm_hidden_states(feats["input_ids"])
+            lm_hidden_states = self.compute_lm_hidden_states(
+                feats["input_ids"],
+                asym_id=feats.get("asym_id"),
+                residue_index=feats.get("residue_index"),
+                mol_type=feats.get("mol_type"),
+                token_mask=feats.get("token_attention_mask"),
+            )
         tok_mask = feats["token_attention_mask"].astype(mx.float32)
         atm_mask = feats["atom_attention_mask"].astype(mx.float32)
         B, L = feats["res_type"].shape
