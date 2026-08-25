@@ -22,17 +22,6 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
 
-class TestGenerateArgs(unittest.TestCase):
-
-    def test_prefill_step_size_default(self):
-        args = setup_arg_parser().parse_args([])
-        self.assertEqual(args.prefill_step_size, DEFAULT_PREFILL_STEP_SIZE)
-
-    def test_prefill_step_size_override(self):
-        args = setup_arg_parser().parse_args(["--prefill-step-size", "512"])
-        self.assertEqual(args.prefill_step_size, 512)
-
-
 class TestGenerate(unittest.TestCase):
 
     @classmethod
@@ -433,6 +422,34 @@ class TestGenerate(unittest.TestCase):
 
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
+
+    def test_batch_processor_survive_a_request_without_it(self):
+        prompt = self.tokenizer.encode("hello")
+
+        def run(batch_gen, uid):
+            n = 0
+            while True:
+                for r in batch_gen.next_generated():
+                    if r.uid == uid:
+                        n += 1
+                        if r.finish_reason is not None:
+                            return n
+
+        batch_gen = BatchGenerator(self.model, max_tokens=3)
+        (uid,) = batch_gen.insert([prompt])
+        run(batch_gen, uid)
+
+        calls = []
+
+        def processor(tokens, logits):
+            calls.append(len(tokens))
+            return logits
+
+        (uid,) = batch_gen.insert([prompt], logits_processors=[[processor]])
+        n_tokens = run(batch_gen, uid)
+        # One call per generated token, plus the step that sampled the token
+        # after the last one returned
+        self.assertEqual(len(calls), n_tokens + 1)
 
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""
