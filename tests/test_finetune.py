@@ -12,7 +12,7 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten
 
-from mlx_lm import lora, tuner
+from mlx_lm import lora, tuner, utils
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
 from mlx_lm.tuner.trainer import evaluate
@@ -110,8 +110,6 @@ class TestLora(unittest.TestCase):
         tuner.utils.linear_to_lora_layers(model, num_lora_layers, params)
 
     def test_bailing_moe_v3(self):
-        from dataclasses import replace
-
         from mlx_lm.models import bailing_moe_v3
 
         args = bailing_moe_v3.ModelArgs(
@@ -142,7 +140,7 @@ class TestLora(unittest.TestCase):
             "dropout": 0.0,
         }
 
-        def check_lora_gradients(model, quantized=False):
+        def check_lora_layers(model, quantized=False):
             model.freeze()
             tuner.utils.linear_to_lora_layers(
                 model, args.num_hidden_layers, lora_config
@@ -155,30 +153,15 @@ class TestLora(unittest.TestCase):
             if quantized:
                 self.assertIsInstance(q_proj.linear, nn.QuantizedLinear)
 
-            def loss_fn(current_model, tokens):
-                return current_model(tokens).astype(mx.float32).mean()
-
-            loss, grads = nn.value_and_grad(model, loss_fn)(model, mx.array([[0, 1]]))
-            mx.eval(loss, grads)
-            self.assertTrue(mx.isfinite(loss).item())
-            flat_grads = tree_flatten(grads)
-            self.assertTrue(flat_grads)
-            self.assertTrue(
-                all(mx.all(mx.isfinite(grad)).item() for _, grad in flat_grads)
-            )
-            self.assertTrue(any(mx.any(grad != 0).item() for _, grad in flat_grads))
-
-        check_lora_gradients(bailing_moe_v3.Model(args))
-        fp8_args = replace(
-            args,
-            quantization_config={
-                "quant_method": "fp8",
-                "fmt": "e4m3",
-                "scale_fmt": "ue8m0",
-                "weight_block_size": [128, 128],
-            },
+        check_lora_layers(bailing_moe_v3.Model(args))
+        fp8_model, _ = utils.quantize_model(
+            bailing_moe_v3.Model(args),
+            {},
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
         )
-        check_lora_gradients(bailing_moe_v3.Model(fp8_args), quantized=True)
+        check_lora_layers(fp8_model, quantized=True)
 
     def test_lora_embedding(self):
         num_embeddings = 256

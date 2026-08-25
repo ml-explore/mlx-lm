@@ -54,7 +54,6 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     rope_interleave: bool = True
     tie_word_embeddings: bool = False
-    quantization_config: dict[str, Any] | None = None
 
 
 def _is_kda_layer(
@@ -74,11 +73,6 @@ def _is_mtp_weight(key: str, num_hidden_layers: int) -> bool:
     return layer_index.isdigit() and int(layer_index) >= num_hidden_layers
 
 
-def _uses_fp8(args: ModelArgs) -> bool:
-    config = args.quantization_config
-    return config is not None and config.get("quant_method") == "fp8"
-
-
 def _normalize_kda_qk(
     q: mx.array, k: mx.array, head_dim: int
 ) -> tuple[mx.array, mx.array]:
@@ -89,27 +83,12 @@ def _normalize_kda_qk(
     return q, k
 
 
-def _linear(
-    args: ModelArgs, input_dims: int, output_dims: int
-) -> nn.Linear | nn.QuantizedLinear:
-    if _uses_fp8(args):
-        return nn.QuantizedLinear(
-            input_dims,
-            output_dims,
-            bias=False,
-            group_size=32,
-            bits=8,
-            mode="mxfp8",
-        )
-    return nn.Linear(input_dims, output_dims, bias=False)
-
-
 class BailingMLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: int):
         super().__init__()
-        self.gate_proj = _linear(args, args.hidden_size, intermediate_size)
-        self.up_proj = _linear(args, args.hidden_size, intermediate_size)
-        self.down_proj = _linear(args, intermediate_size, args.hidden_size)
+        self.gate_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, args.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
@@ -175,13 +154,6 @@ class BailingSparseMoE(nn.Module):
             args.moe_intermediate_size,
             args.num_experts,
         )
-        if _uses_fp8(args):
-            nn.quantize(
-                self.switch_mlp,
-                group_size=32,
-                bits=8,
-                mode="mxfp8",
-            )
         shared_size = args.moe_shared_expert_intermediate_size * args.num_shared_experts
         self.shared_experts = BailingMLP(args, shared_size)
 
@@ -230,13 +202,11 @@ class BailingMLA(nn.Module):
         self.unembed_out = MultiLinear(
             args.kv_lora_rank, args.v_head_dim, args.num_attention_heads
         )
-        self.g_proj = nn.Linear(
-            args.hidden_size, args.num_attention_heads, bias=False
-        )
-        self.dense = _linear(
-            args,
+        self.g_proj = nn.Linear(args.hidden_size, args.num_attention_heads, bias=False)
+        self.dense = nn.Linear(
             args.num_attention_heads * args.v_head_dim,
             args.hidden_size,
+            bias=False,
         )
         if not args.rope_interleave:
             raise ValueError("Bailing V3 MLX currently requires rope_interleave=true")
@@ -325,9 +295,9 @@ class BailingKDA(nn.Module):
         self.lower_bound = args.kda_lower_bound
         self.rms_norm_eps = args.rms_norm_eps
 
-        self.q_proj = _linear(args, args.hidden_size, self.projection_size)
-        self.k_proj = _linear(args, args.hidden_size, self.projection_size)
-        self.v_proj = _linear(args, args.hidden_size, self.projection_size)
+        self.q_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
         self.q_conv1d = nn.Conv1d(
             self.projection_size,
             self.projection_size,
@@ -353,12 +323,12 @@ class BailingKDA(nn.Module):
             padding=0,
         )
         self.A_log = mx.zeros((self.num_heads,), dtype=mx.float32)
-        self.f_proj = _linear(args, args.hidden_size, self.projection_size)
+        self.f_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
         self.dt_bias = mx.zeros((self.projection_size,), dtype=mx.float32)
         self.b_proj = nn.Linear(args.hidden_size, self.num_heads, bias=False)
-        self.g_proj = _linear(args, args.hidden_size, self.projection_size)
+        self.g_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
         self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.o_proj = _linear(args, self.projection_size, args.hidden_size)
+        self.o_proj = nn.Linear(self.projection_size, args.hidden_size, bias=False)
 
     def _causal_conv(
         self,
@@ -498,7 +468,6 @@ class BailingModel(nn.Module):
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self._validate_quantization_config(args.quantization_config)
         self.args = args
         self.model_type = args.model_type
         self.model = BailingModel(args)
@@ -524,21 +493,28 @@ class Model(nn.Module):
             for layer in self.layers
         ]
 
-    @staticmethod
-    def _validate_quantization_config(config: dict[str, Any] | None) -> None:
-        if config is None:
-            return
-        expected = {
-            "quant_method": "fp8",
-            "fmt": "e4m3",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        }
-        if any(config.get(key) != value for key, value in expected.items()):
-            raise ValueError(
-                "Bailing V3 MLX requires an FP8 E4M3 checkpoint with UE8M0 "
-                "scales and weight_block_size=[128, 128]"
-            )
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path in ("model.word_embeddings", "lm_head"):
+                return False
+            if path.endswith(
+                (
+                    "attention.q_a_proj",
+                    "attention.q_b_proj",
+                    "attention.kv_a_proj_with_mqa",
+                    "attention.embed_q",
+                    "attention.unembed_out",
+                    "attention.b_proj",
+                )
+            ):
+                return False
+            if path.endswith(("attention.q_proj", "attention.g_proj")):
+                layer_index = int(path.split(".")[2])
+                return self.layers[layer_index].is_linear
+            return True
+
+        return predicate
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
@@ -548,40 +524,23 @@ class Model(nn.Module):
             for key, value in weights.items()
             if not _is_mtp_weight(key, self.args.num_hidden_layers)
         }
-        scale_keys = [key for key in weights if key.endswith("weight_scale_inv")]
-        uses_fp8 = _uses_fp8(self.args)
-        if not uses_fp8 and scale_keys:
-            raise ValueError(
-                "Unquantized Bailing V3 checkpoints must not contain "
-                "weight_scale_inv tensors"
-            )
-        for scale_key in scale_keys:
-            weight_key = scale_key.removesuffix("_scale_inv")
-            weight = weights.pop(weight_key)
-            scale = weights.pop(scale_key)
-            output_dims, input_dims = weight.shape
-            weights[weight_key] = weight.view(mx.uint32)
-            expanded_scale = mx.repeat(scale.view(mx.uint8), 128, axis=0)
-            expanded_scale = mx.repeat(expanded_scale, 4, axis=1)
-            scale_name = weight_key.removesuffix("weight") + "scales"
-            weights[scale_name] = expanded_scale[:output_dims, : input_dims // 32]
-
-        expert_suffixes = ("weight", "scales") if uses_fp8 else ("weight",)
         for layer_index in range(self.args.num_hidden_layers):
             layer_prefix = f"model.layers.{layer_index}"
             if layer_index >= self.args.first_k_dense_replace:
                 mlp_prefix = f"{layer_prefix}.mlp"
                 for projection in ("gate_proj", "up_proj", "down_proj"):
-                    for suffix in expert_suffixes:
-                        expert_weights = [
-                            weights.pop(
-                                f"{mlp_prefix}.experts.{expert}.{projection}.{suffix}"
-                            )
-                            for expert in range(self.args.num_experts)
-                        ]
-                        weights[f"{mlp_prefix}.switch_mlp.{projection}.{suffix}"] = (
-                            mx.stack(expert_weights)
+                    expert_prefix = f"{mlp_prefix}.experts.0.{projection}"
+                    if f"{expert_prefix}.weight" not in weights:
+                        continue
+                    expert_weights = [
+                        weights.pop(
+                            f"{mlp_prefix}.experts.{expert}.{projection}.weight"
                         )
+                        for expert in range(self.args.num_experts)
+                    ]
+                    weights[f"{mlp_prefix}.switch_mlp.{projection}.weight"] = mx.stack(
+                        expert_weights
+                    )
 
             attention_prefix = f"{layer_prefix}.attention"
             kv_b_key = f"{attention_prefix}.kv_b_proj.weight"

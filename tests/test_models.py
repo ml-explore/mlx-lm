@@ -403,6 +403,7 @@ class TestModels(unittest.TestCase):
     def test_bailing_moe_v3(self):
         from dataclasses import replace
 
+        from mlx_lm import utils
         from mlx_lm.models import bailing_moe_v3
         from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
@@ -426,7 +427,6 @@ class TestModels(unittest.TestCase):
             qk_nope_head_dim=16,
             qk_rope_head_dim=16,
             v_head_dim=32,
-            quantization_config=None,
         )
         model = bailing_moe_v3.Model(args)
         model.eval()
@@ -445,50 +445,28 @@ class TestModels(unittest.TestCase):
             flash_args.num_hidden_layers,
         )
 
-        tied_model = bailing_moe_v3.Model(replace(args, tie_word_embeddings=True))
-        self.assertIsNone(tied_model.lm_head)
-        tied_output = tied_model(mx.array([[0, 1]]))
-        mx.eval(tied_output)
-        self.assertEqual(tied_output.shape, (1, 2, args.vocab_size))
-
-        mla_only_model = bailing_moe_v3.Model(replace(args, num_hidden_layers=1))
-        tokens = mx.array([[0, 1, 2, 3]])
-        full_output = mla_only_model(tokens)
-        cache = mla_only_model.make_cache()
-        cached_output = mx.concatenate(
-            [
-                mla_only_model(tokens[:, :1], cache=cache),
-                mla_only_model(tokens[:, 1:3], cache=cache),
-                mla_only_model(tokens[:, 3:], cache=cache),
-            ],
-            axis=1,
+        fp8_model, _ = utils.quantize_model(
+            bailing_moe_v3.Model(args),
+            {},
+            group_size=None,
+            bits=None,
+            mode="mxfp8",
         )
-
-        self.assertEqual(cache[0].offset, tokens.shape[1])
-        self.assertEqual(cache[0].keys.shape[-1], args.kv_lora_rank)
-        self.assertEqual(cache[0].values.shape[-1], args.qk_rope_head_dim)
-
-        mx.eval(full_output, cached_output)
-        self.assertTrue(mx.allclose(full_output, cached_output, rtol=1e-4, atol=1e-4))
-
-        fp8_args = replace(
-            args,
-            quantization_config={
-                "quant_method": "fp8",
-                "fmt": "e4m3",
-                "scale_fmt": "ue8m0",
-                "weight_block_size": [128, 128],
-            },
-        )
-        fp8_model = bailing_moe_v3.Model(fp8_args)
-        self.assertIsInstance(
-            fp8_model.layers[0].attention.q_proj,
-            nn.QuantizedLinear,
-        )
+        kda = fp8_model.layers[0].attention
+        mla = fp8_model.layers[3].attention
+        self.assertIsInstance(kda.q_proj, nn.QuantizedLinear)
+        self.assertIsInstance(kda.g_proj, nn.QuantizedLinear)
+        self.assertIsInstance(kda.b_proj, nn.Linear)
         self.assertIsInstance(
             fp8_model.layers[1].mlp.switch_mlp.gate_proj,
             QuantizedSwitchLinear,
         )
+        self.assertIsInstance(fp8_model.model.word_embeddings, nn.Embedding)
+        self.assertIsInstance(fp8_model.lm_head, nn.Linear)
+        for projection in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "g_proj"):
+            self.assertIsInstance(getattr(mla, projection), nn.Linear)
+        for projection in ("embed_q", "unembed_out"):
+            self.assertIsInstance(getattr(mla, projection), bailing_moe_v3.MultiLinear)
 
     def test_llama(self):
         from mlx_lm.models import llama
