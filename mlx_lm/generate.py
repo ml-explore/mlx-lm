@@ -465,7 +465,10 @@ def generate_step(
         if n == max_tokens:
             break
         yield y.item(), logprobs
-        if n % CACHE_STATE_EVAL_INTERVAL == 0:
+        # Skip n == 0: the interval only needs to bound long generations,
+        # and evaluating this early perturbs kernel fusion for very short
+        # ones for no benefit.
+        if n > 0 and n % CACHE_STATE_EVAL_INTERVAL == 0:
             mx.eval([c.state for c in prompt_cache])
             mx.clear_cache()
         y, logprobs = next_y, next_logprobs
