@@ -45,6 +45,7 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
 def str2bool(string):
@@ -166,6 +167,13 @@ def setup_arg_parser():
         type=int,
         help="Set the maximum key-value cache size",
         default=None,
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of prompt tokens to process at a time. Smaller values "
+        f"lower peak memory during prefill (default: {DEFAULT_PREFILL_STEP_SIZE})",
     )
     parser.add_argument(
         "--prompt-cache-file",
@@ -2175,6 +2183,7 @@ def main():
         verbose=args.verbose,
         sampler=sampler,
         max_kv_size=args.max_kv_size,
+        prefill_step_size=args.prefill_step_size,
         prompt_cache=prompt_cache if using_cache else None,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,

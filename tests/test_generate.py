@@ -7,17 +7,30 @@ from typing import List
 import mlx.core as mx
 
 from mlx_lm.generate import (
+    DEFAULT_PREFILL_STEP_SIZE,
     BatchGenerator,
     GenerationResponse,
     StopSequenceMatcher,
     batch_generate,
     generate,
     generate_step,
+    setup_arg_parser,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+
+class TestGenerateArgs(unittest.TestCase):
+
+    def test_prefill_step_size_default(self):
+        args = setup_arg_parser().parse_args([])
+        self.assertEqual(args.prefill_step_size, DEFAULT_PREFILL_STEP_SIZE)
+
+    def test_prefill_step_size_override(self):
+        args = setup_arg_parser().parse_args(["--prefill-step-size", "512"])
+        self.assertEqual(args.prefill_step_size, 512)
 
 
 class TestGenerate(unittest.TestCase):
