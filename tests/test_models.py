@@ -646,6 +646,185 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_mrope(self):
+        # M-RoPE is selected by the presence of `mrope_section`, not by the
+        # rope "type": Qwen3-VL / Qwen3.5 configs report type "default".
+        rope = rope_utils.initialize_rope(
+            32,
+            base=100.0,
+            traditional=False,
+            scaling_config={"rope_type": "default", "mrope_section": [6, 5, 5]},
+        )
+        self.assertTrue(isinstance(rope, rope_utils.MRoPE))
+
+        # An mrope_section paired with a SCALING scheme must keep that scheme:
+        # M-RoPE here does not implement scaling, so intercepting these would
+        # silently drop it.
+        for scaled in ("linear", "llama3", "yarn"):
+            cfg = {"rope_type": scaled, "factor": 2.0, "mrope_section": [6, 5, 5]}
+            if scaled == "yarn":
+                cfg["original_max_position_embeddings"] = 2048
+            scaled_rope = rope_utils.initialize_rope(
+                32, base=100.0, traditional=False, scaling_config=cfg
+            )
+            self.assertFalse(
+                isinstance(scaled_rope, rope_utils.MRoPE),
+                f"{scaled} scaling must not be intercepted by M-RoPE",
+            )
+
+        # A config with no mrope_section keeps the plain fused RoPE.
+        plain = rope_utils.initialize_rope(32, base=100.0, traditional=False)
+        self.assertTrue(isinstance(plain, nn.RoPE))
+        self.assertFalse(isinstance(plain, rope_utils.MRoPE))
+
+        x = mx.random.normal((1, 4, 7, 32))
+
+        # 1. No regression: without positions, M-RoPE is the fused 1-D kernel.
+        for offset in (0, 5):
+            self.assertTrue(
+                mx.array_equal(rope(x, offset=offset), plain(x, offset=offset))
+            )
+
+        # 2. Text-only positions (t == h == w == index) are equivalent to 1-D
+        #    RoPE. This is why text generation is unaffected by M-RoPE.
+        seq = mx.arange(7, dtype=mx.int32)
+        text_positions = mx.broadcast_to(seq, (3, 1, 7))
+        self.assertTrue(
+            mx.allclose(rope(x, position_ids=text_positions), plain(x), atol=1e-5)
+        )
+
+        # 3. Image positions (the axes disagree, as they do for grid patches)
+        #    must actually change the encoding -- otherwise spatial layout is
+        #    lost, which is what happens when M-RoPE is silently dropped.
+        image_positions = mx.stack(
+            [
+                mx.zeros((1, 7), dtype=mx.int32),  # t: one frame
+                mx.array([[0, 0, 0, 1, 1, 1, 2]], dtype=mx.int32),  # h: rows
+                mx.array([[0, 1, 2, 0, 1, 2, 0]], dtype=mx.int32),  # w: cols
+            ]
+        )
+        self.assertFalse(
+            mx.allclose(rope(x, position_ids=image_positions), plain(x), atol=1e-5)
+        )
+
+        # 4. Partial rotary: dims beyond `dims` are passed through untouched.
+        partial = rope_utils.initialize_rope(
+            16,
+            base=100.0,
+            traditional=False,
+            scaling_config={"rope_type": "default", "mrope_section": [3, 3, 2]},
+        )
+        y = partial(x, position_ids=image_positions)
+        self.assertEqual(y.shape, x.shape)
+        self.assertTrue(mx.array_equal(y[..., 16:], x[..., 16:]))
+
+    def test_qwen3_5_position_ids(self):
+        # End-to-end: position_ids must thread from generate_step through the
+        # model to the attention's rotary embedding, and must not perturb the
+        # text-only path.
+        from mlx_lm.generate import generate_step
+        from mlx_lm.models import qwen3_5
+        from mlx_lm.utils import does_model_support_position_ids
+
+        args = qwen3_5.ModelArgs(
+            model_type="qwen3_5",
+            text_config={
+                "model_type": "qwen3_5_text",
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "vocab_size": 1000,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 32,
+                "linear_value_head_dim": 32,
+                "linear_conv_kernel_dim": 3,
+                "rms_norm_eps": 1e-5,
+                "head_dim": 64,
+                "full_attention_interval": 2,
+                "rope_parameters": {
+                    "rope_type": "default",
+                    "mrope_section": [6, 5, 5],
+                    "rope_theta": 1000.0,
+                    "partial_rotary_factor": 0.5,
+                },
+            },
+        )
+        mx.random.seed(0)
+        model = qwen3_5.Model(args)
+        model.eval()
+        self.assertTrue(does_model_support_position_ids(model))
+
+        inputs = mx.array([[1, 2, 3, 4, 5]])
+        text_positions = mx.broadcast_to(mx.arange(5, dtype=mx.int32), (3, 1, 5))
+        image_positions = mx.stack(
+            [
+                mx.zeros((1, 5), dtype=mx.int32),
+                mx.array([[0, 0, 0, 1, 1]], dtype=mx.int32),
+                mx.array([[0, 1, 2, 0, 1]], dtype=mx.int32),
+            ]
+        )
+
+        base = model(inputs)
+        # Sequential positions reproduce the implicit-position result. The
+        # tolerance is loose because these weights are random and unnormalised,
+        # which amplifies the ~1e-7 difference between the fused rotary kernel
+        # and the explicit cos/sin path across four layers. The exact
+        # equivalence is asserted at the rotary itself in `test_mrope`.
+        self.assertTrue(
+            mx.allclose(model(inputs, position_ids=text_positions), base, atol=1e-2)
+        )
+        # Grid positions do not -- the spatial layout is now carried.
+        self.assertFalse(
+            mx.allclose(model(inputs, position_ids=image_positions), base, atol=1e-4)
+        )
+
+        # generate_step accepts and threads positions without error.
+        toks = [
+            t
+            for t, _ in generate_step(
+                inputs[0],
+                model,
+                max_tokens=3,
+                position_ids=image_positions,
+                sampler=lambda lg: mx.argmax(lg, axis=-1),
+            )
+        ]
+        self.assertEqual(len(toks), 3)
+
+        # A model without the parameter must reject positions rather than
+        # silently ignoring them.
+        with self.assertRaises(ValueError):
+            next(
+                generate_step(
+                    inputs[0],
+                    mock.Mock(spec=[]),
+                    position_ids=image_positions,
+                )
+            )
+
+        # A length mismatch must be rejected, not silently misaligned.
+        with self.assertRaises(ValueError):
+            next(
+                generate_step(
+                    inputs[0],
+                    model,
+                    position_ids=image_positions[..., :3],
+                )
+            )
+
+        # A malformed shape must be rejected too.
+        with self.assertRaises(ValueError):
+            next(
+                generate_step(
+                    inputs[0],
+                    model,
+                    position_ids=mx.zeros((2, 1, 5), dtype=mx.int32),
+                )
+            )
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 

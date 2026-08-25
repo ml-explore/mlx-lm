@@ -1033,6 +1033,21 @@ def common_prefix_len(list1, list2):
     return min_len
 
 
+def does_model_support_position_ids(model: nn.Module) -> bool:
+    """
+    Check if the model supports position_ids in its call signature.
+    Args:
+        model (nn.Module): The model to check.
+    Returns:
+        bool: True if the model supports position_ids, False otherwise.
+    """
+    try:
+        signature = inspect.signature(model.__call__)
+        return "position_ids" in signature.parameters
+    except (ValueError, TypeError):
+        return False
+
+
 def does_model_support_input_embeddings(model: nn.Module) -> bool:
     """
     Check if the model supports input_embeddings in its call signature.
