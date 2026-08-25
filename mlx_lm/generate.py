@@ -210,6 +210,24 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--mtp",
+        action="store_true",
+        help="Use the model's native MTP (nextn) module for self-speculative "
+        "decoding. Requires a checkpoint converted with the MTP layer retained.",
+    )
+    parser.add_argument(
+        "--mtp-num-draft-tokens",
+        type=int,
+        help="Chained MTP draft tokens per step when --mtp is set.",
+        default=2,
+    )
+    parser.add_argument(
+        "--mtp-hybrid",
+        action="store_true",
+        help="With --mtp: also enable conservative prompt-lookup drafting "
+        "(helps repetition-heavy workloads).",
+    )
     return parser
 
 
@@ -645,12 +663,189 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def _find_suffix_draft(tokens, max_ngram=6, min_match=4, max_draft=6):
+    """Prompt-lookup drafting: if the current suffix (up to max_ngram tokens)
+    re-occurs earlier, return the continuation after the most recent earlier
+    occurrence. Conservative gate (min_match=4): mis-speculated wide verifies
+    are expensive on MoE (~0.3 plain-steps per extra token, measured)."""
+    n = len(tokens)
+    for L in range(max_ngram, min_match - 1, -1):
+        if n < L + 1:
+            continue
+        pat = tokens[-L:]
+        for s in range(n - L - 1, -1, -1):
+            if tokens[s:s + L] == pat:
+                cont = tokens[s + L:s + L + max_draft]
+                if cont:
+                    return cont
+    return None
+
+
+def mtp_speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: int = 2,
+    hybrid_lookup: bool = False,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 2048,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """Native MTP self-speculative decoding for models exposing an MTP (nextn)
+    module (``model.has_mtp``, e.g. GLM-5.2 / DeepSeek-V3-family checkpoints
+    converted with the extra layer retained).
+
+    Drafts ``num_draft_tokens`` per iteration by chaining the MTP head —
+    feeding back its NORMED hidden (shared_head), which is what the reference
+    implementations chain; the raw hidden halves chained acceptance. Verifies
+    all drafts in one batched forward; accepts while the draft equals the
+    target's sampled token (distribution-lossless). ``hybrid_lookup`` enables
+    conservative prompt-lookup drafting for repetition-heavy workloads.
+
+    The MTP KV cache is maintained append-only over committed (hidden, token)
+    pairs: chained draft entries are trimmed after each verify and accepted
+    positions are backfilled from the verify pass's real hiddens.
+
+    Yields (token, logprobs, from_draft).
+    """
+    if not getattr(model, "has_mtp", False):
+        raise ValueError(
+            "Model has no MTP module. Use a checkpoint converted with the "
+            "nextn layer retained (num_nextn_predict_layers > 0)."
+        )
+    k_mtp = max(1, num_draft_tokens)
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = model.make_mtp_cache()
+    else:
+        model_cache = prompt_cache[:-1]
+        mtp_cache = prompt_cache[-1]
+    if not cache.can_trim_prompt_cache(model_cache):
+        raise ValueError("MTP speculative decoding requires a trimmable cache.")
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+
+    toks = prompt.tolist()
+    total = len(toks)
+    with mx.stream(generation_stream):
+        # Chunked prefill of BOTH the backbone and the MTP cache. The MTP pair
+        # for position i is (h_i, t_{i+1}), so each chunk's hiddens go in with
+        # the tokens shifted by one (batched, causal-masked in mtp_forward).
+        y = prompt
+        processed = 0
+        while y.size > 1:
+            n_chunk = min(prefill_step_size, y.size - 1)
+            model(y[:n_chunk][None], cache=model_cache)
+            h_chunk = model.model._h_prenorm
+            model.mtp_forward(h_chunk, y[1:n_chunk + 1][None], cache=mtp_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache], mtp_cache.state)
+            processed += n_chunk
+            prompt_progress_callback(processed, total)
+            y = y[n_chunk:]
+            mx.clear_cache()
+        logits = model(y[None], cache=model_cache)
+        h_last = model.model._h_prenorm[:, -1:, :]
+        logprobs0 = logits[0, -1] - mx.logsumexp(logits[0, -1])
+        t = sampler(logprobs0[None]).squeeze()
+        mx.eval(t, h_last)
+
+    def enqueue_drafts_and_verify(h_anchor, t_next, t_int):
+        """Lazily build drafts + the verify forward for the NEXT iteration and
+        async_eval the lot — called BEFORE yielding, so the detokenizer /
+        response-object Python of the wrapper overlaps GPU work (the spec loop
+        cannot pipeline across its accept/reject sync the way generate_step
+        does, so anything left after the sync sits on the critical path)."""
+        chained = 0
+        drafts = None
+        if hybrid_lookup:
+            cont = _find_suffix_draft(toks + [t_int])
+            if cont:
+                _ = model.mtp_forward(h_anchor, t_next.reshape(1, 1), cache=mtp_cache)
+                drafts = [mx.array(c, dtype=mx.int64) for c in cont]
+        if drafts is None:
+            drafts = []
+            logits, g = model.mtp_forward(
+                h_anchor, t_next.reshape(1, 1), cache=mtp_cache, return_hidden=True
+            )
+            drafts.append(mx.argmax(logits[0, -1]))
+            for _ in range(k_mtp - 1):
+                logits, g = model.mtp_forward(
+                    model.mtp.shared_head(g), drafts[-1].reshape(1, 1),
+                    cache=mtp_cache, return_hidden=True,
+                )
+                drafts.append(mx.argmax(logits[0, -1]))
+            chained = k_mtp - 1
+        k = len(drafts)
+        lg2 = model(mx.stack([t_next] + drafts).reshape(1, k + 1), cache=model_cache)
+        h2 = model.model._h_prenorm
+        lps = lg2[0] - mx.logsumexp(lg2[0], axis=-1, keepdims=True)
+        trues = sampler(lps)
+        quantize_cache_fn(model_cache)
+        mx.async_eval(trues, h2, *drafts)
+        return drafts, chained, trues, lps, h2
+
+    ti = int(t.item())
+    lp = logprobs0
+    with mx.stream(generation_stream):
+        d, chained, trues, lps, h2 = enqueue_drafts_and_verify(h_last, t, ti)
+    produced = 0
+    while produced < max_tokens:
+        k = len(d)
+        di = [int(x.item()) for x in d]          # single sync point per iteration
+        ai = trues.tolist()
+        n = 0
+        while n < k and di[n] == ai[n]:
+            n += 1
+        toks.append(ti)
+        toks.extend(di[:n])
+        emit = [(ti, lp, False)] + [(di[j], lps[j], True) for j in range(n)]
+        if produced + len(emit) < max_tokens:
+            with mx.stream(generation_stream):
+                if k - n > 0:
+                    cache.trim_prompt_cache(model_cache, k - n)
+                if chained:
+                    cache.trim_prompt_cache([mtp_cache], chained)
+                for j in range(n):
+                    _ = model.mtp_forward(
+                        h2[:, j:j + 1, :], d[j].reshape(1, 1), cache=mtp_cache
+                    )
+                ti_next, lp_next = ai[n], lps[n]
+                d, chained, trues, lps, h2 = enqueue_drafts_and_verify(
+                    h2[:, n:n + 1, :], mx.array(ai[n], dtype=mx.int64), ti_next
+                )
+        for tok, lpv, fd in emit:                # wrapper Python overlaps GPU
+            yield tok, lpv, fd
+            produced += 1
+            if produced >= max_tokens:
+                return
+        ti, lp = ti_next, lp_next
+        if produced % 256 <= k:
+            mx.clear_cache()
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    mtp: bool = False,
+    mtp_num_draft_tokens: int = 2,
+    mtp_hybrid: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -666,6 +861,12 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
+        mtp (bool): Use the model's native MTP (nextn) module for
+          self-speculative decoding (requires a checkpoint converted with the
+          MTP layer retained; mutually exclusive with ``draft_model``).
+        mtp_num_draft_tokens (int): Chained MTP draft tokens per step. Default: 2.
+        mtp_hybrid (bool): Also enable conservative prompt-lookup drafting
+          (helps repetition-heavy workloads). Default: ``False``.
         kwargs: The remaining options get passed to :func:`generate_step`.
           See :func:`generate_step` for more details.
 
@@ -689,7 +890,22 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    if mtp:
+        if draft_model is not None:
+            raise ValueError("mtp and draft_model are mutually exclusive.")
+        if kwargs.pop("logits_processors", None):
+            raise ValueError("mtp does not support logits_processors yet.")
+        kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("max_kv_size", None)
+        kwargs.pop("input_embeddings", None)
+        token_generator = mtp_speculative_generate_step(
+            prompt,
+            model,
+            num_draft_tokens=mtp_num_draft_tokens,
+            hybrid_lookup=mtp_hybrid,
+            **kwargs,
+        )
+    elif draft_model is None:
         kwargs.pop("num_draft_tokens", None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
@@ -1654,10 +1870,16 @@ class BatchGenerator:
             gen_time = total_time - self._prompt_time_counter
             stats.prompt_tokens += self._prompt_tokens_counter
             stats.prompt_time += self._prompt_time_counter
-            stats.prompt_tps = stats.prompt_tokens / stats.prompt_time
+            stats.prompt_tps = (
+                stats.prompt_tokens / stats.prompt_time if stats.prompt_time else 0.0
+            )
             stats.generation_tokens += self._gen_tokens_counter
             stats.generation_time += gen_time
-            stats.generation_tps = stats.generation_tokens / stats.generation_time
+            stats.generation_tps = (
+                stats.generation_tokens / stats.generation_time
+                if stats.generation_time
+                else 0.0
+            )
             stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
 
     def insert(
@@ -2181,6 +2403,9 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        mtp=args.mtp,
+        mtp_num_draft_tokens=args.mtp_num_draft_tokens,
+        mtp_hybrid=args.mtp_hybrid,
     )
     if not args.verbose:
         print(response)

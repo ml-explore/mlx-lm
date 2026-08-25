@@ -359,6 +359,10 @@ class KVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # Unused cache (e.g. the indexer KV cache on GLM IndexShare "shared"
+            # layers, which never run the indexer). Serialize as empty.
+            return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -370,7 +374,7 @@ class KVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -781,6 +785,10 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # Unused cache (e.g. the indexer KV cache on GLM IndexShare "shared"
+            # layers, which never run the indexer). Serialize as empty.
+            return None, None
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -792,7 +800,7 @@ class ChunkedKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.offset = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -826,6 +834,11 @@ class CacheList(_BaseCache):
 
     def __getitem__(self, idx):
         return self.caches[idx]
+
+    @property
+    def offset(self):
+        # token position; generate.maybe_quantize_kv_cache reads cache.offset.
+        return self.caches[0].offset
 
     def is_trimmable(self):
         return all(c.is_trimmable() for c in self.caches)
@@ -879,6 +892,20 @@ class CacheList(_BaseCache):
         )
         return cache
 
+    def to_quantized(self, group_size: int = 64, bits: int = 4) -> "CacheList":
+        # MLA layout is CacheList(latent_KVCache, indexer_KVCache): quantize ONLY the
+        # large compressed-latent cache (caches[0]); the DSA indexer cache (caches[1])
+        # is tiny and drives discrete top-k, so it stays full precision. This is what
+        # makes 1M-context fit (latent KV 90GB fp16 -> ~45GB int8). The MLA attention
+        # dequantizes the latent on read (deepseek_v32.py).
+        first = self.caches[0]
+        q0 = (
+            first.to_quantized(group_size=group_size, bits=bits)
+            if hasattr(first, "to_quantized")
+            else first
+        )
+        return CacheList(q0, *self.caches[1:])
+
     def extract(self, idx):
         return CacheList(*(c.extract(idx) for c in self.caches))
 
@@ -910,6 +937,9 @@ class CacheList(_BaseCache):
 
 
 def dynamic_roll(x, shifts, axis):
+    if x is None:
+        # Unwritten batched cache (DSA indexer KV on IndexShare "shared" layers).
+        return x
     n = x.shape[axis]
     expand_shifts = (...,) + (None,) * (x.ndim - axis)
     expand_indices = expand_shifts[:-1]
@@ -998,6 +1028,11 @@ class BatchKVCache(_BaseCache):
     @property
     def state(self):
         k, v = self.keys, self.values
+        if k is None:
+            # Unwritten batched cache (e.g. the DSA indexer KV on GLM IndexShare
+            # "shared" layers) — report empty so mx.eval(cache.state) in batch_generate
+            # doesn't dereference keys=None.
+            return None, None, self.offset, self.left_padding
         if self._idx < k.shape[2]:
             k = k[..., : self._idx, :]
             v = v[..., : self._idx, :]
@@ -1006,7 +1041,7 @@ class BatchKVCache(_BaseCache):
     @state.setter
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self._idx = 0 if self.keys is None else self.keys.shape[2]
 
     def is_trimmable(self):
         return True
@@ -1088,6 +1123,10 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        if self.keys is None:
+            # Unwritten batched cache (DSA indexer KV on IndexShare "shared" layers):
+            # extract an empty per-sequence cache.
+            return cache
         padding = self.left_padding[idx].item()
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])

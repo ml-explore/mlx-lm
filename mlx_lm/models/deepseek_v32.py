@@ -10,10 +10,15 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import CacheList, KVCache
+from .cache import CacheList, KVCache, QuantizedKVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
+
+import os as _os
+
+# Kill-switch for the small-L sparse gather path (validation / fallback).
+_NO_SMALL_L_GATHER = _os.environ.get("MLXLM_NO_SMALL_L_GATHER", "") == "1"
 
 
 @dataclass
@@ -50,7 +55,27 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    index_topk_freq: int = 1
+    indexer_types: Optional[Any] = None
     indexer_rope_interleave: bool = False
+    # GLM-5.2's indexer uses LayerNorm eps 1e-6 (DeepSeek-V3.2: 1e-5).
+    indexer_norm_eps: float = 1e-5
+    # Number of DeepSeek-V3-style MTP (nextn) layers in the checkpoint. When > 0
+    # and the checkpoint retains the extra layer(s), sanitize() attaches them as
+    # an MtpModule for native self-speculative decoding (see Model.mtp_forward).
+    num_nextn_predict_layers: int = 0
+
+
+def derive_indexer_types(num_layers, index_topk_freq, indexer_types):
+    """Per-layer DSA mode. "full" layers run the indexer; "shared" layers reuse
+    the previous full layer's top-k (GLM-5.2 IndexShare). Mirrors the HF rule;
+    index_topk_freq=1 -> every layer "full" (DeepSeek-V3.2 behavior)."""
+    if indexer_types is not None:
+        return list(indexer_types)
+    return [
+        "full" if (max(i - 1, 0) % index_topk_freq) == 0 else "shared"
+        for i in range(num_layers)
+    ]
 
 
 class Indexer(nn.Module):
@@ -66,7 +91,7 @@ class Indexer(nn.Module):
             self.q_lora_rank, self.n_heads * self.head_dim, bias=False
         )
         self.wk = nn.Linear(self.dim, self.head_dim, bias=False)
-        self.k_norm = nn.LayerNorm(self.head_dim)
+        self.k_norm = nn.LayerNorm(self.head_dim, eps=args.indexer_norm_eps)
         self.weights_proj = nn.Linear(self.dim, self.n_heads, bias=False)
         self.softmax_scale = self.head_dim**-0.5
         self.rope = initialize_rope(
@@ -115,9 +140,10 @@ class Indexer(nn.Module):
 
 
 class DeepseekV32Attention(nn.Module):
-    def __init__(self, config: ModelArgs):
+    def __init__(self, config: ModelArgs, is_full: bool = True):
         super().__init__()
         self.config = config
+        self.is_full = is_full
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.max_position_embeddings = config.max_position_embeddings
@@ -166,7 +192,7 @@ class DeepseekV32Attention(nn.Module):
                     s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
                     self.scale = self.scale * s * s
 
-        self.indexer = Indexer(config)
+        self.indexer = Indexer(config) if is_full else None
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -180,7 +206,8 @@ class DeepseekV32Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
+        prev_topk: Optional[mx.array] = None,
+    ):
         B, L, D = x.shape
 
         qr = self.q_a_layernorm(self.q_a_proj(x))
@@ -201,10 +228,21 @@ class DeepseekV32Attention(nn.Module):
 
         if cache is not None:
             kv_latent, k_pe = cache[0].update_and_fetch(kv_latent, k_pe)
+            if isinstance(cache[0], QuantizedKVCache):
+                # int8 MLA latent KV: the cache returns quantized (packed,scales,biases)
+                # tuples; dequantize so the MLA reconstruction (take_along_axis /
+                # embed_q / unembed_out) sees plain arrays. Enables comfortable 1M ctx.
+                _qp = dict(group_size=cache[0].group_size, bits=cache[0].bits)
+                kv_latent = mx.dequantize(*kv_latent, **_qp)
+                k_pe = mx.dequantize(*k_pe, **_qp)
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        if self.is_full:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        else:
+            # IndexShare: reuse the most recent "full" layer's top-k indices.
+            topk_indices = prev_topk
         if topk_indices is not None:
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
@@ -220,6 +258,48 @@ class DeepseekV32Attention(nn.Module):
                 )
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+            elif L <= 4 and not _NO_SMALL_L_GATHER:
+                # Small-L sparse path (MTP verify / tiny continuations): gather each
+                # position's top-k keys instead of building a full-key boolean mask.
+                # The mask path costs ~7 plain-steps PER CALL at 2K+ context (21x
+                # argpartition + put_along_axis + full-key attention) — fine when
+                # amortized over a 2048-token prefill chunk, fatal per spec-decode
+                # iteration (measured: long-ctx MTP 0.26x plain). All-gather batched
+                # matmuls instead; k = v = latent, unembed after (as in L == 1).
+                idx = topk_indices[..., None]                       # [B,1,L,K,1]
+                K = topk_indices.shape[-1]
+                kvl_g = mx.take_along_axis(
+                    kv_latent[:, :, None, :, :],
+                    mx.broadcast_to(idx, idx.shape[:-1] + (kv_latent.shape[-1],)),
+                    axis=3,
+                )                                                    # [B,1,L,K,Dl]
+                kpe_g = mx.take_along_axis(
+                    k_pe[:, :, None, :, :],
+                    mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
+                    axis=3,
+                )                                                    # [B,1,L,K,dpe]
+                pe_g = (q_pe * self.scale)[:, :, :, None, :] @ kpe_g.swapaxes(-1, -2)
+                q_lat = self.embed_q(q_nope)                         # [B,H,L,Dl]
+                scores = (
+                    self.scale * (q_lat[:, :, :, None, :] @ kvl_g.swapaxes(-1, -2))
+                    + pe_g
+                )                                                    # [B,H,L,1,K]
+                if mask is not None:
+                    # Right at the sparse threshold a position can have fewer than K
+                    # causally-valid keys; re-mask the gathered scores to be safe.
+                    mask_g = mx.take_along_axis(
+                        mx.broadcast_to(mask, topk_indices.shape[:-1] + (mask.shape[-1],)),
+                        topk_indices,
+                        axis=-1,
+                    )[:, :, :, None, :]
+                    scores = mx.where(
+                        mask_g, scores, mx.array(mx.finfo(scores.dtype).min, scores.dtype)
+                    )
+                attn = mx.softmax(scores, axis=-1, precise=True)
+                out = (attn @ kvl_g).squeeze(3)                      # [B,H,L,Dl]
+                out = self.unembed_out(out)                          # [B,H,L,Dv]
+                out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(out), topk_indices
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
@@ -232,8 +312,13 @@ class DeepseekV32Attention(nn.Module):
                 mask = sparse_mask
         # Ensure the indexer cache is evaluated even if the topk_indices are unused
         # to keep the graph from getting too large
-        if cache is not None and cache[0] is not None:
-            cache[0].keys = mx.depends(cache[0].keys, (cache[1].keys, cache[1].values))
+        if self.is_full and cache is not None and cache[0] is not None:
+            _dep = (cache[1].keys, cache[1].values)
+            if isinstance(cache[0], QuantizedKVCache):
+                # keys is a (packed, scales, biases) tuple when quantized
+                cache[0].keys = tuple(mx.depends(k, _dep) for k in cache[0].keys)
+            else:
+                cache[0].keys = mx.depends(cache[0].keys, _dep)
 
         pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
         if mask is not None:
@@ -257,7 +342,7 @@ class DeepseekV32Attention(nn.Module):
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
+        return self.o_proj(output), topk_indices
 
 
 class DeepseekV32MLP(nn.Module):
@@ -380,7 +465,12 @@ class DeepseekV32MoE(nn.Module):
 class DeepseekV32DecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, layer_idx: int):
         super().__init__()
-        self.self_attn = DeepseekV32Attention(config)
+        indexer_types = derive_indexer_types(
+            config.num_hidden_layers, config.index_topk_freq, config.indexer_types
+        )
+        self.self_attn = DeepseekV32Attention(
+            config, is_full=(indexer_types[layer_idx] == "full")
+        )
         self.mlp = (
             DeepseekV32MoE(config)
             if (
@@ -400,11 +490,12 @@ class DeepseekV32DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        prev_topk: Optional[mx.array] = None,
+    ):
+        r, topk = self.self_attn(self.input_layernorm(x), mask, cache, prev_topk)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
-        return h + r
+        return h + r, topk
 
 
 class DeepseekV32Model(nn.Module):
@@ -435,6 +526,21 @@ class DeepseekV32Model(nn.Module):
             layers_per_rank += 1
         self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
         self.end_idx = self.start_idx + layers_per_rank
+        # Snap pipeline boundaries to "full" DSA layers. IndexShare cannot cross a
+        # rank boundary: a "shared" layer reuses the previous full layer's indexer
+        # top-k, but at a split that full layer lives on the other rank (topk resets
+        # to None per rank). So make each rank BEGIN on a full layer (computes its
+        # own top-k). Both ranks snap the same boundary value identically -> agree.
+        def _snap_to_full(idx):
+            while 0 < idx < len(self.layers) and not getattr(
+                self.layers[idx].self_attn, "is_full", True
+            ):
+                idx -= 1
+            return idx
+
+        if self.pipeline_size > 1:
+            self.start_idx = _snap_to_full(self.start_idx)
+            self.end_idx = _snap_to_full(self.end_idx)
         self.layers = self.layers[: self.end_idx]
         self.layers[: self.start_idx] = [None] * self.start_idx
         self.num_layers = len(self.layers) - self.start_idx
@@ -458,22 +564,70 @@ class DeepseekV32Model(nn.Module):
         # Receive from the previous process in the pipeline
 
         if pipeline_rank < pipeline_size - 1:
-            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+            # CPU stream: the blocking recv must NOT sit inside a Metal command
+            # buffer or the macOS GPU watchdog (~5s) kills it (RDMA still full speed).
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1), stream=mx.cpu)
+            mx.eval(h)
 
+        # Thread DSA top-k across layers: a "full" layer computes the indices and
+        # subsequent "shared" layers (IndexShare) reuse them. Resets per pipeline
+        # rank — multi-rank IndexShare across a split boundary is not yet handled.
+        topk = None
+        # Optionally break the forward into smaller command buffers (mx.eval every
+        # N layers) to stay under the macOS GPU watchdog for very large / distributed
+        # runs (e.g. DWQ on 744B). Set MLX_LM_EVAL_EVERY_LAYERS>0 to enable; 0 = off
+        # (default, preserves normal inference behavior).
+        import os as _os
+
+        _eval_every = int(_os.environ.get("MLX_LM_EVAL_EVERY_LAYERS", "0"))
         for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+            h, topk = self.layers[self.start_idx + i](h, mask, cache[i], topk)
+            if _eval_every and (i + 1) % _eval_every == 0:
+                mx.eval(h)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
-            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            mx.eval(h)  # finish GPU compute before the CPU-stream send
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size, stream=mx.cpu)
             if cache[-1] is not None:
                 cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
 
-        # Broadcast h while keeping it in the graph
+        # Broadcast h while keeping it in the graph (CPU stream → no watchdog).
         if pipeline_size > 1:
-            h = mx.distributed.all_gather(h)[: h.shape[0]]
+            h = mx.distributed.all_gather(h, stream=mx.cpu)[: h.shape[0]]
 
+        # Stash the pre-final-norm hidden: the MTP draft head consumes this (the
+        # final norm is calibrated for lm_head, not for feeding auxiliary heads).
+        # Underscored so it stays OUT of the parameter tree (a public mx.array
+        # attribute would be saved into checkpoints and break strict loads).
+        self._h_prenorm = h
         return self.norm(h)
+
+
+class MtpModule(nn.Module):
+    """DeepSeek-V3-style MTP (nextn) block: predicts t+2 from the backbone's
+    pre-final-norm hidden at t and the embedding of t+1. Attached by
+    Model.sanitize() when the checkpoint retains layer `num_hidden_layers`.
+    Embedding and lm_head are shared with the main model (see Model.mtp_forward)."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        H = config.hidden_size
+        self.enorm = nn.RMSNorm(H, eps=config.rms_norm_eps)
+        self.hnorm = nn.RMSNorm(H, eps=config.rms_norm_eps)
+        self.eh_proj = nn.Linear(2 * H, H, bias=False)
+        # The MTP block is a full-indexer MoE layer; pick a representative
+        # layer_idx that is both "full" (own DSA indexer) and MoE.
+        idx_types = derive_indexer_types(
+            config.num_hidden_layers, config.index_topk_freq, config.indexer_types
+        )
+        idx = next(
+            (i for i in range(config.num_hidden_layers)
+             if idx_types[i] == "full" and i >= config.first_k_dense_replace),
+            config.first_k_dense_replace,
+        )
+        self.layer = DeepseekV32DecoderLayer(config, idx)
+        self.shared_head = nn.RMSNorm(H, eps=config.rms_norm_eps)
 
 
 class Model(nn.Module):
@@ -484,6 +638,31 @@ class Model(nn.Module):
         self.model = DeepseekV32Model(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    @property
+    def has_mtp(self):
+        return hasattr(self, "mtp")
+
+    def make_mtp_cache(self):
+        return CacheList(KVCache(), KVCache())
+
+    def mtp_forward(self, h_prev, tokens, cache=None, return_hidden=False):
+        """Draft logits from pre-norm hidden(s) `h_prev` (B, L, H) and the
+        committed next token(s) `tokens` (B, L). For CHAINED drafting feed the
+        NORMED hidden back: mtp_forward(model.mtp.shared_head(g), d, ...) —
+        chaining the raw hidden costs ~2x chained acceptance (measured)."""
+        emb = self.model.embed_tokens(tokens)
+        x = self.mtp.eh_proj(
+            mx.concatenate([self.mtp.enorm(emb), self.mtp.hnorm(h_prev)], axis=-1)
+        )
+        mask = None
+        if x.shape[1] > 1:
+            mask = create_attention_mask(
+                x, cache[0] if cache is not None else None, return_array=True
+            )
+        out, _ = self.mtp.layer(x, mask, cache, None)
+        logits = self.lm_head(self.mtp.shared_head(out))
+        return (logits, out) if return_hidden else logits
+
     def __call__(
         self,
         inputs: mx.array,
@@ -493,12 +672,28 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        # Remove multi-token prediction layers
+        # Multi-token-prediction layer(s): keep the first one as an MtpModule
+        # when enabled (num_nextn_predict_layers > 0 and weights present in the
+        # checkpoint); otherwise strip, preserving the old behavior.
         mpt_layer = self.args.num_hidden_layers
+        keep_mtp = getattr(self.args, "num_nextn_predict_layers", 0) > 0 and any(
+            k.startswith(f"model.layers.{mpt_layer}.") for k in weights
+        )
+        if keep_mtp:
+            self.mtp = MtpModule(self.args)
         new_weights = {}
         for k, v in weights.items():
             parts = k.split(".")
             if len(parts) >= 3 and parts[1] == "layers" and int(parts[2]) >= mpt_layer:
+                if keep_mtp and int(parts[2]) == mpt_layer:
+                    b = k.split(f"layers.{mpt_layer}.")[1]
+                    if b.startswith(("self_attn.", "mlp.", "input_layernorm",
+                                     "post_attention_layernorm")):
+                        new_weights[f"mtp.layer.{b}"] = v
+                    elif b.startswith("shared_head.norm."):
+                        new_weights["mtp.shared_head." + b[len("shared_head.norm."):]] = v
+                    elif b.startswith(("enorm", "hnorm", "eh_proj")):
+                        new_weights[f"mtp.{b}"] = v
                 continue
             new_weights[k] = v
         weights = new_weights
