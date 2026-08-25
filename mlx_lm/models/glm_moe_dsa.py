@@ -51,10 +51,7 @@ class ModelArgs(BaseModelArgs):
     index_topk_freq: int = 1
     indexer_types: Optional[Any] = None
     index_skip_topk_offset: int = 0
-    # GLM-5.2 indexer: non-interleaved RoPE + LayerNorm eps 1e-6 (verified vs HF).
-    # The config's `indexer_rope_interleave` flag is not honored by HF's modeling,
-    # which hardcodes half-split RoPE; we match that empirically-correct behavior.
-    indexer_rope_traditional: bool = False
+    indexer_rope_interleave: bool = False
     indexer_norm_eps: float = 1e-6
     # GLM-5.2 ships one nextn (MTP) layer; kept as an MtpModule when the
     # checkpoint retains layer 78 (see deepseek_v32.Model.sanitize).
@@ -63,6 +60,10 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
         self.rope_theta = self.rope_parameters["rope_theta"]
+        # GLM-5.2 configs ship `indexer_rope_interleave: true`, but HF's modeling
+        # ignores the flag and hardcodes half-split (non-interleaved) RoPE in the
+        # indexer (verified vs HF); force the empirically-correct behavior.
+        self.indexer_rope_interleave = False
 
 
 class Model(DSV32Model):

@@ -627,11 +627,16 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
-        return self.cache
+        # None can not be seralized so return empty array instead
+        left_padding = mx.array([]) if self.left_padding is None else self.left_padding
+        lengths = mx.array([]) if self.lengths is None else self.lengths
+        return self.cache, left_padding, lengths
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        self.cache, left_padding, lengths = v
+        self.left_padding = left_padding if left_padding.size > 0 else None
+        self.lengths = lengths if lengths.size > 0 else None
 
     def filter(self, batch_indices):
         """
@@ -743,11 +748,15 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        # Maintain the cache below the chunk size.
+        if self.keys is None:
+            return
+        valid = self.offset - self.start_position
+        if valid > self.chunk_size:
+            trim = valid - self.chunk_size
+            self.start_position += trim
+            self.keys = self.keys[..., trim:valid, :]
+            self.values = self.values[..., trim:valid, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position

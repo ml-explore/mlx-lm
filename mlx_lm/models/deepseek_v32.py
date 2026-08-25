@@ -57,9 +57,8 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = False
     index_topk_freq: int = 1
     indexer_types: Optional[Any] = None
-    # GLM-5.2's indexer uses non-interleaved (half-split) RoPE and LayerNorm eps 1e-6,
-    # unlike its interleaved main attention. Defaults preserve DeepSeek-V3.2 behavior.
-    indexer_rope_traditional: bool = True
+    indexer_rope_interleave: bool = False
+    # GLM-5.2's indexer uses LayerNorm eps 1e-6 (DeepSeek-V3.2: 1e-5).
     indexer_norm_eps: float = 1e-5
     # Number of DeepSeek-V3-style MTP (nextn) layers in the checkpoint. When > 0
     # and the checkpoint retains the extra layer(s), sanitize() attaches them as
@@ -98,7 +97,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=args.indexer_rope_traditional,
+            traditional=args.indexer_rope_interleave,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )

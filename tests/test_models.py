@@ -2,6 +2,7 @@
 import copy
 import importlib
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -339,6 +340,37 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def test_quantized_sdpa_gqa_batched_mask(self):
+        # Regression test: quantized SDPA with grouped-query attention and a
+        # batched (B >= 2) padding mask used to crash with a broadcast error
+        # because the mask lacked the n_repeats axis introduced by the GQA
+        # reshape of the scores.
+        B, n_q_heads, n_kv_heads, L, D = 2, 8, 2, 16, 32
+
+        cache = KVCache()
+        k = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        v = 1e-1 * mx.random.normal(shape=(B, n_kv_heads, L, D))
+        k_up, v_up = cache.update_and_fetch(k, v)
+        quant_cache = cache.to_quantized(group_size=32, bits=8)
+        qk_up, qv_up = quant_cache.state
+
+        q = 1e-1 * mx.random.normal(shape=(B, n_q_heads, L, D))
+
+        # Batched padding mask, shape (B, 1, L, L), as produced by BatchKVCache.
+        mask = mx.ones((B, 1, L, L), dtype=mx.bool_)
+        mask[1, :, :, L // 2 :] = False
+
+        out = scaled_dot_product_attention(
+            q, k_up, v_up, cache=cache, mask=mask, scale=1.0
+        )
+        qout = scaled_dot_product_attention(
+            q, qk_up, qv_up, cache=quant_cache, mask=mask, scale=1.0
+        )
+        mx.eval(out, qout)
+        self.assertEqual(qout.shape, (B, n_q_heads, L, D))
+        self.assertTrue(mx.all(mx.isfinite(qout)).item())
+        self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
@@ -615,7 +647,9 @@ class TestModels(unittest.TestCase):
             "max_position_embeddings": 64,
         }
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        mlx_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
 
         for model_type, hf_mtp_key in (
             ("qwen3_5", "mtp.fc.weights"),
@@ -631,20 +665,27 @@ class TestModels(unittest.TestCase):
             model = module.Model(args)
 
             base = mx.arange(8, dtype=mx.float32)
+            raw_conv = mx.zeros((4, 1, 3), dtype=mx.float32)
 
-            # Simulate convert sanitize on HF-style keys.
+            # Raw HF Conv1D layout is the reliable signal that RMSNorm weights
+            # are still zero-centered and need the MLX +1 conversion.
             converted = model.sanitize(
                 {
                     hf_norm_key: base,
+                    hf_conv_key: raw_conv,
                     hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
             self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
+            self.assertEqual(converted[mlx_conv_key].shape, (4, 3, 1))
             self.assertFalse(any("mtp." in k for k in converted))
 
-            # Simulate load sanitize on already-converted keys.
-            loaded = model.sanitize(converted)
+            # MTP can also be present in an already-converted checkpoint. It
+            # must be dropped without shifting converted norm weights again.
+            loaded = model.sanitize(
+                {**converted, hf_mtp_key: mx.zeros((1,), dtype=mx.float32)}
+            )
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
@@ -1184,6 +1225,40 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_falcon_mamba_bcdt_normalization(self):
+        from mlx_lm.models import mamba
+
+        args = mamba.ModelArgs(
+            model_type="falcon_mamba",
+            vocab_size=32,
+            use_bias=False,
+            use_conv_bias=True,
+            conv_kernel=4,
+            hidden_size=4,
+            num_hidden_layers=1,
+            state_size=2,
+            intermediate_size=8,
+            time_step_rank=2,
+        )
+        block = mamba.MambaBlock(args)
+
+        x = mx.ones((1, args.intermediate_size))
+        A = -mx.ones((args.intermediate_size, args.state_size))
+
+        with (
+            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
+            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
+        ):
+            y, state = block.ssm_step(x, A)
+
+        mx.eval(y, state)
+        self.assertEqual(rms_norm.call_count, 3)
+        for call in rms_norm.call_args_list:
+            self.assertIsNone(call.kwargs["weight"])
+        self.assertEqual(ones.call_count, 0)
+        self.assertEqual(y.shape, (1, args.intermediate_size))
+        self.assertEqual(state.shape, (1, args.intermediate_size, args.state_size))
 
     def test_falcon_h1(self):
         from mlx_lm.models import falcon_h1
@@ -2348,6 +2423,49 @@ class TestModels(unittest.TestCase):
                 },
             },
             {
+                "model_type": "laguna",
+                "vocab_size": 10_000,
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 32,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 4,
+                "partial_rotary_factor": 0.5,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 128,
+                "shared_expert_intermediate_size": 128,
+                "moe_routed_scaling_factor": 2.5,
+                "moe_router_score_func": "sqrtsoftplus",
+                "layer_types": [
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                "mlp_layer_types": ["dense", "sparse", "sparse", "sparse"],
+                "num_attention_heads_per_layer": [4, 4, 4, 4],
+                "rope_parameters": {
+                    "full_attention": {
+                        "rope_type": "yarn",
+                        "rope_theta": 500000.0,
+                        "factor": 8.0,
+                        "original_max_position_embeddings": 4096,
+                        "beta_slow": 1.0,
+                        "beta_fast": 32.0,
+                        "partial_rotary_factor": 0.5,
+                    },
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 1.0,
+                    },
+                },
+            },
+            {
                 "model_type": "llama4",
                 "text_config": {
                     "attention_bias": False,
@@ -3116,6 +3234,56 @@ class TestModels(unittest.TestCase):
         self.assertIsNone(dynamic_roll(None, mx.array([0, 0]), 2))
         c.state = c.state  # round-trip empty state through the setter
         self.assertEqual(c._idx, 0)
+    def test_llama4_chunked_kv_cache(self):
+        # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
+        # the number of valid cached tokens, not on the padded buffer size.
+        # When the chunk size is smaller than the cache allocation step, the old
+        # logic dropped live tokens on the first decode step, so incremental
+        # generation diverged from a single full forward pass.
+        from mlx_lm.models import llama4
+
+        args = llama4.ModelArgs.from_dict(
+            {
+                "model_type": "llama4",
+                "vocab_size": 1000,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "attention_bias": False,
+                    "attention_chunk_size": 4,
+                    "head_dim": 32,
+                    "hidden_size": 128,
+                    "interleave_moe_layer_step": 2,
+                    "intermediate_size": 128,
+                    "intermediate_size_mlp": 128,
+                    "max_position_embeddings": 1000,
+                    "model_type": "llama4",
+                    "num_attention_heads": 4,
+                    "num_experts_per_tok": 1,
+                    "num_hidden_layers": 4,
+                    "num_key_value_heads": 2,
+                    "num_local_experts": 2,
+                    "rms_norm_eps": 1e-4,
+                    "rope_scaling": None,
+                    "rope_theta": 1000,
+                    "use_qk_norm": True,
+                    "vocab_size": 1000,
+                },
+            }
+        )
+        model = llama4.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        # A sequence several chunks long so the trim path runs repeatedly.
+        tokens = mx.array([list(range(1, 13))])
+        full = model(tokens)
+
+        cache = make_prompt_cache(model)
+        step = [model(tokens[:, :1], cache=cache)]
+        for i in range(1, tokens.shape[1]):
+            step.append(model(tokens[:, i : i + 1], cache=cache))
+        step = mx.concatenate(step, axis=1)
+
+        self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
 
     def test_ssm(self):
         for batch_size in [1, 2]:
