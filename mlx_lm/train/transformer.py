@@ -100,14 +100,14 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
         if args.rope_scaling_factor > 1:
-            self.rope = YarnRoPE(
+            self._rope = YarnRoPE(
                 head_dim,
                 base=args.rope_theta,
                 scaling_factor=args.rope_scaling_factor,
                 original_max_position_embeddings=args.original_max_position_embeddings,
             )
         else:
-            self.rope = nn.RoPE(head_dim, base=args.rope_theta, traditional=False)
+            self._rope = nn.RoPE(head_dim, base=args.rope_theta, traditional=False)
 
     def __call__(
         self,
@@ -126,12 +126,12 @@ class Attention(nn.Module):
         values = values.transpose(0, 2, 1, 3)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            queries = self._rope(queries, offset=cache.offset)
+            keys = self._rope(keys, offset=cache.offset)
             keys, values = cache.update_and_fetch(keys, values)
         else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
+            queries = self._rope(queries)
+            keys = self._rope(keys)
 
         out = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
