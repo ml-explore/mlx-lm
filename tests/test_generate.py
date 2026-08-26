@@ -877,7 +877,6 @@ class TestGenerate(unittest.TestCase):
         self.assertIsNone(response.logprobs)
         self.assertIsNone(response.token_ids)
 
-
     def test_generate_step_worker_thread(self):
         """generate_step must not crash on a non-main thread.
 

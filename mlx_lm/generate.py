@@ -608,7 +608,9 @@ def speculative_generate_step(
                 num_draft = min(max_tokens - ntoks, num_draft_tokens)
                 draft_tokens = _draft_generate(draft_y, num_draft)
                 if prev_tokens is not None:
-                    prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
+                    prev_tokens = prev_tokens[
+                        : prev_tokens.size - y.size - num_draft + 1
+                    ]
                 y = mx.concatenate([y, draft_tokens])
                 tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
                 mx.eval(tokens, draft_tokens)
