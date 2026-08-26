@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
+from mlx.utils import tree_map
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
@@ -667,6 +668,15 @@ class Model(nn.Module):
         if N == 1:
             return
 
+        def repeat_kv_heads(proj, h):
+            def _repeat(p):
+                s = p.shape
+                p = p.reshape(h, s[0] // h, *s[1:])
+                p = mx.repeat(p, N // h, axis=0)
+                return p.reshape(-1, *s[1:])
+
+            proj.update(tree_map(_repeat, proj.parameters()))
+
         for layer in self.model.layers:
             attn = layer.self_attn
             if attn.n_heads % N != 0:
@@ -675,27 +685,30 @@ class Model(nn.Module):
                     f"which is not divisible by the group size {N}."
                 )
 
-            split_kv = attn.n_kv_heads % N == 0
-            if not split_kv and attn.n_kv_heads != 1:
+            h = attn.n_kv_heads
+            if max(h, N) % min(h, N) != 0:
                 raise ValueError(
-                    f"Layer {attn.layer_idx} has {attn.n_kv_heads} KV heads which "
-                    f"is neither 1 nor divisible by the group size {N}."
+                    f"Layer {attn.layer_idx} has {h} KV heads which does not "
+                    f"divide and is not divided by the group size {N}."
                 )
 
             attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
             attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
             attn.n_heads //= N
 
-            if split_kv:
-                if attn.has_kv:
-                    attn.k_proj = shard_linear(
-                        attn.k_proj, "all-to-sharded", group=group
+            if attn.has_kv:
+                # Fewer KV heads than ranks, so copy them until each rank owns
+                # the head its queries read.
+                if h < N:
+                    repeat_kv_heads(attn.k_proj, h)
+                attn.k_proj = shard_linear(attn.k_proj, "all-to-sharded", group=group)
+                if not attn.use_k_eq_v:
+                    if h < N:
+                        repeat_kv_heads(attn.v_proj, h)
+                    attn.v_proj = shard_linear(
+                        attn.v_proj, "all-to-sharded", group=group
                     )
-                    if not attn.use_k_eq_v:
-                        attn.v_proj = shard_linear(
-                            attn.v_proj, "all-to-sharded", group=group
-                        )
-                attn.n_kv_heads //= N
+            attn.n_kv_heads = max(1, h // N)
 
             layer.mlp.gate_proj = shard_linear(
                 layer.mlp.gate_proj, "all-to-sharded", group=group
