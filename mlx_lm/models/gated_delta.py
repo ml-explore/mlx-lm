@@ -10,6 +10,16 @@ def compute_g(A_log, a, dt_bias):
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
+@partial(mx.compile, shapeless=True)
+def compute_lower_bound_g(A_log, a, dt_bias, lower_bound):
+    return mx.exp(
+        lower_bound
+        * mx.sigmoid(
+            mx.exp(A_log.astype(mx.float32)) * (a.astype(mx.float32) + dt_bias)
+        )
+    )
+
+
 def _make_gated_delta_kernel(has_mask=False, vectorized=False):
     if not mx.metal.is_available():
         return None
@@ -270,9 +280,13 @@ def gated_delta_update(
     state: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
+    lower_bound: float | None = None,
 ) -> Tuple[mx.array, mx.array]:
     beta = mx.sigmoid(b)
-    g = compute_g(A_log, a, dt_bias)
+    if lower_bound is None:
+        g = compute_g(A_log, a, dt_bias)
+    else:
+        g = compute_lower_bound_g(A_log, a, dt_bias, lower_bound)
     if state is None:
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
