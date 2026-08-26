@@ -9,6 +9,7 @@ from typing import List
 import mlx.core as mx
 
 from mlx_lm.generate import (
+    DEFAULT_PREFILL_STEP_SIZE,
     BatchGenerator,
     GenerationResponse,
     StopSequenceMatcher,
@@ -16,6 +17,7 @@ from mlx_lm.generate import (
     generate,
     generate_step,
     generation_stream,
+    setup_arg_parser,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -423,6 +425,34 @@ class TestGenerate(unittest.TestCase):
 
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
+
+    def test_batch_processor_survive_a_request_without_it(self):
+        prompt = self.tokenizer.encode("hello")
+
+        def run(batch_gen, uid):
+            n = 0
+            while True:
+                for r in batch_gen.next_generated():
+                    if r.uid == uid:
+                        n += 1
+                        if r.finish_reason is not None:
+                            return n
+
+        batch_gen = BatchGenerator(self.model, max_tokens=3)
+        (uid,) = batch_gen.insert([prompt])
+        run(batch_gen, uid)
+
+        calls = []
+
+        def processor(tokens, logits):
+            calls.append(len(tokens))
+            return logits
+
+        (uid,) = batch_gen.insert([prompt], logits_processors=[[processor]])
+        n_tokens = run(batch_gen, uid)
+        # One call per generated token, plus the step that sampled the token
+        # after the last one returned
+        self.assertEqual(len(calls), n_tokens + 1)
 
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""

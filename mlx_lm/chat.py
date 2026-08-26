@@ -16,6 +16,7 @@ DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
+DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 
 
@@ -67,6 +68,13 @@ def setup_arg_parser():
         type=int,
         help="Set the maximum key-value cache size",
         default=None,
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of prompt tokens to process at a time. Smaller values "
+        f"lower peak memory during prefill (default: {DEFAULT_PREFILL_STEP_SIZE})",
     )
     parser.add_argument(
         "--max-tokens",
@@ -154,6 +162,7 @@ def main():
                     ),
                 ),
                 prompt_cache=prompt_cache,
+                prefill_step_size=args.prefill_step_size,
             ):
                 ui.stream_token(response.text)
                 last_response = response
