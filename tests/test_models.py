@@ -686,6 +686,63 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_qwen4_exp(self):
+        from mlx_lm.models import qwen4_exp
+
+        args = qwen4_exp.ModelArgs(
+            model_type="qwen4_exp",
+            text_config=dict(
+                hidden_size=64,
+                num_hidden_layers=4,
+                num_attention_heads=4,
+                num_key_value_heads=2,
+                head_dim=32,
+                vocab_size=10_000,
+                rms_norm_eps=1e-6,
+                full_attention_interval=4,
+                num_experts=8,
+                num_experts_per_tok=2,
+                moe_intermediate_size=32,
+                shared_expert_intermediate_size=32,
+                linear_num_key_heads=2,
+                linear_num_value_heads=4,
+                linear_key_head_dim=16,
+                linear_value_head_dim=16,
+                linear_conv_kernel_dim=4,
+                hc_count=4,
+                hc_lowrank=16,
+                indexer_n_heads=2,
+                indexer_kv_heads=1,
+                indexer_head_dim=16,
+                indexer_budget=8,
+                indexer_compress_ratio=4,
+                ngram_size=3,
+                heads_per_ngram=2,
+                ngram_vocab_size_base=101,
+                split_ngram_parts=4,
+                ple_embed_dim=64,
+                ple_layer_ids=[2],
+                eos_token_id=1,
+                rope_parameters={
+                    "rope_theta": 10000000,
+                    "partial_rotary_factor": 0.25,
+                },
+            ),
+        )
+        model = qwen4_exp.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers
+        )
+
+        # Un contexte plus long que le budget de l'indexeur force la voie creuse
+        # de la sparse attention, que le runner generique n'atteint pas.
+        cache = make_prompt_cache(model)
+        inputs = mx.array([list(range(2, 22))])
+        outputs = model(inputs, cache=cache)
+        self.assertEqual(outputs.shape, (1, 20, args.text.vocab_size))
+        outputs = model(mx.array([[7]]), cache=cache)
+        self.assertEqual(outputs.shape, (1, 1, args.text.vocab_size))
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 
