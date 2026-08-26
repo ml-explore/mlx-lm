@@ -81,6 +81,9 @@ class Model(nn.Module):
 
         return self.language_model.sanitize(new_weights)
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        self.language_model.shard(group)
+
     @property
     def layers(self):
         return self.language_model.layers

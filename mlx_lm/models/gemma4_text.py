@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_linear
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache, _BaseCache
@@ -659,6 +660,52 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        if N == 1:
+            return
+
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            if attn.n_heads % N != 0:
+                raise ValueError(
+                    f"Layer {attn.layer_idx} has {attn.n_heads} attention heads "
+                    f"which is not divisible by the group size {N}."
+                )
+
+            split_kv = attn.n_kv_heads % N == 0
+            if not split_kv and attn.n_kv_heads != 1:
+                raise ValueError(
+                    f"Layer {attn.layer_idx} has {attn.n_kv_heads} KV heads which "
+                    f"is neither 1 nor divisible by the group size {N}."
+                )
+
+            attn.q_proj = shard_linear(attn.q_proj, "all-to-sharded", group=group)
+            attn.o_proj = shard_linear(attn.o_proj, "sharded-to-all", group=group)
+            attn.n_heads //= N
+
+            if split_kv:
+                if attn.has_kv:
+                    attn.k_proj = shard_linear(
+                        attn.k_proj, "all-to-sharded", group=group
+                    )
+                    if not attn.use_k_eq_v:
+                        attn.v_proj = shard_linear(
+                            attn.v_proj, "all-to-sharded", group=group
+                        )
+                attn.n_kv_heads //= N
+
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
 
     @property
     def layers(self):
