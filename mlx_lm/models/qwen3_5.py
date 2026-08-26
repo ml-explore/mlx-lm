@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
@@ -462,6 +463,10 @@ class TextModel(nn.Module):
             return out, hidden  # pre-norm hidden for MTP head
         return out
 
+    @property
+    def supports_mtp(self):
+        return hasattr(self, "mtp")
+
     def mtp_forward(
         self,
         hidden_states: mx.array,
@@ -478,6 +483,8 @@ class TextModel(nn.Module):
         Returns:
             logits of shape (B, N, vocab_size).
         """
+        if not self.supports_mtp:
+            raise ValueError("This checkpoint does not contain native MTP weights.")
         mtp_out = self.mtp(
             hidden_states,
             next_token_ids,
@@ -502,17 +509,31 @@ class TextModel(nn.Module):
         return []
 
     def sanitize(self, weights):
+        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
+        # Norm weights need a +1 shift only in raw HF checkpoints (detected via
+        # unsanitized conv1d). Already-converted MLX models must not be shifted
+        # again, even when they contain MTP weights.
+        should_shift_norm_weights = has_unsanitized_conv1d
         # Keep MTP weights if this model has an MTP head; drop them otherwise
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
-        elif not any("mtp." in k for k in weights):
-            raise ValueError(
-                "Config specifies mtp_num_hidden_layers > 0 but the model weights "
-                "contain no MTP parameters. Set mtp_num_hidden_layers=0 to disable MTP."
+        elif not has_mtp_weights:
+            # Some converted checkpoints retain mtp_num_hidden_layers in config
+            # even though conversion stripped the MTP tensors. Keep ordinary
+            # autoregressive loading compatible, but retain the specific diagnosis
+            # that the checkpoint config and packaged tensors disagree.
+            warnings.warn(
+                "Checkpoint configuration declares an MTP head, but no MTP tensors "
+                "were found. MTP has been disabled; the checkpoint may be "
+                "incorrectly converted or packaged.",
+                UserWarning,
+                stacklevel=2,
             )
+            del self.mtp
+            self.args.mtp_num_hidden_layers = 0
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -531,7 +552,7 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
+            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
@@ -729,6 +750,10 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
+
+    @property
+    def supports_mtp(self):
+        return self.language_model.supports_mtp
 
     def mtp_forward(
         self,

@@ -65,11 +65,11 @@ class Model(Qwen3_5Model):
         # MTP layers: fused format (Qwen3.6) or per-expert format (Qwen3.5).
         # Detect format once from the first layer and apply uniformly.
         mtp_num = getattr(self.language_model.args, "mtp_num_hidden_layers", 0)
-        if mtp_num > 0:
+        fused_key = "language_model.mtp.layers.0.mlp.experts.gate_up_proj"
+        per_expert_key = "language_model.mtp.layers.0.mlp.experts.0.gate_proj.weight"
+        if mtp_num > 0 and (fused_key in new_weights or per_expert_key in new_weights):
             num_experts = self.language_model.args.num_experts
-            mtp_is_fused = (
-                "language_model.mtp.layers.0.mlp.experts.gate_up_proj" in new_weights
-            )
+            mtp_is_fused = fused_key in new_weights
             for layer_idx in range(mtp_num):
                 prefix = f"language_model.mtp.layers.{layer_idx}.mlp"
                 if mtp_is_fused:

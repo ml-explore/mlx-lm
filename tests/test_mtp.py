@@ -1,10 +1,18 @@
 import importlib
+import itertools
+import tempfile
 import unittest
+import warnings
 
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step, mtp_generate_step
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import (
+    MTPPromptCacheState,
+    load_prompt_cache,
+    make_prompt_cache,
+    save_prompt_cache,
+)
 
 
 def _make_qwen3_5_mtp_model():
@@ -43,6 +51,32 @@ def _make_qwen3_5_mtp_model():
     return model
 
 
+def _make_qwen3_5_moe_mtp_model():
+    module = importlib.import_module("mlx_lm.models.qwen3_5_moe")
+    args = module.ModelArgs.from_dict(
+        {
+            "model_type": "qwen3_5_moe",
+            "text_config": {
+                "model_type": "qwen3_5_moe",
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 64,
+                "full_attention_interval": 1,
+                "head_dim": 8,
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 16,
+                "shared_expert_intermediate_size": 16,
+                "mtp_num_hidden_layers": 1,
+            },
+        }
+    )
+    return module.Model(args)
+
+
 class TestMTP(unittest.TestCase):
     """Tests for native MTP (Multi-Token Prediction) speculative decoding.
 
@@ -72,6 +106,34 @@ class TestMTP(unittest.TestCase):
         mtp_cache = self.model.make_mtp_cache()
         self.assertEqual(len(mtp_cache), 1)
         self.assertTrue(mtp_cache[0].is_trimmable())
+
+    def test_missing_mtp_weights_disable_head(self):
+        model = _make_qwen3_5_mtp_model()
+        self.assertTrue(model.supports_mtp)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model.sanitize({})
+        self.assertTrue(
+            any(
+                "configuration declares an MTP head" in str(item.message)
+                and "no MTP tensors" in str(item.message)
+                for item in caught
+            )
+        )
+        self.assertFalse(model.supports_mtp)
+        self.assertEqual(model.make_mtp_cache(), [])
+
+    def test_missing_mtp_moe_weights_do_not_crash(self):
+        model = _make_qwen3_5_moe_mtp_model()
+        self.assertTrue(model.supports_mtp)
+        model.sanitize({})
+        self.assertFalse(model.supports_mtp)
+
+    def test_mtp_rejects_input_embeddings(self):
+        prompt = mx.array([0, 1], dtype=mx.uint32)
+        embeddings = mx.zeros((2, 64))
+        with self.assertRaisesRegex(ValueError, "input_embeddings"):
+            next(mtp_generate_step(prompt, self.model, input_embeddings=embeddings))
 
     def test_return_hidden(self):
         """return_hidden=True should return (logits, hidden) with correct shapes."""
@@ -185,6 +247,56 @@ class TestMTP(unittest.TestCase):
                     break
             self.assertEqual(len(tokens), n_tokens, f"kwargs={kwargs}")
 
+    def test_mtp_infinite_max_tokens(self):
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        tokens = list(
+            itertools.islice(
+                mtp_generate_step(prompt, self.model, max_tokens=-1),
+                3,
+            )
+        )
+        self.assertEqual(len(tokens), 3)
+
+    def test_mtp_extends_fresh_prompt_cache(self):
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        prompt_cache = make_prompt_cache(self.model)
+        n_main = len(prompt_cache)
+        generator = mtp_generate_step(
+            prompt,
+            self.model,
+            max_tokens=1,
+            prompt_cache=prompt_cache,
+        )
+        next(generator)
+        generator.close()
+        self.assertEqual(len(prompt_cache), n_main + 2)
+
+    def test_mtp_rejects_unaligned_populated_prompt_cache(self):
+        prompt_cache = make_prompt_cache(self.model)
+        self.model(mx.array([[0, 1]], dtype=mx.uint32), cache=prompt_cache)
+        with self.assertRaisesRegex(ValueError, "MTP cache entries and boundary state"):
+            next(
+                mtp_generate_step(
+                    mx.array([2, 3], dtype=mx.uint32),
+                    self.model,
+                    prompt_cache=prompt_cache,
+                )
+            )
+
+    def test_mtp_rejects_stateful_logits_processor(self):
+        class StatefulProcessor:
+            def __call__(self, tokens, logits):
+                return logits
+
+        with self.assertRaisesRegex(ValueError, "stateless logits processors"):
+            next(
+                mtp_generate_step(
+                    mx.array([0, 1, 2, 3], dtype=mx.uint32),
+                    self.model,
+                    logits_processors=[StatefulProcessor()],
+                )
+            )
+
     def test_mtp_generate_identity_with_logits_processor(self):
         """mtp_generate_step must produce the same greedy tokens as generate_step
         when a context-sensitive stateless processor is applied.
@@ -270,6 +382,117 @@ class TestMTP(unittest.TestCase):
         self.assertEqual(logged[0], 3)
         # Second call (MTP head): context must be T0 = 4, not the prompt token.
         self.assertEqual(logged[1], 4)
+
+    def _assert_transactional_prompt_cache(self, prompt_cache, expected_tokens):
+        n_main = len(self.model.layers)
+        n_mtp = len(self.model.make_mtp_cache())
+        self.assertEqual(len(prompt_cache), n_main + n_mtp + 1)
+
+        state = prompt_cache[-1]
+        self.assertIsInstance(state, MTPPromptCacheState)
+        self.assertFalse(state.empty())
+        self.assertEqual(state.num_tokens, expected_tokens)
+        self.assertEqual(state.last_hidden.shape, (1, 1, 64))
+
+        target_attention = next(c for c in prompt_cache[:n_main] if c.is_trimmable())
+        mtp_attention = prompt_cache[n_main]
+        self.assertEqual(target_attention.offset, expected_tokens)
+        self.assertEqual(mtp_attention.offset, expected_tokens - 1)
+
+    def test_mtp_prompt_cache_finalizes_at_length_boundary(self):
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        prompt_cache = make_prompt_cache(self.model)
+
+        output = list(
+            mtp_generate_step(
+                prompt,
+                self.model,
+                max_tokens=1,
+                prompt_cache=prompt_cache,
+            )
+        )
+        self.assertEqual(len(output), 1)
+        self._assert_transactional_prompt_cache(prompt_cache, len(prompt) + 1)
+
+    def test_mtp_prompt_cache_finalizes_on_generator_close(self):
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        prompt_cache = make_prompt_cache(self.model)
+        generator = mtp_generate_step(
+            prompt,
+            self.model,
+            max_tokens=10,
+            prompt_cache=prompt_cache,
+        )
+
+        next(generator)
+        generator.close()
+        self._assert_transactional_prompt_cache(prompt_cache, len(prompt) + 1)
+
+    def test_mtp_prompt_cache_reuse_matches_uncached_generation(self):
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        suffix = [10, 11]
+        prompt_cache = make_prompt_cache(self.model)
+
+        first_turn = [
+            int(token)
+            for token, _, _ in mtp_generate_step(
+                prompt,
+                self.model,
+                max_tokens=3,
+                prompt_cache=prompt_cache,
+            )
+        ]
+        transcript = prompt.tolist() + first_turn
+
+        cached_tokens = [
+            int(token)
+            for token, _, _ in mtp_generate_step(
+                mx.array(suffix, dtype=mx.uint32),
+                self.model,
+                max_tokens=6,
+                prompt_cache=prompt_cache,
+            )
+        ]
+        uncached_tokens = [
+            int(token)
+            for token, _, _ in mtp_generate_step(
+                mx.array(transcript + suffix, dtype=mx.uint32),
+                self.model,
+                max_tokens=6,
+            )
+        ]
+
+        self.assertEqual(cached_tokens, uncached_tokens)
+        self._assert_transactional_prompt_cache(
+            prompt_cache,
+            len(transcript) + len(suffix) + len(cached_tokens),
+        )
+
+    def test_mtp_prompt_cache_state_round_trip(self):
+        prompt = mx.array([0, 1, 2, 3], dtype=mx.uint32)
+        prompt_cache = make_prompt_cache(self.model)
+        list(
+            mtp_generate_step(
+                prompt,
+                self.model,
+                max_tokens=2,
+                prompt_cache=prompt_cache,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = f"{directory}/mtp-cache.safetensors"
+            save_prompt_cache(path, prompt_cache)
+            loaded = load_prompt_cache(path)
+
+        self.assertIsInstance(loaded[-1], MTPPromptCacheState)
+        self.assertEqual(loaded[-1].num_tokens, prompt_cache[-1].num_tokens)
+        self.assertTrue(
+            mx.allclose(
+                loaded[-1].last_hidden,
+                prompt_cache[-1].last_hidden,
+            ).item()
+        )
 
     def _collect_rejection_tokens(self, n_runs=60, **kwargs):
         """Run mtp_generate_step n_runs times with max_tokens=1 and return all
