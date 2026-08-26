@@ -446,22 +446,23 @@ def generate_step(
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
-    mx.async_eval(y, logprobs)
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
-        if n == 0:
-            mx.eval(y)
-            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
-        yield y.item(), logprobs
-        if n % 256 == 0:
-            mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
-        n += 1
+    with mx.stream(generation_stream):
+        mx.async_eval(y, logprobs)
+        n = 0
+        while True:
+            if n != max_tokens:
+                next_y, next_logprobs = _step(y)
+                mx.async_eval(next_y, next_logprobs)
+            if n == 0:
+                mx.eval(y)
+                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+            if n == max_tokens:
+                break
+            yield y.item(), logprobs
+            if n % 256 == 0:
+                mx.clear_cache()
+            y, logprobs = next_y, next_logprobs
+            n += 1
 
 
 def speculative_generate_step(
@@ -598,54 +599,56 @@ def speculative_generate_step(
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
-    ntoks = 0
-    # Set these so the finally block doesn't raise
-    num_draft = 0
-    n = 0
-    try:
-        while True:
-            num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
-            y = mx.concatenate([y, draft_tokens])
-            tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
-            mx.eval(tokens, draft_tokens)
-            draft_tokens = draft_tokens.tolist()
-            tokens = tokens.tolist()
-            n = 0
-            while n < num_draft:
-                tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                if tn != dtn:
-                    break
-                n += 1
-                ntoks += 1
-                yield tn, lpn, True
+        ntoks = 0
+        # Set these so the finally block doesn't raise
+        num_draft = 0
+        n = 0
+        try:
+            while True:
+                num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                draft_tokens = _draft_generate(draft_y, num_draft)
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[
+                        : prev_tokens.size - y.size - num_draft + 1
+                    ]
+                y = mx.concatenate([y, draft_tokens])
+                tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+                mx.eval(tokens, draft_tokens)
+                draft_tokens = draft_tokens.tolist()
+                tokens = tokens.tolist()
+                n = 0
+                while n < num_draft:
+                    tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
+                    if tn != dtn:
+                        break
+                    n += 1
+                    ntoks += 1
+                    yield tn, lpn, True
+                    if ntoks == max_tokens:
+                        break
+                if ntoks < max_tokens:
+                    ntoks += 1
+                    yield tokens[n], logprobs[n], False
+
                 if ntoks == max_tokens:
                     break
-            if ntoks < max_tokens:
-                ntoks += 1
-                yield tokens[n], logprobs[n], False
 
-            if ntoks == max_tokens:
-                break
+                y = mx.array([tokens[n]], mx.uint32)
+                draft_y = y
 
-            y = mx.array([tokens[n]], mx.uint32)
-            draft_y = y
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model
+                if n == num_draft:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
+                    )
 
-            # If we accepted all the draft tokens, include the last
-            # draft token in the next draft step since it hasn't been
-            # processed yet by the draft model
-            if n == num_draft:
-                draft_y = mx.concatenate(
-                    [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                )
-
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+                _rewind_cache(num_draft, n)
+        finally:
             _rewind_cache(num_draft, n)
-    finally:
-        _rewind_cache(num_draft, n)
 
 
 def stream_generate(

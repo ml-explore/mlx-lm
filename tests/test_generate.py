@@ -1,6 +1,8 @@
 # Copyright © 2024 Apple Inc.
 
+import concurrent.futures
 import random
+import threading
 import unittest
 from typing import List
 
@@ -14,6 +16,7 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    generation_stream,
     setup_arg_parser,
     stream_generate,
 )
@@ -873,6 +876,57 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertIsNone(response.logprobs)
         self.assertIsNone(response.token_ids)
+
+    def test_generate_step_worker_thread(self):
+        """generate_step must not crash on a non-main thread.
+
+        Servers like vllm-mlx run generation on worker threads.  The decode
+        loop in generate_step calls mx.async_eval which needs a valid stream.
+        Without the generation_stream context wrapping the decode loop, this
+        crashes with ``RuntimeError: There is no Stream(gpu, N) in current
+        thread`` because the thread-local default stream doesn't exist on the
+        worker.
+        """
+        import mlx_lm.generate as gen_mod
+
+        prompt = self.tokenizer.encode("hi")
+        prompt = mx.array(prompt)
+
+        def run_on_worker():
+            new_stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(new_stream)
+            gen_mod.generation_stream = new_stream
+
+            tokens = []
+            for token, _ in generate_step(prompt, self.model, max_tokens=3):
+                tokens.append(token)
+            return tokens
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_on_worker)
+            tokens = future.result(timeout=30)
+        self.assertGreater(len(tokens), 0)
+
+    def test_stream_generate_worker_thread(self):
+        """stream_generate must not crash on a non-main thread."""
+        import mlx_lm.generate as gen_mod
+
+        def run_on_worker():
+            new_stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(new_stream)
+            gen_mod.generation_stream = new_stream
+
+            tokens = []
+            for response in stream_generate(
+                self.model, self.tokenizer, "hello", max_tokens=3
+            ):
+                tokens.append(response.token)
+            return tokens
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_on_worker)
+            tokens = future.result(timeout=30)
+        self.assertGreater(len(tokens), 0)
 
 
 if __name__ == "__main__":
