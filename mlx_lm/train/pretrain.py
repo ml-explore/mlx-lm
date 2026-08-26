@@ -62,7 +62,6 @@ def main(config, save_dir):
 
     params = model.trainable_parameters()
     mx.eval(params)
-
     z_loss_weight = config.get("z_loss_weight", 0.0)
 
     def loss_fn(params, sample):
@@ -174,9 +173,11 @@ def main(config, save_dir):
 def build_parser():
     parser = argparse.ArgumentParser(description="Pretrain a language model.")
     parser.add_argument(
-        "--model",
+        "-c",
+        "--config",
         required=True,
-        help="Model config under configs/models, e.g. qwen/4B, or a path to one",
+        help="Path to an experiment config, or a bundled name under "
+        "configs/experiments, e.g. qwen/4B",
     )
     parser.add_argument(
         "--stage",
@@ -189,6 +190,12 @@ def build_parser():
         default=None,
         choices=("hf", "s3"),
         help="Where to read the data from. Default: hf. Options: hf (Hugging Face), s3 (Dolma corpus in S3)",
+    )
+    parser.add_argument(
+        "--fsdp-dim",
+        type=int,
+        default=None,
+        help="Number of ranks to shard the model over. Overrides the experiment config",
     )
     parser.add_argument(
         "--save-dir",
@@ -208,7 +215,10 @@ def cli():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    config = load_config(config_path(args.model, "models"))
+    config = load_config(config_path(args.config, "experiments"))
+
+    if args.fsdp_dim is not None:
+        config.fsdp_dim = args.fsdp_dim
 
     if args.stage or args.source or config.get("dataset") is None:
         name = "dolma/{}/{}".format(args.stage or "pre", args.source or "hf")

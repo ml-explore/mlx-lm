@@ -1,15 +1,6 @@
 import ml_collections
 
 
-def bolt_config():
-    config = ml_collections.ConfigDict()
-    config.name = "olmo_7B"
-    config.gpu_type = "b200"
-    config.num_gpus = 16
-    config.tags = ["16gpu", "olmo_7B"]
-    return config
-
-
 def model_config():
     # https://huggingface.co/allenai/Olmo-3-1025-7B/blob/main/config.json
     config = ml_collections.ConfigDict()
@@ -56,7 +47,6 @@ def get_config():
     config.seed = 0
     config.model = model_config()
     config.optimizer = optimizer_config()
-    config.bolt = bolt_config()
 
     # Optimization params
     config.batch_size = 2  # per GPU
@@ -71,7 +61,7 @@ def get_config():
     # Logging params
     config.steps_per_report = 10
     config.steps_per_checkpoint = 100_000
-    config.fsdp_dim = 8
+    config.fsdp_dim = 1
     config.reduction_size = 32 * 1024 * 1024  # 32MB
     config.grad_checkpoint = False
 

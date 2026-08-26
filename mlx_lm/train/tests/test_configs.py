@@ -14,8 +14,8 @@ def config_paths(kind):
 
 class TestConfigs(unittest.TestCase):
 
-    def test_model_configs_carry_no_dataset(self):
-        for path in config_paths("models"):
+    def test_experiment_configs_carry_no_dataset(self):
+        for path in config_paths("experiments"):
             with self.subTest(config=path.name):
                 config = load_config(str(path))
                 self.assertIsNone(config.get("dataset"))
@@ -33,10 +33,10 @@ class TestConfigs(unittest.TestCase):
                     self.assertTrue(dataset.name)
 
     def test_every_pairing_composes(self):
-        for model in config_paths("models"):
+        for experiment in config_paths("experiments"):
             for data in config_paths("data"):
-                with self.subTest(model=model.name, data=data.name):
-                    config = load_config(str(model))
+                with self.subTest(experiment=experiment.name, data=data.name):
+                    config = load_config(str(experiment))
                     config.dataset = load_config(str(data))
                     config.to_json()
 

@@ -1,15 +1,6 @@
 import ml_collections
 
 
-def bolt_config():
-    config = ml_collections.ConfigDict()
-    config.name = "LMX"
-    config.gpu_type = "b200"
-    config.num_gpus = 8
-    config.tags = ["8gpu", "qwen0.6B"]
-    return config
-
-
 def model_config():
     config = ml_collections.ConfigDict()
     config.model_type = "transformer"
@@ -46,8 +37,8 @@ def get_config():
     config.optimizer = optimizer_config()
 
     # Optimization params
-    config.batch_size = 8  # per GPU
-    config.context_size = 2048
+    config.batch_size = 1  # per GPU
+    config.context_size = 256
     config.grad_accum_steps = 1
     config.num_steps = 1_000_000
 
@@ -58,9 +49,7 @@ def get_config():
     # Logging params
     config.steps_per_report = 10
     config.steps_per_checkpoint = 100_000
-    config.fsdp_dim = 8
+    config.fsdp_dim = 1
     config.grad_checkpoint = False
-    # Bolt config
-    config.bolt = bolt_config()
 
     return config

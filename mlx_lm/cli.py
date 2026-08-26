@@ -20,6 +20,7 @@ def main():
         "dwq",
         "dynamic_quant",
         "gptq",
+        "pretrain",
         "server",
         "upload",
         "share",
@@ -29,15 +30,19 @@ def main():
         "dwq": "quant",
         "dynamic_quant": "quant",
         "gptq": "quant",
+        "pretrain": "train",
     }
+    # Subcommands whose entry point is not called `main`.
+    entry_points = {"pretrain": "cli"}
     if len(sys.argv) < 2:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")
     subcommand = sys.argv.pop(1)
     if subcommand in subcommands:
+        entry_point = entry_points.get(subcommand, "main")
         if subpackage := subpackages.get(subcommand):
             subcommand = f"{subpackage}.{subcommand}"
         submodule = importlib.import_module(f"mlx_lm.{subcommand}")
-        submodule.main()
+        getattr(submodule, entry_point)()
     elif subcommand == "--version":
         from mlx_lm import __version__
 

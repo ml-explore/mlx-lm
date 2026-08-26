@@ -12,6 +12,15 @@ from _version import __version__
 
 MIN_MLX_VERSION = "0.32.1"
 
+TRAIN_REQUIRES = [
+    "boto3",
+    "datasets",
+    "ml_collections",
+    "tqdm",
+    "wandb",
+    "zstandard",
+]
+
 setup(
     name="mlx-lm",
     version=__version__,
@@ -31,6 +40,7 @@ setup(
         "protobuf",
         "pyyaml",
         "jinja2",
+        *TRAIN_REQUIRES,
     ],
     packages=find_packages(include=["mlx_lm", "mlx_lm.*"], exclude=["*.tests"]),
     package_data={
@@ -43,15 +53,7 @@ setup(
     python_requires=">=3.8",
     extras_require={
         "test": ["datasets", "lm-eval"],
-        "train": [
-            f"mlx[cuda13]>={MIN_MLX_VERSION}",
-            "boto3",
-            "datasets",
-            "ml_collections",
-            "tqdm",
-            "wandb",
-            "zstandard",
-        ],
+        "train": TRAIN_REQUIRES,
         "evaluate": ["lm-eval", "tqdm"],
         "cuda13": [f"mlx[cuda13]>={MIN_MLX_VERSION}"],
         "cuda12": [f"mlx[cuda12]>={MIN_MLX_VERSION}"],
@@ -73,6 +75,7 @@ setup(
             "mlx_lm.generate = mlx_lm.generate:main",
             "mlx_lm.lora = mlx_lm.lora:main",
             "mlx_lm.perplexity = mlx_lm.perplexity:main",
+            "mlx_lm.pretrain = mlx_lm.train.pretrain:cli",
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.share = mlx_lm.share:main",
             "mlx_lm.manage = mlx_lm.manage:main",
