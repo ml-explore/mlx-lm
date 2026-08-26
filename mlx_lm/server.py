@@ -367,8 +367,8 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self._model_map.get(model_path, model_path)
         adapter_path = self._adapter_map.get(model_path, adapter_path)
+        model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
@@ -1301,7 +1301,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
             choice[key_name] = {"role": "assistant"}
-            if text:
+            if not self.stream:
+                # The schema requires "content" field to be present
+                choice[key_name]["content"] = text if text else None
+            elif text:
                 choice[key_name]["content"] = text
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
