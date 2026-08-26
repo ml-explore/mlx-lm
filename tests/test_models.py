@@ -1245,6 +1245,23 @@ class TestModels(unittest.TestCase):
         model = gpt2.Model(args)
         self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
 
+    def test_gptj(self):
+
+        from mlx_lm.models import gptj
+
+        args = gptj.ModelArgs(
+            model_type="gptj",
+            n_embd=4096,
+            vocab_size=50400,
+            layer_norm_epsilon=1e-5,
+            n_positions=2048,
+            n_head=16,
+            rotary_dim=64,
+            n_layer=28,
+        )
+        model = gptj.Model(args)
+        self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
+
     def test_gpt_neox(self):
         from mlx_lm.models import gpt_neox
 
