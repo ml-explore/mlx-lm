@@ -12,8 +12,13 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import ArraysCache, KVCache, _BaseCache
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    create_ssm_mask,
+    scaled_dot_product_attention,
+)
+from .cache import ArraysCache, BatchKVCache, KVCache, _BaseCache, dynamic_roll
 from .gated_delta import gated_delta_update
 from .switch_layers import SwitchGLU
 
@@ -181,6 +186,14 @@ def _positions(offset: Union[int, mx.array], S: int) -> mx.array:
     return mx.arange(offset, offset + S)[None]
 
 
+def _left_padding(cache) -> Optional[mx.array]:
+    """Left padding of a batched cache, per row, or None if the rows align."""
+    pad = getattr(cache, "left_padding", None)
+    if pad is None or pad.max().item() == 0:
+        return None
+    return pad
+
+
 # ------------------------------------------------------------------------ QSA
 
 
@@ -206,7 +219,7 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-    def __call__(self, x, rope, cache, offset) -> Optional[mx.array]:
+    def __call__(self, x, rope, cache, offset, left_padding=None) -> Optional[mx.array]:
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -223,13 +236,33 @@ class QSAIndexer(nn.Module):
             return None
 
         n_blocks = kv_len // self.compress_ratio
-        pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
-            B, n_blocks, self.compress_ratio, self.head_dim
-        )
+        pad = left_padding
+        if pad is None:
+            pooled = raw_k[:, : n_blocks * self.compress_ratio].reshape(
+                B, n_blocks, self.compress_ratio, self.head_dim
+            )
+        else:
+            # A block groups the tokens of one row, so it starts at the first
+            # real token of that row, not at column 0 of the shared buffer.
+            # Credit: Blaizzy/mlx-vlm#2028.
+            cols = (
+                pad[:, None, None]
+                + (mx.arange(n_blocks) * self.compress_ratio)[None, :, None]
+                + mx.arange(self.compress_ratio)[None, None, :]
+            ).reshape(B, -1)
+            # A block that runs past the buffer is masked out below.
+            cols = mx.minimum(cols, kv_len - 1)
+            pooled = mx.take_along_axis(
+                raw_k,
+                mx.broadcast_to(cols[..., None], (*cols.shape, self.head_dim)),
+                axis=1,
+            ).reshape(B, n_blocks, self.compress_ratio, self.head_dim)
         pooled = self.k_layernorm(
             pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
         )
 
+        # Block n holds the logical positions n * compress_ratio and up in every
+        # row, so the padding does not move the block rope.
         block_starts = mx.arange(n_blocks) * self.compress_ratio
         cos_k, sin_k = rope(block_starts[None, :])
         pooled = _rope_partial(pooled, cos_k, sin_k)
@@ -245,40 +278,61 @@ class QSAIndexer(nn.Module):
         )
         scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
 
-        # a block is only a candidate if it lies entirely in the query's past
-        block_end = block_starts + self.compress_ratio - 1
-        # In cache coordinates, not position ids: the blocks index the shared
-        # key buffer, which a batched cache left-pads.
-        kv_pos = mx.arange(kv_len - S, kv_len)
-        visible = block_end[None, None, :] <= kv_pos[None, :, None]
+        # A block is only a candidate if it lies entirely in the query's past.
+        # Count real tokens: `q_pos` already excludes the left padding.
+        n_complete = mx.maximum(q_pos + 1, 0) // self.compress_ratio
+        visible = mx.arange(n_blocks)[None, None, :] < n_complete[..., None]
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
         top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]  # (B, S, k)
-
-        keep_block = mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_)
-        top = mx.where(mx.take_along_axis(visible, top, axis=-1), top, n_blocks)
-        keep_block = mx.put_along_axis(keep_block, top, mx.array(True), axis=-1)[
-            ..., :n_blocks
-        ]
+        picked = mx.take_along_axis(visible, top, axis=-1)
 
         # remap block -> tokens; the buffer's trailing partial block belongs to no
         # candidate block, so it is not selectable on its own
-        keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        rest = kv_len - n_blocks * self.compress_ratio
-        if rest:
-            keep = mx.concatenate(
-                [keep, mx.zeros((B, S, rest), dtype=mx.bool_)], axis=-1
-            )
+        if pad is None:
+            keep_block = mx.put_along_axis(
+                mx.zeros((B, S, n_blocks + 1), dtype=mx.bool_),
+                mx.where(picked, top, n_blocks),
+                mx.array(True),
+                axis=-1,
+            )[..., :n_blocks]
+            keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
+            rest = kv_len - n_blocks * self.compress_ratio
+            if rest:
+                keep = mx.concatenate(
+                    [keep, mx.zeros((B, S, rest), dtype=mx.bool_)], axis=-1
+                )
+        else:
+            # One block grid per row, so a repeat no longer expands it: scatter
+            # the winners straight on the token axis.
+            tok = (
+                pad[:, None, None, None]
+                + top[..., None] * self.compress_ratio
+                + mx.arange(self.compress_ratio)[None, None, None, :]
+            ).reshape(B, S, -1)
+            flag = mx.broadcast_to(
+                picked[..., None], (*picked.shape, self.compress_ratio)
+            ).reshape(B, S, -1) & (tok < kv_len)
+            keep = mx.put_along_axis(
+                mx.zeros((B, S, kv_len + 1), dtype=mx.bool_),
+                mx.where(flag, tok, kv_len),
+                flag,
+                axis=-1,
+            )[..., :kv_len]
 
         # The reference appends the tail of each query's own visible list, i.e. the
         # partial block it sits in. Without it a query whose past holds fewer than
         # compress_ratio tokens gets an all-masked row, which softmax turns into a
         # uniform average over every key, future ones included.
-        block_start = (kv_pos + 1) // self.compress_ratio * self.compress_ratio
+        own_start = n_complete * self.compress_ratio
+        if pad is not None:
+            own_start = own_start + pad[:, None]
         tokens = mx.arange(kv_len)
-        own = (tokens[None, :] >= block_start[:, None]) & (
-            tokens[None, :] <= kv_pos[:, None]
+        # Physical column of each query in the shared buffer.
+        kv_pos = mx.arange(kv_len - S, kv_len)
+        own = (tokens[None, None, :] >= own_start[..., None]) & (
+            tokens[None, None, :] <= kv_pos[None, :, None]
         )
         return (keep | own)[:, None]  # (B, 1, S, kv_len)
 
@@ -304,7 +358,7 @@ class Attention(nn.Module):
         B, S, _ = x.shape
         offset = cache.offset if cache is not None else 0
 
-        sparse = self.indexer(x, rope, idx_cache, offset)
+        sparse = self.indexer(x, rope, idx_cache, offset, _left_padding(cache))
 
         q, gate = mx.split(self.q_proj(x).reshape(B, S, self.n_heads, -1), 2, axis=-1)
         gate = gate.reshape(B, S, -1)
@@ -396,7 +450,14 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
         conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
         if cache is not None:
-            cache[0] = mx.contiguous(conv_input[:, -(self.conv_kernel_size - 1) :, :])
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                # A right padded batch ends each row at its own length.
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = mx.split(conv_out, [self.key_dim, 2 * self.key_dim], axis=-1)
@@ -676,7 +737,13 @@ class PLELayer(nn.Module):
         )
         full = mx.concatenate([state, x], axis=1)
         if cache is not None:
-            cache[2] = mx.contiguous(full[:, -n:, :])
+            if cache.lengths is not None:
+                # A right padded batch ends each row at its own length.
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n))[..., None]
+                cache[2] = mx.take_along_axis(full, positions, axis=1)
+            else:
+                cache[2] = mx.contiguous(full[:, -n:, :])
         return nn.silu(self.conv1d(full[:, -(n + S) :, :]))
 
     def __call__(
@@ -756,11 +823,17 @@ class Qwen4ExpModel(nn.Module):
         full_idx = [
             i for i, l in enumerate(self.layers) if l.layer_type == "full_attention"
         ]
-        attn_cache = cache[full_idx[0]] if full_idx else None
-        mask = create_attention_mask(h, attn_cache)
-        conv_mask = None
+        lin_idx = [
+            i for i, l in enumerate(self.layers) if l.layer_type == "linear_attention"
+        ]
+        mask = create_attention_mask(h, cache[full_idx[0]] if full_idx else None)
+        # The deltanet reads the tokens in order, so it needs the padded ones
+        # zeroed out. Its cache holds the padding, one value per row.
+        conv_mask = create_ssm_mask(h, cache[lin_idx[0]]) if lin_idx else None
 
         prev_ctx = None
+        # The n-gram hash reads `ids` in order, so it holds for the right padded
+        # prompt of a batch, but not for one that is already left padded.
         if self.ple_layers:
             ctx_len = self.args.ngram_size - 1
             eos = self.args.eos_token_id
@@ -773,8 +846,14 @@ class Qwen4ExpModel(nn.Module):
                 else mx.full((ids.shape[0], ctx_len), eos, ids.dtype)
             )
             if pc is not None:
-                tail = mx.concatenate([prev_ctx, ids], axis=1)[:, -ctx_len:]
-                pc[3] = tail
+                history = mx.concatenate([prev_ctx, ids], axis=1)
+                if pc.lengths is not None:
+                    ends = mx.clip(pc.lengths, 0, ids.shape[1])
+                    pc[3] = mx.take_along_axis(
+                        history, ends[:, None] + mx.arange(ctx_len), axis=1
+                    )
+                else:
+                    pc[3] = history[:, -ctx_len:]
 
         h = mx.tile(h, (1, 1, self.hc))
         for layer, c in zip(self.layers, cache):
@@ -793,19 +872,183 @@ class _IndexerCache(_BaseCache):
         self.keys = k if self.keys is None else mx.concatenate([self.keys, k], axis=1)
         return self.keys
 
+    def trim(self, size: int):
+        if self.keys is not None:
+            self.keys = self.keys[:, :size]
+
     @property
     def state(self):
-        return self.keys
+        # `None` is not serializable, so an empty array stands for it.
+        return mx.array([]) if self.keys is None else self.keys
 
     @state.setter
     def state(self, v):
-        self.keys = v
+        self.keys = v if v.size > 0 else None
 
 
 class _AttnCache(KVCache):
     def __init__(self):
         super().__init__()
         self.indexer = _IndexerCache()
+
+    def trim(self, n):
+        # `KVCache.trim` only moves the offset, but the indexer keys are exact.
+        n = super().trim(n)
+        self.indexer.trim(self.offset)
+        return n
+
+    @property
+    def state(self):
+        return (*super().state, self.indexer.state)
+
+    @state.setter
+    def state(self, v):
+        *kv, self.indexer.state = v
+        KVCache.state.fset(self, tuple(kv))
+
+    @classmethod
+    def merge(cls, caches):
+        return _BatchAttnCache.merge(caches)
+
+
+class _BatchAttnCache(BatchKVCache):
+    """Batched `_AttnCache`. The indexer keys follow the KV padding exactly.
+
+    Credit: mirrors BatchQSAKVCache from Blaizzy/mlx-vlm#2028 (MIT).
+    """
+
+    def __init__(self, left_padding):
+        super().__init__(left_padding)
+        self.indexer = _IndexerCache()
+
+    def finalize(self):
+        # The base class rolls a right padded prefill into left padding. The
+        # indexer keys share those columns, so they take the same roll.
+        padding = self._right_padding
+        super().finalize()
+        if padding is not None and self.indexer.keys is not None:
+            self.indexer.keys = dynamic_roll(self.indexer.keys, padding, axis=1)
+
+    def trim(self, n):
+        n = super().trim(n)
+        self.indexer.trim(self._idx)
+        return n
+
+    def filter(self, batch_indices):
+        min_pad = self.left_padding[batch_indices].min().item()
+        super().filter(batch_indices)
+        if self.indexer.keys is not None:
+            keys = self.indexer.keys[batch_indices]
+            self.indexer.keys = keys[:, min_pad:] if min_pad else keys
+
+    def extend(self, other):
+        keys, other_keys = self.indexer.keys, other.indexer.keys
+        idx, other_idx = self._idx, other._idx
+        super().extend(other)
+        if keys is None and other_keys is None:
+            return
+        sample = keys if keys is not None else other_keys
+        target = max(idx, other_idx)
+        rows = self.offset.shape[0] - other.offset.shape[0]
+
+        # Right-justify both sides on the shared index, like `BatchKVCache`.
+        def pad(k, n_rows, used):
+            if k is None:
+                k = mx.zeros((n_rows, 0, sample.shape[-1]), dtype=sample.dtype)
+            return mx.pad(k[:, :used], [(0, 0), (target - used, 0), (0, 0)])
+
+        self.indexer.keys = mx.concatenate(
+            [pad(keys, rows, idx), pad(other_keys, other.offset.shape[0], other_idx)],
+            axis=0,
+        )
+
+    def extract(self, idx):
+        cache = _AttnCache()
+        pad = self.left_padding[idx].item()
+        if self.keys is not None:
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, pad : self._idx])
+            cache.values = mx.contiguous(self.values[idx : idx + 1, :, pad : self._idx])
+            cache.offset = cache.keys.shape[2]
+        if self.indexer.keys is not None:
+            cache.indexer.keys = mx.contiguous(
+                self.indexer.keys[idx : idx + 1, pad : self._idx]
+            )
+        return cache
+
+    @classmethod
+    def merge(cls, caches):
+        # `BatchKVCache.merge` names its own class on the all-empty path, which
+        # drops the indexer.
+        if max(c.size() for c in caches) == 0:
+            return cls([0] * len(caches))
+        out = super().merge(caches)
+        rows = [c.indexer.keys for c in caches]
+        sample = next((k for k in rows if k is not None), None)
+        if sample is None:
+            return out
+        out.indexer.keys = mx.concatenate(
+            [
+                (
+                    mx.zeros((1, out._idx, sample.shape[-1]), dtype=sample.dtype)
+                    if k is None
+                    else mx.pad(
+                        k[:, : c.offset],
+                        [(0, 0), (out._idx - c.offset, 0), (0, 0)],
+                    )
+                )
+                for k, c in zip(rows, caches)
+            ],
+            axis=0,
+        )
+        return out
+
+    @property
+    def state(self):
+        return (*super().state, self.indexer.state)
+
+    @state.setter
+    def state(self, v):
+        *kv, self.indexer.state = v
+        BatchKVCache.state.fset(self, tuple(kv))
+
+
+class _LayerCache(ArraysCache):
+    """`ArraysCache` whose slots can stay unused on every row.
+
+    The PLE slots are only filled by the PLE layers, and `ArraysCache` raises
+    `StopIteration` on a slot that is `None` everywhere.
+    """
+
+    @classmethod
+    def merge(cls, caches):
+        n_state = len(caches[0].cache)
+        B = len(caches)
+        cache = cls(n_state)
+        if all(c.empty() for c in caches):
+            cache.left_padding = mx.array([0] * B)
+            return cache
+        for e in range(n_state):
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                continue
+            shape = list(c_init.shape)
+            shape[0] = B
+            cache[e] = mx.zeros(shape, c_init.dtype)
+            for i in range(B):
+                if caches[i][e] is not None:
+                    cache[e][i : i + 1] = caches[i][e]
+        return cache
+
+    def extract(self, idx):
+        cache = _LayerCache(len(self.cache))
+        cache.cache = [None if c is None else c[idx : idx + 1] for c in self.cache]
+        return cache
+
+    def prepare(self, lengths=None, **kwargs):
+        # An empty merge leaves a zero `left_padding`, which shadows `lengths`
+        # in `make_mask` and lets the right padding into the deltanet.
+        self.left_padding = None
+        super().prepare(lengths=lengths, **kwargs)
 
 
 class Model(nn.Module):
@@ -836,7 +1079,7 @@ class Model(nn.Module):
                 caches.append(_AttnCache())
             else:
                 # 0: deltanet conv, 1: ssm state, 2: PLE conv, 3: n-gram context
-                caches.append(ArraysCache(4))
+                caches.append(_LayerCache(4))
         return caches
 
     def sanitize(self, weights):

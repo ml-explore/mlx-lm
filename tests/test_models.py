@@ -759,6 +759,43 @@ class TestModels(unittest.TestCase):
         steps = [model(inputs[:, i : i + 1], cache=cache) for i in range(22)]
         self.assertTrue(mx.allclose(prefill, mx.concatenate(steps, axis=1), atol=1e-4))
 
+        # Rows of unequal length in one batch: the merge left-pads the short
+        # row, so the sparse index must read its blocks from the first real
+        # token of each row and not from the start of the shared buffer.
+        lengths = [22, 15]
+        rows = [mx.array([list(range(2, 2 + n))]) for n in lengths]
+        per_row = [make_prompt_cache(model) for _ in lengths]
+        for r, c in zip(rows, per_row):
+            model(r, cache=c)
+        batch_cache = [cs[0].merge(list(cs)) for cs in zip(*per_row)]
+
+        step = mx.array([[31], [31]])
+        batched = model(step, cache=batch_cache)
+        solo = [model(step[:1], cache=c) for c in per_row]
+        for i, s in enumerate(solo):
+            self.assertTrue(mx.allclose(batched[i : i + 1], s, atol=1e-4))
+
+        # Same rows through the batch generator path: the prompts are right
+        # padded, then `finalize` turns that padding into left padding.
+        padding = [max(lengths) - n for n in lengths]
+        batch_cache = [
+            cs[0].merge(list(cs))
+            for cs in zip(*[make_prompt_cache(model) for _ in lengths])
+        ]
+        for c in batch_cache:
+            c.prepare(lengths=lengths, right_padding=padding)
+        model(
+            mx.concatenate(
+                [mx.pad(r, [(0, 0), (0, p)]) for r, p in zip(rows, padding)]
+            ),
+            cache=batch_cache,
+        )
+        for c in batch_cache:
+            c.finalize()
+        batched = model(step, cache=batch_cache)
+        for i, s in enumerate(solo):
+            self.assertTrue(mx.allclose(batched[i : i + 1], s, atol=1e-4))
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 
