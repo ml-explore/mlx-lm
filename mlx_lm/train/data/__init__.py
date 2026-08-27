@@ -8,11 +8,17 @@ preparation, which makes it the easy way to try a run. Both hand
 :func:`iterate_batches` the same documents.
 """
 
-from mlx_lm.train.data.batching import get_documents, iterate_batches, prefetch
+from mlx_lm.train.data.batching import (
+    dolma,
+    get_documents,
+    iterate_batches,
+    prefetch,
+)
 from mlx_lm.train.data.hf import load_hf
 from mlx_lm.train.data.s3 import load_s3
 
 __all__ = [
+    "dolma",
     "iterate_batches",
     "load_hf",
     "load_s3",

@@ -25,6 +25,17 @@ from mlx_lm.train.data.batching import tokenized_data
 S3_MAX_ATTEMPTS = int(os.environ.get("S3_MAX_ATTEMPTS", 10))
 MANIFEST_NAME = "manifest.json"
 
+DOLMA = {
+    "pre": {
+        "uri": "s3://smollm/dolma3-mix-6T-shuffled/data/",
+        "num_groups": 1024,
+    },
+    "mid": {
+        "uri": "s3://smollm/dolma3_dolmino_mix-100B-1025-shuffled/data/",
+        "num_groups": 64,
+    },
+}
+
 
 def s3_client(endpoint_url=None):
     return boto3.session.Session().client(

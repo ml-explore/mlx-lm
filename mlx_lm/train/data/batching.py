@@ -2,9 +2,23 @@
 
 import multiprocessing as mp
 
+import ml_collections
 import numpy as np
 
 import mlx_lm.train.data as data
+
+STAGES = ("pre", "mid")
+SOURCES = ("hf", "s3")
+
+
+def dolma(stage="pre", source="hf"):
+    """The dolma corpus for a stage, read from the hub or from S3."""
+    if stage not in STAGES:
+        raise ValueError(f"unknown stage {stage!r}; expected one of {STAGES}")
+    if source not in SOURCES:
+        raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}")
+    corpora = data.hf.DOLMA if source == "hf" else data.s3.DOLMA
+    return ml_collections.ConfigDict({"source": source, **corpora[stage]})
 
 
 def get_documents(dataset, tokenizer, mesh, data_state, seed=0):

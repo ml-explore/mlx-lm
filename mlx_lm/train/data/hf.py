@@ -2,6 +2,11 @@
 
 from mlx_lm.train.data.batching import tokenized_data
 
+DOLMA = {
+    "pre": {"name": "allenai/dolma3_mix-6T"},
+    "mid": {"name": "allenai/dolma3_dolmino_mix-100B-1025"},
+}
+
 
 def hf_data(dataset, text_key="text", start_sample_idx=0):
     """Documents from a streaming dataset, numbered so a position can be named."""

@@ -94,9 +94,11 @@ def load_training_state(model, optimizer, config, mesh):
 
     checkpoint_dir = Path(init_from)
     weights = checkpoint_dir / "model.safetensors"
+    if not weights.exists():
+        raise SystemExit(f"no checkpoint to load at {weights}")
     try:
         model.load_weights(str(weights))
-    except (ValueError, FileNotFoundError) as error:
+    except ValueError as error:
         raise SystemExit(f"cannot load {weights}: {error}") from error
 
     if mode == "model":
