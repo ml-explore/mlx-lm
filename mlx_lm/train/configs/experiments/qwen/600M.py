@@ -38,7 +38,7 @@ def get_config():
 
     # Optimization params
     config.batch_size = 1  # per GPU
-    config.context_size = 256
+    config.context_size = 2048
     config.grad_accum_steps = 1
     config.num_steps = 1_000_000
 
@@ -51,5 +51,9 @@ def get_config():
     config.steps_per_checkpoint = 100_000
     config.fsdp_dim = 1
     config.grad_checkpoint = False
+    # Restore from a checkpoint directory. Use "all" for exact resume,
+    # "optimizer" for a new phase, or "model" for fresh optimization.
+    # config.init_from = "checkpoints/000000040000"
+    # config.restore = "all"
 
     return config

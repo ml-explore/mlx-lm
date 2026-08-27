@@ -211,7 +211,8 @@ def build_parser():
 def cli():
     from mlx_lm.train.utils import config_path, load_config
 
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)

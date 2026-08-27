@@ -58,7 +58,7 @@ def save_config(dirname, config):
         fid.write(config.to_json(indent=4))
 
 
-def load_tokenizer(path="tokenizer"):
+def load_tokenizer(path):
 
     os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
     import transformers
