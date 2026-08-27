@@ -256,8 +256,7 @@ def cli():
         config.resume_from_step = args.resume_from_step
 
     if args.stage or args.source or config.get("dataset") is None:
-        name = "dolma/{}/{}".format(args.stage or "pre", args.source or "hf")
-        config.dataset = load_config(config_path(name, "data"))
+        config.dataset = data.dolma(args.stage or "pre", args.source or "hf")
 
     init_wandb(config, args, os.environ.get("MLX_RANK", "0") == "0")
     main(config, args.save_dir)
