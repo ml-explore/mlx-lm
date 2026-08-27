@@ -734,12 +734,14 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers
         )
 
-        # Un contexte plus long que le budget de l'indexeur force la voie creuse
-        # de la sparse attention, que le runner generique n'atteint pas.
+        # A context longer than the indexer budget takes the sparse attention
+        # path, which the generic runner does not reach. The length is not a
+        # multiple of the compression ratio, so the incomplete block at the end
+        # is also covered.
         cache = make_prompt_cache(model)
-        inputs = mx.array([list(range(2, 22))])
+        inputs = mx.array([list(range(2, 24))])
         outputs = model(inputs, cache=cache)
-        self.assertEqual(outputs.shape, (1, 20, args.text.vocab_size))
+        self.assertEqual(outputs.shape, (1, 22, args.text.vocab_size))
         outputs = model(mx.array([[7]]), cache=cache)
         self.assertEqual(outputs.shape, (1, 1, args.text.vocab_size))
 

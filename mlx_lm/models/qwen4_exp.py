@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -94,30 +94,38 @@ class ModelArgs(BaseModelArgs):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm, normalized per group when group_size is given.
+    """Zero-centered RMSNorm: y = norm(x) * (1 + weight).
+
+    The checkpoint stores zero-centered weights, so `Qwen4ExpTextRMSNorm` scales
+    by `1 + weight` and initializes the weight to 0. Only the gated variant used
+    by the delta net is conventional, see `RMSNormGated`.
 
     Hyper-connections normalize each of the hc_count streams separately, hence the
-    reshape: one weight of size hc_count*hidden, but one statistic per stream.
+    reshape: one weight of size hc_count*hidden, but one statistic per stream. The
+    scale applies to the flat vector, after the reshape, like the reference.
     """
 
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
-        self.weight = mx.ones(dim)
+        self.weight = mx.zeros(dim)
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
-            raise ValueError(f"dim {dim} non divisible par group_size {group_size}")
+            raise ValueError(f"dim {dim} is not divisible by group_size {group_size}")
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.group_size is None:
-            return mx.fast.rms_norm(x, self.weight, self.eps)
+            return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
         shape = x.shape
         x = x.reshape(*shape[:-1], -1, self.group_size)
         x = mx.fast.rms_norm(x, None, self.eps).reshape(shape)
-        return x * self.weight
+        return x * (1.0 + self.weight)
 
 
 class RMSNormGated(nn.Module):
+    """Conventional RMSNorm: `Qwen4ExpTextRMSNormGated` scales by `weight` alone
+    and initializes it to 1, unlike the non-gated norm above."""
+
     def __init__(self, dim: int, eps: float = 1e-6, activation: str = "sigmoid"):
         super().__init__()
         self.weight = mx.ones(dim)
@@ -162,6 +170,17 @@ class RotaryEmbedding:
         return mx.cos(emb), mx.sin(emb)
 
 
+def _positions(offset: Union[int, mx.array], S: int) -> mx.array:
+    """Positions of `S` tokens from `offset`, (1, S) or (B, S).
+
+    `offset` is an int with the usual caches, and one position per slot with a
+    batched cache (see `BatchKVCache.offset`).
+    """
+    if isinstance(offset, mx.array):
+        return offset.reshape(-1, 1) + mx.arange(S)
+    return mx.arange(offset, offset + S)[None]
+
+
 # ------------------------------------------------------------------------ QSA
 
 
@@ -187,7 +206,7 @@ class QSAIndexer(nn.Module):
         self.q_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_layernorm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
-    def __call__(self, x, rope, cache, offset: int) -> Optional[mx.array]:
+    def __call__(self, x, rope, cache, offset) -> Optional[mx.array]:
         B, S, _ = x.shape
         qk = self.index_qk_proj(x)
         split = self.n_heads * self.head_dim
@@ -215,8 +234,8 @@ class QSAIndexer(nn.Module):
         cos_k, sin_k = rope(block_starts[None, :])
         pooled = _rope_partial(pooled, cos_k, sin_k)
 
-        q_pos = mx.arange(offset, offset + S)
-        cos_q, sin_q = rope(q_pos[None, :])
+        q_pos = _positions(offset, S)
+        cos_q, sin_q = rope(q_pos)
         q = self.q_layernorm(q)
         q = _rope_partial(q, cos_q[:, :, None, :], sin_q[:, :, None, :])
 
@@ -228,7 +247,10 @@ class QSAIndexer(nn.Module):
 
         # a block is only a candidate if it lies entirely in the query's past
         block_end = block_starts + self.compress_ratio - 1
-        visible = block_end[None, None, :] <= q_pos[None, :, None]
+        # In cache coordinates, not position ids: the blocks index the shared
+        # key buffer, which a batched cache left-pads.
+        kv_pos = mx.arange(kv_len - S, kv_len)
+        visible = block_end[None, None, :] <= kv_pos[None, :, None]
         scores = mx.where(visible, scores, -mx.inf)
 
         k = min(self.block_topk, n_blocks)
@@ -281,7 +303,7 @@ class Attention(nn.Module):
         )
         v = self.v_proj(x).reshape(B, S, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
 
-        cos, sin = rope(mx.arange(offset, offset + S)[None])
+        cos, sin = rope(_positions(offset, S))
         cos, sin = cos[:, None], sin[:, None]
         q, k = _rope_partial(q, cos, sin), _rope_partial(k, cos, sin)
 
@@ -289,13 +311,20 @@ class Attention(nn.Module):
             k, v = cache.update_and_fetch(k, v)
 
         if sparse is not None:
-            neg = mx.finfo(q.dtype).min if hasattr(mx, "finfo") else -1e9
-            add = mx.where(sparse, mx.array(0, q.dtype), mx.array(neg, q.dtype))
-            mask = (
-                add
-                if mask is None
-                else (mask + add if not isinstance(mask, str) else add)
-            )
+            # `sparse` is a boolean keep mask. Keep the combination boolean:
+            # adding it drops the causality held by the "causal" string.
+            if mask is None:
+                mask = sparse
+            elif isinstance(mask, str):  # "causal"
+                kv_len = k.shape[2]
+                rinds = mx.arange(kv_len)
+                linds = mx.arange(kv_len - S, kv_len)[:, None]
+                mask = (linds >= rinds) & sparse
+            elif mask.dtype == mx.bool_:
+                mask = mask & sparse
+            else:
+                neg = mx.finfo(mask.dtype).min
+                mask = mask + mx.where(sparse, mx.array(0, mask.dtype), neg)
 
         out = scaled_dot_product_attention(
             q, k, v, cache=cache, scale=self.scale, mask=mask
@@ -717,9 +746,7 @@ class Qwen4ExpModel(nn.Module):
             i for i, l in enumerate(self.layers) if l.layer_type == "full_attention"
         ]
         attn_cache = cache[full_idx[0]] if full_idx else None
-        mask = create_attention_mask(
-            h, [attn_cache] if attn_cache is not None else None
-        )
+        mask = create_attention_mask(h, attn_cache)
         conv_mask = None
 
         prev_ctx = None
@@ -804,14 +831,44 @@ class Model(nn.Module):
     def sanitize(self, weights):
         out = {}
         for k, v in weights.items():
-            if k.startswith("language_model."):
+            # Multi-token-prediction head and vision tower: not implemented by this
+            # text-only port, and absent from the module tree -> drop them.
+            if k.startswith(("mtp.", "model.mtp.")):
+                continue
+            if k.startswith(("model.visual.", "visual.", "vision_tower.")):
+                continue
+
+            # Prefix. The official checkpoint nests the text model under
+            # `model.language_model.` while already-converted MLX checkpoints use
+            # the flat `language_model.` form; both must land on `model.`.
+            # `lm_head.weight` sits at the top level upstream and is left alone.
+            if k.startswith("model.language_model."):
+                k = "model." + k[len("model.language_model.") :]
+            elif k.startswith("language_model."):
                 k = k[len("language_model.") :]
-            if k.startswith("vision_tower.") or k.startswith("model.visual."):
-                continue  # text-only pour l'instant
-            if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
-                # (C, 1, K) torch -> (C, K, 1) mlx
-                if v.shape[1] == 1:
-                    v = v.transpose(0, 2, 1)
+
+            # Experts. Upstream stacks them as `experts.gate_up_proj`
+            # (E, 2 * moe_intermediate, hidden) and `experts.down_proj`
+            # (E, hidden, moe_intermediate), i.e. already the (E, out, in) layout
+            # SwitchGLU wants. The reference splits the *output* of the fused
+            # projection with chunk(2, dim=-1), so gate is the first half of
+            # axis -2 of the weight and up the second.
+            if k.endswith("mlp.experts.gate_up_proj"):
+                base = k[: -len("experts.gate_up_proj")]
+                mid = v.shape[-2] // 2
+                out[base + "switch_mlp.gate_proj.weight"] = v[..., :mid, :]
+                out[base + "switch_mlp.up_proj.weight"] = v[..., mid:, :]
+                continue
+            if k.endswith("mlp.experts.down_proj"):
+                base = k[: -len("experts.down_proj")]
+                out[base + "switch_mlp.down_proj.weight"] = v
+                continue
+
+            # (C, 1, K) torch -> (C, K, 1) mlx. Idempotent: an already converted
+            # weight has shape[1] == kernel_size != 1.
+            if k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1:
+                v = v.transpose(0, 2, 1)
+
             out[k] = v
         return out
 
