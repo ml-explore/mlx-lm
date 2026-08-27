@@ -745,6 +745,20 @@ class TestModels(unittest.TestCase):
         outputs = model(mx.array([[7]]), cache=cache)
         self.assertEqual(outputs.shape, (1, 1, args.text.vocab_size))
 
+        # The runner leaves the model in float16, too coarse to compare logits.
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        # The sparse path must stay causal: changing the last token cannot move
+        # the logits of the earlier ones.
+        other = mx.concatenate([inputs[:, :-1], mx.array([[997]])], axis=-1)
+        prefill = model(inputs)
+        self.assertTrue(mx.allclose(prefill[:, :-1], model(other)[:, :-1]))
+
+        # ...and a prefill must match a token by token decoding.
+        cache = make_prompt_cache(model)
+        steps = [model(inputs[:, i : i + 1], cache=cache) for i in range(22)]
+        self.assertTrue(mx.allclose(prefill, mx.concatenate(steps, axis=1), atol=1e-4))
+
     def test_qwen3_moe(self):
         from mlx_lm.models import qwen3_moe
 

@@ -262,14 +262,25 @@ class QSAIndexer(nn.Module):
             ..., :n_blocks
         ]
 
-        # remap block -> tokens; the incomplete tail is always visible
+        # remap block -> tokens; the buffer's trailing partial block belongs to no
+        # candidate block, so it is not selectable on its own
         keep = mx.repeat(keep_block, self.compress_ratio, axis=-1)
-        tail = kv_len - n_blocks * self.compress_ratio
-        if tail:
+        rest = kv_len - n_blocks * self.compress_ratio
+        if rest:
             keep = mx.concatenate(
-                [keep, mx.ones((B, S, tail), dtype=mx.bool_)], axis=-1
+                [keep, mx.zeros((B, S, rest), dtype=mx.bool_)], axis=-1
             )
-        return keep[:, None]  # (B, 1, S, kv_len)
+
+        # The reference appends the tail of each query's own visible list, i.e. the
+        # partial block it sits in. Without it a query whose past holds fewer than
+        # compress_ratio tokens gets an all-masked row, which softmax turns into a
+        # uniform average over every key, future ones included.
+        block_start = (kv_pos + 1) // self.compress_ratio * self.compress_ratio
+        tokens = mx.arange(kv_len)
+        own = (tokens[None, :] >= block_start[:, None]) & (
+            tokens[None, :] <= kv_pos[:, None]
+        )
+        return (keep | own)[:, None]  # (B, 1, S, kv_len)
 
 
 class Attention(nn.Module):
