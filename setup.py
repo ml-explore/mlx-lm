@@ -68,6 +68,7 @@ setup(
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.share = mlx_lm.share:main",
             "mlx_lm.manage = mlx_lm.manage:main",
+            "mlx_lm.oscar_calibrate = mlx_lm.oscar_calibration:main",
             "mlx_lm.upload = mlx_lm.upload:main",
         ]
     },

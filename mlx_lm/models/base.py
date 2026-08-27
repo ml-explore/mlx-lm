@@ -116,6 +116,13 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    # OSCAR's packed history has a native attention implementation that keeps
+    # the full dense K/V history out of the decode graph. The hook is opt-in
+    # and duck-typed so ordinary caches and models retain the existing path.
+    if cache is not None and getattr(cache, "bounded_attention", False):
+        if sinks is not None:
+            raise ValueError("OSCAR bounded attention does not support attention sinks")
+        return cache.attention(queries, scale=scale, mask=mask)
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")

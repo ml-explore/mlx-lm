@@ -15,6 +15,7 @@ def main():
         "generate",
         "lora",
         "manage",
+        "oscar_calibrate",
         "perplexity",
         "awq",
         "dwq",

@@ -12,9 +12,19 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 from .base import create_causal_mask
 
 
+def __getattr__(name):
+    """Expose the optional cache without introducing an import cycle."""
+    if name == "OscarKVCache":
+        from .oscar import OscarKVCache
+
+        return OscarKVCache
+    raise AttributeError(name)
+
+
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    oscar_config: Optional[Any] = None,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -27,7 +37,15 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        oscar_config: Optional explicit OSCAR configuration. When supplied,
+            eligible native KV caches are replaced with OscarKVCache instances.
+            The default ``None`` keeps the ordinary cache path unchanged.
     """
+    if oscar_config is not None:
+        return make_oscar_prompt_cache(
+            model, max_kv_size=max_kv_size, config=oscar_config
+        )
+
     if hasattr(model, "make_cache"):
         return model.make_cache()
 
@@ -50,7 +68,7 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
-    cache_data = [c.state for c in cache]
+    cache_data = [_cache_state_for_save(c) for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
     cache_classes = [type(c).__name__ for c in cache]
@@ -77,12 +95,100 @@ def load_prompt_cache(file_name, return_metadata=False):
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
     cache = [
-        globals()[c].from_state(state, meta_state)
+        _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
     ]
     if return_metadata:
         return cache, metadata
     return cache
+
+
+def _resolve_cache_class(name: str):
+    """Resolve built-in cache classes plus the optional native OSCAR class."""
+    if name == "OscarKVCache":
+        from .oscar import OscarKVCache
+
+        return OscarKVCache
+    return globals()[name]
+
+
+def _cache_state_for_save(cache):
+    """Make optional OSCAR tiers safe for native safetensors serialization."""
+    if type(cache).__name__ == "OscarKVCache":
+        return cache.serialized_state()
+    if isinstance(cache, CacheList):
+        return [_cache_state_for_save(sub_cache) for sub_cache in cache.caches]
+    return cache.state
+
+
+def make_oscar_prompt_cache(
+    model: nn.Module,
+    *,
+    config: Optional[Any] = None,
+    max_kv_size: Optional[int] = None,
+) -> List[Any]:
+    """Construct a prompt cache with explicitly opted-in OSCAR KV layers.
+
+    The model's normal cache is preserved for all non-plain KV cache types.
+    Plain KVCache members are replaced recursively inside CacheList values and
+    receive rotations in the same order as the eligible members.
+    """
+    from .oscar import OscarConfig, OscarKVCache, load_rotations
+
+    if config is None:
+        config = OscarConfig()
+    elif isinstance(config, dict):
+        config = OscarConfig(**config)
+    if not isinstance(config, OscarConfig):
+        raise TypeError("config must be an OscarConfig or a configuration dict")
+
+    cache = make_prompt_cache(model, max_kv_size=max_kv_size, oscar_config=None)
+    eligible = []
+
+    def collect(value):
+        if isinstance(value, CacheList):
+            for sub_cache in value.caches:
+                collect(sub_cache)
+        elif type(value) is KVCache:
+            eligible.append(value)
+
+    for layer_cache in cache:
+        collect(layer_cache)
+    if not eligible:
+        raise ValueError("OSCAR opt-in found no plain KVCache layers to replace")
+
+    rotations = None
+    if config.rotation_dir is not None:
+        rotations = load_rotations(config.rotation_dir, len(eligible))
+    if rotations is not None and (
+        len(rotations.rK) != len(eligible) or len(rotations.rV) != len(eligible)
+    ):
+        raise ValueError("OSCAR rotation count does not match eligible KV caches")
+
+    index = 0
+
+    def replace(value):
+        nonlocal index
+        if isinstance(value, CacheList):
+            return CacheList(*(replace(sub_cache) for sub_cache in value.caches))
+        if type(value) is not KVCache:
+            return value
+        r_k = rotations.rK[index] if rotations is not None else None
+        r_v = rotations.rV[index] if rotations is not None else None
+        index += 1
+        return OscarKVCache(
+            rK=r_k,
+            rV=r_v,
+            group_size=config.group_size,
+            sink_tokens=config.sink_tokens,
+            recent_tokens=config.recent_tokens,
+            k_clip_ratio=config.k_clip_ratio,
+            v_clip_ratio=config.v_clip_ratio,
+            absorb_v_rotation=config.absorb_v_rotation,
+            bounded_attention=config.bounded_attention,
+        )
+
+    return [replace(layer_cache) for layer_cache in cache]
 
 
 def can_trim_prompt_cache(cache: List[Any]) -> bool:
@@ -904,7 +1010,8 @@ class CacheList(_BaseCache):
     def from_state(cls, state, meta_state):
         obj = cls.__new__(cls)
         obj.caches = [
-            globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
+            _resolve_cache_class(c).from_state(s, m)
+            for s, c, m in zip(state, *meta_state)
         ]
         return obj
 
