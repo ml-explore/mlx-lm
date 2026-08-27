@@ -37,8 +37,8 @@ def get_config():
     config.optimizer = optimizer_config()
 
     # Optimization params
-    config.batch_size = 1  # per GPU
-    config.context_size = 128
+    config.batch_size = 2  # per GPU
+    config.context_size = 8192
     config.grad_accum_steps = 1
     config.num_steps = 1_000_000
 

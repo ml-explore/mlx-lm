@@ -2,6 +2,7 @@
 
 import logging
 
+import mlx.core as mx
 import mlx.optimizers as optim
 
 
@@ -69,8 +70,16 @@ def build_schedule(config, num_steps=None):
     return lr_schedule
 
 
-def build_optimizer(config, num_steps=None):
-    lr_schedule = build_schedule(config, num_steps)
+def build_optimizer(config, num_steps=None, step_offset=0):
+    """Build the optimizer with its learning rate schedule."""
+    schedule = build_schedule(config, num_steps)
+    if step_offset:
+
+        def lr_schedule(step):
+            return schedule(mx.maximum(step.astype(mx.int64) - step_offset, 0))
+
+    else:
+        lr_schedule = schedule
     weight_decay = config.get("weight_decay", 0.0)
 
     if config.optim == "adam" or config.optim == "adamw":

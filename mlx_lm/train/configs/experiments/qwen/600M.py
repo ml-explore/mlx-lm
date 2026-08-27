@@ -51,9 +51,8 @@ def get_config():
     config.steps_per_checkpoint = 100_000
     config.fsdp_dim = 1
     config.grad_checkpoint = False
-    # Restore from a checkpoint directory. Use "all" for exact resume,
-    # "optimizer" for a new phase, or "model" for fresh optimization.
+    # Restart from a checkpoint directory, or from a run directory to take its
     # config.init_from = "checkpoints/000000040000"
-    # config.restore = "all"
+    # config.restore = "all" | "model" | "optimizer"
 
     return config

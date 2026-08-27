@@ -13,7 +13,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map
 
 from mlx_lm.train import data, fsdp, optim, utils
-from mlx_lm.train.checkpoint import init_state, save_checkpoint
+from mlx_lm.train.checkpoint import load_training_state, save_checkpoint
 from mlx_lm.train.distributed import init_distributed
 from mlx_lm.train.metrics import Losses, Metrics, init_wandb, log_metrics
 
@@ -39,19 +39,22 @@ def main(config, save_dir):
         save_dir.mkdir(parents=True, exist_ok=True)
         utils.save_config(save_dir, config)
 
-    tokenizer = utils.load_tokenizer(config.get("tokenizer", "allenai/Olmo-3-1025-7B"))
     model = utils.build_model(config.model)
-    optimizer = optim.build_optimizer(config.optimizer, config.num_steps)
+    optimizer = optim.build_optimizer(
+        config.optimizer, config.num_steps, config.get("resume_from_step", 0)
+    )
+    init_step, data_state = load_training_state(model, optimizer, config, mesh)
+    tokenizer = utils.load_tokenizer(config.get("tokenizer", "allenai/Olmo-3-1025-7B"))
 
-    model, optimizer, data_state = init_state(model, optimizer, config, save_dir, mesh)
-
-    documents = data.get_documents(config.dataset, tokenizer, mesh, data_state)
+    documents = data.get_documents(
+        config.dataset, tokenizer, mesh, data_state, seed=config.seed
+    )
 
     stream = data.iterate_batches(
         documents,
         context_size=config.context_size,
         batch_size=config.batch_size,
-        resume_d_next=data_state.get("d_next"),
+        resume_state=data_state,
     )
 
     if config.get("grad_checkpoint", False):
@@ -67,7 +70,7 @@ def main(config, save_dir):
     def loss_fn(params, sample):
 
         model.update(
-            tree_map(lambda x: x.astype(dtype), params) if fsdp_dim > 1 else params
+            tree_map(lambda x: x.astype(dtype), params) if fsdp_dim == 1 else params
         )
         inputs = sample[:, :-1]
         targets = sample[:, 1:]
@@ -118,9 +121,9 @@ def main(config, save_dir):
         steps_per_report=config.steps_per_report,
     )
     losses_sum = Losses()
-    init_step = config.get("init_step", 0)
     batches = data.prefetch(stream)
     exhausted = False
+    step_done = init_step
 
     for it in range(init_step, config.num_steps):
         grads = None
@@ -129,7 +132,7 @@ def main(config, save_dir):
             if sample is None:
                 exhausted = True
                 break
-            data_state = sample.get("_data_state") or data_state
+            data_state = sample["_data_state"]
 
             losses, grad_norm, grads, params = step(
                 mx.array(sample["input_ids"]),
@@ -144,7 +147,7 @@ def main(config, save_dir):
 
         if exhausted:
             break
-
+        step_done = it + 1
         reduced = losses_sum.all_reduce(mesh.world)
         losses_sum = Losses()
         mx.eval(reduced, grad_norm)
@@ -167,7 +170,10 @@ def main(config, save_dir):
                 logging.info("saving checkpoint at step %d", it + 1)
             save_checkpoint(save_dir, it + 1, params, optimizer, data_state, mesh)
 
-    save_checkpoint(save_dir, None, params, optimizer, data_state, mesh)
+    if step_done > init_step:
+        if mesh.is_master:
+            logging.info("saving final checkpoint at step %d", step_done)
+        save_checkpoint(save_dir, step_done, params, optimizer, data_state, mesh)
 
 
 def build_parser():
@@ -203,6 +209,27 @@ def build_parser():
         help="Where to write the model and checkpoints",
     )
     parser.add_argument(
+        "--init-from",
+        default=None,
+        help="Checkpoint directory to start from",
+    )
+    parser.add_argument(
+        "--restore",
+        default=None,
+        choices=("all", "optimizer", "model"),
+        help="How much of the checkpoint to keep: all resumes the run, optimizer "
+        "keeps the moments and restarts the schedule and the data, model loads "
+        "the weights alone. Default: all",
+    )
+    parser.add_argument(
+        "--resume-from-step",
+        type=int,
+        default=None,
+        help="The step --init-from holds. With restore all the loop counts on "
+        "from it; with restore optimizer it is the number of updates to hold the "
+        "schedule back by. Checked against the checkpoint",
+    )
+    parser.add_argument(
         "--experiment-name", default=None, help="Run name for wandb; omit to disable"
     )
     return parser
@@ -211,8 +238,7 @@ def build_parser():
 def cli():
     from mlx_lm.train.utils import config_path, load_config
 
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -220,6 +246,14 @@ def cli():
 
     if args.fsdp_dim is not None:
         config.fsdp_dim = args.fsdp_dim
+
+    if args.init_from is not None:
+        with config.ignore_type():
+            config.init_from = args.init_from
+    if args.restore is not None:
+        config.restore = args.restore
+    if args.resume_from_step is not None:
+        config.resume_from_step = args.resume_from_step
 
     if args.stage or args.source or config.get("dataset") is None:
         name = "dolma/{}/{}".format(args.stage or "pre", args.source or "hf")

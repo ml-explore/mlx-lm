@@ -85,18 +85,19 @@ def iterate_batches(
     context_size,
     batch_size,
     max_batches=None,
-    start_batch_idx=0,
-    resume_d_next=None,
+    resume_state=None,
 ):
     """
     Simply concatenate documents until the batch is full.
     """
     seq_len = context_size + 1
     max_batches = max_batches or float("inf")
-    d_next = resume_d_next if resume_d_next is not None else []
+    resume_state = resume_state or {}
+    d_next = list(resume_state.get("d_next", []))
+    last_file_name = resume_state.get("file_name")
+    next_sample_idx = resume_state.get("sample_idx", 0)
+    resume_batch_idx = resume_state.get("batch_idx", 0)
     batch_num = 0
-    last_file_name = None
-    next_sample_idx = 0
     while batch_num < max_batches:
         batch = np.empty((batch_size * seq_len), np.int32)
         i = 0
@@ -122,15 +123,13 @@ def iterate_batches(
         if i < len(batch):
             break
         batch_num += 1
-        if batch_num <= start_batch_idx:
-            continue
         yield {
             "input_ids": batch.reshape(batch_size, seq_len),
             "mask": None,
             "_data_state": {
                 "file_name": last_file_name,
                 "sample_idx": next_sample_idx,
-                "batch_idx": batch_num,
+                "batch_idx": resume_batch_idx + batch_num,
                 "d_next": list(d_next),
             },
         }
