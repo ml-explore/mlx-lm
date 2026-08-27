@@ -442,6 +442,10 @@ class ResponseGenerator:
     def join(self):
         self._generation_thread.join()
 
+    @property
+    def is_healthy(self):
+        return self._generation_thread.is_alive()
+
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
         n_bytes = self.prompt_cache.nbytes
@@ -1615,10 +1619,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
-        self._set_completion_headers(200)
+        is_healthy = self.response_generator.is_healthy
+        status_code = 200 if is_healthy else 503
+        status = "ok" if is_healthy else "unavailable"
+
+        self._set_completion_headers(status_code)
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.write(json.dumps({"status": status}).encode())
         self.wfile.flush()
 
     def handle_models_request(self):

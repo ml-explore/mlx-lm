@@ -388,6 +388,18 @@ class TestServer(unittest.TestCase):
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
 
+    def test_health_endpoint(self):
+        url = f"http://localhost:{self.port}/health"
+
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+        self.response_generator.stop_and_join()
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "unavailable"})
+
 
 class TestServerWithDraftModel(unittest.TestCase):
     @classmethod
