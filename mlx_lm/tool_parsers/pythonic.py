@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import ast
-from typing import Any, Dict, List
+from typing import Any
 
 import regex as re
 
@@ -42,7 +42,7 @@ def parse_tool_call(text: str, tools: Any | None = None):
 
             arguments[key] = value
 
-    return dict(name=func_name, arguments=arguments)
+    return {"name": func_name, "arguments": arguments}
 
 
 tool_call_start = "<|tool_call_start|>"
