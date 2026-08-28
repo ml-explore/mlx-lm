@@ -194,7 +194,7 @@ def apply_min_p(
         tokens_to_remove = mx.put_along_axis(
             tokens_to_remove,
             top_indices,
-            False,
+            mx.array(False),
             axis=-1,
         )
 
