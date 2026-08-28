@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import importlib
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -40,6 +41,27 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
+def _resolve_cache_class(name):
+    """Resolve a cache class from a (possibly module-qualified) name.
+
+    Model-specific cache classes are saved as ``module.ClassName`` and imported
+    on load; built-in caches are saved bare and resolved from this module. Only
+    ``mlx_lm`` modules are importable, so loading a cache file cannot import
+    arbitrary code.
+    """
+    if "." not in name:
+        return globals()[name]
+    module_name, class_name = name.rsplit(".", 1)
+    if module_name != __name__ and not module_name.startswith("mlx_lm."):
+        raise ValueError(
+            f"Refusing to load cache class from non-mlx_lm module {module_name!r}."
+        )
+    try:
+        return getattr(importlib.import_module(module_name), class_name)
+    except (ImportError, AttributeError) as e:
+        raise ValueError(f"Could not resolve cache class {name!r}: {e}") from e
+
+
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
     """
     Save a pre-computed prompt cache to a file.
@@ -53,7 +75,16 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
-    cache_classes = [type(c).__name__ for c in cache]
+    # Built-in caches keep a bare name (readable by older mlx-lm); only
+    # out-of-module (model-specific) caches need the module-qualified name.
+    cache_classes = [
+        (
+            type(c).__name__
+            if type(c).__module__ == __name__
+            else type(c).__module__ + "." + type(c).__name__
+        )
+        for c in cache
+    ]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
@@ -77,7 +108,7 @@ def load_prompt_cache(file_name, return_metadata=False):
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
     info, metadata, classes = cache_metadata
     cache = [
-        globals()[c].from_state(state, meta_state)
+        _resolve_cache_class(c).from_state(state, meta_state)
         for c, state, meta_state in zip(classes, arrays, info)
     ]
     if return_metadata:
