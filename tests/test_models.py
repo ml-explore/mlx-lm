@@ -3457,7 +3457,8 @@ class TestModels(unittest.TestCase):
             lower_bound=lower_bound,
         )
 
-        self.assertTrue(mx.allclose(output, expected))
+        # gated_delta_update applies 1/sqrt(head_v_dim) readout scale
+        self.assertTrue(mx.allclose(output, expected * (v.shape[-1] ** -0.5)))
         self.assertTrue(mx.allclose(state, expected_state))
 
     def test_gated_delta_precision(self):
@@ -3547,6 +3548,36 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+    def test_gated_delta_readout_scale(self):
+        """gated_delta_update must scale output by 1/sqrt(head_v_dim)."""
+        mx.random.seed(0)
+        B, T = 1, 2
+        Hk, Hv, Dk, Dv = 2, 4, 16, 16
+
+        q = mx.random.normal(shape=(B, T, Hk, Dk))
+        k = mx.random.normal(shape=(B, T, Hk, Dk))
+        v = mx.random.normal(shape=(B, T, Hv, Dv))
+        a = mx.random.normal(shape=(B, T, Hv))
+        b = mx.random.normal(shape=(B, T, Hv))
+        A_log = mx.zeros((Hv,))
+        dt_bias = mx.zeros((Hv,))
+
+        # Raw (unscaled) output from the ops path
+        beta = mx.sigmoid(b)
+        g = mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+        y_raw, _ = gated_delta_ops(q, k, v, g, beta, state)
+
+        # Scaled output from gated_delta_update
+        y_scaled, _ = gated_delta_update(
+            q, k, v, a, b, A_log, dt_bias, use_kernel=False
+        )
+
+        scale = Dv**-0.5
+        self.assertTrue(mx.allclose(y_scaled, y_raw * scale, rtol=1e-5, atol=1e-6))
+        # Verify the scale is not identity
+        self.assertFalse(mx.allclose(y_scaled, y_raw, rtol=1e-2, atol=1e-3))
 
 
 if __name__ == "__main__":

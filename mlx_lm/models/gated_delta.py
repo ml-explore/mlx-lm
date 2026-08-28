@@ -610,5 +610,12 @@ def gated_delta_update(
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
     if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
-        return gated_delta_ops(q, k, v, g, beta, state, mask)
-    return gated_delta_kernel(q, k, v, g, beta, state, mask)
+        y, state = gated_delta_ops(q, k, v, g, beta, state, mask)
+    else:
+        y, state = gated_delta_kernel(q, k, v, g, beta, state, mask)
+
+    # Readout scale: ggml GATED_DELTA_NET applies 1/sqrt(head_v_dim)
+    # unconditionally (ops.cpp:10824). Without it the raw delta output is
+    # ~1/head_v_dim^0.5 too large, compounding over layers.
+    y = y * (v.shape[-1] ** -0.5)
+    return y, state
