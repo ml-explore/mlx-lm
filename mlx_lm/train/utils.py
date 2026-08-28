@@ -14,13 +14,14 @@ from mlx.utils import tree_map
 CONFIG_ROOT = Path(__file__).resolve().parent / "configs"
 
 
-def config_path(name, kind):
+def config_path(name):
+    """A path to a config: as given, or a name under the bundled configs."""
     path = Path(name)
     if path.suffix == ".py" or path.is_dir():
         return str(path)
-    resolved = CONFIG_ROOT / kind / f"{name}.py"
+    resolved = CONFIG_ROOT / f"{name}.py"
     if not resolved.exists():
-        raise SystemExit(f"no {kind} config at {resolved}")
+        raise SystemExit(f"no config at {resolved}")
     return str(resolved)
 
 

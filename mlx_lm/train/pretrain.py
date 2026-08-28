@@ -9,7 +9,7 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.nn.utils import average_gradients
+from mlx.nn.utils import average_gradients, clip_grad_norm_sharded
 from mlx.utils import tree_map
 
 from mlx_lm.train import data, fsdp, optim, utils
@@ -101,7 +101,7 @@ def main(config, save_dir):
             )
             grad_norm = None
             if max_grad_norm is not None:
-                grads, grad_norm = fsdp.clip_grad_norm_sharded(
+                grads, grad_norm = clip_grad_norm_sharded(
                     grads, max_norm=max_grad_norm, group=mesh.fsdp.group
                 )
             params = optimizer.apply_gradients(grads, params)
@@ -242,7 +242,7 @@ def cli():
     logging.basicConfig(level=logging.INFO)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    config = load_config(config_path(args.config, "experiments"))
+    config = load_config(config_path(args.config))
 
     if args.fsdp_dim is not None:
         config.fsdp_dim = args.fsdp_dim

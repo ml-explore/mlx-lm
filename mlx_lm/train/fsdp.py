@@ -4,7 +4,7 @@ from typing import Optional
 import mlx.core as mx
 from mlx.nn.layers.base import Module
 from mlx.nn.layers.distributed import _shard
-from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+from mlx.utils import tree_flatten, tree_unflatten
 
 
 def _make_gather_fn(group, full_shapes, shard_sizes, cast_dtype):
@@ -122,18 +122,3 @@ def shard_model(model, group, dtype):
     if not model.args.tie_word_embeddings:
         model.lm_head = shard(model.lm_head)
     return model
-
-
-def clip_grad_norm_sharded(
-    gradients,
-    max_norm: float,
-    group: Optional[mx.distributed.Group] = None,
-):
-    local_norm_squared = tree_reduce(
-        lambda acc, g: acc + g.square().sum(), gradients, 0.0
-    )
-    global_norm_squared = mx.distributed.all_sum(local_norm_squared, group=group)
-    grad_norm = mx.sqrt(global_norm_squared)
-    normalizer = mx.minimum(max_norm / (grad_norm + 1e-6), 1.0)
-    clipped_gradients = tree_map(lambda g: g * normalizer, gradients)
-    return clipped_gradients, grad_norm
