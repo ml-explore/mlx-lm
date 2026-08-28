@@ -154,6 +154,22 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_pythonic_single_quoted_args_with_commas(self):
+        # LFM2.5 emits single-quoted strings; embedded commas must not truncate
+        test_case = (
+            "[write(filePath='/tmp/hello.py', "
+            "content='# Hello, world!')]"
+        )
+        tool_call = pythonic.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "write")
+        self.assertEqual(tool_call["arguments"]["filePath"], "/tmp/hello.py")
+        self.assertEqual(tool_call["arguments"]["content"], "# Hello, world!")
+
+        # Double-quoted still works
+        test_case = '[search(query="hello, world")]'
+        tool_call = pythonic.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["arguments"]["query"], "hello, world")
+
     def test_qwen3_coder_single_quoted_params(self):
         tools = [
             {
