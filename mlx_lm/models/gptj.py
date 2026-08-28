@@ -173,6 +173,7 @@ class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
+        self.model_type = args.model_type
         self.model = GPTJModel(args=args)
         self.lm_head = nn.Linear(args.n_embd, args.vocab_size, bias=True)
 
