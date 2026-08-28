@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 import copy
 import importlib
+import math
 import unittest
 from unittest import mock
 
@@ -1605,6 +1606,820 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_deepseek_v4_rope_inverse(self):
+        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+
+        scaling = {
+            "type": "yarn",
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+        rope = DeepseekV4RoPE(8, 160000, scaling)
+        x = mx.random.uniform(shape=(1, 2, 4, 8))
+
+        y = rope(x, offset=3)
+        z = rope(y, offset=3, inverse=True)
+        self.assertTrue(mx.allclose(x, z, rtol=1e-5, atol=1e-5))
+
+        inv_freq = 1.0 / (160000 ** (mx.arange(0, 8, 2, dtype=mx.float32) / 8))
+
+        def correction_dim(num_rotations):
+            return (
+                8
+                * math.log(65536 / (num_rotations * 2 * math.pi))
+                / (2 * math.log(160000))
+            )
+
+        low = max(math.floor(correction_dim(32)), 0)
+        high = min(math.ceil(correction_dim(1)), 7)
+        if low == high:
+            high += 0.001
+        ramp = (mx.arange(4, dtype=mx.float32) - low) / (high - low)
+        smooth = 1 - mx.clip(ramp, 0, 1)
+        inv_freq = inv_freq / 16 * (1 - smooth) + inv_freq * smooth
+
+        theta = mx.arange(3, 7, dtype=mx.float32)[:, None] * inv_freq[None, :]
+        cos = mx.cos(theta).reshape(1, 1, 4, 4)
+        sin = mx.sin(theta).reshape(1, 1, 4, 4)
+        rot = x.reshape(1, 2, 4, 4, 2)
+        expected = mx.stack(
+            (
+                rot[..., 0] * cos - rot[..., 1] * sin,
+                rot[..., 0] * sin + rot[..., 1] * cos,
+            ),
+            axis=-1,
+        ).reshape(1, 2, 4, 8)
+        self.assertTrue(mx.allclose(y, expected, rtol=1e-5, atol=1e-5))
+
+    def test_deepseek_v4_sliding_rope_no_yarn(self):
+        # Sliding-window ("main") layers must use PLAIN RoPE (no YaRN); compressed
+        # (CSA/HCA) layers use YaRN. Matches the DeepSeek-V4 reference
+        # (HF DeepseekV4Config: main={"rope_type": "default"}, compress={**yarn}).
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.deepseek_v4 import DeepseekV4RoPE
+
+        scaling = {
+            "type": "yarn",
+            "factor": 16,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32,
+            "beta_slow": 1,
+        }
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=256,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=1,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 4, 128, 0],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=8,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            rope_theta=10000.0,
+            compress_rope_theta=160000.0,
+            max_position_embeddings=256,
+            rope_scaling=scaling,
+        )
+        sliding = deepseek_v4.V4Attention(args, 0)  # compress_ratio == 0
+        comp = deepseek_v4.V4Attention(args, 1)  # compress_ratio == 4
+
+        d, theta = args.qk_rope_head_dim, args.rope_theta
+        plain = DeepseekV4RoPE(d, theta, None).inv_freq
+        yarn160 = DeepseekV4RoPE(d, args.compress_rope_theta, scaling).inv_freq
+        plain160 = DeepseekV4RoPE(d, args.compress_rope_theta, None).inv_freq
+
+        # Sliding layer: main rope is plain (no YaRN interpolation).
+        self.assertTrue(mx.allclose(sliding.rope.inv_freq, plain))
+        # Compressed layer: compress rope is YaRN, and YaRN actually changed it.
+        self.assertTrue(mx.allclose(comp.compress_rope.inv_freq, yarn160))
+        self.assertFalse(mx.allclose(comp.compress_rope.inv_freq, plain160))
+
+    def test_deepseek_v4(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=8,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=256,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 128,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        self.assertEqual(len(model.layers), args.num_hidden_layers)
+        self.assertEqual(model.model_type, args.model_type)
+        parameter_names = {name for name, _ in tree_flatten(model.parameters())}
+        self.assertNotIn("model.layers.0.attn.rope.inv_freq", parameter_names)
+        self.assertEqual(
+            model.layers[2].attn.compressor.wkv.weight.shape,
+            (2 * args.head_dim, args.hidden_size),
+        )
+        self.assertEqual(
+            model.layers[2].attn.indexer.compressor.wkv.weight.shape,
+            (2 * args.index_head_dim, args.hidden_size),
+        )
+
+        for dtype in [mx.float32, mx.float16, mx.bfloat16]:
+            model.update(
+                tree_map(
+                    lambda p: (
+                        p.astype(dtype) if mx.issubdtype(p.dtype, mx.floating) else p
+                    ),
+                    model.parameters(),
+                )
+            )
+            for layer in model.model.layers:
+                layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+            inputs = mx.array([[0, 1, 2, 3, 4]], dtype=mx.int32)
+            outputs = model(inputs)
+            self.assertEqual(outputs.shape, (1, 5, args.vocab_size))
+            self.assertEqual(outputs.dtype, dtype)
+
+            cache = model.make_cache()
+            self.assertIsInstance(cache[0], RotatingKVCache)
+            self.assertIsInstance(cache[2], deepseek_v4.CompressedKVCache)
+            outputs = model(inputs[:, :3], cache=cache)
+            self.assertEqual(outputs.shape, (1, 3, args.vocab_size))
+            self.assertEqual(outputs.dtype, dtype)
+            outputs = model(inputs[:, 3:4], cache=cache)
+            self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
+            self.assertEqual(outputs.dtype, dtype)
+
+    def test_deepseek_v4_hyper_connection_transpose(self):
+        # mHC recombines residual streams as comb^T @ residual (the HF reference
+        # consumes the doubly-stochastic `comb` transposed). `comb` is not
+        # symmetric, so the direction is observable in the output; this reference
+        # value pins it against a silent regression. Every other V4 test asserts
+        # only shape/dtype or self-consistency and is blind to the direction.
+        from mlx_lm.models.deepseek_v4 import HyperConnection
+
+        hc = HyperConnection(
+            dim=3, hc_mult=2, norm_eps=1e-5, sinkhorn_iters=2, hc_eps=1e-6
+        )
+        # Asymmetric mixing matrix and known residual streams.
+        comb = mx.array([[[[0.7, 0.3], [0.1, 0.9]]]], dtype=mx.float32)  # [1,1,2,2]
+        residual = mx.array(
+            [[[[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]]], dtype=mx.float32
+        )  # [1,1,2,3]
+        post = mx.zeros((1, 1, 2), dtype=mx.float32)  # isolate the comb term
+        f_out = mx.zeros((1, 1, 3), dtype=mx.float32)
+
+        out = hc.hc_post(f_out, residual, post, comb)
+
+        # Hand-computed comb^T @ residual:
+        #   row0 = 0.7*[0,1,2] + 0.1*[3,4,5] = [0.3, 1.1, 1.9]
+        #   row1 = 0.3*[0,1,2] + 0.9*[3,4,5] = [2.7, 3.9, 5.1]
+        expected = mx.array([[[[0.3, 1.1, 1.9], [2.7, 3.9, 5.1]]]], dtype=mx.float32)
+        self.assertTrue(mx.allclose(out, expected, atol=1e-5).item())
+        # The un-transposed contraction is genuinely different, so the assertion
+        # above would fail on the pre-fix (comb @ residual) code path.
+        plain = comb @ residual
+        self.assertFalse(mx.allclose(out, plain, atol=1e-5).item())
+
+    def test_deepseek_v4_indexer_roped_path(self):
+        # Production always calls the indexer with the compress RoPE (rope != None);
+        # the existing topk test only exercises the rope=None branch. Cover the
+        # roped query/key path (offset 0 and >0) so a regression there is caught.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=4,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=256,
+        )
+        attn = deepseek_v4.Model(args).layers[2].attn
+        indexer = attn.indexer
+        rope = attn.compress_rope
+
+        B, S = 1, 32
+        n_comp = S // 4
+        x = mx.random.normal((B, S, args.hidden_size))
+        q_inter = mx.random.normal((B, S, args.q_lora_rank))
+
+        for offset in (0, 8):
+            topk_idx = indexer(x, q_inter, offset=offset, rope=rope)
+            mx.eval(topk_idx)
+            self.assertEqual(topk_idx.shape, (B, 4))
+            self.assertTrue((topk_idx < n_comp).all().item())
+            self.assertTrue((topk_idx >= 0).all().item())
+
+    def test_mixed_quant_preserves_deepseek_v4_attention_paths(self):
+        from mlx_lm.convert import mixed_quant_predicate_builder
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+        modules = dict(model.named_modules())
+        predicate = mixed_quant_predicate_builder("mixed_3_6", model, group_size=32)
+
+        high = {"group_size": 32, "bits": 6, "mode": "affine"}
+        low = {"group_size": 32, "bits": 3, "mode": "affine"}
+        for path in [
+            "model.layers.0.attn.wq_a",
+            "model.layers.0.attn.wq_b",
+            "model.layers.0.attn.wkv",
+            "model.layers.0.attn.wo_a",
+            "model.layers.0.attn.wo_b",
+            "model.layers.2.attn.compressor.wkv",
+            "model.layers.2.attn.indexer.wq_b",
+            "model.layers.0.ffn.shared_experts.down_proj",
+            "model.embed_tokens",
+            "lm_head",
+        ]:
+            self.assertEqual(predicate(path, modules[path]), high)
+
+        self.assertEqual(
+            predicate(
+                "model.layers.0.ffn.switch_mlp.gate_proj",
+                modules["model.layers.0.ffn.switch_mlp.gate_proj"],
+            ),
+            low,
+        )
+
+    def test_deepseek_v4_quantized_grouped_output_projection(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0],
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        attn = deepseek_v4.V4Attention(args, layer_idx=0)
+        out = mx.random.uniform(shape=(1, 3, args.num_attention_heads * args.head_dim))
+        # Reference: the float per-group (einsum) projection path.
+        ref = attn._grouped_output_projection(out)
+        # Quantize wo_a so the call takes the batched-quantized-matmul path.
+        attn.wo_a = nn.QuantizedLinear.from_linear(
+            attn.wo_a,
+            group_size=32,
+            bits=6,
+            mode="affine",
+        )
+        y = attn._grouped_output_projection(out)
+        mx.eval(y, ref)
+        self.assertEqual(y.shape, (1, 3, args.o_groups * args.o_lora_rank))
+        # The optimized batched path must match the per-group reference within
+        # 6-bit affine quantization error; a wrong transpose/reshape misroutes
+        # values and diverges far beyond this tolerance.
+        self.assertTrue(mx.allclose(y, ref, atol=1e-1, rtol=1e-1))
+
+    def test_deepseek_v4_partial_rope_kernel_matches_fallback(self):
+        # The fused partial-RoPE Metal kernel and its pure-MLX fallback (used on
+        # CPU, on non-4D inputs, or when MLX_LM_DISABLE_PARTIAL_ROPE_KERNEL=1)
+        # must agree numerically; CI otherwise exercises only whichever path the
+        # host selects. Force the fallback by nulling the module-level kernel.
+        from mlx_lm.models import deepseek_v4
+
+        if deepseek_v4._partial_rope_kernel is None:
+            self.skipTest("partial-RoPE Metal kernel unavailable on this host")
+
+        dims = 16
+        rope = deepseek_v4.DeepseekV4RoPE(dims, 10000.0, scaling_config=None)
+        x = mx.random.normal((2, 3, 5, dims))  # 4D, rope-only -> hits the kernel path
+        saved = deepseek_v4._partial_rope_kernel
+        for inverse in (False, True):
+            try:
+                deepseek_v4._partial_rope_kernel = saved
+                y_kernel = rope(x, offset=7, inverse=inverse)
+                deepseek_v4._partial_rope_kernel = None
+                y_fallback = rope(x, offset=7, inverse=inverse)
+            finally:
+                deepseek_v4._partial_rope_kernel = saved
+            mx.eval(y_kernel, y_fallback)
+            self.assertTrue(mx.allclose(y_kernel, y_fallback, atol=1e-4))
+
+    def test_deepseek_v4_indexer_topk(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=4,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=256,
+        )
+        model = deepseek_v4.Model(args)
+
+        # Indexer should be on ratio-4 layer (layer 2)
+        self.assertTrue(hasattr(model.layers[2].attn, "indexer"))
+        indexer = model.layers[2].attn.indexer
+        self.assertEqual(indexer.index_topk, 4)
+        self.assertEqual(indexer.n_heads, 4)
+        self.assertEqual(indexer.head_dim, 16)
+
+        # Test indexer forward: 32 tokens gives 8 compressed rows (32/4),
+        # indexer should select topk=4 of them
+        B, S, D = 1, 32, args.hidden_size
+        x = mx.random.normal((B, S, D))
+        q_inter = mx.random.normal((B, S, args.q_lora_rank))
+        topk_idx = indexer(x, q_inter)
+        mx.eval(topk_idx)
+        self.assertIsNotNone(topk_idx)
+        self.assertEqual(topk_idx.shape, (B, 4))
+        # All indices must be valid (< n_compressed = 32/4 = 8)
+        self.assertTrue((topk_idx < 8).all().item())
+        self.assertTrue((topk_idx >= 0).all().item())
+
+        # Selected rows must be the true highest-scoring rows, not just valid
+        # indices. Recompute the indexer's aggregated score from its own
+        # submodules (rope=None here) and assert the selected set dominates the
+        # rest; this fails for a sign-flipped bottom-k or an arange() stub that
+        # still satisfies the shape/range checks above.
+        ck = indexer.compressor(x)
+        qh = indexer.wq_b(q_inter).reshape(B, S, indexer.n_heads, indexer.head_dim)
+        qh = qh.transpose(0, 2, 1, 3)
+        sc = mx.maximum(qh @ ck[:, None].transpose(0, 1, 3, 2), 0.0) * indexer.scale
+        ww = (indexer.weights_proj(x) * (indexer.n_heads**-0.5)).transpose(0, 2, 1)
+        agg = (sc.astype(mx.float32) * ww[..., None]).sum(axis=1).sum(axis=1)[0]
+        mx.eval(agg)
+        sel = set(int(i) for i in topk_idx[0].tolist())
+        chosen = [agg[i].item() for i in range(agg.shape[0]) if i in sel]
+        rest = [agg[i].item() for i in range(agg.shape[0]) if i not in sel]
+        self.assertGreaterEqual(min(chosen), max(rest) - 1e-4)
+
+        # Full model forward should work with enough tokens to trigger indexer
+        inputs = mx.array([list(range(32))], dtype=mx.int32)
+        outputs = model(inputs)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 32, args.vocab_size))
+
+        # Prefill + decode should also work
+        cache = model.make_cache()
+        outputs = model(inputs[:, :24], cache=cache)
+        mx.eval(outputs)
+        outputs = model(inputs[:, 24:25], cache=cache)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
+
+    def test_deepseek_v4_sparse_gather_path(self):
+        # With index_gate_rows lowered, a modest prompt crosses the gate so the
+        # top-k indexer fires and V4Attention exercises the gather + compressed-
+        # mask read path (unreachable at the default 8192-row gate). Prefill then
+        # decode must run and stay shape-consistent.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=2,
+            index_gate_rows=4,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=256,
+        )
+        model = deepseek_v4.Model(args)
+        # 40 tokens -> 10 compressed rows on the ratio-4 layer, above the
+        # max(index_topk=2, index_gate_rows=4) gate, so the indexer gathers.
+        inputs = mx.array([list(range(40))], dtype=mx.int32)
+        outputs = model(inputs)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 40, args.vocab_size))
+
+        cache = model.make_cache()
+        outputs = model(inputs[:, :36], cache=cache)
+        mx.eval(outputs)
+        outputs = model(inputs[:, 36:37], cache=cache)
+        mx.eval(outputs)
+        self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
+
+        # Chunked prefill: a second S>1 chunk at offset>0 exercises the
+        # offset-aware compressed-column mask over the gathered pool.
+        cache2 = model.make_cache()
+        model(inputs[:, :20], cache=cache2)
+        out2 = model(inputs[:, 20:40], cache=cache2)
+        mx.eval(out2)
+        self.assertEqual(out2.shape, (1, 20, args.vocab_size))
+
+    def test_deepseek_v4_prompt_cache_roundtrip(self):
+        # Regression: saving/loading a compressed-attention prompt cache must
+        # preserve the compressed pool, indexer pool and raw buffers, so that
+        # continued generation from a restored cache matches the live cache.
+        import os
+        import tempfile
+
+        from mlx_lm.models import deepseek_v4
+        from mlx_lm.models.cache import load_prompt_cache, save_prompt_cache
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],
+            index_n_heads=4,
+            index_head_dim=8,
+            index_topk=4,
+            moe_intermediate_size=16,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+        ids = (mx.arange(20) % 128).reshape(1, 20)
+        nxt = mx.array([[7]])
+        cache = model.make_cache()
+        mx.eval(model(ids, cache=cache))
+        path = os.path.join(tempfile.mkdtemp(), "c.safetensors")
+        save_prompt_cache(path, cache)
+        live = mx.array(model(nxt, cache=cache))[0, -1]
+        restored = load_prompt_cache(path)
+        rest = mx.array(model(nxt, cache=restored))[0, -1]
+        self.assertTrue(mx.allclose(live, rest, atol=1e-4))
+
+    def test_deepseek_v4_prompt_cache_class_resolution(self):
+        # The cache-class resolver added for compressed-attention prompt caches
+        # must resolve both a module-qualified name (written by save_prompt_cache)
+        # and a legacy bare class name (older cache files) via the globals()
+        # fallback, which otherwise has no coverage.
+        from mlx_lm.models import cache as cache_mod
+
+        self.assertIs(cache_mod._resolve_cache_class("KVCache"), cache_mod.KVCache)
+        self.assertIs(
+            cache_mod._resolve_cache_class("mlx_lm.models.cache.KVCache"),
+            cache_mod.KVCache,
+        )
+
+    def test_deepseek_v4_indexer_decode_topk(self):
+        # Regression: the indexer pool must accumulate across decode steps so
+        # top-k block selection works during generation. Previously the indexer
+        # recomputed its compressor on the single decode token, produced zero
+        # rows, and returned None (top-k silently disabled during decode).
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            head_dim=32,
+            qk_rope_head_dim=16,
+            rms_norm_eps=1e-6,
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=2,
+            q_lora_rank=16,
+        )
+        indexer = deepseek_v4.Indexer(args, compress_ratio=4)
+        S = 22
+        x = mx.random.normal((1, S, 64))
+        qr = mx.random.normal((1, S, 16))
+
+        ref = indexer.compressor(x)
+        cache = deepseek_v4.CompressedKVCache()
+        for i in range(S):
+            cache.accumulate_index(x[:, i : i + 1], indexer.compressor)
+        self.assertEqual(cache._index_pool.shape, ref.shape)
+        self.assertTrue(mx.allclose(cache._index_pool, ref, atol=1e-4, rtol=1e-4))
+
+        topk = indexer(x[:, -1:], qr[:, -1:], cache._index_pool)
+        self.assertIsNotNone(topk)
+        self.assertEqual(topk.shape, (1, args.index_topk))
+
+    def test_deepseek_v4_compressed_cache_matches_prefill(self):
+        # Regression: the incremental-decode compressed-KV cache must reproduce
+        # the prefill Compressor output bit-for-bit, including the prefill
+        # remainder tokens (S % ratio) and the ratio-4 cross-window overlap.
+        # Guards against the decode/chunk divergence that dropped tokens.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            head_dim=32,
+            qk_rope_head_dim=16,
+            rms_norm_eps=1e-6,
+        )
+
+        def check(ratio, S, chunks):
+            comp = deepseek_v4.Compressor(args, ratio, head_dim=32)
+            x = mx.random.normal((1, S, 64))
+            ref = comp(x)
+            c1 = deepseek_v4.CompressedKVCache()
+            for i in range(S):
+                c1.accumulate(x[:, i : i + 1], comp)
+            c2 = deepseek_v4.CompressedKVCache()
+            j = 0
+            for cs in chunks:
+                c2.accumulate(x[:, j : j + cs], comp)
+                j += cs
+            for pool in (c1._pool, c2._pool):
+                self.assertEqual(pool.shape, ref.shape)
+                self.assertTrue(mx.allclose(pool, ref, atol=1e-5, rtol=1e-5))
+
+        check(4, 14, [5, 9])
+        check(4, 16, [3, 3, 10])
+        check(2, 15, [7, 8])
+
+    def test_deepseek_v4_sanitize_unpacks_fp4_experts(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+
+        packed = mx.array(
+            [
+                [0x21] * 16,
+                [0xFE] * 16,
+            ],
+            dtype=mx.int8,
+        )
+        weights = {
+            "layers.0.ffn.experts.0.w1.weight": packed,
+            "layers.0.ffn.experts.0.w1.scale": mx.full((2, 1), 127, dtype=mx.uint8),
+            "layers.0.ffn.experts.1.w1.weight": packed,
+            "layers.0.ffn.experts.1.w1.scale": mx.full((2, 1), 127, dtype=mx.uint8),
+        }
+
+        converted = model.sanitize(weights)
+        key = "model.layers.0.ffn.switch_mlp.gate_proj.weight"
+        self.assertIn(key, converted)
+        self.assertEqual(converted[key].shape, (2, 2, 32))
+        self.assertTrue(
+            mx.array_equal(
+                converted[key][0, 0, :4].astype(mx.float32),
+                mx.array([0.5, 1.0, 0.5, 1.0], dtype=mx.float32),
+            )
+        )
+        self.assertTrue(
+            mx.array_equal(
+                converted[key][0, 1, :4].astype(mx.float32),
+                mx.array([-4.0, -6.0, -4.0, -6.0], dtype=mx.float32),
+            )
+        )
+
+    def test_deepseek_v4_sanitize_dequantizes_fp8_blocks(self):
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        import numpy as np
+
+        model = deepseek_v4.Model(args)
+        bs = 128
+        m, n = 130, 130  # non-multiple of 128 -> forces padding + a 2x2 block grid
+        # Distinct, exactly-fp8-representable value per 128x128 block, plus a
+        # per-block scale grid, so a wrong block reshape, scale-broadcast axis,
+        # or pad/unpad trim changes the result (the old all-ones, unit-scale,
+        # single-block case could not catch any of those).
+        wvals = np.array([[1.0, 2.0], [0.5, 1.5]], dtype=np.float32)
+        svals = np.array([[127, 128], [126, 129]], dtype=np.uint8)  # 2**(e-127)
+        w_np = np.zeros((m, n), dtype=np.float32)
+        ref = np.zeros((m, n), dtype=np.float32)
+        for bi in range(2):
+            for bj in range(2):
+                r0, r1 = bi * bs, min((bi + 1) * bs, m)
+                c0, c1 = bj * bs, min((bj + 1) * bs, n)
+                w_np[r0:r1, c0:c1] = wvals[bi, bj]
+                ref[r0:r1, c0:c1] = wvals[bi, bj] * (2.0 ** (int(svals[bi, bj]) - 127))
+        converted = model.sanitize(
+            {
+                "layers.0.attn.wkv.weight": mx.to_fp8(mx.array(w_np)),
+                "layers.0.attn.wkv.scale": mx.array(svals),
+                "norm.weight": mx.ones((32,), dtype=mx.float32),
+            }
+        )
+        key = "model.layers.0.attn.wkv.weight"
+        self.assertIn(key, converted)
+        self.assertIn("model.norm.weight", converted)
+        self.assertEqual(converted[key].shape, (m, n))
+        self.assertTrue(
+            mx.allclose(
+                converted[key].astype(mx.float32),
+                mx.array(ref),
+                rtol=1e-2,
+                atol=1e-2,
+            )
+        )
+
+    def test_deepseek_v4_sanitize_renames_attn_hc_order(self):
+        """Community quants (mlx-community/DeepSeek-V4-Flash-8bit) store the
+        per-layer hyper-connections as `attn_hc.X` / `ffn_hc.X` rather than the
+        `hc_attn.X` / `hc_ffn.X` order used by the raw HF checkpoint and our
+        model. The sanitizer must converge both to the model's order."""
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=128,
+            hidden_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=4,
+            q_lora_rank=16,
+            o_lora_rank=8,
+            o_groups=2,
+            head_dim=16,
+            qk_rope_head_dim=4,
+            moe_intermediate_size=2,
+            n_routed_experts=2,
+            n_shared_experts=1,
+            num_experts_per_tok=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+        )
+        model = deepseek_v4.Model(args)
+
+        weights = {
+            # community-quant order: <sub>_hc.<param>
+            "layers.0.attn_hc.fn": mx.zeros((4,), dtype=mx.float32),
+            "layers.0.attn_hc.base": mx.zeros((6,), dtype=mx.float32),
+            "layers.0.attn_hc.scale": mx.ones((3,), dtype=mx.float32),
+            "layers.0.ffn_hc.fn": mx.zeros((4,), dtype=mx.float32),
+            "layers.0.ffn_hc.base": mx.zeros((6,), dtype=mx.float32),
+            "layers.0.ffn_hc.scale": mx.ones((3,), dtype=mx.float32),
+        }
+
+        converted = model.sanitize(weights)
+
+        # Verify every input key has been renamed to the model's order.
+        for sub in ("attn", "ffn"):
+            for param in ("fn", "base", "scale"):
+                self.assertIn(f"model.layers.0.hc_{sub}.{param}", converted)
+                self.assertNotIn(f"model.layers.0.{sub}_hc.{param}", converted)
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
@@ -3113,6 +3928,32 @@ class TestModels(unittest.TestCase):
                     "original_max_position_embeddings": 4096,
                     "type": "yarn",
                 },
+            },
+            {
+                "model_type": "deepseek_v4",
+                "vocab_size": 1024,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "q_lora_rank": 32,
+                "o_lora_rank": 16,
+                "o_groups": 2,
+                "head_dim": 32,
+                "qk_rope_head_dim": 8,
+                "sliding_window": 16,
+                "compress_ratios": [0, 0, 4, 0],
+                "index_n_heads": 4,
+                "index_head_dim": 16,
+                "index_topk": 8,
+                "moe_intermediate_size": 32,
+                "n_routed_experts": 4,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 2,
+                "num_hash_layers": 1,
+                "hc_mult": 2,
+                "hc_sinkhorn_iters": 2,
+                "max_position_embeddings": 256,
             },
             {
                 "model_type": "mimo_v2_flash",
