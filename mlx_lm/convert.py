@@ -44,6 +44,10 @@ def mixed_quant_predicate_builder(
         if k.isdigit():
             break
     num_layers = len(model.layers)
+    # Module names a model marks as always high-bit (e.g. sensitive
+    # projections). Empty unless the model sets it, so behavior is unchanged
+    # for models that do not.
+    extra_high = tuple(getattr(model, "mixed_quant_extra_high", ()))
 
     def mixed_quant_predicate(
         path: str,
@@ -53,23 +57,25 @@ def mixed_quant_predicate_builder(
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
-        index = (
-            int(path.split(".")[layer_location])
-            if len(path.split(".")) > layer_location
-            else 0
-        )
+        parts = path.split(".")
+        # Layer index: the component at the usual position when it is numeric,
+        # else the first numeric component (module paths can vary in depth).
+        if len(parts) > layer_location and parts[layer_location].isdigit():
+            index = int(parts[layer_location])
+        else:
+            index = next((int(p) for p in parts if p.isdigit()), 0)
         use_more_bits = (
             index < num_layers // 8
             or index >= 7 * num_layers // 8
             or (index - num_layers // 8) % 3 == 2
         )
+        if "lm_head" in path or any(name in parts for name in extra_high):
+            return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if (
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "down_proj" in path and use_more_bits:
-            return {"group_size": group_size, "bits": high_bits, "mode": mode}
-        if "lm_head" in path:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
 
         return {"group_size": group_size, "bits": low_bits, "mode": mode}
