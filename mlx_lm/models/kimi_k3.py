@@ -314,62 +314,6 @@ def _attn_res_mix(
     return _attn_res_combine(blocks.raw, blocks.inv_rms, partial_sum, w_eff, eps)
 
 
-_SHORT_CONV_SOURCE = """
-    auto c = thread_position_in_grid.x;
-    auto b = thread_position_in_grid.y;
-
-    const device T* s = state + b * (KS - 1) * C;
-    float v = 0.0f;
-    for (int j = 0; j < KS - 1; ++j) {
-      v += static_cast<float>(w[c * KS + j]) * static_cast<float>(s[j * C + c]);
-    }
-    v += static_cast<float>(w[c * KS + KS - 1]) * static_cast<float>(x[b * C + c]);
-    y[b * C + c] = static_cast<T>(v / (1.0f + metal::exp(-v)));
-
-    device T* ns = new_state + b * (KS - 1) * C;
-    for (int j = 0; j < KS - 2; ++j) {
-      ns[j * C + c] = s[(j + 1) * C + c];
-    }
-    ns[(KS - 2) * C + c] = x[b * C + c];
-"""
-
-_short_conv_kernel = (
-    mx.fast.metal_kernel(
-        name="k3_short_conv_step",
-        input_names=["x", "state", "w"],
-        output_names=["y", "new_state"],
-        source=_SHORT_CONV_SOURCE,
-    )
-    if mx.metal.is_available()
-    else None
-)
-
-
-class KimiK3ShortConv(ShortConv1d):
-    def __call__(self, x, state, mask=None, lengths=None):
-        if (
-            _short_conv_kernel is None
-            or self.training
-            or x.shape[1] != 1
-            or state is None
-            or mask is not None
-            or lengths is not None
-            or x.dtype != state.dtype
-            or x.dtype != self.conv.weight.dtype
-            or mx.default_device() != mx.gpu
-        ):
-            return super().__call__(x, state, mask, lengths)
-        B, _, C = x.shape
-        return _short_conv_kernel(
-            inputs=[x, state, self.conv.weight],
-            template=[("T", x.dtype), ("C", C), ("KS", self.kernel_size)],
-            grid=(C, B, 1),
-            threadgroup=(min(1024, C), 1, 1),
-            output_shapes=[x.shape, state.shape],
-            output_dtypes=[x.dtype, x.dtype],
-        )
-
-
 class KimiK3DeltaAttention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -386,7 +330,7 @@ class KimiK3DeltaAttention(nn.Module):
 
         hidden = args.hidden_size
         self.qkv_proj = nn.Linear(hidden, 3 * self.projection_dim, bias=False)
-        self.qkv_conv = KimiK3ShortConv(3 * self.projection_dim, self.conv_kernel)
+        self.qkv_conv = ShortConv1d(3 * self.projection_dim, self.conv_kernel)
 
         self.f_a_proj = nn.Linear(hidden, self.head_dim, bias=False)
         self.f_b_proj = nn.Linear(self.head_dim, self.projection_dim, bias=False)

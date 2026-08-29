@@ -310,6 +310,21 @@ def _infer_structural_markers(tokenizer):
     return ()
 
 
+def _infer_thinking_kwarg(tokenizer):
+    custom_renderer = (
+        getattr(type(tokenizer), "apply_chat_template", None)
+        is not PreTrainedTokenizerBase.apply_chat_template
+    )
+    if custom_renderer:
+        try:
+            params = inspect.signature(type(tokenizer).apply_chat_template).parameters
+            if "thinking" in params and "enable_thinking" not in params:
+                return "thinking", custom_renderer
+        except (ValueError, TypeError):
+            pass
+    return "enable_thinking", custom_renderer
+
+
 class TokenizerWrapper:
     """A wrapper that combines an HF tokenizer and a detokenizer.
 
@@ -343,25 +358,12 @@ class TokenizerWrapper:
         self._structural_markers = _infer_structural_markers(tokenizer)
 
         self._chat_template = chat_template
-        custom_renderer = (
-            getattr(type(tokenizer), "apply_chat_template", None)
-            is not PreTrainedTokenizerBase.apply_chat_template
-        )
+        self._thinking_kwarg, has_custom_renderer = _infer_thinking_kwarg(tokenizer)
         self.has_chat_template = (
             tokenizer.chat_template is not None
             or chat_template is not None
-            or custom_renderer
+            or has_custom_renderer
         )
-        self._thinking_kwarg = "enable_thinking"
-        if custom_renderer:
-            try:
-                params = inspect.signature(
-                    type(tokenizer).apply_chat_template
-                ).parameters
-                if "thinking" in params and "enable_thinking" not in params:
-                    self._thinking_kwarg = "thinking"
-            except (TypeError, ValueError):
-                pass
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
@@ -595,9 +597,12 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def _infer_tool_parser(chat_template):
-    """Attempt to auto-infer a tool parser from the chat template."""
+def _infer_tool_parser(tokenizer):
+    """Attempt to auto-infer a tool parser from the chat template or vocab."""
+    chat_template = tokenizer.chat_template
     if not isinstance(chat_template, str):
+        if _is_xtml_vocab(tokenizer.get_vocab()):
+            return "kimi_k3"
         return None
     elif "<minimax:tool_call>" in chat_template:
         return "minimax_m2"
@@ -673,11 +678,8 @@ def load(
         ).apply_chat_template
 
     tool_parser_type = tokenizer_config.get(
-        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
+        "tool_parser_type", _infer_tool_parser(tokenizer)
     )
-    if tool_parser_type is None and _is_xtml_vocab(tokenizer.get_vocab()):
-        tool_parser_type = "kimi_k3"
-
     if tool_parser_type is not None:
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
         tool_parser = tool_module.parse_tool_call
