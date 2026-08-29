@@ -1397,6 +1397,23 @@ class TestModels(unittest.TestCase):
         model = gpt2.Model(args)
         self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
 
+    def test_gptj(self):
+
+        from mlx_lm.models import gptj
+
+        args = gptj.ModelArgs(
+            model_type="gptj",
+            n_embd=4096,
+            vocab_size=50400,
+            layer_norm_epsilon=1e-5,
+            n_positions=2048,
+            n_head=16,
+            rotary_dim=64,
+            n_layer=28,
+        )
+        model = gptj.Model(args)
+        self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
+
     def test_gpt_neox(self):
         from mlx_lm.models import gpt_neox
 
@@ -2101,6 +2118,28 @@ class TestModels(unittest.TestCase):
             loop_window_size=32,
         )
         model = iquestloopcoder.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_nanbeige(self):
+        from mlx_lm.models import nanbeige
+
+        args = nanbeige.ModelArgs(
+            model_type="nanbeige",
+            hidden_size=256,
+            num_hidden_layers=2,
+            intermediate_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=1000,
+            rope_theta=70000000.0,
+            tie_word_embeddings=False,
+            num_loops=2,
+        )
+        model = nanbeige.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
