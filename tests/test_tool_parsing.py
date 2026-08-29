@@ -155,10 +155,7 @@ class TestToolParsing(unittest.TestCase):
 
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
-        test_case = (
-            "[write(filePath='/tmp/hello.py', "
-            "content='# Hello, world!')]"
-        )
+        test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
         tool_call = pythonic.parse_tool_call(test_case, None)
         self.assertEqual(tool_call["name"], "write")
         self.assertEqual(tool_call["arguments"]["filePath"], "/tmp/hello.py")

@@ -14,7 +14,9 @@ Parses assistant responses containing tool calls in formats like:
 
 
 _tool_call_regex = re.compile(r"\[(\w+)\((.*?)\)\]", re.DOTALL)
-_tool_args_regex = re.compile(r"""(\w+)=(?:"([^"]*)"|'([^']*)'|([^,]+))(?:,\s*|$)""", re.DOTALL)
+_tool_args_regex = re.compile(
+    r"""(\w+)=(?:"([^"]*)"|'([^']*)'|([^,]+))(?:,\s*|$)""", re.DOTALL
+)
 
 
 def parse_tool_call(text: str, tools: Any | None = None):
