@@ -13,6 +13,7 @@ from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
     ArraysCache,
+    BatchRotatingKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
@@ -1786,6 +1787,77 @@ class TestModels(unittest.TestCase):
             outputs = model(inputs[:, 3:4], cache=cache)
             self.assertEqual(outputs.shape, (1, 1, args.vocab_size))
             self.assertEqual(outputs.dtype, dtype)
+
+    def test_deepseek_v4_batched_matches_sequential(self):
+        # Serving through mlx_lm.server routes batchable models through the
+        # continuous-batching engine, which backs each layer with a
+        # BatchRotatingKVCache. Its `offset` is a mutable mx.array that
+        # update_and_fetch() increments in place, whereas the sequential cache
+        # exposes a plain int. V4Attention captures `offset` once and reuses it
+        # AFTER the cache update for the inverse RoPE applied to the attention
+        # output (query positions must stay at their pre-update value). If the
+        # captured array is not snapshotted it is corrupted to the post-update
+        # offset, so batched decode diverges from sequential decode from the very
+        # first token. Assert exact parity across sliding + compressed layers.
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],  # exercise sliding AND compressed caches
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=8,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=256,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 128,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        mx.eval(model.parameters())
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        prompt = mx.array([[7, 3, 11, 0, 5, 9, 2, 8, 1, 6, 4]], dtype=mx.int32)
+
+        # Sequential path (stream_generate style): int offset.
+        seq_cache = model.make_cache()
+        model(prompt, cache=seq_cache)
+        # Batched B=1 path (BatchGenerator style): merged caches, mx.array offset.
+        batch_cache = [type(c).merge([c]) for c in model.make_cache()]
+        self.assertIsInstance(batch_cache[0], BatchRotatingKVCache)
+        model(prompt, cache=batch_cache)
+
+        token = mx.array([[10]], dtype=mx.int32)
+        for step in range(6):
+            seq_logits = model(token, cache=seq_cache)[:, -1, :]
+            batch_logits = model(token, cache=batch_cache)[:, -1, :]
+            self.assertTrue(
+                mx.allclose(seq_logits, batch_logits, atol=1e-4).item(),
+                msg=f"batched decode diverged from sequential at step {step}",
+            )
+            token = mx.argmax(seq_logits, axis=-1)[:, None].astype(mx.int32)
 
     def test_deepseek_v4_hyper_connection_transpose(self):
         # mHC recombines residual streams as comb^T @ residual (the HF reference

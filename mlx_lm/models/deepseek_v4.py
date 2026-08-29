@@ -1339,6 +1339,15 @@ class V4Attention(nn.Module):
         kv = kv.reshape(B, 1, S, self.head_dim)
 
         offset = cache.offset if cache is not None else 0
+        if isinstance(offset, mx.array):
+            # Snapshot the pre-update offset. BatchRotatingKVCache stores offset as
+            # an mx.array and update_and_fetch() (below) mutates it in place
+            # (self.offset += S). This forward reuses `offset` AFTER that update —
+            # for the inverse RoPE on the attention output and for _compressed_mask —
+            # where the correct value is the query start position (pre-update). An
+            # aliased array would be corrupted to the post-update value, misrotating
+            # the output. Sequential caches expose an int (a value copy), so are immune.
+            offset = mx.array(offset)
 
         # Apply RoPE only to the last rope_head_dim dims
         q_nope, q_pe = mx.split(q, [self.nope_head_dim], axis=-1)
