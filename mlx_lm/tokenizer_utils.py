@@ -543,6 +543,26 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
+def _has_byte_level_pretokenizer(tokenizer_content):
+    """Whether the tokenizer encodes its vocabulary with byte-level markers.
+
+    A ``ByteLevel`` pre-tokenizer (possibly nested in a ``Sequence``) means the
+    vocabulary uses GPT-2-style byte markers (e.g. ``Ġ`` for spaces), which only
+    ``BPEStreamingDetokenizer`` knows how to decode -- regardless of what the
+    ``decoder`` field looks like.
+    """
+
+    def _is_byte_level(node):
+        return isinstance(node, dict) and node.get("type", None) == "ByteLevel"
+
+    pre_tokenizer = tokenizer_content.get("pre_tokenizer")
+    if _is_byte_level(pre_tokenizer):
+        return True
+    if isinstance(pre_tokenizer, dict) and pre_tokenizer.get("type") == "Sequence":
+        return any(_is_byte_level(p) for p in pre_tokenizer.get("pretokenizers", []))
+    return False
+
+
 def _infer_tool_parser(chat_template):
     """Attempt to auto-infer a tool parser from the chat template."""
     if not isinstance(chat_template, str):
@@ -596,12 +616,20 @@ def load(
                 raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
 
         if "decoder" in tokenizer_content:
-            if _is_spm_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = SPMStreamingDetokenizer
-            elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
-                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
-            elif _is_bpe_decoder(tokenizer_content["decoder"]):
+            decoder = tokenizer_content["decoder"]
+            if _is_bpe_decoder(decoder) or _has_byte_level_pretokenizer(
+                tokenizer_content
+            ):
+                # A byte-level vocabulary must use the BPE detokenizer even when
+                # the tokenizer ships an SPM-style decoder (e.g. Mistral tekken
+                # v13): the SPM detokenizer only strips the ``▁`` marker and so
+                # leaves the byte-level space marker ``Ġ`` (U+0120) in the
+                # output. See issue #1041.
                 detokenizer_class = BPEStreamingDetokenizer
+            elif _is_spm_decoder(decoder):
+                detokenizer_class = SPMStreamingDetokenizer
+            elif _is_spm_decoder_no_space(decoder):
+                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
 
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
