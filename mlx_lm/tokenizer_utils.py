@@ -543,33 +543,44 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def _infer_tool_parser(chat_template):
+def _infer_tool_parser(chat_template, tokenizer=None):
     """Attempt to auto-infer a tool parser from the chat template."""
-    if not isinstance(chat_template, str):
-        return None
-    elif "<minimax:tool_call>" in chat_template:
-        return "minimax_m2"
-    elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
-        return "gemma4"
-    elif "<start_function_call>" in chat_template:
-        return "function_gemma"
-    elif "<longcat_tool_call>" in chat_template:
-        return "longcat"
-    elif "<arg_key>" in chat_template:
-        return "glm47"
-    elif "<|tool_list_start|>" in chat_template:
-        return "pythonic"
-    elif (
-        "<tool_call>\\n<function=" in chat_template
-        or "<tool_call>\n<function=" in chat_template
-    ):
-        return "qwen3_coder"
-    elif "<|tool_calls_section_begin|>" in chat_template:
-        return "kimi_k2"
-    elif "[TOOL_CALLS]" in chat_template:
-        return "mistral"
-    elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
-        return "json_tools"
+    if isinstance(chat_template, str):
+        if "<minimax:tool_call>" in chat_template:
+            return "minimax_m2"
+        elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
+            return "gemma4"
+        elif "<start_function_call>" in chat_template:
+            return "function_gemma"
+        elif "<longcat_tool_call>" in chat_template:
+            return "longcat"
+        elif "<arg_key>" in chat_template:
+            return "glm47"
+        elif "<|tool_call_start|>" in chat_template:
+            return "pythonic"
+        elif (
+            "<tool_call>\\n<function=" in chat_template
+            or "<tool_call>\n<function=" in chat_template
+        ):
+            return "qwen3_coder"
+        elif "<|tool_calls_section_begin|>" in chat_template:
+            return "kimi_k2"
+        elif "[TOOL_CALLS]" in chat_template:
+            return "mistral"
+        elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
+            return "json_tools"
+    # Fallback: some models (e.g. LFM2.5) encode tool-call delimiters only in
+    # their vocabulary and generate them at inference time, without referencing
+    # them in the chat template. Detect this by checking whether the tokenizer
+    # knows <|tool_call_start|> as a real (non-UNK) token.
+    if tokenizer is not None:
+        try:
+            unk_id = tokenizer.unk_token_id
+            tcs_id = tokenizer.convert_tokens_to_ids("<|tool_call_start|>")
+            if tcs_id is not None and tcs_id != unk_id:
+                return "pythonic"
+        except Exception:
+            pass
     return None
 
 
@@ -621,7 +632,7 @@ def load(
         ).apply_chat_template
 
     tool_parser_type = tokenizer_config.get(
-        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
+        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template, tokenizer)
     )
 
     if tool_parser_type is not None:
