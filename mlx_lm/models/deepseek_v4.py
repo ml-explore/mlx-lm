@@ -916,6 +916,20 @@ class CompressedKVCache(KVCache):
         return obj
 
     def is_trimmable(self):
+        # trim() rolls back only the sliding-window local cache. The compressed
+        # pool / indexer pool cannot be un-compressed, and the raw hidden states
+        # behind them are not retained, so a trim would leave stale compressed rows
+        # for tokens that were rolled back — corrupting sparse attention on reuse.
+        # Refuse to trim once any compressed state has accumulated; callers
+        # (trim_prompt_cache) then skip trimming rather than corrupt the pool. A
+        # fresh/empty cache stays trimmable (there is nothing to skew).
+        if (
+            self._pool is not None
+            or self._buf is not None
+            or self._index_pool is not None
+            or self._index_buf is not None
+        ):
+            return False
         return self.local.is_trimmable()
 
     def trim(self, n):
