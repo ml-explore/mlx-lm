@@ -530,8 +530,12 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
+    if not can_trim_prompt_cache(model_cache, num_draft_tokens):
+        types = {
+            type(c).__name__
+            for c in model_cache
+            if not c.is_trimmable(num_draft_tokens)
+        }
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )

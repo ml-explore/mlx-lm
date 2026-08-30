@@ -18,6 +18,7 @@ from mlx_lm.models.cache import (
     ChunkedKVCache,
     KVCache,
     QuantizedKVCache,
+    RecurrentCache,
     RotatingKVCache,
     load_prompt_cache,
     make_prompt_cache,
@@ -104,6 +105,7 @@ class TestPromptCache(unittest.TestCase):
 
         cache = [
             ArraysCache(size=2),
+            RecurrentCache(conv_state_size=1, max_size=4),
             KVCache(),
             RotatingKVCache(8),
             ArraysCache(size=2),
@@ -113,6 +115,9 @@ class TestPromptCache(unittest.TestCase):
             if isinstance(c, ArraysCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))
                 c[1] = mx.random.uniform(shape=(4, 4, 4))
+            elif isinstance(c, RecurrentCache):
+                c.update_conv_input(mx.random.uniform(shape=(4, 4, 4)))
+                c.update_ssm_states(mx.random.uniform(shape=(4, 4, 1, 4, 4)))
             else:
                 x = mx.random.uniform(shape=(4, 4, 7, 4))
                 y = mx.random.uniform(shape=(4, 4, 7, 4))
@@ -122,6 +127,9 @@ class TestPromptCache(unittest.TestCase):
         loaded_cache = load_prompt_cache(cache_file)
         for c, lc in zip(cache, loaded_cache):
             if isinstance(c, ArraysCache):
+                self.assertTrue(mx.array_equal(c[0], lc[0]))
+                self.assertTrue(mx.array_equal(c[1], lc[1]))
+            elif isinstance(c, RecurrentCache):
                 self.assertTrue(mx.array_equal(c[0], lc[0]))
                 self.assertTrue(mx.array_equal(c[1], lc[1]))
             else:
@@ -138,6 +146,7 @@ class TestPromptCache(unittest.TestCase):
 
         cache = [
             ArraysCache(size=2),
+            RecurrentCache(conv_state_size=1, max_size=4),
             KVCache(),
             RotatingKVCache(8),
             ArraysCache(size=2),
@@ -147,6 +156,9 @@ class TestPromptCache(unittest.TestCase):
             if isinstance(c, ArraysCache):
                 c[0] = mx.random.uniform(shape=(4, 4, 4))
                 c[1] = mx.random.uniform(shape=(4, 4, 4))
+            elif isinstance(c, RecurrentCache):
+                c.update_conv_input(mx.random.uniform(shape=(4, 4, 4)))
+                c.update_ssm_states(mx.random.uniform(shape=(4, 4, 1, 4, 4)))
             else:
                 x = mx.random.uniform(shape=(4, 4, 7, 4))
                 y = mx.random.uniform(shape=(4, 4, 7, 4))
@@ -157,6 +169,9 @@ class TestPromptCache(unittest.TestCase):
         loaded_cache = load_prompt_cache(cache_file)
         for c, lc in zip(cache[0].caches, loaded_cache[0].caches):
             if isinstance(c, ArraysCache):
+                self.assertTrue(mx.array_equal(c[0], lc[0]))
+                self.assertTrue(mx.array_equal(c[1], lc[1]))
+            elif isinstance(c, RecurrentCache):
                 self.assertTrue(mx.array_equal(c[0], lc[0]))
                 self.assertTrue(mx.array_equal(c[1], lc[1]))
             else:
@@ -824,6 +839,280 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+
+class TestRecurrentCache(unittest.TestCase):
+    def test_nbytes(self):
+        S, D = 4, 16
+        n_keep = 3
+        c = RecurrentCache(conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=S)
+
+        self.assertTrue(c.empty())
+        self.assertEqual(c.nbytes, 0)
+
+        x = mx.random.uniform(shape=(1, 1, D))
+        c.update_conv_input(x)
+        self.assertFalse(c.empty())
+        self.assertGreater(c.nbytes, x.nbytes)
+
+        old_size = c.nbytes
+        x = mx.random.uniform(shape=(1, 1, 1, D, D))
+        c.update_ssm_states(x)
+        self.assertGreater(c.nbytes, x.nbytes + old_size)
+
+    def test_update_conv_input(self):
+        S, D = 4, 16
+        n_keep = 3
+        c = RecurrentCache(conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=S)
+
+        # Append single tokens within max size
+        states = [mx.random.uniform(shape=(1, 1, D)) for i in range(S)]
+        for x in states:
+            y = c.update_conv_input(x)
+        states = [mx.zeros((1, 1, D))] * n_keep + states
+        self.assertTrue(mx.array_equal(c[0], mx.concatenate(states, axis=1)))
+        input = states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+        # Overflow by one
+        x = mx.random.uniform(shape=(1, 1, D))
+        y = c.update_conv_input(x)
+        states = states[1:] + [x]
+        self.assertTrue(mx.array_equal(c[0], mx.concatenate(states, axis=1)))
+        input = states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+        # Overflow by multiple
+        x = mx.random.uniform(shape=(1, 2, D))
+        y = c.update_conv_input(x)
+        states = (states + mx.split(x, x.shape[1], 1))[-(S + n_keep) :]
+        self.assertTrue(mx.array_equal(c[0], mx.concatenate(states, axis=1)))
+        input = states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+        # Overflow by max size
+        x = mx.random.uniform(shape=(1, S, D))
+        y = c.update_conv_input(x)
+        states = (states + mx.split(x, x.shape[1], 1))[-(S + n_keep) :]
+        self.assertTrue(mx.array_equal(c[0], mx.concatenate(states, axis=1)))
+        input = states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+        # Overflow by more than max size
+        x = mx.random.uniform(shape=(1, S + 2, D))
+        y = c.update_conv_input(x)
+        full_states = states + mx.split(x, x.shape[1], 1)
+        states = full_states[-(S + n_keep) :]
+        self.assertTrue(mx.array_equal(c[0], mx.concatenate(states, axis=1)))
+        input = full_states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+    def test_trim_conv_states(self):
+        S, D = 4, 16
+        n_keep = 3
+        c = RecurrentCache(conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=S)
+
+        # Trim empty
+        with self.assertRaises(ValueError):
+            c.trim(1)
+
+        # Prefill
+        x = mx.random.uniform(shape=(1, S + n_keep, D))
+        c.update_conv_input(x)
+        states = mx.split(x, x.shape[1], 1)
+        self.assertTrue(mx.array_equal(c[0], x))
+
+        # Trim too much
+        with self.assertRaises(ValueError):
+            c.trim(S + 1)
+
+        # Trim one
+        c.trim(1)
+        x = mx.random.uniform(shape=(1, 1, D))
+        y = c.update_conv_input(x)
+        states = states[:-1] + [x]
+        input = states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+        # Trim multiple
+        c.trim(3)
+        x = mx.random.uniform(shape=(1, 1, D))
+        y = c.update_conv_input(x)
+        states = states[:-3] + mx.split(x, x.shape[1], 1)
+        input = states[-(x.shape[1] + n_keep) :]
+        self.assertTrue(mx.array_equal(y, mx.concatenate(input, axis=1)))
+
+    def test_update_ssm_states(self):
+        S, H, D = 4, 2, 16
+        c = RecurrentCache(max_size=S)
+
+        # Append single tokens within max size
+        states = mx.random.uniform(shape=(S - 1, 1, H, D, D))
+        c.update_ssm_states(states)
+        self.assertTrue(mx.array_equal(c[0], states[-1]))
+
+        # Overflow
+        for T in (1, 2, S):
+            states = mx.random.uniform(shape=(T, 1, H, D, D))
+            c.update_ssm_states(states)
+            self.assertTrue(mx.array_equal(c[0], states[-1]))
+
+    def test_trim_ssm_states(self):
+        S, H, D = 4, 2, 16
+        c = RecurrentCache(max_size=S)
+
+        # Trim too much
+        states = mx.random.uniform(shape=(S, 1, H, D, D))
+        c.update_ssm_states(states)
+        with self.assertRaises(ValueError):
+            c.trim(S + 1)
+
+        # Trim one
+        c.trim(1)
+        self.assertTrue(mx.array_equal(c[0], states[-2]))
+
+        # Trim two
+        c.trim(2)
+        self.assertTrue(mx.array_equal(c[0], states[-4]))
+
+    def test_filter(self):
+        B, S, D = 8, 1, 2
+        n_keep = 3
+        c = RecurrentCache(conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=S)
+
+        x = mx.random.uniform(shape=(B, 1, D))
+        c.update_conv_input(x)
+        y = mx.random.uniform(shape=(1, B, 1, D, D))
+        c.update_ssm_states(y)
+
+        batch_indices = [1, 2]
+        c.filter(batch_indices)
+        self.assertTrue(mx.array_equal(c[0][:, -1:, :], x[batch_indices, ...]))
+        self.assertTrue(mx.array_equal(c[1], y[0, batch_indices, ...]))
+
+    def test_extend(self):
+        S, D = 3, 2
+        n_keep = 2
+
+        def make_caches(B1, S1, B2, S2, max_size1=S, max_size2=S):
+            c1 = RecurrentCache(
+                conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=max_size1
+            )
+            c2 = RecurrentCache(
+                conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=max_size2
+            )
+            x1 = mx.random.uniform(shape=(B1, S1, D))
+            c1.update_conv_input(x1)
+            y1 = mx.random.uniform(shape=(S1, B1, 1, D, D))
+            c1.update_ssm_states(y1)
+            x2 = mx.random.uniform(shape=(B2, S2, D))
+            c2.update_conv_input(x2)
+            y2 = mx.random.uniform(shape=(S2, B2, 1, D, D))
+            c2.update_ssm_states(y2)
+            return c1, c2, x1, x2, y1, y2
+
+        # Different batch size, same sequance size
+        B1 = 2
+        B2 = 3
+        S1 = S2 = S + n_keep
+        c1, c2, x1, x2, y1, y2 = make_caches(B1, S1, B2, S2)
+        c1.extend(c2)
+        self.assertTrue(mx.array_equal(c1[0], mx.concatenate([x1, x2])))
+        self.assertTrue(mx.array_equal(c1[1], mx.concatenate([y1[-1], y2[-1]])))
+
+        # Different batch size, different sequance size
+        B1 = 2
+        B2 = 3
+        S1 = S + n_keep
+        S2 = S + n_keep + 2
+        c1, c2, x1, x2, y1, y2 = make_caches(
+            B1, S1, B2, S2, max_size1=S, max_size2=S + 2
+        )
+        c1.extend(c2)
+        x1 = mx.pad(x1, [(0, 0), (S2 - S1, 0), (0, 0)])
+        self.assertTrue(mx.array_equal(c1[0], mx.concatenate([x1, x2])))
+        self.assertTrue(mx.array_equal(c1[1], mx.concatenate([y1[-1], y2[-1]])))
+
+    def test_merge_extract(self):
+        D = 2
+        n_keep = 2
+        c1 = RecurrentCache(conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=2)
+        c2 = RecurrentCache(conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=4)
+        c3 = RecurrentCache.merge([c1, c2])
+        self.assertEqual(c3[0], None)
+        self.assertEqual(c3[1], None)
+
+        # Merge with empty
+        x1 = mx.random.uniform(shape=(1, 2, D))
+        c1.update_conv_input(x1)
+        y1 = mx.random.uniform(shape=(2, 1, 1, 1, D))
+        c1.update_ssm_states(y1)
+        c3 = RecurrentCache.merge([c1, c2])
+        self.assertTrue(mx.array_equal(c3[0][:, : c3.conv_offset, :], c1[0]))
+        self.assertTrue(mx.array_equal(c3[1], c1[1]))
+        c1_e = c3.extract(0)
+        self.assertTrue(mx.array_equal(c1_e[0][:, : c1_e.conv_offset, :], c1[0]))
+        self.assertTrue(mx.array_equal(c1_e[1], c1[1]))
+
+        # Merge with non-empty
+        x2 = mx.random.uniform(shape=(2, 3, D))
+        c2.update_conv_input(x2)
+        y2 = mx.random.uniform(shape=(3, 2, 1, 1, D))
+        c2.update_ssm_states(y2)
+        c3 = RecurrentCache.merge([c1, c2])
+        self.assertTrue(
+            mx.array_equal(
+                c3[0][:, c3.conv_offset - 3 : c3.conv_offset, :],
+                mx.concatenate([mx.pad(x1, [(0, 0), (1, 0), (0, 0)]), x2]),
+            )
+        )
+        self.assertTrue(mx.array_equal(c3[1], mx.concatenate([y1[-1], y2[-1]])))
+        c1_e = c3.extract(0)
+        self.assertTrue(
+            mx.array_equal(
+                c1_e[0][:, c1_e.conv_offset - 4 : c1_e.conv_offset, :],
+                c1[0],
+            )
+        )
+        self.assertTrue(mx.array_equal(c1_e[1], c1[1]))
+
+    def test_batch_prefill(self):
+        max_size = 3
+        n_keep = 2
+        c = RecurrentCache(
+            conv_state_size=1, conv_kernel_size=n_keep + 1, max_size=max_size
+        )
+
+        # Prepare data: batch of B with sequence length 1 to B
+        B, D = 4, 2
+        qkv = mx.random.uniform(shape=(B, B, D))
+        lengths = mx.arange(1, B + 1, dtype=mx.int32).tolist()
+        right_padding = [B - l for l in lengths]
+        for i, l in enumerate(lengths):
+            qkv[i, l:, :] = 0
+
+        c.prepare(lengths=lengths, right_padding=right_padding)
+
+        # Prefill half
+        M = 2
+        conv_inputs = c.update_conv_input(qkv[:, :M, :])
+        self.assertTrue(
+            mx.array_equal(
+                conv_inputs,
+                mx.concatenate([mx.zeros((B, n_keep, D)), qkv[:, :M, :]], axis=1),
+            )
+        )
+
+        # Prefill rest
+        conv_inputs = c.update_conv_input(qkv[:, M:, :])
+        self.assertTrue(mx.array_equal(conv_inputs, qkv[:, -M - n_keep :, :]))
+
+        # Right-aligned after prefilling
+        c.finalize()
+        expected = mx.zeros((B, max_size + n_keep, D))
+        for i, l in enumerate(lengths):
+            expected[i, -l:, :] = qkv[i, :l, :]
+        self.assertTrue(mx.array_equal(c[0], expected))
 
 
 if __name__ == "__main__":

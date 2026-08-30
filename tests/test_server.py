@@ -94,7 +94,7 @@ class MockCache:
     def __eq__(self, other):
         return other.value == self.value
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return self._is_trimmable
 
     def trim(self, n):
