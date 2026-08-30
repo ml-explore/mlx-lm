@@ -1859,6 +1859,83 @@ class TestModels(unittest.TestCase):
             )
             token = mx.argmax(seq_logits, axis=-1)[:, None].astype(mx.int32)
 
+    def test_deepseek_v4_batched_multi_sequence_compressed_prefill(self):
+        # Concurrent serving (mlx_lm.server, --decode-concurrency > 1) batches
+        # requests into B>1 through the continuous-batching engine, whose caches
+        # store `offset` as a per-batch mx.array [B]. A compressed-context prefill
+        # then builds the compressed-column mask with that array offset.
+        # _compressed_mask previously assumed a scalar offset, so
+        # (offset + arange(S_q)) put the batch dim on the S_q axis and the broadcast
+        # crashed the whole engine. Assert the B=2 compressed prefill runs and each
+        # row matches the same sequence decoded sequentially (int offset).
+        from mlx_lm.models import deepseek_v4
+
+        args = deepseek_v4.ModelArgs(
+            model_type="deepseek_v4",
+            vocab_size=1024,
+            hidden_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            q_lora_rank=32,
+            o_lora_rank=16,
+            o_groups=2,
+            head_dim=32,
+            qk_rope_head_dim=8,
+            sliding_window=16,
+            compress_ratios=[0, 0, 4, 0],  # exercise the compressed cache
+            index_n_heads=4,
+            index_head_dim=16,
+            index_topk=8,
+            moe_intermediate_size=32,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=1,
+            hc_mult=2,
+            hc_sinkhorn_iters=2,
+            max_position_embeddings=256,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 2,
+                "original_max_position_embeddings": 128,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v4.Model(args)
+        mx.eval(model.parameters())
+        for layer in model.model.layers:
+            layer.attn.attn_sink = layer.attn.attn_sink.astype(mx.float32)
+
+        # Two distinct, equal-length prompts (equal length -> no left padding, so a
+        # single dense B=2 prefill), long enough for the compressed layer to form
+        # pool blocks and reach the compressed-mask path.
+        prompt_a = mx.array([[7, 3, 11, 0, 5, 9, 2, 8, 1, 6, 4]], dtype=mx.int32)
+        prompt_b = mx.array([[1, 10, 2, 9, 3, 8, 4, 7, 5, 6, 0]], dtype=mx.int32)
+
+        # Sequential path (int offset), one sequence at a time.
+        seq_a = model(prompt_a, cache=model.make_cache())[:, -1, :]
+        seq_b = model(prompt_b, cache=model.make_cache())[:, -1, :]
+
+        # Batched B=2 path: merged caches expose a per-batch mx.array offset.
+        batch_cache = [
+            type(a).merge([a, b])
+            for a, b in zip(model.make_cache(), model.make_cache())
+        ]
+        self.assertIsInstance(batch_cache[0], BatchRotatingKVCache)
+        prompt = mx.concatenate([prompt_a, prompt_b], axis=0)
+        batch_logits = model(prompt, cache=batch_cache)[:, -1, :]
+
+        self.assertTrue(
+            mx.allclose(batch_logits[0:1], seq_a, atol=1e-4).item(),
+            msg="B=2 compressed prefill row 0 diverged from sequential",
+        )
+        self.assertTrue(
+            mx.allclose(batch_logits[1:2], seq_b, atol=1e-4).item(),
+            msg="B=2 compressed prefill row 1 diverged from sequential",
+        )
+
     def test_deepseek_v4_compressed_cache_not_trimmable_after_accumulation(self):
         # trim_prompt_cache() rolls back only the local sliding window; the
         # compressed pool cannot be un-compressed, so once a compressed layer has

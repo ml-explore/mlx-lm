@@ -11,7 +11,7 @@
 import math
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -774,18 +774,32 @@ def _compressed_col_mask(
 
 def _compressed_mask(
     S_q: int,
-    offset: int,
+    offset: Union[int, mx.array],
     n_comp: int,
     r: int,
     dtype: mx.Dtype,
     block_ids: Optional[mx.array],
 ) -> mx.array:
-    """Compressed-pool mask columns [S_q, n_comp]. Query row i sits at absolute
-    position offset+i and attends compressed column g (covering raw block b, ending at
-    b*r+r-1) iff offset+i >= b*r+r-1, where b = block_ids[g] for a gathered (top-k)
-    pool or g for a contiguous pool. The contiguous case is memoized; the gathered case
-    is data-dependent (unordered top-k ids) so it is built per call. block_ids is 1-D
-    (batch 1 — the single-sequence generation path)."""
+    """Compressed-pool mask columns. Query row i sits at absolute position offset+i and
+    attends compressed column g (covering raw block b, ending at b*r+r-1) iff
+    offset+i >= b*r+r-1, where b = block_ids[g] for a gathered (top-k) pool or g for a
+    contiguous pool. Scalar offset -> [S_q, n_comp] (contiguous case memoized). Batched
+    (B>1) serving passes a per-batch offset (mx.array [B]) -> per-batch [B, 1, S_q,
+    n_comp] mask (block_ids is None there: B>1 top-k is unsupported at the call site).
+    """
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        comp_end = (
+            mx.arange(n_comp) * r + (r - 1)
+            if block_ids is None
+            else block_ids.astype(mx.int32) * r + (r - 1)
+        )  # [n_comp]
+        q_pos = offset[:, None] + mx.arange(S_q)[None, :]  # [B, S_q]
+        keep = (
+            q_pos[:, None, :, None] >= comp_end[None, None, None, :]
+        )  # [B,1,S_q,n_comp]
+        if dtype == mx.bool_:
+            return keep
+        return mx.where(keep, mx.array(0.0, dtype), mx.array(float("-inf"), dtype))
     if block_ids is None:
         return _compressed_col_mask(S_q, offset, n_comp, r, dtype)
     comp_end = block_ids.astype(mx.int32) * r + (r - 1)  # [n_comp]
