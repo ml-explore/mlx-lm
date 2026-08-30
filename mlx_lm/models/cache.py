@@ -591,6 +591,7 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+# ArraysCache has been deprecated by RecurrentCache, no new code should use this.
 class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
@@ -720,6 +721,214 @@ class ArraysCache(_BaseCache):
     @property
     def nbytes(self):
         return sum(c.nbytes for c in self.cache if c is not None)
+
+
+class RecurrentCache(_BaseCache):
+    def __init__(
+        self, conv_state_size=0, conv_kernel_size=4, conv_dim=None, max_size=1
+    ):
+        self.conv_kernel_size = conv_kernel_size
+        self.max_size = max_size
+        self.conv_states = [None] * conv_state_size
+        self.ssm_states = []
+        self.left_padding = None
+        self.lengths = None
+        self._idx = 0
+
+    @property
+    def batch_size(self):
+        for c in self.conv_states:
+            if c is not None:
+                return c.shape[0]
+        if len(self.ssm_states) > 0:
+            return self.ssm_states[0].shape[0]
+        if self.left_padding is not None:
+            return self.left_padding.size
+        if self.lengths is not None:
+            return self.lengths.size
+        return 1
+
+    def __getitem__(self, idx):
+        if idx < len(self.conv_states):
+            return self.conv_states[idx]
+        elif idx == len(self.conv_states):
+            return self.ssm_states[-1] if len(self.ssm_states) > 0 else None
+        else:
+            raise IndexError("Cache index out of bounds")
+
+    def update_conv_input(self, idx, qkv):
+        B, S, D = qkv.shape
+        n_keep = self.conv_kernel_size - 1
+
+        conv_state = prev_conv_state = self.conv_states[idx]
+        if conv_state is None:
+            conv_state = mx.zeros(
+                (B, max(S, self.max_size) + n_keep, D),
+                dtype=qkv.dtype,
+            )
+
+        # Rotate
+        overflow = self._idx + S + n_keep - conv_state.shape[1]
+        if overflow > 0:
+            overflow = min(self._idx, overflow)
+            self._idx -= overflow
+            conv_state = mx.roll(conv_state, -overflow, axis=1)
+
+        # Update
+        start = self._idx + n_keep
+        conv_state[:, start : start + S, :] = qkv
+        self._idx = min(self._idx + S, self.max_size)
+
+        # Slice to S for conv input
+        conv_input = conv_state[:, start - n_keep : start + S, :]
+
+        # Slice to max_size for cache
+        if self.lengths is not None:
+            ends = mx.clip(cache.lengths, 0, self.max_size)
+            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+            self.conv_states[idx] = mx.take_along_axis(conv_state, positions, axis=1)
+        else:
+            if conv_state.shape[1] > self.max_size + n_keep:
+                conv_state = mx.contiguous(
+                    conv_state[:, -(self.max_size + n_keep) :, :]
+                )
+            self.conv_states[idx] = conv_state
+
+        return conv_input
+
+    def update_ssm_states(self, states):
+        if self.lengths is not None:
+            raise NotImplementedError
+        self.ssm_states += states
+        if len(self.ssm_states) > self.max_size:
+            self.ssm_states = self.ssm_states[-self.max_size :]
+        self.advance(len(states))
+
+    @property
+    def state(self):
+        return (
+            self.conv_states,
+            self.ssm_states,
+            self.left_padding,
+            self.lengths,
+            self.conv_kernel_size,
+            self.max_size,
+            self._idx,
+        )
+
+    @state.setter
+    def state(self, v):
+        (
+            self.conv_states,
+            self.ssm_states,
+            self.left_padding,
+            self.lengths,
+            self.conv_kernel_size,
+            self.max_size,
+            self._idx,
+        ) = v
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        if n > self._idx:
+            raise NotImplementedError
+        self._idx -= n
+        self.ssm_states = self.ssm_states[:-n]
+        return n
+
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        self.conv_states = [
+            c[batch_indices] if c is not None else None for c in self.conv_states
+        ]
+        self.ssm_states = [s[batch_indices] for s in self.ssm_states]
+        if self.left_padding is not None:
+            self.left_padding = self.left_padding[batch_indices]
+        if self.lengths is not None:
+            self.lengths = self.lengths[batch_indices]
+
+    def extend(self, other):
+        """
+        In-place extend this cache with the other cache.
+        """
+
+        a_batch = self.batch_size
+        b_batch = other.batch_size
+
+        def cat(a, b):
+            shape = dtype = None
+            if a is not None:
+                shape = a.shape
+                dtype = a.dtype
+            if b is not None:
+                shape = b.shape
+                dtype = b.dtype
+
+            if shape is None:
+                return None
+
+            if a is None:
+                a = mx.zeros((a_batch,) + shape[1:], dtype=dtype)
+            if b is None:
+                b = mx.zeros((b_batch,) + shape[1:], dtype=dtype)
+
+            return mx.concatenate([a, b])
+
+        self.conv_states = [
+            cat(c, o) for c, o in zip(self.conv_states, other.conv_states)
+        ]
+        self.ssm_states = [cat(s, o) for s, o in zip(self.ssm_states, other.ssm_states)]
+        self.left_padding = cat(self.left_padding, other.left_padding)
+        self.lengths = cat(self.lengths, other.lengths)
+
+    def extract(self, idx):
+        cache = RecurrentCache(
+            len(self.conv_states), self.conv_kernel_size, self.max_size
+        )
+        cache.conv_states = [c[idx : idx + 1] for c in self.conv_states]
+        cache.ssm_states = [s[idx : idx + 1] for s in self.ssm_states]
+        return cache
+
+    def prepare(self, lengths=None, **kwargs):
+        self.lengths = mx.array(lengths)
+
+    def finalize(self):
+        self.left_padding = None
+        self.lengths = None
+
+    def advance(self, N):
+        if self.left_padding is not None:
+            self.left_padding -= N
+        if self.lengths is not None:
+            self.lengths -= N
+
+    def make_mask(self, N: int):
+        if self.left_padding is not None:
+            pos = mx.arange(N)
+            return pos >= self.left_padding[:, None]
+        elif self.lengths is not None:
+            pos = mx.arange(N)
+            return pos < self.lengths[:, None]
+        else:
+            return None
+
+    @classmethod
+    def merge(cls, caches):
+        raise NotImplementedError
+
+    def empty(self):
+        empty_conv = len(self.conv_states) > 0 and self.conv_states[0] is None
+        return empty_conv and self.ssm_states is None
+
+    @property
+    def nbytes(self):
+        conv_nbytes = sum(c.nbytes for c in self.conv_states if c is not None)
+        ssm_nbytes = sum(s.bytes for s in self.ssm_states)
+        return conv_nbytes + ssm_nbytes
 
 
 class ChunkedKVCache(_BaseCache):
