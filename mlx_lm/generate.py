@@ -903,38 +903,37 @@ def _build_trie(sequences):
     return trie
 
 
-def _step_trie(node, trie, x):
-    """One step in the Aho-Corasick trie."""
-    while x not in node and node is not trie:
-        node = node["__fail__"]
-    if x in node:
-        node = node[x]
-    return node
+class StopSequences:
+    """An immutable Aho-Corasick automaton over stop sequences.
 
-
-class StopSequenceMatcher:
-    """Detect stop sequences in a stream of tokens using an Aho-Corasick trie.
-
-    Any matched sequence signals stop. Used by the batch generator for EOS and
-    stop word detection.
+    Any matched sequence signals stop. A :class:`StopSequences.Matcher` holds
+    one stream's position in it.
     """
 
-    def __init__(self, stop_sequences=None):
-        self._trie = _build_trie(stop_sequences) if stop_sequences else {}
+    class Matcher:
+        """A position in a :class:`StopSequences` automaton."""
 
-    def __deepcopy__(self, memo):
-        new = object.__new__(StopSequenceMatcher)
-        new._trie = self._trie
-        return new
+        def __init__(self, root):
+            self._root = root
+            self._node = root
 
-    def make_state(self):
-        return self._trie
+        def advance(self, token: int) -> bool:
+            """Consume one token. Returns whether a stop sequence completed."""
+            node = self._node
+            # Fail back until the token continues a match, or we hit the root.
+            while token not in node and node is not self._root:
+                node = node["__fail__"]
+            if token in node:
+                node = node[token]
+            self._node = node
+            return node.get("__match__") is not None
 
-    @staticmethod
-    def match(state, trie, x):
-        """Advance by one token. Returns (new_state, matched)."""
-        node = _step_trie(state, trie, x)
-        return node, node.get("__match__") is not None
+    def __init__(self, stop_sequences: Optional[Sequence[Sequence[int]]] = None):
+        self._root = _build_trie(stop_sequences) if stop_sequences else {}
+
+    def matcher(self) -> "StopSequences.Matcher":
+        """A fresh matcher at the start of this automaton."""
+        return self.Matcher(self._root)
 
 
 class TextStateMachine:
@@ -1028,12 +1027,12 @@ class TextStateMachine:
         return (s, trie, states, ""), s
 
 
-def make_stop_matcher(tokenizer, stop_words=None):
-    """Build a StopSequenceMatcher from EOS tokens and stop words."""
+def make_stop_sequences(tokenizer, stop_words=None):
+    """Build StopSequences from EOS tokens and stop words."""
     stop_sequences = [(t,) for t in tokenizer.eos_token_ids]
     for w in stop_words or []:
         stop_sequences.append(tuple(tokenizer.encode(w, add_special_tokens=False)))
-    return StopSequenceMatcher(stop_sequences)
+    return StopSequences(stop_sequences)
 
 
 def make_text_state_machine(tokenizer, stop_words=None):
@@ -1095,7 +1094,7 @@ class PromptProcessingBatch:
         samplers: Optional[List[Sampler]] = None,
         fallback_sampler: Optional[Sampler] = None,
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
-        stop_matchers: Optional[List[StopSequenceMatcher]] = None,
+        stop_sequences: Optional[List[StopSequences]] = None,
         max_tokens: Optional[List[int]] = None,
     ):
         self.model = model
@@ -1109,10 +1108,10 @@ class PromptProcessingBatch:
         self.logits_processors = (
             logits_processors if logits_processors is not None else []
         )
-        self.stop_matchers = (
-            stop_matchers
-            if stop_matchers is not None
-            else [StopSequenceMatcher()] * len(uids)
+        self.stop_sequences = (
+            stop_sequences
+            if stop_sequences is not None
+            else [StopSequences()] * len(uids)
         )
         self.max_tokens = (
             max_tokens
@@ -1144,7 +1143,7 @@ class PromptProcessingBatch:
         self.samplers.extend(samplers)
         self.logits_processors.extend(logits_processors)
         self.max_tokens.extend(batch.max_tokens)
-        self.stop_matchers.extend(batch.stop_matchers)
+        self.stop_sequences.extend(batch.stop_sequences)
 
     def _copy(self):
         new_batch = self.__class__.__new__(self.__class__)
@@ -1156,7 +1155,7 @@ class PromptProcessingBatch:
         new_batch.samplers = list(self.samplers)
         new_batch.fallback_sampler = self.fallback_sampler
         new_batch.logits_processors = list(self.logits_processors)
-        new_batch.stop_matchers = list(self.stop_matchers)
+        new_batch.stop_sequences = list(self.stop_sequences)
         new_batch.max_tokens = list(self.max_tokens)
         return new_batch
 
@@ -1180,7 +1179,7 @@ class PromptProcessingBatch:
         self.samplers = [self.samplers[idx] for idx in keep]
         self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
-        self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
+        self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
 
     def prompt(self, tokens: List[List[int]]):
         """
@@ -1253,7 +1252,7 @@ class PromptProcessingBatch:
             self.samplers,
             self.fallback_sampler,
             self.logits_processors,
-            self.stop_matchers,
+            self.stop_sequences,
             self.max_tokens,
         )
 
@@ -1283,7 +1282,7 @@ class PromptProcessingBatch:
             samplers=[],
             logits_processors=[],
             max_tokens=[],
-            stop_matchers=[],
+            stop_sequences=[],
         )
 
 
@@ -1314,7 +1313,7 @@ class GenerationBatch:
         samplers: Optional[List[Sampler]],
         fallback_sampler: Sampler,
         logits_processors: Optional[List[List[LogitsProcessor]]],
-        stop_matchers: List[StopSequenceMatcher],
+        stop_sequences: List[StopSequences],
         max_tokens: List[int],
     ):
         self.model = model
@@ -1325,7 +1324,7 @@ class GenerationBatch:
         self.samplers = samplers
         self.fallback_sampler = fallback_sampler
         self.logits_processors = logits_processors
-        self.stop_matchers = stop_matchers
+        self.stop_sequences = stop_sequences
         self.max_tokens = max_tokens
 
         if self.samplers and len(self.samplers) != len(self.uids):
@@ -1339,7 +1338,7 @@ class GenerationBatch:
         self._next_logprobs = []
         self._token_context = [TokenBuffer(t) for t in tokens]
         self._num_tokens = [0] * len(self.uids)
-        self._matcher_states = [m.make_state() for m in stop_matchers]
+        self._matchers = [ss.matcher() for ss in stop_sequences]
 
         if self.uids:
             self._step()
@@ -1355,7 +1354,7 @@ class GenerationBatch:
         self.samplers.extend(batch.samplers)
         self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
-        self.stop_matchers.extend(batch.stop_matchers)
+        self.stop_sequences.extend(batch.stop_sequences)
         if self._current_tokens is None:
             self._current_tokens = batch._current_tokens
             self._current_logprobs = batch._current_logprobs
@@ -1372,7 +1371,7 @@ class GenerationBatch:
             self._next_logprobs.extend(batch._next_logprobs)
         self._token_context.extend(batch._token_context)
         self._num_tokens.extend(batch._num_tokens)
-        self._matcher_states.extend(batch._matcher_states)
+        self._matchers.extend(batch._matchers)
 
     def _step(self) -> Tuple[List[int], List[mx.array]]:
         """
@@ -1449,13 +1448,13 @@ class GenerationBatch:
         self.samplers = [self.samplers[idx] for idx in keep]
         self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
-        self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
+        self.stop_sequences = [self.stop_sequences[idx] for idx in keep]
 
         self._next_tokens = self._next_tokens[keep] if keep else None
         self._next_logprobs = [self._next_logprobs[idx] for idx in keep]
         self._token_context = [self._token_context[idx] for idx in keep]
         self._num_tokens = [self._num_tokens[idx] for idx in keep]
-        self._matcher_states = [self._matcher_states[idx] for idx in keep]
+        self._matchers = [self._matchers[idx] for idx in keep]
 
     def next(self) -> List[Response]:
         """
@@ -1478,12 +1477,7 @@ class GenerationBatch:
             if self._num_tokens[i] >= self.max_tokens[i]:
                 finish_reason = "length"
 
-            self._matcher_states[i], matched = StopSequenceMatcher.match(
-                self._matcher_states[i],
-                self.stop_matchers[i]._trie,
-                tokens[i],
-            )
-            if matched:
+            if self._matchers[i].advance(tokens[i]):
                 finish_reason = "stop"
 
             if finish_reason is not None:
@@ -1531,7 +1525,7 @@ class GenerationBatch:
             samplers=[],
             logits_processors=[],
             max_tokens=[],
-            stop_matchers=[],
+            stop_sequences=[],
         )
 
 
@@ -1572,7 +1566,7 @@ class BatchGenerator:
 
         self._stream = stream or generation_stream
 
-        self._default_stop_matcher = StopSequenceMatcher(
+        self._default_stop_sequences = StopSequences(
             stop_tokens if stop_tokens else None,
         )
         self._uid_count = 0
@@ -1639,7 +1633,7 @@ class BatchGenerator:
         all_tokens: Optional[List[List[int]]] = None,
         samplers: Optional[List[Sampler]] = None,
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
-        stop_matchers: Optional[List[StopSequenceMatcher]] = None,
+        stop_sequences: Optional[List[StopSequences]] = None,
     ):
         return self.insert_segments(
             [[p] for p in prompts],
@@ -1648,7 +1642,7 @@ class BatchGenerator:
             all_tokens,
             samplers,
             logits_processors,
-            stop_matchers,
+            stop_sequences,
         )
 
     def insert_segments(
@@ -1659,7 +1653,7 @@ class BatchGenerator:
         all_tokens: Optional[List[List[int]]] = None,
         samplers: Optional[List[Sampler]] = None,
         logits_processors: Optional[List[List[LogitsProcessor]]] = None,
-        stop_matchers: Optional[List[StopSequenceMatcher]] = None,
+        stop_sequences: Optional[List[StopSequences]] = None,
     ):
         num_segments = len(segments)
 
@@ -1669,7 +1663,9 @@ class BatchGenerator:
         logits_processors = logits_processors or (
             [self.logits_processors] * num_segments
         )
-        stop_matchers = stop_matchers or ([self._default_stop_matcher] * num_segments)
+        stop_sequences = stop_sequences or (
+            [self._default_stop_sequences] * num_segments
+        )
 
         caches = caches or [None] * num_segments
 
@@ -1680,7 +1676,7 @@ class BatchGenerator:
             "all_tokens": all_tokens,
             "samplers": samplers,
             "logits_processors": logits_processors,
-            "stop_matchers": stop_matchers,
+            "stop_sequences": stop_sequences,
         }
         for k, v in opts.items():
             if len(v) != num_segments:
@@ -1699,7 +1695,7 @@ class BatchGenerator:
             all_tokens,
             samplers,
             logits_processors,
-            stop_matchers,
+            stop_sequences,
         ):
             seq = [segment for segment in seq if segment]
             if not seq:
@@ -1790,7 +1786,7 @@ class BatchGenerator:
         samplers = []
         logits_processors = []
         max_tokens = []
-        stop_matchers = []
+        stop_sequences = []
         for _ in range(n):
             sequence = self._unprocessed_sequences.popleft()
             uids.append(sequence[0])
@@ -1799,7 +1795,7 @@ class BatchGenerator:
             samplers.append(sequence[5])
             logits_processors.append(sequence[6])
             max_tokens.append(sequence[2])
-            stop_matchers.append(sequence[7])
+            stop_sequences.append(sequence[7])
             self._currently_processing.append(
                 [sequence[1], 0, sum(len(s) for s in sequence[1])]
             )
@@ -1813,7 +1809,7 @@ class BatchGenerator:
             samplers=samplers,
             fallback_sampler=self.sampler,
             logits_processors=logits_processors,
-            stop_matchers=stop_matchers,
+            stop_sequences=stop_sequences,
             max_tokens=max_tokens,
         )
 
