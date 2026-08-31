@@ -684,6 +684,11 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    if max_tokens == 0:
+        raise ValueError(
+            "Maximum number of tokens must be non-zero (use -1 for no limit)."
+        )
+
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
@@ -874,6 +879,9 @@ def _build_trie(sequences):
         try:
             for tok in seq:
                 node = node.setdefault(tok, {})
+            if node is trie:
+                # An empty pattern would make the root match every token.
+                continue
             node["__match__"] = (tuple(seq), idx)
         except TypeError:
             node = node.setdefault(seq, {})
@@ -1669,22 +1677,38 @@ class BatchGenerator:
         ] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
     ):
-        uids = []
+        num_segments = len(segments)
 
-        max_tokens = max_tokens or [self.max_tokens] * len(segments)
+        max_tokens = max_tokens or [self.max_tokens] * num_segments
         all_tokens = all_tokens or [[] for _ in segments]
-        samplers = samplers or [None] * len(segments)
+        samplers = samplers or [None] * num_segments
         logits_processors = logits_processors or (
-            [self.logits_processors] * len(segments)
+            [self.logits_processors] * num_segments
         )
-        stop_matchers = stop_matchers or ([self._default_stop_matcher] * len(segments))
+        stop_matchers = stop_matchers or ([self._default_stop_matcher] * num_segments)
 
-        caches = caches or [None] * len(segments)
-        for i in range(len(segments)):
-            if caches[i] is None:
-                caches[i] = make_prompt_cache(self.model, self.max_kv_size)
+        caches = caches or [None] * num_segments
 
-        for seq, m, c, at, s, lp, sm in zip(
+        # Validate before touching any state: ``zip`` pairs up to the shortest.
+        opts = {
+            "max_tokens": max_tokens,
+            "caches": caches,
+            "all_tokens": all_tokens,
+            "samplers": samplers,
+            "logits_processors": logits_processors,
+            "stop_matchers": stop_matchers,
+        }
+        for k, v in opts.items():
+            if len(v) != num_segments:
+                raise ValueError(
+                    f"Option {k} must have one entry per segment: expected "
+                    f"{num_segments}, got {len(v)}."
+                )
+
+        uids = list(range(self._uid_count, self._uid_count + num_segments))
+        pending = []
+        for uid, seq, m, c, at, s, lp, sm in zip(
+            uids,
             segments,
             max_tokens,
             caches,
@@ -1693,15 +1717,20 @@ class BatchGenerator:
             logits_processors,
             stop_matchers,
         ):
-            seq = list(seq)
+            seq = [segment for segment in seq if segment]
+            if not seq:
+                raise ValueError(f"Sequence {uid} has an empty prompt.")
+            if m <= 0:
+                raise ValueError(f"Sequence {uid}'s max_tokens must be > 0.")
             if len(seq[-1]) != 1:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
-            self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
-            )
-            uids.append(self._uid_count)
-            self._uid_count += 1
+            if c is None:
+                c = make_prompt_cache(self.model, self.max_kv_size)
+            pending.append((uid, seq, m, c, at, s, lp, sm))
+
+        self._unprocessed_sequences.extend(pending)
+        self._uid_count += num_segments
 
         return uids
 
