@@ -405,6 +405,45 @@ class TestModels(unittest.TestCase):
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
 
+    def test_spark2_5(self):
+        from mlx_lm.models import spark2_5
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=4,
+            vocab_size=32,
+            layer_types=["sliding_attention", "full_attention"],
+            rope_parameters={
+                "sliding_attention": {
+                    "partial_rotary_factor": 1.0,
+                    "rope_theta": 10_000,
+                },
+                "full_attention": {
+                    "partial_rotary_factor": 0.5,
+                    "rope_theta": 1_000_000,
+                },
+            },
+            sliding_window=8,
+        )
+
+        model = spark2_5.Model(args)
+
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], RotatingKVCache)
+        self.assertIsInstance(caches[1], KVCache)
+
+        self.model_test_runner(
+            model,
+            args.model_type,
+            args.vocab_size,
+            args.num_hidden_layers,
+        )
+
     def test_bailing_moe_v3(self):
         from dataclasses import replace
 
