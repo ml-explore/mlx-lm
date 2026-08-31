@@ -1128,7 +1128,9 @@ class Model(nn.Module):
 
     @property
     def quant_predicate(self):
-        def fn(path, module, _):
+        # mlx-lm 0.31.3 calls predicates with two arguments, later versions with
+        # three; the default keeps both conventions working
+        def fn(path, module, _=None):
             # only the MoE router stays in full precision (norms and conv1d are
             # never quantized anyway)
             return not path.endswith("mlp.gate")
