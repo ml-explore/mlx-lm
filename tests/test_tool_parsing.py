@@ -1,5 +1,4 @@
 import unittest
-from pathlib import Path
 
 from mlx_lm.tool_parsers import (
     function_gemma,
@@ -153,6 +152,19 @@ class TestToolParsing(unittest.TestCase):
                     "arguments": {"location": "London"},
                 }
                 self.assertEqual(tool_call, expected)
+
+    def test_pythonic_single_quoted_args_with_commas(self):
+        # LFM2.5 emits single-quoted strings; embedded commas must not truncate
+        test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
+        tool_call = pythonic.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "write")
+        self.assertEqual(tool_call["arguments"]["filePath"], "/tmp/hello.py")
+        self.assertEqual(tool_call["arguments"]["content"], "# Hello, world!")
+
+        # Double-quoted still works
+        test_case = '[search(query="hello, world")]'
+        tool_call = pythonic.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["arguments"]["query"], "hello, world")
 
     def test_qwen3_coder_single_quoted_params(self):
         tools = [
@@ -328,6 +340,70 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_qwen3_coder_iso_date(self):
+        """Qwen3 coder parser should not crash on ISO 8601 dates."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "schedule",
+                    "description": "Schedule a task",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["name", "deadline"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "deadline": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=schedule>\n"
+            "<parameter=name>\n"
+            "deploy\n"
+            "</parameter>\n"
+            "<parameter=deadline>\n"
+            "2025-06-15T10:30:00Z\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
+        # parse_tool_call returns dict, not list
+        self.assertEqual(tool_calls["name"], "schedule")
+        self.assertEqual(tool_calls["arguments"]["name"], "deploy")
+        self.assertEqual(tool_calls["arguments"]["deadline"], "2025-06-15T10:30:00Z")
+
+    def test_qwen3_coder_partial_number(self):
+        """Qwen3 coder parser should handle partial number-like strings."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "log",
+                    "description": "Log a message",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["msg"],
+                        "properties": {
+                            "msg": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=log>\n"
+            "<parameter=msg>\n"
+            "version 3.10.5-beta\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
+        # parse_tool_call returns dict, not list
+        self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
 
 
 if __name__ == "__main__":

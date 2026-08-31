@@ -135,7 +135,7 @@ def iterate_batches(
         idx[i + offset : i + offset + batch_size : step]
         for i in range(0, len(idx) - batch_size + 1, batch_size)
     ]
-    if seed:
+    if seed is not None:
         np.random.seed(seed)
     while True:
         indices = np.random.permutation(len(batch_idx))
