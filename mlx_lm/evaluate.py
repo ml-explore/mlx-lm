@@ -343,7 +343,8 @@ class MLXLM(LM):
 
         # TODO consider multi-token, per-prompt stop conditions
         max_tokens = [
-            self._max_tokens or opt.get("max_gen_tokens", DEFAULT_MAX_TOKENS)
+            self._max_tokens
+            or opt.get("max_gen_tokens", opt.get("max_gen_toks", DEFAULT_MAX_TOKENS))
             for opt in options
         ]
 
@@ -354,6 +355,8 @@ class MLXLM(LM):
             max_tokens=max_tokens,
             verbose=True,
             sampler=self._sampler,
+            completion_batch_size=self._batch_size,
+            prefill_batch_size=max(self._batch_size // 2, 1),
         ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
