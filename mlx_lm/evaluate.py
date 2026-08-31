@@ -355,6 +355,8 @@ class MLXLM(LM):
             max_tokens=max_tokens,
             verbose=True,
             sampler=self._sampler,
+            prefill_batch_size=self._batch_size,
+            completion_batch_size=self._batch_size,
         ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
@@ -406,7 +408,13 @@ def main():
     parser.add_argument(
         "--output-dir", default=".", help="Output directory for result files."
     )
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Maximum number of sequences processed at once, both when "
+        "scoring and when generating.",
+    )
     parser.add_argument("--num-shots", type=int, default=None, help="Number of shots")
     parser.add_argument(
         "--max-tokens",

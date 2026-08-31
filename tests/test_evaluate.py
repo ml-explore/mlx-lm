@@ -97,6 +97,13 @@ class TestMLXLM(unittest.TestCase):
         kwargs = self._run_generate_until(lm, [{"until": ["\n\n"], "max_gen_toks": 10}])
         self.assertEqual(kwargs["max_tokens"], [128])
 
+    def test_generate_until_respects_batch_size(self):
+        """--batch-size bounds generation, not just loglikelihood scoring."""
+        lm = self._make_lm(max_tokens=None, batch_size=4)
+        kwargs = self._run_generate_until(lm, [{"until": ["\n\n"]}] * 6)
+        self.assertEqual(kwargs["prefill_batch_size"], 4)
+        self.assertEqual(kwargs["completion_batch_size"], 4)
+
 
 if __name__ == "__main__":
     unittest.main()
