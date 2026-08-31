@@ -16,6 +16,7 @@ class TestMLXLM(unittest.TestCase):
         self.mock_tokenizer.model_max_length = 2048
         self.mock_tokenizer.chat_template = None
         self.mock_tokenizer.encode = MagicMock(return_value=[1, 2, 3, 4])
+        self.mock_tokenizer.has_thinking = False
 
         with patch("mlx_lm.evaluate.load") as mock_load:
             mock_load.return_value = (self.mock_model, self.mock_tokenizer)
@@ -66,6 +67,35 @@ class TestMLXLM(unittest.TestCase):
         result = self.mlx_lm.generate_until([request])
 
         self.assertEqual(result, ["answer"])
+    def _make_lm(self, **kwargs):
+        with patch("mlx_lm.evaluate.load") as mock_load:
+            mock_load.return_value = (self.mock_model, self.mock_tokenizer)
+            return MLXLM("test_model", **kwargs)
+
+    def _run_generate_until(self, lm, options):
+        requests = [MagicMock(args=(f"prompt {i}", o)) for i, o in enumerate(options)]
+        with patch("mlx_lm.evaluate.batch_generate") as mock_generate:
+            mock_generate.return_value = MagicMock(texts=[""] * len(requests))
+            lm.generate_until(requests)
+        return mock_generate.call_args.kwargs
+
+    def test_generate_until_uses_task_max_gen_toks(self):
+        """lm-eval passes the per-task generation cap as `max_gen_toks`."""
+        lm = self._make_lm(max_tokens=None)
+        kwargs = self._run_generate_until(
+            lm,
+            [
+                {"until": ["\n\n"], "max_gen_toks": 10},
+                {"until": ["\n\n"], "max_gen_toks": 1024},
+            ],
+        )
+        self.assertEqual(kwargs["max_tokens"], [10, 1024])
+
+    def test_generate_until_max_tokens_overrides_task_default(self):
+        """--max-tokens takes precedence over task specific defaults."""
+        lm = self._make_lm(max_tokens=128)
+        kwargs = self._run_generate_until(lm, [{"until": ["\n\n"], "max_gen_toks": 10}])
+        self.assertEqual(kwargs["max_tokens"], [128])
 
 
 if __name__ == "__main__":

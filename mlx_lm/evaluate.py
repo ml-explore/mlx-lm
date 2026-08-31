@@ -342,8 +342,9 @@ class MLXLM(LM):
         ]
 
         # TODO consider multi-token, per-prompt stop conditions
+        # lm-eval names the per-task generation cap "max_gen_toks".
         max_tokens = [
-            self._max_tokens or opt.get("max_gen_tokens", DEFAULT_MAX_TOKENS)
+            self._max_tokens or opt.get("max_gen_toks", DEFAULT_MAX_TOKENS)
             for opt in options
         ]
 
