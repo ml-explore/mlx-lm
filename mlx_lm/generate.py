@@ -24,7 +24,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -303,8 +303,8 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    sampler: Optional[Sampler] = None,
+    logits_processors: Optional[List[LogitsProcessor]] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
@@ -322,9 +322,9 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+        sampler (Sampler, optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+        logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         max_kv_size (int, optional): Maximum size of the key-value cache. Old
@@ -377,7 +377,7 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or greedy_sampler
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -477,8 +477,8 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    sampler: Optional[Sampler] = None,
+    logits_processors: Optional[List[LogitsProcessor]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 512,
     kv_bits: Optional[int] = None,
@@ -496,9 +496,9 @@ def speculative_generate_step(
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[[mx.array], mx.array], optional): A sampler for sampling a
+        sampler (Sampler, optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+        logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
@@ -532,7 +532,7 @@ def speculative_generate_step(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or greedy_sampler
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -799,12 +799,6 @@ def generate(
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
-
-
-def _left_pad_prompts(prompts, max_length=None):
-    if max_length is None:
-        max_length = max(len(p) for p in prompts)
-    return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
 
 
 def _right_pad_prompts(prompts, max_length=None):
@@ -1090,11 +1084,9 @@ class PromptProcessingBatch:
         caches: List[List[Any]],
         tokens: Optional[List[List[int]]] = None,
         prefill_step_size: int = 2048,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        fallback_sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Sampler]] = None,
+        fallback_sampler: Optional[Sampler] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
         max_tokens: Optional[List[int]] = None,
     ):
@@ -1105,7 +1097,7 @@ class PromptProcessingBatch:
 
         self.prefill_step_size = prefill_step_size
         self.samplers = samplers if samplers is not None else []
-        self.fallback_sampler = fallback_sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.fallback_sampler = fallback_sampler or greedy_sampler
         self.logits_processors = (
             logits_processors if logits_processors is not None else []
         )
@@ -1270,7 +1262,7 @@ class PromptProcessingBatch:
     def empty(
         cls,
         model: nn.Module,
-        fallback_sampler: Callable[[mx.array], mx.array],
+        fallback_sampler: Sampler,
         prefill_step_size: int = 2048,
     ):
         return cls(
@@ -1311,11 +1303,9 @@ class GenerationBatch:
         inputs: mx.array,
         prompt_cache: List[Any],
         tokens: List[List[int]],
-        samplers: Optional[List[Callable[[mx.array], mx.array]]],
-        fallback_sampler: Callable[[mx.array], mx.array],
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ],
+        samplers: Optional[List[Sampler]],
+        fallback_sampler: Sampler,
+        logits_processors: Optional[List[List[LogitsProcessor]]],
         stop_matchers: List[StopSequenceMatcher],
         max_tokens: List[int],
     ):
@@ -1521,7 +1511,7 @@ class GenerationBatch:
     def empty(
         cls,
         model: nn.Module,
-        fallback_sampler: Callable[[mx.array], mx.array],
+        fallback_sampler: Sampler,
     ):
         return cls(
             model=model,
@@ -1554,10 +1544,8 @@ class BatchGenerator:
         *,
         max_tokens: int = 128,
         stop_tokens: Optional[Sequence[Sequence[int]]] = None,
-        sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        logits_processors: Optional[
-            List[Callable[[mx.array, mx.array], mx.array]]
-        ] = None,
+        sampler: Optional[Sampler] = None,
+        logits_processors: Optional[List[LogitsProcessor]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
@@ -1566,7 +1554,7 @@ class BatchGenerator:
     ):
         self.model = model
         self.max_tokens = max_tokens
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.sampler = sampler or greedy_sampler
         self.logits_processors = logits_processors or []
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
@@ -1641,10 +1629,8 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Sampler]] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
     ):
         return self.insert_segments(
@@ -1663,10 +1649,8 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Sampler]] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
     ):
         uids = []
