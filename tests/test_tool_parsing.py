@@ -405,6 +405,24 @@ class TestToolParsing(unittest.TestCase):
         # parse_tool_call returns dict, not list
         self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
 
+    def test_qwen3_coder_missing_function_tag_close(self):
+        """Recover the function name when the model drops the ">" after it."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Get the current time",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        # Missing ">" after the name plus an orphan "</parameter>"
+        test_case = "<function=get_current_time\n</parameter>\n</function>"
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "get_current_time")
+        self.assertEqual(tool_call["arguments"], {})
+
 
 if __name__ == "__main__":
     unittest.main()
