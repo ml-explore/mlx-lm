@@ -12,7 +12,7 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten
 
-from mlx_lm import lora, tuner
+from mlx_lm import lora, tuner, utils
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
 from mlx_lm.tuner.trainer import evaluate
@@ -108,6 +108,60 @@ class TestLora(unittest.TestCase):
         model = gpt_neox.Model(args)
         model.freeze()
         tuner.utils.linear_to_lora_layers(model, num_lora_layers, params)
+
+    def test_bailing_moe_v3(self):
+        from mlx_lm.models import bailing_moe_v3
+
+        args = bailing_moe_v3.ModelArgs(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            moe_intermediate_size=32,
+            moe_shared_expert_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=1,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            n_group=2,
+            topk_group=1,
+            layer_group_size=4,
+            head_dim=32,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+        )
+        lora_config = {
+            "keys": ["attention.q_proj", "attention.q_a_proj"],
+            "rank": 4,
+            "scale": 1.0,
+            "dropout": 0.0,
+        }
+
+        def check_lora_layers(model, quantized=False):
+            model.freeze()
+            tuner.utils.linear_to_lora_layers(
+                model, args.num_hidden_layers, lora_config
+            )
+            model.train()
+            q_proj = model.layers[0].attention.q_proj
+            q_a_proj = model.layers[3].attention.q_a_proj
+            self.assertIsInstance(q_proj, LoRALinear)
+            self.assertIsInstance(q_a_proj, LoRALinear)
+            if quantized:
+                self.assertIsInstance(q_proj.linear, nn.QuantizedLinear)
+
+        check_lora_layers(bailing_moe_v3.Model(args))
+        fp8_model, _ = utils.quantize_model(
+            bailing_moe_v3.Model(args),
+            {},
+            group_size=32,
+            bits=8,
+            mode="mxfp8",
+        )
+        check_lora_layers(fp8_model, quantized=True)
 
     def test_lora_embedding(self):
         num_embeddings = 256

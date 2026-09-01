@@ -2,7 +2,7 @@ import argparse
 import unittest
 from unittest.mock import MagicMock, patch
 
-from mlx_lm.chat import setup_arg_parser
+from mlx_lm.chat import DEFAULT_PREFILL_STEP_SIZE, setup_arg_parser
 
 
 class TestChat(unittest.TestCase):
@@ -17,6 +17,12 @@ class TestChat(unittest.TestCase):
         # Test with system prompt
         args = parser.parse_args(["--system-prompt", "You are a helpful assistant."])
         self.assertEqual(args.system_prompt, "You are a helpful assistant.")
+
+    def test_setup_arg_parser_prefill_step_size_default(self):
+        parser = setup_arg_parser()
+
+        args = parser.parse_args([])
+        self.assertEqual(args.prefill_step_size, DEFAULT_PREFILL_STEP_SIZE)
 
     def test_setup_arg_parser_all_args(self):
         parser = setup_arg_parser()
@@ -38,6 +44,8 @@ class TestChat(unittest.TestCase):
                 "42",
                 "--max-kv-size",
                 "1024",
+                "--prefill-step-size",
+                "512",
                 "--max-tokens",
                 "512",
                 "--system-prompt",
@@ -53,6 +61,7 @@ class TestChat(unittest.TestCase):
         self.assertEqual(args.xtc_threshold, 0.1)
         self.assertEqual(args.seed, 42)
         self.assertEqual(args.max_kv_size, 1024)
+        self.assertEqual(args.prefill_step_size, 512)
         self.assertEqual(args.max_tokens, 512)
         self.assertEqual(args.system_prompt, "You are a helpful assistant.")
 
