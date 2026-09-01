@@ -179,17 +179,65 @@ def bench_step(
     return all_max(dt, group)
 
 
+def run_tests(group: mx.distributed.Group):
+    """Checks the sharded block against the unsharded one on every rank.
+
+    Every rank draws the same weights and the same input, so each can build
+    the unsharded reference locally and compare it to what the sharded block
+    returns after the real all_sum.
+    """
+    N = group.size()
+    args = ModelArgs(
+        hidden_size=64,
+        moe_intermediate_size=128,
+        num_experts=256,
+        num_experts_per_tok=8,
+    )
+
+    inds = mx.array([[5, 12, 77, 130, 201, 3, 64, 99]])
+    lidx, mask = local_experts(inds, args.num_experts, group)
+    assert (lidx < args.num_experts // N).all().item()
+    assert (mx.where(mask, group.rank() + lidx * N, inds) == inds).all().item()
+    claims = mx.distributed.all_sum(mask.astype(mx.int32), group=group)
+    assert (claims == 1).all().item(), claims.tolist()
+
+    mx.random.seed(0)
+    x = mx.random.normal((1, 5, args.hidden_size))
+    reference = Model(args)
+    ref = reference(x)
+
+    for mode in ("tp", "ep"):
+        experts = args.num_experts // N if mode == "ep" else args.num_experts
+        model = Model(args)
+        model.update(reference.parameters())
+        getattr(model, f"shard_{mode}")(group)
+        assert model.mlp.switch_mlp.gate_proj.weight.shape[0] == experts
+
+        err = mx.abs(model(x) - ref).max().item()
+        assert err < 1e-5, (mode, err)
+        if group.rank() == 0:
+            print(f"{mode}: matches unsharded on {N} rank(s), max err {err:.2e}")
+
+    if group.rank() == 0:
+        print("local_experts: every expert owned by exactly one rank")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Benchmark one sparse MoE block")
     parser.add_argument("--sharding", choices=["none", "tp", "ep"], default="none")
     parser.add_argument("--seq-len", type=int, default=1)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--warmup", type=int, default=50)
+    parser.add_argument("--test", action="store_true")
     cli = parser.parse_args()
 
     # The same seed gives every rank the same weights and the same inputs.
     mx.random.seed(0)
     group = mx.distributed.init()
+
+    if cli.test:
+        run_tests(group)
+        return
 
     args = ModelArgs()
     model = Model(args)
