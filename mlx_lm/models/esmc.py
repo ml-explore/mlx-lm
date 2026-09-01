@@ -21,46 +21,89 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs
 
+# Every published ESMC uses this SwiGLU expansion.
+EXPANSION_RATIO = 8 / 3
+
+
+# Indices are fixed by the weights; mirrors esm's SEQUENCE_VOCAB.
+SEQUENCE_VOCAB = (
+    "<cls> <pad> <eos> <unk> L A G V S E R T I D P K Q N F Y M H W C X B U Z O "
+    ". - | <mask>"
+).split()
+_TOKEN_TO_ID = {t: i for i, t in enumerate(SEQUENCE_VOCAB)}
+BOS_ID, PAD_ID, EOS_ID, UNK_ID = 0, 1, 2, 3
+
+
+def encode(sequence: str) -> list[int]:
+    """Amino-acid string -> ``<cls>`` + residues + ``<eos>``."""
+    return [BOS_ID] + [_TOKEN_TO_ID.get(c, UNK_ID) for c in sequence] + [EOS_ID]
+
+
+def batch_encode(sequences) -> tuple[mx.array, mx.array]:
+    """Right-pad a list of sequences. Returns (input_ids, attention_mask)."""
+    ids = [encode(s) for s in sequences]
+    width = max(len(i) for i in ids)
+    padded = [i + [PAD_ID] * (width - len(i)) for i in ids]
+    return (
+        mx.array(padded),
+        mx.array([[1] * len(i) + [0] * (width - len(i)) for i in ids]),
+    )
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
     model_type: str = "esmc"
     vocab_size: int = 64
-    d_model: int = 960
-    n_heads: int = 30
-    n_layers: int = 30
+    hidden_size: int = 2560
+    num_attention_heads: int = 40
+    num_hidden_layers: int = 80
+    # SwiGLU width. Authoritative when the checkpoint carries it; otherwise
+    # derived from hidden_size the way esm's esmc_intermediate_size does.
+    intermediate_size: Optional[int] = None
     pad_token_id: int = 1
     mask_token_id: int = 32
-    # ESM-C FFN: SwiGLU with hidden = round_to_256(expansion_ratio * d_model).
-    expansion_ratio: float = 8.0 / 3.0
     # ESM3 residue-scaling reference depth.
     residue_scaling_base: float = 36.0
     layer_norm_eps: float = 1e-5
     rope_base: float = 10000.0
 
+    @classmethod
+    def from_dict(cls, params: dict) -> "ModelArgs":
+        # esm's pre-alignment field names, mapped in esm/models/esmc/config.py
+        # and scheduled for removal once every biohub/ESMC-* repo is republished.
+        legacy = {
+            "d_model": "hidden_size",
+            "n_heads": "num_attention_heads",
+            "n_layers": "num_hidden_layers",
+        }
+        params = {legacy.get(k, k): v for k, v in params.items()}
+        return super().from_dict(params)
+
     @property
     def head_dim(self) -> int:
-        return self.d_model // self.n_heads
+        return self.hidden_size // self.num_attention_heads
 
     @property
     def ffn_hidden(self) -> int:
-        return int(((self.expansion_ratio * self.d_model) + 255) // 256 * 256)
+        if self.intermediate_size is not None:
+            return self.intermediate_size
+        return int(((EXPANSION_RATIO * self.hidden_size) + 255) // 256 * 256)
 
     @property
     def residue_scaling_factor(self) -> float:
-        return math.sqrt(self.n_layers / self.residue_scaling_base)
+        return math.sqrt(self.num_hidden_layers / self.residue_scaling_base)
 
 
 class Attention(nn.Module):
-    """Multi-head self-attention with QK-LayerNorm (over full d_model) and RoPE."""
+    """Multi-head self-attention with QK-LayerNorm (over full hidden_size) and RoPE."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.n_heads = args.n_heads
+        self.n_heads = args.num_attention_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
 
-        d = args.d_model
+        d = args.hidden_size
         # Fused pre-norm + QKV projection in the reference (no bias on the proj).
         self.ln_qkv = nn.LayerNorm(d, eps=args.layer_norm_eps)
         self.qkv = nn.Linear(d, 3 * d, bias=False)
@@ -77,7 +120,7 @@ class Attention(nn.Module):
         q = self.q_ln(q)
         k = self.k_ln(k)
 
-        # (B, L, D) -> (B, n_heads, L, head_dim)
+        # (B, L, D) -> (B, heads, L, head_dim)
         def heads(t):
             return t.reshape(B, L, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
 
@@ -95,7 +138,7 @@ class FFN(nn.Module):
 
     def __init__(self, args: ModelArgs):
         super().__init__()
-        d, h = args.d_model, args.ffn_hidden
+        d, h = args.hidden_size, args.ffn_hidden
         self.ln = nn.LayerNorm(d, eps=args.layer_norm_eps)
         self.fc1 = nn.Linear(d, 2 * h, bias=False)
         self.fc2 = nn.Linear(h, d, bias=False)
@@ -122,30 +165,35 @@ class TransformerBlock(nn.Module):
 class TransformerStack(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.blocks = [TransformerBlock(args) for _ in range(args.n_layers)]
-        self.norm = nn.LayerNorm(args.d_model, eps=args.layer_norm_eps, bias=False)
+        self.blocks = [TransformerBlock(args) for _ in range(args.num_hidden_layers)]
+        self.norm = nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps, bias=False)
 
-    def __call__(self, x: mx.array, mask: Optional[mx.array], collect: bool):
-        hidden = []
-        for block in self.blocks:
-            if collect:
-                hidden.append(x)  # residual stream entering this block
+    def __call__(self, x: mx.array, mask: Optional[mx.array], collect):
+        """``collect`` is a set of layer indices to keep, or None for none.
+
+        Index ``i < n_layers`` is the residual stream entering block ``i``;
+        index ``n_layers`` is the final post-norm output.
+        """
+        hidden = {}
+        for i, block in enumerate(self.blocks):
+            if collect and i in collect:
+                hidden[i] = x
             x = block(x, mask)
         normed = self.norm(x)
-        if collect:
-            hidden.append(normed)  # final post-norm output
+        last = len(self.blocks)
+        if collect and last in collect:
+            hidden[last] = normed
         return normed, hidden
 
 
 class ESMCModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.embed = nn.Embedding(args.vocab_size, args.d_model)
+        self.embed = nn.Embedding(args.vocab_size, args.hidden_size)
         self.transformer = TransformerStack(args)
 
     def __call__(self, input_ids, mask, collect):
-        x = self.embed(input_ids)
-        return self.transformer(x, mask, collect)
+        return self.transformer(self.embed(input_ids), mask, collect)
 
 
 def _attention_mask(
@@ -176,6 +224,16 @@ def _attention_mask(
     add = mx.where(allowed, mx.array(0.0, dtype=dtype), neg)
     return add[:, None, :, :]  # (B, 1, L, L)
 
+
+@dataclass
+class EsmcOutput:
+    """Mirrors esm's ``EsmcOutput``."""
+
+    last_hidden_state: mx.array
+    hidden_states: Optional[mx.array] = None
+    sae_outputs: Optional[dict] = None
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -184,11 +242,19 @@ class Model(nn.Module):
         self.esmc = ESMCModel(args)
         # MLM head: Linear -> GELU -> LayerNorm -> Linear (indices match HF keys).
         self.lm_head = [
-            nn.Linear(args.d_model, args.d_model),
+            nn.Linear(args.hidden_size, args.hidden_size),
             nn.GELU(),
-            nn.LayerNorm(args.d_model, eps=args.layer_norm_eps),
-            nn.Linear(args.d_model, args.vocab_size),
+            nn.LayerNorm(args.hidden_size, eps=args.layer_norm_eps),
+            nn.Linear(args.hidden_size, args.vocab_size),
         ]
+        self.sae_layers = {}
+
+    def add_sae_layers(self, layers):
+        """Register SAEs keyed by the backbone layer each was trained against."""
+        for layer in layers:
+            if layer.layer in self.sae_layers:
+                raise ValueError(f"an SAE is already registered at layer {layer.layer}")
+            self.sae_layers[layer.layer] = layer
 
     def encode(
         self,
@@ -196,20 +262,38 @@ class Model(nn.Module):
         attention_mask=None,
         output_hidden_states=False,
         sequence_id=None,
-    ):
-        """Return (last_hidden_state, hidden_states) like the reference encoder.
+        compute_sae=True,
+        normalize_sae=False,
+    ) -> EsmcOutput:
+        """Encode ``input_ids``.
 
-        ``hidden_states`` is a stacked array of shape (n_layers+1, B, L, d_model)
-        when ``output_hidden_states`` else None. ``sequence_id`` gives chain-aware
-        attention for multi-chain inputs; it takes precedence over
-        ``attention_mask``.
+        ``hidden_states`` is (n_layers+1, B, L, hidden_size) when
+        ``output_hidden_states``; index ``i`` is the input to block ``i`` and the
+        last entry is the post-norm output. ``sequence_id`` gives chain-aware
+        attention and takes precedence over ``attention_mask``.
         """
+        n = self.args.num_hidden_layers
+        sae = self.sae_layers if compute_sae else {}
+        if output_hidden_states:
+            collect = set(range(n + 1))
+        else:
+            collect = set(sae)
         mask = _attention_mask(
             attention_mask, self.esmc.embed.weight.dtype, sequence_id=sequence_id
         )
-        last, hidden = self.esmc(input_ids, mask, output_hidden_states)
-        hs = mx.stack(hidden, axis=0) if output_hidden_states else None
-        return last, hs
+        last, hidden = self.esmc(input_ids, mask, collect)
+        return EsmcOutput(
+            last_hidden_state=last,
+            hidden_states=(
+                mx.stack([hidden[i] for i in range(n + 1)], axis=0)
+                if output_hidden_states
+                else None
+            ),
+            sae_outputs={
+                i: layer(hidden[i], normalize=normalize_sae) for i, layer in sae.items()
+            }
+            or None,
+        )
 
     def _lm_head(self, x):
         for layer in self.lm_head:
@@ -217,8 +301,7 @@ class Model(nn.Module):
         return x
 
     def __call__(self, input_ids, attention_mask=None):
-        last, _ = self.encode(input_ids, attention_mask)
-        return self._lm_head(last)
+        return self._lm_head(self.encode(input_ids, attention_mask).last_hidden_state)
 
     def sanitize(self, weights):
         out = {}
@@ -240,3 +323,30 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.esmc.transformer.blocks
+
+
+def from_pretrained(repo: str = "biohub/ESMC-6B", dtype=mx.bfloat16) -> Model:
+    """Load a published ESMC checkpoint. Mirrors esm's ``from_pretrained``."""
+    import glob
+    import json
+
+    from huggingface_hub import snapshot_download
+
+    local = snapshot_download(repo, allow_patterns=["config.json", "*.safetensors"])
+    model = Model(ModelArgs.from_dict(json.load(open(f"{local}/config.json"))))
+    weights = {}
+    # Shard by shard: loading the fp32 whole and casting after peaks ~55 GB.
+    for shard in sorted(glob.glob(f"{local}/*.safetensors")):
+        part = {k: _cast(v, dtype) for k, v in mx.load(shard).items()}
+        mx.eval(list(part.values()))
+        weights.update(part)
+    model.load_weights(list(model.sanitize(weights).items()), strict=True)
+    model.set_dtype(dtype)
+    model.eval()
+    mx.eval(model.parameters())
+    return model
+
+
+def _cast(v, dtype):
+    floating = (mx.float32, mx.float16, mx.bfloat16, mx.float64)
+    return v.astype(dtype) if v.dtype in floating else v
