@@ -513,10 +513,6 @@ class TextModel(nn.Module):
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        # Norm weights need a +1 shift only in raw HF checkpoints (detected via
-        # unsanitized conv1d). Already-converted MLX models must not be shifted
-        # again, even when they contain MTP weights.
-        should_shift_norm_weights = has_unsanitized_conv1d
         # Keep MTP weights if this model has an MTP head; drop them otherwise
         if not hasattr(self, "mtp"):
             weights = {k: v for k, v in weights.items() if "mtp." not in k}
@@ -552,7 +548,7 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
+            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
