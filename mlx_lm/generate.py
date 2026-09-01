@@ -437,9 +437,7 @@ def generate_step(
             mx.eval([c.state for c in prompt_cache])
             if logits_processors and len(processed) > 0:
                 tokens = (
-                    mx.concat([tokens, processed])
-                    if tokens is not None
-                    else processed
+                    mx.concat([tokens, processed]) if tokens is not None else processed
                 )
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
