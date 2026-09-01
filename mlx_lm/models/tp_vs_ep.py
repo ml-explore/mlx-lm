@@ -1,3 +1,4 @@
+import argparse
 import time
 from dataclasses import dataclass
 
@@ -52,6 +53,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
         self.sharding_group = None
+        self.sharding = None
 
     def __call__(
         self,
@@ -98,6 +100,9 @@ class Model(nn.Module):
 
     def shard_tp(self, group: mx.distributed.Group):
         """Shards the model for tensor parallelism."""
+        # The block sums the partial results at the end of the forward pass.
+        self.mlp.sharding_group = group
+        self.mlp.sharding = "tp"
         shard_inplace(
             self.mlp.shared_expert.gate_proj, "all-to-sharded", group=group
         )
@@ -119,10 +124,30 @@ class Model(nn.Module):
 
     def shard_ep(self, group: mx.distributed.Group):
         """Shards the model for expert parallelism."""
-        pass
+        raise NotImplementedError("expert parallel sharding is not written yet")
 
 
-def bench_step(model, args, seq_len: int = 1, steps: int = 100, warmup: int = 5):
+def barrier(group: mx.distributed.Group):
+    """Waits for every rank, so they all start the same work together."""
+    if group.size() > 1:
+        mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group, stream=mx.cpu))
+
+
+def all_max(value: float, group: mx.distributed.Group) -> float:
+    """The value of the slowest rank, which sets the step time."""
+    if group.size() == 1:
+        return value
+    return mx.distributed.all_max(mx.array(value), group=group, stream=mx.cpu).item()
+
+
+def bench_step(
+    model,
+    args,
+    group: mx.distributed.Group,
+    seq_len: int = 1,
+    steps: int = 100,
+    warmup: int = 5,
+):
     """Times one MoE step the way generate_step runs it.
 
     Same setup as generation: batch 1, the generation stream, a wired limit for
@@ -139,6 +164,7 @@ def bench_step(model, args, seq_len: int = 1, steps: int = 100, warmup: int = 5)
         for x in xs[:warmup]:
             mx.eval(model(x))
 
+        barrier(group)
         mx.reset_peak_memory()
         y = model(xs[0])
         mx.async_eval(y)
@@ -149,13 +175,48 @@ def bench_step(model, args, seq_len: int = 1, steps: int = 100, warmup: int = 5)
             mx.eval(y)  # the sync that `y.item()` does in generate_step
             y = next_y
         mx.eval(y)
-        return (time.perf_counter() - tic) / steps
+        dt = (time.perf_counter() - tic) / steps
+
+    return all_max(dt, group)
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(description="Benchmark one sparse MoE block")
+    parser.add_argument("--sharding", choices=["none", "tp", "ep"], default="none")
+    parser.add_argument("--seq-len", type=int, default=1)
+    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--warmup", type=int, default=50)
+    cli = parser.parse_args()
+
+    # The same seed gives every rank the same weights and the same inputs.
+    mx.random.seed(0)
+    group = mx.distributed.init()
+
     args = ModelArgs()
     model = Model(args)
     model.set_dtype(mx.bfloat16)
+    if cli.sharding == "tp":
+        model.shard_tp(group)
+    elif cli.sharding == "ep":
+        model.shard_ep(group)
+    mx.eval(model.parameters())
+    barrier(group)
 
-    dt = bench_step(model, args)
-    print(f"{dt * 1e3:.3f} ms/step, peak memory {mx.get_peak_memory() / 1e9:.3f} GB")
+    dt = bench_step(
+        model,
+        args,
+        group,
+        seq_len=cli.seq_len,
+        steps=cli.steps,
+        warmup=cli.warmup,
+    )
+    # memory = all_max(mx.get_peak_memory() / 1e9, group)
+    if group.rank() == 0:
+        print(
+            f"{cli.sharding} on {group.size()} rank(s), seq_len {cli.seq_len}: "
+            f"{dt * 1e3:.3f} ms/step"
+        )
+
+
+if __name__ == "__main__":
+    main()
