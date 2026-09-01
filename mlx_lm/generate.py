@@ -19,8 +19,8 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
-from .models import cache
 from .models.cache import (
+    MTPPromptCacheState,
     QuantizedKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
@@ -765,7 +765,7 @@ def mtp_generate_step(
     cached_token_count = 0
 
     if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
+        model_cache = make_prompt_cache(model)
         mtp_cache = fresh_mtp_cache
     else:
         n_main = len(model.layers)
@@ -777,7 +777,7 @@ def mtp_generate_step(
 
         model_cache = list(prompt_cache[:n_main])
         tail = list(prompt_cache[n_main:])
-        if tail and isinstance(tail[-1], cache.MTPPromptCacheState):
+        if tail and isinstance(tail[-1], MTPPromptCacheState):
             prompt_state = tail.pop()
         mtp_cache = tail
 
@@ -808,7 +808,7 @@ def mtp_generate_step(
                 raise TypeError(
                     "prompt_cache must be a mutable sequence for native MTP."
                 )
-            prompt_state = cache.MTPPromptCacheState()
+            prompt_state = MTPPromptCacheState()
             prompt_cache.append(prompt_state)
         elif not prompt_state.empty():
             cached_token_count = prompt_state.num_tokens
