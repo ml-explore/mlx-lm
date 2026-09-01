@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import copy
+import io
 import os
 import tempfile
 import unittest
@@ -757,6 +758,22 @@ class TestPromptCache(unittest.TestCase):
         stepwise.extend(ArraysCache.merge((ArraysCache(2), ArraysCache(2))))
         self.assertEqual(stepwise[0].shape, (4, 4, 8))
         self.assertEqual(stepwise[1].shape, (4, 4))
+
+    def test_arrays_cache_advance(self):
+        cache = ArraysCache(2, left_padding=[2])
+        cache.prepare(lengths=[3])
+
+        for _ in range(256):
+            cache.advance(1)
+            mx.eval(cache.state)
+
+        for attr in [cache.lengths, cache.left_padding]:
+            f = io.StringIO()
+            mx.export_to_dot(f, attr)
+            f.seek(0)
+            self.assertEqual(f.read().count("->"), 0)
+        self.assertEqual(cache.lengths.item(), 3 - 256)
+        self.assertEqual(cache.left_padding.item(), 2 - 256)
 
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()

@@ -1,18 +1,23 @@
 # Copyright © 2024 Apple Inc.
 
+import concurrent.futures
 import random
+import threading
 import unittest
 from typing import List
 
 import mlx.core as mx
 
 from mlx_lm.generate import (
+    DEFAULT_PREFILL_STEP_SIZE,
     BatchGenerator,
     GenerationResponse,
     StopSequenceMatcher,
     batch_generate,
     generate,
     generate_step,
+    generation_stream,
+    setup_arg_parser,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -33,6 +38,28 @@ class TestGenerate(unittest.TestCase):
         text = generate(
             self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
         )
+
+    def test_generate_step_processor_sees_prefilled_prompt(self):
+        # prefill_step_size=2 over a 4-token prompt leaves one token for _step,
+        # so the processor only sees the whole prompt if prefill contributes.
+        prompt = mx.array([2, 5, 7, 9])
+        histories = []
+
+        def record_history(tokens, logits):
+            histories.append(tokens.tolist())
+            return logits
+
+        list(
+            generate_step(
+                prompt,
+                self.model,
+                max_tokens=1,
+                prefill_step_size=2,
+                logits_processors=[record_history],
+            )
+        )
+
+        self.assertEqual(histories[0], [2, 5, 7, 9])
 
     def test_generate_with_logit_bias(self):
         logit_bias = {0: 2000.0, 1: -20.0}
@@ -420,6 +447,34 @@ class TestGenerate(unittest.TestCase):
 
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
+
+    def test_batch_processor_survive_a_request_without_it(self):
+        prompt = self.tokenizer.encode("hello")
+
+        def run(batch_gen, uid):
+            n = 0
+            while True:
+                for r in batch_gen.next_generated():
+                    if r.uid == uid:
+                        n += 1
+                        if r.finish_reason is not None:
+                            return n
+
+        batch_gen = BatchGenerator(self.model, max_tokens=3)
+        (uid,) = batch_gen.insert([prompt])
+        run(batch_gen, uid)
+
+        calls = []
+
+        def processor(tokens, logits):
+            calls.append(len(tokens))
+            return logits
+
+        (uid,) = batch_gen.insert([prompt], logits_processors=[[processor]])
+        n_tokens = run(batch_gen, uid)
+        # One call per generated token, plus the step that sampled the token
+        # after the last one returned
+        self.assertEqual(len(calls), n_tokens + 1)
 
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""
@@ -843,6 +898,57 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertIsNone(response.logprobs)
         self.assertIsNone(response.token_ids)
+
+    def test_generate_step_worker_thread(self):
+        """generate_step must not crash on a non-main thread.
+
+        Servers like vllm-mlx run generation on worker threads.  The decode
+        loop in generate_step calls mx.async_eval which needs a valid stream.
+        Without the generation_stream context wrapping the decode loop, this
+        crashes with ``RuntimeError: There is no Stream(gpu, N) in current
+        thread`` because the thread-local default stream doesn't exist on the
+        worker.
+        """
+        import mlx_lm.generate as gen_mod
+
+        prompt = self.tokenizer.encode("hi")
+        prompt = mx.array(prompt)
+
+        def run_on_worker():
+            new_stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(new_stream)
+            gen_mod.generation_stream = new_stream
+
+            tokens = []
+            for token, _ in generate_step(prompt, self.model, max_tokens=3):
+                tokens.append(token)
+            return tokens
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_on_worker)
+            tokens = future.result(timeout=30)
+        self.assertGreater(len(tokens), 0)
+
+    def test_stream_generate_worker_thread(self):
+        """stream_generate must not crash on a non-main thread."""
+        import mlx_lm.generate as gen_mod
+
+        def run_on_worker():
+            new_stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(new_stream)
+            gen_mod.generation_stream = new_stream
+
+            tokens = []
+            for response in stream_generate(
+                self.model, self.tokenizer, "hello", max_tokens=3
+            ):
+                tokens.append(response.token)
+            return tokens
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_on_worker)
+            tokens = future.result(timeout=30)
+        self.assertGreater(len(tokens), 0)
 
 
 if __name__ == "__main__":
