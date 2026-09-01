@@ -1833,6 +1833,34 @@ def _to_mlx(features: dict, dtype) -> dict:
     return out
 
 
+def _subsample_msa(feats: dict, msa: mx.array, max_depth: Optional[int]):
+    """Keep the query row and ``max_depth - 1`` random others, index order preserved.
+
+    esm redraws this every trunk loop; the MLX trunk hoists the MSA encoder out
+    of the loop, so it is drawn once. Same distribution per row, one sample
+    instead of ``num_loops`` of them.
+    """
+    depth = msa.shape[1]
+    if max_depth is None or depth <= max(max_depth, 1):
+        return (
+            msa,
+            feats["msa_attention_mask"],
+            feats["has_deletion"],
+            feats["deletion_value"],
+        )
+    keep = mx.random.permutation(depth - 1)[: max_depth - 1] + 1
+    keep = mx.sort(mx.concatenate([mx.zeros((1,), keep.dtype), keep]))
+    return tuple(
+        mx.take(a, keep, axis=1)
+        for a in (
+            msa,
+            feats["msa_attention_mask"],
+            feats["has_deletion"],
+            feats["deletion_value"],
+        )
+    )
+
+
 class ESMFold2Model(nn.Module):
     """MLX ESMFold2 (release). Pure-MLX; features in / dict out.
 
@@ -2214,24 +2242,19 @@ class ESMFold2Model(nn.Module):
         z = self._init_pair_state(z_init) if z0 is None else z0
         a, b = self._dynamics()
 
-        # The reference redraws the MSA row subsample and the LM dropout mask
-        # every loop; with neither active the injection is loop-invariant, so it
-        # is computed once here instead of per loop.
+        # The reference rebuilds this every loop, redrawing the MSA subsample and
+        # the LM dropout mask each time. Both are hoisted here instead: one MSA
+        # draw for the whole fold, and no LM dropout.
         z_inject = z_init
         if self.msa_encoder is not None and msa is not None:
-            if msa_max_depth is not None and msa.shape[1] > msa_max_depth:
-                raise NotImplementedError(
-                    f"msa_max_depth={msa_max_depth} would subsample an MSA of depth "
-                    f"{msa.shape[1]}; the MLX trunk hoists the MSA encoder out of the "
-                    "loop and cannot resample per loop. Pass msa_max_depth=None."
-                )
-            msa_attn = feats["msa_attention_mask"].transpose(0, 2, 1).astype(mx.float32)
+            msa, mask, hd, dv = _subsample_msa(feats, msa, msa_max_depth)
+            msa_attn = mask.transpose(0, 2, 1).astype(mx.float32)
             msa_pair = self.msa_encoder(
                 z_inject,
                 x_inputs,
                 _one_hot(msa.transpose(0, 2, 1), NUM_RES_TYPES) * msa_attn[..., None],
-                feats["has_deletion"].transpose(0, 2, 1).astype(mx.float32),
-                feats["deletion_value"].transpose(0, 2, 1).astype(mx.float32),
+                hd.transpose(0, 2, 1).astype(mx.float32),
+                dv.transpose(0, 2, 1).astype(mx.float32),
                 msa_attn,
             )
             z_inject = msa_pair if self.msa_encoder_overwrite else z_inject + msa_pair
