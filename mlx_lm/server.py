@@ -1854,7 +1854,7 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    if mx.metal.is_available():
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)
 

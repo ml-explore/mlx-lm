@@ -226,7 +226,7 @@ def train(
     iterate_batches: callable = iterate_batches,
     training_callback: TrainingCallback = None,
 ):
-    if mx.metal.is_available():
+    if mx.metal.is_available() and mx.default_device() == mx.gpu:
         mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
     world = mx.distributed.init()
     world_size = world.size()
