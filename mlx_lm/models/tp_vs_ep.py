@@ -35,12 +35,22 @@ class Qwen3NextMLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
+def local_experts(indices, num_experts, group: mx.distributed.Group):
+
+    N = group.size()
+    if num_experts % N != 0:
+        raise ValueError(f"Cannot shard {num_experts} experts across {N} devices.")
+
+    mask = (indices % N) == group.rank()
+
+    return mx.where(mask, indices // N, 0), mask
+
+
 class Qwen3NextSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         dim = args.hidden_size
         intermediate_size = args.moe_intermediate_size
-        shared_expert_intermediate_size = args.shared_expert_intermediate_size
 
         self.norm_topk_prob = args.norm_topk_prob
         self.num_experts = num_experts = args.num_experts
@@ -48,9 +58,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
-
-        self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
-        self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
 
         self.sharding_group = None
         self.sharding = None
@@ -70,23 +77,20 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
-
+            scores = scores / scores.sum(axis=-1, keepdims=True) # normalise in the same way on each gpu
+        if self.sharding == 'ep':
+            inds, mask = local_experts(inds, self.num_experts, self.sharding_group)
+            scores = mx.where(mask, scores, 0)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
-
-        shared_y = self.shared_expert(x)
-        shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
-
-        y = y + shared_y
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
-        return y    
+        return y
 
 class Model(nn.Module):
-    """One Qwen3-Next sparse MoE block: router, experts and shared expert."""
+    """One Qwen3-Next sparse MoE block: router and routed experts."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -104,15 +108,6 @@ class Model(nn.Module):
         self.mlp.sharding_group = group
         self.mlp.sharding = "tp"
         shard_inplace(
-            self.mlp.shared_expert.gate_proj, "all-to-sharded", group=group
-        )
-        shard_inplace(
-            self.mlp.shared_expert.down_proj, "sharded-to-all", group=group
-        )
-        shard_inplace(
-            self.mlp.shared_expert.up_proj, "all-to-sharded", group=group
-        )
-        shard_inplace(
             self.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
         )
         shard_inplace(
@@ -124,7 +119,17 @@ class Model(nn.Module):
 
     def shard_ep(self, group: mx.distributed.Group):
         """Shards the model for expert parallelism."""
-        raise NotImplementedError("expert parallel sharding is not written yet")
+        self.mlp.sharding_group = group
+        self.mlp.sharding = "ep"
+        shard_inplace(
+            self.mlp.switch_mlp.gate_proj, "expert-parallel", group=group
+        ) # [E, H, D] -> [E // N, H, D]
+        shard_inplace(
+            self.mlp.switch_mlp.down_proj, "expert-parallel", group=group
+        ) # [E, D, H] -> [E // N, D, H]
+        shard_inplace(
+            self.mlp.switch_mlp.up_proj, "expert-parallel", group=group
+        ) # [E, H, D] -> [E // N, H, D]
 
 
 def barrier(group: mx.distributed.Group):
@@ -148,12 +153,6 @@ def bench_step(
     steps: int = 100,
     warmup: int = 5,
 ):
-    """Times one MoE step the way generate_step runs it.
-
-    Same setup as generation: batch 1, the generation stream, a wired limit for
-    the weights, one step of look-ahead and one sync per step. A new input each
-    step keeps the routing random, like real decoding.
-    """
     xs = [
         mx.random.normal((1, seq_len, args.hidden_size)).astype(mx.bfloat16)
         for _ in range(steps)
