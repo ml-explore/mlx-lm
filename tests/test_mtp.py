@@ -394,7 +394,9 @@ class TestMTP(unittest.TestCase):
         self.assertEqual(state.num_tokens, expected_tokens)
         self.assertEqual(state.last_hidden.shape, (1, 1, 64))
 
-        target_attention = next(c for c in prompt_cache[:n_main] if c.is_trimmable())
+        target_attention = next(
+            c for c in prompt_cache[:n_main] if hasattr(c, "offset")
+        )
         mtp_attention = prompt_cache[n_main]
         self.assertEqual(target_attention.offset, expected_tokens)
         self.assertEqual(mtp_attention.offset, expected_tokens - 1)
