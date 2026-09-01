@@ -420,6 +420,8 @@ def load_model(
         elif quant_method == "compressed-tensors":
             if quantization_config.get("format") == "nvfp4-pack-quantized":
                 quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            elif quantization_config.get("format") == "mxfp4-pack-quantized":
+                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             else:
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             config["quantization"] = quantization
