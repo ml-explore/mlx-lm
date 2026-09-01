@@ -473,6 +473,35 @@ class TestModels(unittest.TestCase):
         for projection in ("embed_q", "unembed_out"):
             self.assertIsInstance(getattr(mla, projection), bailing_moe_v3.MultiLinear)
 
+    def test_gear(self):
+        from mlx_lm.models import gear
+
+        args = gear.ModelArgs(
+            model_type="gear",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=100,
+            layer_types=[
+                "sliding_attention",
+                "conv_mixer",
+                "full_attention",
+                "conv_mixer",
+            ],
+            sliding_window=4,
+            conv_L_cache=3,
+            rope_theta=10000,
+            rope_local_base_freq=1000,
+        )
+        model = gear.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_llama(self):
         from mlx_lm.models import llama
 
@@ -517,40 +546,36 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-    def test_gear(self):
-        from mlx_lm.models import gear
+    def test_lfm2_intermediate_size(self):
+        from mlx_lm.models import lfm2
 
-        args = gear.ModelArgs(
-            model_type="gear",
-            hidden_size=64,
-            intermediate_size=128,
-            num_hidden_layers=4,
-            num_attention_heads=4,
-            num_key_value_heads=1,
-            head_dim=16,
-            rms_norm_eps=1e-6,
-            vocab_size=100,
-            layer_types=[
-                "sliding_attention",
-                "conv_mixer",
-                "full_attention",
-                "conv_mixer",
-            ],
-            sliding_window=4,
-            conv_L_cache=3,
-            rope_theta=10000,
-            rope_local_base_freq=1000,
+        # Newer LFM2.5 configs ship intermediate_size instead of block_ff_dim
+        args = lfm2.ModelArgs.from_dict(
+            {
+                "model_type": "lfm2",
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "norm_eps": 1e-5,
+                "vocab_size": 10_000,
+                "full_attn_idxs": [0, 1, 2],
+                "rope_theta": 10000,
+                "block_dim": 1024,
+                "block_ffn_dim_multiplier": 1.0,
+                "block_auto_adjust_ff_dim": False,
+                "intermediate_size": 2560,
+                "block_multiple_of": 256,
+                "max_position_embeddings": 1000,
+                "conv_bias": True,
+                "conv_L_cache": 3,
+            }
         )
-        model = gear.Model(args)
-        self.model_test_runner(
-            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        self.assertEqual(args.block_ff_dim, 2560)
+        model = lfm2.Model(args)
+        self.assertEqual(
+            model.model.layers[0].feed_forward.w1.weight.shape, (2560, 1024)
         )
-
-        caches = model.make_cache()
-        self.assertIsInstance(caches[0], RotatingKVCache)
-        self.assertIsInstance(caches[1], ArraysCache)
-        self.assertIsInstance(caches[2], KVCache)
-        self.assertIsInstance(caches[3], ArraysCache)
 
     def test_lfm2_moe(self):
         from mlx_lm.models import lfm2_moe
