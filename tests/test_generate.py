@@ -39,6 +39,28 @@ class TestGenerate(unittest.TestCase):
             self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
         )
 
+    def test_generate_step_processor_sees_prefilled_prompt(self):
+        # prefill_step_size=2 over a 4-token prompt leaves one token for _step,
+        # so the processor only sees the whole prompt if prefill contributes.
+        prompt = mx.array([2, 5, 7, 9])
+        histories = []
+
+        def record_history(tokens, logits):
+            histories.append(tokens.tolist())
+            return logits
+
+        list(
+            generate_step(
+                prompt,
+                self.model,
+                max_tokens=1,
+                prefill_step_size=2,
+                logits_processors=[record_history],
+            )
+        )
+
+        self.assertEqual(histories[0], [2, 5, 7, 9])
+
     def test_generate_with_logit_bias(self):
         logit_bias = {0: 2000.0, 1: -20.0}
         text = generate(

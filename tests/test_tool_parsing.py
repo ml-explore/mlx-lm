@@ -6,6 +6,7 @@ from mlx_lm.tool_parsers import (
     glm47,
     json_tools,
     kimi_k2,
+    kimi_k3,
     longcat,
     minimax_m2,
     mistral,
@@ -325,6 +326,108 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
+    def test_kimi_k3(self):
+        # Typed per-key arguments
+        test_case = (
+            '<|open|>call tool="multiply" index="1"<|sep|>'
+            '<|open|>argument key="a" type="number"<|sep|>12234585<|close|>argument<|sep|>'
+            '<|open|>argument key="b" type="number"<|sep|>48838483920<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # String argument stays raw, other types decode as JSON
+        test_case = (
+            '<|open|>call tool="search" index="1"<|sep|>'
+            '<|open|>argument key="query" type="string"<|sep|>{"not": "json"}<|close|>argument<|sep|>'
+            '<|open|>argument key="limit" type="number"<|sep|>5<|close|>argument<|sep|>'
+            '<|open|>argument key="safe" type="boolean"<|sep|>true<|close|>argument<|sep|>'
+            '<|open|>argument key="filters" type="array"<|sep|>["a", "b"]<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "name": "search",
+                "arguments": {
+                    "query": '{"not": "json"}',
+                    "limit": 5,
+                    "safe": True,
+                    "filters": ["a", "b"],
+                },
+            }
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Raw JSON object block
+        test_case = (
+            '<|open|>call tool="get_weather" index="1"<|sep|>'
+            '<|open|>json type="object"<|sep|>{"city": "Tokyo"}<|close|>json<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+        self.assertEqual(tool_calls, expected)
+
+        # Multiple calls in one tools section, escaped attribute values
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="echo&amp;log" index="2"<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "say", "arguments": {"text": "hi"}},
+            {"name": "echo&log", "arguments": {}},
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Malformed call (missing tool name) does not discard valid siblings
+        test_case = (
+            '<|open|>call index="1"<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="say" index="2"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Valid call followed by a call with a bad JSON block
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="broken" index="2"<|sep|>'
+            '<|open|>json type="object"<|sep|>{not json<|close|>json<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Truncated trailing call after a complete one
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="cut" index="2"<|sep|>'
+            '<|open|>argument key="x" type="num'
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Nothing parseable still raises
+        with self.assertRaises(ValueError):
+            kimi_k3.parse_tool_call(
+                '<|open|>call index="1"<|sep|><|close|>call<|sep|>', None
+            )
+
     def test_minimax_m2(self):
         test_case = (
             '<invoke name="search">\n'
@@ -404,6 +507,24 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
         # parse_tool_call returns dict, not list
         self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
+
+    def test_qwen3_coder_missing_function_tag_close(self):
+        """Recover the function name when the model drops the ">" after it."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Get the current time",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        # Missing ">" after the name plus an orphan "</parameter>"
+        test_case = "<function=get_current_time\n</parameter>\n</function>"
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "get_current_time")
+        self.assertEqual(tool_call["arguments"], {})
 
 
 if __name__ == "__main__":

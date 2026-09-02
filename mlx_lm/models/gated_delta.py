@@ -609,6 +609,12 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if (
+        not use_kernel
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or k.shape[-1] < 32
+        or k.shape[-1] % 32 != 0
+    ):
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
