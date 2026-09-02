@@ -94,6 +94,26 @@ class TestModelParallel(unittest.TestCase):
                 "tie_word_embeddings": False,
                 "num_nextn_predict_layers": 1,
             },
+            {
+                "model_type": "qwen3_moe",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "mlp_only_layers": [0],
+                "norm_topk_prob": True,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 256,
+                "tie_word_embeddings": False,
+            },
         ]
         mx.random.seed(0)
         for config in test_configs:
@@ -106,6 +126,43 @@ class TestModelParallel(unittest.TestCase):
                 x = mx.random.randint(0, vocab_size, shape=(32, 4))
                 expected = model(x)
                 model.shard()
+                out = model(x)
+                self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+
+    def test_pipeline(self):
+        test_configs = [
+            {
+                "model_type": "qwen3_moe",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "mlp_only_layers": [0],
+                "norm_topk_prob": True,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 256,
+                "tie_word_embeddings": False,
+            },
+        ]
+        mx.random.seed(0)
+        for config in test_configs:
+            model_type = config["model_type"]
+            with self.subTest(f"Testing {model_type}", model_type=model_type):
+                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                args = arch.ModelArgs.from_dict(config)
+                model = arch.Model(args)
+                vocab_size = args.vocab_size
+                x = mx.random.randint(0, vocab_size, shape=(32, 4))
+                expected = model(x)
+                model.model.pipeline(mx.distributed.init())
                 out = model(x)
                 self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
 
