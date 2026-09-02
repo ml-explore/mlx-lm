@@ -31,3 +31,4 @@ Added support for the following other features:
 MoonshotAI's `Kimi K2.5`, Upstage's `Solar Open`, LG AI Research's `K-Exaone MoE`, 
 Meituan's `LongCat Flash Lite` Helped add support for the following model architectures: 
 Z.ai & THUKEG's `GLM5 (GLM MoE DSA)`
+- Jonathan Springer: Added architecture-specific tool parser for IBM Granite models
