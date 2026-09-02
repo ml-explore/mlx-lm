@@ -1594,7 +1594,7 @@ class BatchGenerator:
         self._gen_tokens_counter = 0
         self._steps_counter = 0
 
-        if mx.metal.is_available():
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
             )
