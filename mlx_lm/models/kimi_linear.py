@@ -15,7 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
-from .mla import MultiLinear
+from .mla import MultiLinear, latent_length, max_absorbed_queries
 from .switch_layers import SwitchGLU
 
 
@@ -176,6 +176,11 @@ class KimiMLAAttention(nn.Module):
             bias=False,
         )
         self.kv_a_layernorm = nn.RMSNorm(args.kv_lora_rank, eps=args.rms_norm_eps)
+        self._absorbed_dims = (
+            self.kv_lora_rank,
+            self.qk_nope_head_dim,
+            self.v_head_dim,
+        )
         self.embed_q = MultiLinear(
             self.qk_nope_head_dim, args.kv_lora_rank, self.num_heads
         )
@@ -214,7 +219,10 @@ class KimiMLAAttention(nn.Module):
                 mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
             )
 
-        if L == 1:
+        absorbed = L == 1 or L <= max_absorbed_queries(
+            *self._absorbed_dims, latent_length(kv_latent)
+        )
+        if absorbed:
             q_nope = self.embed_q(q_nope)
             k = v = kv_latent
         else:
@@ -225,7 +233,7 @@ class KimiMLAAttention(nn.Module):
             q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
         )
 
-        if L == 1:
+        if absorbed:
             output = self.unembed_out(output)
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
