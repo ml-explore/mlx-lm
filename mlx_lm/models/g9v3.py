@@ -67,6 +67,7 @@ class ModelArgs(BaseModelArgs):
     n_shared_experts: int = 1
     rms_norm_eps: float = 1e-06
     num_hidden_layers: int = 38
+    max_position_embeddings: int = 131072
 
 
 class G9v3Attention(nn.Module):
@@ -106,6 +107,7 @@ class G9v3Attention(nn.Module):
             base=config.rope_theta,
             traditional=False,
             scaling_config=config.rope_scaling,
+            max_position_embeddings=config.max_position_embeddings,
         )
 
     def __call__(
