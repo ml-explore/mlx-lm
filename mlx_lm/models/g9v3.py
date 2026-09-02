@@ -4,6 +4,7 @@ from typing import Any, Dict, Optional
 import mlx.core as mx
 from mlx import nn
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -184,7 +185,7 @@ class G9v3MLP(nn.Module):
 
     def __call__(self, hidden_states: mx.array) -> mx.array:
         return self.down_proj(
-            nn.silu(self.gate_proj(hidden_states)) * self.up_proj(hidden_states)
+            swiglu(self.gate_proj(hidden_states), self.up_proj(hidden_states))
         )
 
 
