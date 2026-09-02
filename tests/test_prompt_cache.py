@@ -718,6 +718,37 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(batch_full.keys.shape[0], 5)
         self.assertEqual(batch_full.offset.shape[0], 5)
 
+    def test_extend_with_empty_batch_cache_preserves_dtype(self):
+        """Extending a batch cache when one side has keys=None should keep the
+        dtype of the non-empty side. The placeholder used to default to
+        float32, so mx.concatenate silently promoted the whole K/V cache."""
+        H, D = 8, 64
+
+        def make_batch(cls, n, with_content, **kwargs):
+            caches = [cls(**kwargs) for _ in range(n)]
+            if with_content:
+                for c in caches:
+                    kv = mx.ones((1, H, 5, D), mx.bfloat16)
+                    c.update_and_fetch(kv, kv)
+            if cls is RotatingKVCache:
+                return BatchRotatingKVCache.merge(caches)
+            return BatchKVCache.merge(caches)
+
+        for cls, kwargs in ((KVCache, {}), (RotatingKVCache, {"max_size": 512})):
+            # Non-empty extended with empty (new sequence joins a batch)
+            batch = make_batch(cls, 2, True, **kwargs)
+            empty = make_batch(cls, 1, False, **kwargs)
+            batch.extend(empty)
+            self.assertEqual(batch.keys.dtype, mx.bfloat16)
+            self.assertEqual(batch.values.dtype, mx.bfloat16)
+
+            # Empty extended with non-empty
+            empty = make_batch(cls, 1, False, **kwargs)
+            batch = make_batch(cls, 2, True, **kwargs)
+            empty.extend(batch)
+            self.assertEqual(empty.keys.dtype, mx.bfloat16)
+            self.assertEqual(empty.values.dtype, mx.bfloat16)
+
     def test_arrays_cache_extend_with_empty(self):
         # test simple merge
         c1 = ArraysCache(2)
