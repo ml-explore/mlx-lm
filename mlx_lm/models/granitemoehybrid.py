@@ -297,9 +297,9 @@ class GraniteMoeHybridTopKGating(nn.Module):
 
     def __call__(self, hidden_states: mx.array):
         logits = self.layer(hidden_states)
-        top_k_idx = mx.argpartition(logits, kth=-self.top_k, axis=-1)[
-            ..., -self.top_k :
-        ]
+        top_k_idx = mx.stop_gradient(
+            mx.argpartition(logits, kth=-self.top_k, axis=-1)[..., -self.top_k :]
+        )
         top_k_logits = mx.take_along_axis(logits, top_k_idx, axis=-1)
         top_k_gates = mx.softmax(top_k_logits, precise=True, axis=-1)
         return top_k_idx, top_k_gates
