@@ -592,6 +592,10 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
+    # Snapshot of (conv_state, ssm_state) saved after processing confirmed tokens
+    # in an MTP draft-verification step. Cleared after each step.
+    rollback_state: Optional[tuple] = None
+
     def __new__(cls, *args, **kwargs):
         instance = super().__new__(cls)
         instance.left_padding = None
@@ -1493,6 +1497,47 @@ class BatchRotatingKVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class MTPPromptCacheState(_BaseCache):
+    """Serializable boundary metadata for a reusable native-MTP prompt cache.
+
+    The target cache contains ``num_tokens`` committed tokens.  The MTP-head
+    cache intentionally trails by one position because its next update needs
+    the first token of the following suffix.  ``last_hidden`` is the target
+    backbone hidden state for the final committed token and closes that gap
+    when a subsequent request supplies its first suffix token.
+    """
+
+    def __init__(self, last_hidden=None, num_tokens: int = 0):
+        self.last_hidden = last_hidden
+        self.num_tokens = num_tokens
+
+    @property
+    def state(self):
+        return [] if self.last_hidden is None else [self.last_hidden]
+
+    @state.setter
+    def state(self, value):
+        self.last_hidden = value[0] if value else None
+
+    @property
+    def meta_state(self):
+        return str(self.num_tokens)
+
+    @meta_state.setter
+    def meta_state(self, value):
+        self.num_tokens = int(value or 0)
+
+    def empty(self):
+        return self.last_hidden is None
+
+    def size(self):
+        return self.num_tokens
+
+    @property
+    def nbytes(self):
+        return 0 if self.last_hidden is None else self.last_hidden.nbytes
 
 
 class TokenBuffer:
