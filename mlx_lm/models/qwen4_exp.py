@@ -112,7 +112,9 @@ class RMSNorm(nn.Module):
 
     def __init__(self, dim: int, group_size: Optional[int] = None, eps: float = 1e-6):
         super().__init__()
-        self.weight = mx.zeros(dim)
+        # ones, not zeros: the reference scales by `1 + w` and `sanitize` folds that 1
+        # into the weight, so an unloaded module has to be the identity.
+        self.weight = mx.ones(dim)
         self.eps = eps
         self.group_size = group_size
         if group_size is not None and dim % group_size:
@@ -120,11 +122,11 @@ class RMSNorm(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         if self.group_size is None:
-            return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
+            return mx.fast.rms_norm(x, self.weight, self.eps)
         shape = x.shape
         x = x.reshape(*shape[:-1], -1, self.group_size)
         x = mx.fast.rms_norm(x, None, self.eps).reshape(shape)
-        return x * (1.0 + self.weight)
+        return x * self.weight
 
 
 class RMSNormGated(nn.Module):
@@ -1082,7 +1084,22 @@ class Model(nn.Module):
                 caches.append(_LayerCache(4))
         return caches
 
+    # Norms scaled by `1 + w` in the reference (RMSNorm above); `linear_attn.norm` is
+    # RMSNormGated and scales by `w` alone, so it must stay out of this list.
+    _FOLD_ONE = (
+        "q_layernorm.weight", "k_layernorm.weight",
+        "q_norm.weight", "k_norm.weight",
+        "hc_norm.weight",
+        "norm_key.weight", "norm_query.weight", "norm_conv.weight",
+    )
+
     def sanitize(self, weights):
+        # Fold the reference's `1 +` into the weight here instead of at every call. Gated on
+        # the HF layout, because sanitize also runs on load: a checkpoint converted by this
+        # file comes back as `model.*`, matches nothing below, and must not be folded twice.
+        # Checkpoints from other MLX converters already carry the folded value.
+        fold = any(k.startswith("model.language_model.") for k in weights)
+
         out = {}
         for k, v in weights.items():
             # Multi-token-prediction head and vision tower: not implemented by this
@@ -1122,6 +1139,9 @@ class Model(nn.Module):
             # weight has shape[1] == kernel_size != 1.
             if k.endswith("conv1d.weight") and v.ndim == 3 and v.shape[1] == 1:
                 v = v.transpose(0, 2, 1)
+
+            if fold and k.endswith(self._FOLD_ONE):
+                v = 1.0 + v
 
             out[k] = v
         return out
