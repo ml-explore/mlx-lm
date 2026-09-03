@@ -67,6 +67,28 @@ class TestMLXLM(unittest.TestCase):
 
         self.assertEqual(result, ["answer"])
 
+    def test_loglikelihood_returns_negative_infinity_when_context_is_fully_truncated(
+        self,
+    ):
+        # Make the continuation too long for the scoring window, so all context
+        # tokens are truncated and the request is skipped.
+        self.mlx_lm._max_tokens = 1
+        self.mlx_lm._tokenize = MagicMock(
+            side_effect=[
+                [[1, 2]],  # Context tokens.
+                [[1, 2, 3, 4]],  # Context + continuation tokens.
+            ]
+        )
+        self.mlx_lm._process_prompt = MagicMock()
+        self.mlx_lm._score_fn = MagicMock()
+        request = MagicMock(args=("context", " continuation"))
+
+        result = self.mlx_lm.loglikelihood([request])
+
+        self.assertEqual(result, [(-float("inf"), False)])
+        self.mlx_lm._process_prompt.assert_not_called()
+        self.mlx_lm._score_fn.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

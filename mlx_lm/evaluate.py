@@ -208,8 +208,8 @@ class MLXLM(LM):
             # If the entire prompt got truncated ignore the question
             if prefix_l == 0:
                 long_completions += 1
-                all_scores.extend([-float("inf")] * len(rs))
-                all_is_greedy.extend([False] * len(rs))
+                scores.extend([-float("inf")] * len(rs))
+                is_greedy.extend([False] * len(rs))
                 continue
 
             # model scoring, returns num_requests x (logp, is_greedy, length).
