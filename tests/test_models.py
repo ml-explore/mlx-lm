@@ -6,6 +6,7 @@ from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
@@ -3565,6 +3566,88 @@ class TestModels(unittest.TestCase):
 
         self.assertTrue(mx.allclose(output, expected))
         self.assertTrue(mx.allclose(state, expected_state))
+
+    def test_gated_delta_contract(self):
+        # HF reference recurrence: the helper must not apply any readout scale
+        # of its own, since callers fold the Dk**-0.5 factor into q. Adding a
+        # Dv**-0.5 scale at this boundary would multiply the output by 0.088
+        # (Dv=128) and fail below.
+        def softplus(x):
+            return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
+
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-x))
+
+        def rms_norm(x, eps):
+            d = x.shape[-1]
+            return np.sqrt(d) * x / np.sqrt((x * x).sum(-1, keepdims=True) + d * eps)
+
+        def hf_recurrence(q, k, v, g_log, beta):
+            B, T, Hk, Dk = k.shape
+            Hv, Dv = v.shape[-2:]
+            rep = Hv // Hk
+            q = np.repeat(q, rep, -2)
+            k = np.repeat(k, rep, -2)
+            state = np.zeros((B, Hv, Dk, Dv))
+            out = np.zeros((B, T, Hv, Dv))
+            for t in range(T):
+                decay = np.exp(g_log[:, t])
+                if decay.ndim == 3:
+                    state *= decay[..., None]
+                else:
+                    state *= decay[..., None, None]
+                k_t, q_t, v_t = k[:, t], q[:, t], v[:, t]
+                beta_t = beta[:, t][..., None]
+                mem = (state * k_t[..., None]).sum(-2)
+                delta = (v_t - mem) * beta_t
+                state += k_t[..., None] * delta[..., None, :]
+                out[:, t] = (state * q_t[..., None]).sum(-2)
+            return out
+
+        def run_case(Hk, Hv, Dk, Dv, vector_gate, rms_eps):
+            rng = np.random.default_rng(0)
+            B, T = 1, 6
+            q = rng.standard_normal((B, T, Hk, Dk))
+            k = rng.standard_normal((B, T, Hk, Dk))
+            v = rng.standard_normal((B, T, Hv, Dv))
+            a = rng.standard_normal((B, T, Hv, Dk) if vector_gate else (B, T, Hv))
+            b = rng.standard_normal((B, T, Hv))
+            param = (Hv, Dk) if vector_gate else (Hv,)
+            A_log = rng.standard_normal(param) * 0.5
+            dt_bias = rng.standard_normal(param) * 0.5
+
+            inv_scale = Dk**-0.5
+            q_pp = (inv_scale**2) * rms_norm(q, rms_eps)
+            k_pp = inv_scale * rms_norm(k, rms_eps)
+            g_log = -np.exp(A_log) * softplus(a + dt_bias)
+            ref = hf_recurrence(q_pp, k_pp, v, g_log, sigmoid(b)).astype(np.float32)
+
+            f32 = lambda x: mx.array(x, dtype=mx.float32)
+            qm = (inv_scale**2) * mx.fast.rms_norm(f32(q), None, rms_eps)
+            km = inv_scale * mx.fast.rms_norm(f32(k), None, rms_eps)
+            for use_kernel in (False, True):
+                out, _ = gated_delta_update(
+                    qm,
+                    km,
+                    f32(v),
+                    f32(a),
+                    f32(b),
+                    f32(A_log),
+                    f32(dt_bias),
+                    use_kernel=use_kernel,
+                )
+                self.assertTrue(
+                    mx.allclose(out, mx.array(ref), rtol=1e-4, atol=1e-4),
+                    f"Hk={Hk} Hv={Hv} Dk={Dk} Dv={Dv} "
+                    f"vector={vector_gate} kernel={use_kernel}",
+                )
+
+        # Qwen3-Next defaults: scalar gate
+        run_case(16, 32, 128, 128, False, 1e-6)
+        # qwen3_5 defaults: Dk != Dv
+        run_case(16, 64, 192, 128, False, 1e-6)
+        # Kimi-style vector gate
+        run_case(8, 8, 128, 128, True, 1e-6 / 128)
 
     def test_gated_delta_precision(self):
         mx.random.seed(42)
