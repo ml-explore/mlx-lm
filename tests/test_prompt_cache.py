@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import copy
+import io
 import os
 import tempfile
 import unittest
@@ -717,6 +718,37 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(batch_full.keys.shape[0], 5)
         self.assertEqual(batch_full.offset.shape[0], 5)
 
+    def test_extend_with_empty_batch_cache_preserves_dtype(self):
+        """Extending a batch cache when one side has keys=None should keep the
+        dtype of the non-empty side. The placeholder used to default to
+        float32, so mx.concatenate silently promoted the whole K/V cache."""
+        H, D = 8, 64
+
+        def make_batch(cls, n, with_content, **kwargs):
+            caches = [cls(**kwargs) for _ in range(n)]
+            if with_content:
+                for c in caches:
+                    kv = mx.ones((1, H, 5, D), mx.bfloat16)
+                    c.update_and_fetch(kv, kv)
+            if cls is RotatingKVCache:
+                return BatchRotatingKVCache.merge(caches)
+            return BatchKVCache.merge(caches)
+
+        for cls, kwargs in ((KVCache, {}), (RotatingKVCache, {"max_size": 512})):
+            # Non-empty extended with empty (new sequence joins a batch)
+            batch = make_batch(cls, 2, True, **kwargs)
+            empty = make_batch(cls, 1, False, **kwargs)
+            batch.extend(empty)
+            self.assertEqual(batch.keys.dtype, mx.bfloat16)
+            self.assertEqual(batch.values.dtype, mx.bfloat16)
+
+            # Empty extended with non-empty
+            empty = make_batch(cls, 1, False, **kwargs)
+            batch = make_batch(cls, 2, True, **kwargs)
+            empty.extend(batch)
+            self.assertEqual(empty.keys.dtype, mx.bfloat16)
+            self.assertEqual(empty.values.dtype, mx.bfloat16)
+
     def test_arrays_cache_extend_with_empty(self):
         # test simple merge
         c1 = ArraysCache(2)
@@ -757,6 +789,22 @@ class TestPromptCache(unittest.TestCase):
         stepwise.extend(ArraysCache.merge((ArraysCache(2), ArraysCache(2))))
         self.assertEqual(stepwise[0].shape, (4, 4, 8))
         self.assertEqual(stepwise[1].shape, (4, 4))
+
+    def test_arrays_cache_advance(self):
+        cache = ArraysCache(2, left_padding=[2])
+        cache.prepare(lengths=[3])
+
+        for _ in range(256):
+            cache.advance(1)
+            mx.eval(cache.state)
+
+        for attr in [cache.lengths, cache.left_padding]:
+            f = io.StringIO()
+            mx.export_to_dot(f, attr)
+            f.seek(0)
+            self.assertEqual(f.read().count("->"), 0)
+        self.assertEqual(cache.lengths.item(), 3 - 256)
+        self.assertEqual(cache.left_padding.item(), 2 - 256)
 
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()

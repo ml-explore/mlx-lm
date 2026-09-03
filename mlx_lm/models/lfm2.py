@@ -28,16 +28,23 @@ class ModelArgs(BaseModelArgs):
     conv_bias: bool
     conv_L_cache: int
     block_dim: int
-    block_ff_dim: int
     block_multiple_of: int
     block_ffn_dim_multiplier: float
     block_auto_adjust_ff_dim: bool
+    block_ff_dim: Optional[int] = None
+    intermediate_size: Optional[int] = None
     rope_theta: float = 1000000.0
     rope_parameters: Optional[dict] = None
     full_attn_idxs: Optional[List[int]] = None
     layer_types: Optional[List[str]] = None
 
     def __post_init__(self):
+        if self.block_ff_dim is None:
+            if self.intermediate_size is None:
+                raise ValueError(
+                    "Config must specify either 'block_ff_dim' or 'intermediate_size'"
+                )
+            self.block_ff_dim = self.intermediate_size
         if self.rope_parameters is not None and "rope_theta" in self.rope_parameters:
             self.rope_theta = self.rope_parameters["rope_theta"]
         if self.num_key_value_heads is None:

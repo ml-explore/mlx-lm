@@ -1,60 +1,27 @@
-# Contributing to MLX LM 
+# Contributing to MLX LM
 
 We want to make contributing to this project as easy and transparent as
 possible.
 
-## Pull Requests
+## AI Usage Policy
 
-1. Fork and submit pull requests to the repo. 
-2. If you've added code that should be tested, add tests.
-3. Every PR should have passing tests and at least one review. 
-4. For code formatting install `pre-commit` using something like `pip install pre-commit` and run `pre-commit install`.
-   This should install hooks for running `black` and `clang-format` to ensure
-   consistent style for C++ and python code.
- 
-   You can also run the formatters manually as follows on individual files:
- 
-     ```bash
-     clang-format -i file.cpp
-     ```
- 
-     ```bash
-     black file.py
-     ```
+AI-generated code is allowed. What is not allowed is submitting code you do not
+understand. You are 100% responsible for every line, however it was produced,
+and must explicitly disclose the manner in which AI was employed.
 
-     or,
-
-     ```bash
-     # single file
-     pre-commit run --files file1.py 
-
-     # specific files
-     pre-commit run --files file1.py file2.py
-     ```
- 
-   or run `pre-commit run --all-files` to check all files in the repo.
-
-## Issues
-
-We use GitHub issues to track public bugs. Please ensure your description is
-clear and has sufficient instructions to be able to reproduce the issue.
-
-## License
-
-By contributing to mlx-lm, you agree that your contributions will be licensed
-under the LICENSE file in the root directory of this source tree.
+It is strictly prohibited to use AI to write your posts for you (bug reports,
+feature requests, pull request descriptions, Github discussions, responding to
+humans, ...).
 
 ## Adding New Models
 
+When creating a pull request to add new models, the pull request template
+[new_model.md](https://github.com/ml-explore/mlx-lm/blob/main/.github/PULL_REQUEST_TEMPLATE/new_model.md)
+must be used.
+
 Below are some tips to port LLMs available on Hugging Face to MLX.
 
-From this directory, do an editable install:
-
-```shell
-pip install -e .
-```
-
-Then check if the model has weights in the
+Check if the model has weights in the
 [safetensors](https://huggingface.co/docs/safetensors/index) format. If not
 [follow instructions](https://huggingface.co/spaces/safetensors/convert) to
 convert it.
@@ -88,3 +55,29 @@ You can run the tests with:
 ```shell
 python -m unittest discover tests/
 ```
+
+## Pull Requests
+
+- Search for existing pull requests first before creating one.
+- Make sure new code is covered by tests. Add new tests if not, and confirm
+  the new tests fail in the main branch.
+- If performance may be impacted, run benchmarks for both the main branch and
+  the pull request.
+- When providing benchmarking results, include scripts and reproduction steps.
+- Format the code with `uvx pre-commit run --all` before submitting a pull
+  request. You can also install git hooks to run it automatically:
+
+  ```shell
+  pip install pre-commit
+  pre-commit install
+  ```
+
+## Issues
+
+We use GitHub issues to track public bugs. Please ensure your description is
+clear and has sufficient instructions to be able to reproduce the issue.
+
+## License
+
+By contributing to mlx-lm, you agree that your contributions will be licensed
+under the LICENSE file in the root directory of this source tree.

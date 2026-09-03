@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -55,17 +56,21 @@ MODEL_REMAPPING = {
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
 }
 
+MODEL_ARCHITECTURE_REMAPPING = {
+    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
+}
+
 MAX_FILE_SIZE_GB = 5
 
 
 def _parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
     split = 0
     for xi in x:
         if not (xi.isdigit() or xi == "."):
             break
         split += 1
-    digits = float(x[:split])
+    digits = Decimal(x[:split])
     size = (x[split:]).strip().upper()
     return int(digits * sizes[size])
 
@@ -184,7 +189,16 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            model_type = remapped
+            break
+    else:
+        model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
@@ -406,6 +420,8 @@ def load_model(
         elif quant_method == "compressed-tensors":
             if quantization_config.get("format") == "nvfp4-pack-quantized":
                 quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            elif quantization_config.get("format") == "mxfp4-pack-quantized":
+                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             else:
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             config["quantization"] = quantization
@@ -982,7 +998,7 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
+    save_model(dst_path, model, donate_model=donate_model)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 

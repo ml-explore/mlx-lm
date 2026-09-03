@@ -2,14 +2,21 @@
 import copy
 import importlib
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -399,6 +406,103 @@ class TestModels(unittest.TestCase):
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
 
+    def test_bailing_moe_v3(self):
+        from dataclasses import replace
+
+        from mlx_lm import utils
+        from mlx_lm.models import bailing_moe_v3
+        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
+
+        args = bailing_moe_v3.ModelArgs(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=32,
+            moe_intermediate_size=32,
+            moe_shared_expert_intermediate_size=32,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            num_experts=4,
+            num_experts_per_tok=2,
+            num_shared_experts=1,
+            n_group=2,
+            topk_group=1,
+            layer_group_size=4,
+            head_dim=32,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+        )
+        model = bailing_moe_v3.Model(args)
+        model.eval()
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        flash_args = replace(args, q_lora_rank=None)
+        flash_model = bailing_moe_v3.Model(flash_args)
+        flash_model.eval()
+        self.assertIsInstance(flash_model.layers[3].attention.q_proj, nn.Linear)
+        self.model_test_runner(
+            flash_model,
+            flash_args.model_type,
+            flash_args.vocab_size,
+            flash_args.num_hidden_layers,
+        )
+
+        fp8_model, _ = utils.quantize_model(
+            bailing_moe_v3.Model(args),
+            {},
+            group_size=None,
+            bits=None,
+            mode="mxfp8",
+        )
+        kda = fp8_model.layers[0].attention
+        mla = fp8_model.layers[3].attention
+        self.assertIsInstance(kda.q_proj, nn.QuantizedLinear)
+        self.assertIsInstance(kda.g_proj, nn.QuantizedLinear)
+        self.assertIsInstance(kda.b_proj, nn.Linear)
+        self.assertIsInstance(
+            fp8_model.layers[1].mlp.switch_mlp.gate_proj,
+            QuantizedSwitchLinear,
+        )
+        self.assertIsInstance(fp8_model.model.word_embeddings, nn.Embedding)
+        self.assertIsInstance(fp8_model.lm_head, nn.Linear)
+        for projection in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "g_proj"):
+            self.assertIsInstance(getattr(mla, projection), nn.Linear)
+        for projection in ("embed_q", "unembed_out"):
+            self.assertIsInstance(getattr(mla, projection), bailing_moe_v3.MultiLinear)
+
+    def test_gear(self):
+        from mlx_lm.models import gear
+
+        args = gear.ModelArgs(
+            model_type="gear",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            vocab_size=100,
+            layer_types=[
+                "sliding_attention",
+                "conv_mixer",
+                "full_attention",
+                "conv_mixer",
+            ],
+            sliding_window=4,
+            conv_L_cache=3,
+            rope_theta=10000,
+            rope_local_base_freq=1000,
+        )
+        model = gear.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_llama(self):
         from mlx_lm.models import llama
 
@@ -441,6 +545,37 @@ class TestModels(unittest.TestCase):
         model = lfm2.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_lfm2_intermediate_size(self):
+        from mlx_lm.models import lfm2
+
+        # Newer LFM2.5 configs ship intermediate_size instead of block_ff_dim
+        args = lfm2.ModelArgs.from_dict(
+            {
+                "model_type": "lfm2",
+                "hidden_size": 1024,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "norm_eps": 1e-5,
+                "vocab_size": 10_000,
+                "full_attn_idxs": [0, 1, 2],
+                "rope_theta": 10000,
+                "block_dim": 1024,
+                "block_ffn_dim_multiplier": 1.0,
+                "block_auto_adjust_ff_dim": False,
+                "intermediate_size": 2560,
+                "block_multiple_of": 256,
+                "max_position_embeddings": 1000,
+                "conv_bias": True,
+                "conv_L_cache": 3,
+            }
+        )
+        self.assertEqual(args.block_ff_dim, 2560)
+        model = lfm2.Model(args)
+        self.assertEqual(
+            model.model.layers[0].feed_forward.w1.weight.shape, (2560, 1024)
         )
 
     def test_lfm2_moe(self):
@@ -646,7 +781,9 @@ class TestModels(unittest.TestCase):
             "max_position_embeddings": 64,
         }
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
         mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        mlx_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
 
         for model_type, hf_mtp_key in (
             ("qwen3_5", "mtp.fc.weights"),
@@ -662,20 +799,27 @@ class TestModels(unittest.TestCase):
             model = module.Model(args)
 
             base = mx.arange(8, dtype=mx.float32)
+            raw_conv = mx.zeros((4, 1, 3), dtype=mx.float32)
 
-            # Simulate convert sanitize on HF-style keys.
+            # Raw HF Conv1D layout is the reliable signal that RMSNorm weights
+            # are still zero-centered and need the MLX +1 conversion.
             converted = model.sanitize(
                 {
                     hf_norm_key: base,
+                    hf_conv_key: raw_conv,
                     hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
             self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
+            self.assertEqual(converted[mlx_conv_key].shape, (4, 3, 1))
             self.assertFalse(any("mtp." in k for k in converted))
 
-            # Simulate load sanitize on already-converted keys.
-            loaded = model.sanitize(converted)
+            # MTP can also be present in an already-converted checkpoint. It
+            # must be dropped without shifting converted norm weights again.
+            loaded = model.sanitize(
+                {**converted, hf_mtp_key: mx.zeros((1,), dtype=mx.float32)}
+            )
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
@@ -1216,6 +1360,40 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_falcon_mamba_bcdt_normalization(self):
+        from mlx_lm.models import mamba
+
+        args = mamba.ModelArgs(
+            model_type="falcon_mamba",
+            vocab_size=32,
+            use_bias=False,
+            use_conv_bias=True,
+            conv_kernel=4,
+            hidden_size=4,
+            num_hidden_layers=1,
+            state_size=2,
+            intermediate_size=8,
+            time_step_rank=2,
+        )
+        block = mamba.MambaBlock(args)
+
+        x = mx.ones((1, args.intermediate_size))
+        A = -mx.ones((args.intermediate_size, args.state_size))
+
+        with (
+            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
+            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
+        ):
+            y, state = block.ssm_step(x, A)
+
+        mx.eval(y, state)
+        self.assertEqual(rms_norm.call_count, 3)
+        for call in rms_norm.call_args_list:
+            self.assertIsNone(call.kwargs["weight"])
+        self.assertEqual(ones.call_count, 0)
+        self.assertEqual(y.shape, (1, args.intermediate_size))
+        self.assertEqual(state.shape, (1, args.intermediate_size, args.state_size))
+
     def test_falcon_h1(self):
         from mlx_lm.models import falcon_h1
 
@@ -1243,6 +1421,23 @@ class TestModels(unittest.TestCase):
             vocab_size=50256,
         )
         model = gpt2.Model(args)
+        self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
+
+    def test_gptj(self):
+
+        from mlx_lm.models import gptj
+
+        args = gptj.ModelArgs(
+            model_type="gptj",
+            n_embd=4096,
+            vocab_size=50400,
+            layer_norm_epsilon=1e-5,
+            n_positions=2048,
+            n_head=16,
+            rotary_dim=64,
+            n_layer=28,
+        )
+        model = gptj.Model(args)
         self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
 
     def test_gpt_neox(self):
@@ -1953,6 +2148,28 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_nanbeige(self):
+        from mlx_lm.models import nanbeige
+
+        args = nanbeige.ModelArgs(
+            model_type="nanbeige",
+            hidden_size=256,
+            num_hidden_layers=2,
+            intermediate_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=32,
+            vocab_size=1000,
+            rope_theta=70000000.0,
+            tie_word_embeddings=False,
+            num_loops=2,
+        )
+        model = nanbeige.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_smollm3(self):
         from mlx_lm.models import smollm3
 
@@ -2395,6 +2612,7 @@ class TestModels(unittest.TestCase):
                 "moe_intermediate_size": 128,
                 "shared_expert_intermediate_size": 128,
                 "moe_routed_scaling_factor": 2.5,
+                "moe_router_score_func": "sqrtsoftplus",
                 "layer_types": [
                     "full_attention",
                     "sliding_attention",
@@ -2913,6 +3131,48 @@ class TestModels(unittest.TestCase):
                 "v_head_dim": 16,
             },
             {
+                "model_type": "kimi_k3",
+                "vocab_size": 1000,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "model_type": "kimi_linear",
+                    "vocab_size": 1000,
+                    "hidden_size": 64,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "intermediate_size": 96,
+                    "rms_norm_eps": 1e-5,
+                    "hidden_act": "situ",
+                    "activation_situ_beta": 4.0,
+                    "activation_situ_linear_beta": 25.0,
+                    "linear_attn_config": {
+                        "kda_layers": [1, 2, 3],
+                        "full_attn_layers": [4],
+                        "num_heads": 2,
+                        "head_dim": 32,
+                        "short_conv_kernel_size": 4,
+                        "gate_lower_bound": -5.0,
+                        "use_full_rank_gate": True,
+                    },
+                    "num_experts": 8,
+                    "moe_intermediate_size": 32,
+                    "q_lora_rank": 24,
+                    "kv_lora_rank": 16,
+                    "qk_nope_head_dim": 16,
+                    "qk_rope_head_dim": 8,
+                    "v_head_dim": 16,
+                    "mla_use_nope": True,
+                    "mla_use_output_gate": True,
+                    "num_experts_per_token": 2,
+                    "num_shared_experts": 1,
+                    "first_k_dense_replace": 1,
+                    "routed_expert_hidden_size": 32,
+                    "latent_moe_use_norm": True,
+                    "attn_res_block_size": 2,
+                },
+            },
+            {
                 "model_type": "afmoe",
                 "vocab_size": 1000,
                 "hidden_size": 128,
@@ -3071,6 +3331,27 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 1000.0,
                 "max_position_embeddings": 256,
             },
+            {
+                "model_type": "muse_glimmer",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-5,
+                "post_norm_eps": 1e-8,
+                "sliding_window": 8,
+                "qk_scale_factor": 3.87,
+                "rope_theta": 100.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -3084,6 +3365,57 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_llama4_chunked_kv_cache(self):
+        # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
+        # the number of valid cached tokens, not on the padded buffer size.
+        # When the chunk size is smaller than the cache allocation step, the old
+        # logic dropped live tokens on the first decode step, so incremental
+        # generation diverged from a single full forward pass.
+        from mlx_lm.models import llama4
+
+        args = llama4.ModelArgs.from_dict(
+            {
+                "model_type": "llama4",
+                "vocab_size": 1000,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "attention_bias": False,
+                    "attention_chunk_size": 4,
+                    "head_dim": 32,
+                    "hidden_size": 128,
+                    "interleave_moe_layer_step": 2,
+                    "intermediate_size": 128,
+                    "intermediate_size_mlp": 128,
+                    "max_position_embeddings": 1000,
+                    "model_type": "llama4",
+                    "num_attention_heads": 4,
+                    "num_experts_per_tok": 1,
+                    "num_hidden_layers": 4,
+                    "num_key_value_heads": 2,
+                    "num_local_experts": 2,
+                    "rms_norm_eps": 1e-4,
+                    "rope_scaling": None,
+                    "rope_theta": 1000,
+                    "use_qk_norm": True,
+                    "vocab_size": 1000,
+                },
+            }
+        )
+        model = llama4.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        # A sequence several chunks long so the trim path runs repeatedly.
+        tokens = mx.array([list(range(1, 13))])
+        full = model(tokens)
+
+        cache = make_prompt_cache(model)
+        step = [model(tokens[:, :1], cache=cache)]
+        for i in range(1, tokens.shape[1]):
+            step.append(model(tokens[:, i : i + 1], cache=cache))
+        step = mx.concatenate(step, axis=1)
+
+        self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
 
     def test_ssm(self):
         for batch_size in [1, 2]:
@@ -3215,6 +3547,118 @@ class TestModels(unittest.TestCase):
                 y_c, st_c = gated_delta_kernel(q, k, v, g, beta, state)
                 self.assertTrue(mx.allclose(y_op, y_c, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st_op, st_c, rtol=1e-4, atol=1e-4))
+
+    def test_gated_delta_lower_bound(self):
+        mx.random.seed(0)
+        q = mx.random.normal(shape=(1, 2, 2, 4))
+        k = mx.random.normal(shape=(1, 2, 2, 4))
+        v = mx.random.normal(shape=(1, 2, 2, 3))
+        a = mx.random.normal(shape=(1, 2, 2, 4))
+        b = mx.random.normal(shape=(1, 2, 2))
+        A_log = mx.log(mx.array([1.0, 2.0]))[:, None]
+        dt_bias = mx.random.normal(shape=(2, 4))
+        lower_bound = -5.0
+
+        g = mx.exp(
+            lower_bound * mx.sigmoid(mx.exp(A_log) * (a.astype(mx.float32) + dt_bias))
+        )
+        expected, expected_state = gated_delta_ops(q, k, v, g, mx.sigmoid(b))
+        output, state = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            use_kernel=False,
+            lower_bound=lower_bound,
+        )
+
+        self.assertTrue(mx.allclose(output, expected))
+        self.assertTrue(mx.allclose(state, expected_state))
+
+    def test_gated_delta_contract(self):
+        # HF reference recurrence: the helper must not apply any readout scale
+        # of its own, since callers fold the Dk**-0.5 factor into q. Adding a
+        # Dv**-0.5 scale at this boundary would multiply the output by 0.088
+        # (Dv=128) and fail below.
+        def softplus(x):
+            return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
+
+        def sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-x))
+
+        def rms_norm(x, eps):
+            d = x.shape[-1]
+            return np.sqrt(d) * x / np.sqrt((x * x).sum(-1, keepdims=True) + d * eps)
+
+        def hf_recurrence(q, k, v, g_log, beta):
+            B, T, Hk, Dk = k.shape
+            Hv, Dv = v.shape[-2:]
+            rep = Hv // Hk
+            q = np.repeat(q, rep, -2)
+            k = np.repeat(k, rep, -2)
+            state = np.zeros((B, Hv, Dk, Dv))
+            out = np.zeros((B, T, Hv, Dv))
+            for t in range(T):
+                decay = np.exp(g_log[:, t])
+                if decay.ndim == 3:
+                    state *= decay[..., None]
+                else:
+                    state *= decay[..., None, None]
+                k_t, q_t, v_t = k[:, t], q[:, t], v[:, t]
+                beta_t = beta[:, t][..., None]
+                mem = (state * k_t[..., None]).sum(-2)
+                delta = (v_t - mem) * beta_t
+                state += k_t[..., None] * delta[..., None, :]
+                out[:, t] = (state * q_t[..., None]).sum(-2)
+            return out
+
+        def run_case(Hk, Hv, Dk, Dv, vector_gate, rms_eps):
+            rng = np.random.default_rng(0)
+            B, T = 1, 6
+            q = rng.standard_normal((B, T, Hk, Dk))
+            k = rng.standard_normal((B, T, Hk, Dk))
+            v = rng.standard_normal((B, T, Hv, Dv))
+            a = rng.standard_normal((B, T, Hv, Dk) if vector_gate else (B, T, Hv))
+            b = rng.standard_normal((B, T, Hv))
+            param = (Hv, Dk) if vector_gate else (Hv,)
+            A_log = rng.standard_normal(param) * 0.5
+            dt_bias = rng.standard_normal(param) * 0.5
+
+            inv_scale = Dk**-0.5
+            q_pp = (inv_scale**2) * rms_norm(q, rms_eps)
+            k_pp = inv_scale * rms_norm(k, rms_eps)
+            g_log = -np.exp(A_log) * softplus(a + dt_bias)
+            ref = hf_recurrence(q_pp, k_pp, v, g_log, sigmoid(b)).astype(np.float32)
+
+            f32 = lambda x: mx.array(x, dtype=mx.float32)
+            qm = (inv_scale**2) * mx.fast.rms_norm(f32(q), None, rms_eps)
+            km = inv_scale * mx.fast.rms_norm(f32(k), None, rms_eps)
+            for use_kernel in (False, True):
+                out, _ = gated_delta_update(
+                    qm,
+                    km,
+                    f32(v),
+                    f32(a),
+                    f32(b),
+                    f32(A_log),
+                    f32(dt_bias),
+                    use_kernel=use_kernel,
+                )
+                self.assertTrue(
+                    mx.allclose(out, mx.array(ref), rtol=1e-4, atol=1e-4),
+                    f"Hk={Hk} Hv={Hv} Dk={Dk} Dv={Dv} "
+                    f"vector={vector_gate} kernel={use_kernel}",
+                )
+
+        # Qwen3-Next defaults: scalar gate
+        run_case(16, 32, 128, 128, False, 1e-6)
+        # qwen3_5 defaults: Dk != Dv
+        run_case(16, 64, 192, 128, False, 1e-6)
+        # Kimi-style vector gate
+        run_case(8, 8, 128, 128, True, 1e-6 / 128)
 
     def test_gated_delta_precision(self):
         mx.random.seed(42)

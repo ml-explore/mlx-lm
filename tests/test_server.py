@@ -330,6 +330,7 @@ class TestServer(unittest.TestCase):
             tool_call_start_tokens = (100,)
             tool_call_end_tokens = ()
             eos_token_ids = [2]
+            structural_markers = ()
 
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"

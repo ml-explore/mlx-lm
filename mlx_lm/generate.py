@@ -9,7 +9,6 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -17,19 +16,15 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
-from .models import cache
 from .models.cache import (
-    ArraysCache,
-    BatchKVCache,
-    BatchRotatingKVCache,
-    CacheList,
-    KVCache,
     QuantizedKVCache,
-    RotatingKVCache,
     TokenBuffer,
+    can_trim_prompt_cache,
     load_prompt_cache,
+    make_prompt_cache,
+    trim_prompt_cache,
 )
-from .sample_utils import make_sampler
+from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -40,11 +35,12 @@ DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
 DEFAULT_TOP_K = 0
 DEFAULT_XTC_PROBABILITY = 0.0
-DEFAULT_XTC_THRESHOLD = 0.0
+DEFAULT_XTC_THRESHOLD = 0.1
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
+DEFAULT_PREFILL_STEP_SIZE = 2048
 
 
 def str2bool(string):
@@ -124,8 +120,8 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.1,
-        help="Thresold the probs of each next token candidate to be sampled by XTC",
+        default=DEFAULT_XTC_THRESHOLD,
+        help="Threshold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
         "--min-tokens-to-keep",
@@ -166,6 +162,13 @@ def setup_arg_parser():
         type=int,
         help="Set the maximum key-value cache size",
         default=None,
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of prompt tokens to process at a time. Smaller values "
+        f"lower peak memory during prefill (default: {DEFAULT_PREFILL_STEP_SIZE})",
     )
     parser.add_argument(
         "--prompt-cache-file",
@@ -300,8 +303,8 @@ def generate_step(
     model: nn.Module,
     *,
     max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    sampler: Optional[Sampler] = None,
+    logits_processors: Optional[List[LogitsProcessor]] = None,
     max_kv_size: Optional[int] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 2048,
@@ -319,9 +322,9 @@ def generate_step(
         model (nn.Module): The model to use for generation.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[mx.array, mx.array], optional): A sampler for sampling a
+        sampler (Sampler, optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+        logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         max_kv_size (int, optional): Maximum size of the key-value cache. Old
@@ -360,7 +363,7 @@ def generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        prompt_cache = cache.make_prompt_cache(
+        prompt_cache = make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
         )
@@ -374,7 +377,7 @@ def generate_step(
         kv_bits=kv_bits,
     )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or greedy_sampler
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -421,8 +424,9 @@ def generate_step(
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
             n_to_process = min(prefill_step_size, remaining)
+            processed = prompt[:n_to_process]
             _model_call(
-                input_tokens=prompt[:n_to_process][None],
+                input_tokens=processed[None],
                 input_embeddings=(
                     input_embeddings[:n_to_process][None]
                     if input_embeddings is not None
@@ -431,6 +435,10 @@ def generate_step(
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
+            if logits_processors and len(processed) > 0:
+                tokens = (
+                    mx.concat([tokens, processed]) if tokens is not None else processed
+                )
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
@@ -443,22 +451,23 @@ def generate_step(
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
-    mx.async_eval(y, logprobs)
-    n = 0
-    while True:
-        if n != max_tokens:
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
-        if n == 0:
-            mx.eval(y)
-            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
-        if n == max_tokens:
-            break
-        yield y.item(), logprobs
-        if n % 256 == 0:
-            mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
-        n += 1
+    with mx.stream(generation_stream):
+        mx.async_eval(y, logprobs)
+        n = 0
+        while True:
+            if n != max_tokens:
+                next_y, next_logprobs = _step(y)
+                mx.async_eval(next_y, next_logprobs)
+            if n == 0:
+                mx.eval(y)
+                prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
+            if n == max_tokens:
+                break
+            yield y.item(), logprobs
+            if n % 256 == 0:
+                mx.clear_cache()
+            y, logprobs = next_y, next_logprobs
+            n += 1
 
 
 def speculative_generate_step(
@@ -468,8 +477,8 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    sampler: Optional[Sampler] = None,
+    logits_processors: Optional[List[LogitsProcessor]] = None,
     prompt_cache: Optional[Any] = None,
     prefill_step_size: int = 512,
     kv_bits: Optional[int] = None,
@@ -487,9 +496,9 @@ def speculative_generate_step(
           speculative decoding. Default: ``2``.
         max_tokens (int): The maximum number of tokens. Use``-1`` for an infinite
           generator. Default: ``256``.
-        sampler (Callable[[mx.array], mx.array], optional): A sampler for sampling a
+        sampler (Sampler, optional): A sampler for sampling a
           token from a vector of log probabilities. Default: ``None``.
-        logits_processors (List[Callable[[mx.array, mx.array], mx.array]], optional):
+        logits_processors (List[LogitsProcessor], optional):
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
@@ -511,19 +520,19 @@ def speculative_generate_step(
 
     # Create the KV cache for generation
     if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
+        model_cache = make_prompt_cache(model)
+        draft_cache = make_prompt_cache(draft_model)
     else:
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not cache.can_trim_prompt_cache(model_cache):
+    if not can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
             f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
         )
 
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+    sampler = sampler or greedy_sampler
 
     quantize_cache_fn = functools.partial(
         maybe_quantize_kv_cache,
@@ -578,8 +587,8 @@ def speculative_generate_step(
         return y
 
     def _rewind_cache(num_draft, num_accept):
-        cache.trim_prompt_cache(model_cache, num_draft - num_accept)
-        cache.trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        trim_prompt_cache(model_cache, num_draft - num_accept)
+        trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -595,54 +604,56 @@ def speculative_generate_step(
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
-    ntoks = 0
-    # Set these so the finally block doesn't raise
-    num_draft = 0
-    n = 0
-    try:
-        while True:
-            num_draft = min(max_tokens - ntoks, num_draft_tokens)
-            draft_tokens = _draft_generate(draft_y, num_draft)
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: prev_tokens.size - y.size - num_draft + 1]
-            y = mx.concatenate([y, draft_tokens])
-            tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
-            mx.eval(tokens, draft_tokens)
-            draft_tokens = draft_tokens.tolist()
-            tokens = tokens.tolist()
-            n = 0
-            while n < num_draft:
-                tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
-                if tn != dtn:
-                    break
-                n += 1
-                ntoks += 1
-                yield tn, lpn, True
+        ntoks = 0
+        # Set these so the finally block doesn't raise
+        num_draft = 0
+        n = 0
+        try:
+            while True:
+                num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                draft_tokens = _draft_generate(draft_y, num_draft)
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[
+                        : prev_tokens.size - y.size - num_draft + 1
+                    ]
+                y = mx.concatenate([y, draft_tokens])
+                tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+                mx.eval(tokens, draft_tokens)
+                draft_tokens = draft_tokens.tolist()
+                tokens = tokens.tolist()
+                n = 0
+                while n < num_draft:
+                    tn, dtn, lpn = tokens[n], draft_tokens[n], logprobs[n]
+                    if tn != dtn:
+                        break
+                    n += 1
+                    ntoks += 1
+                    yield tn, lpn, True
+                    if ntoks == max_tokens:
+                        break
+                if ntoks < max_tokens:
+                    ntoks += 1
+                    yield tokens[n], logprobs[n], False
+
                 if ntoks == max_tokens:
                     break
-            if ntoks < max_tokens:
-                ntoks += 1
-                yield tokens[n], logprobs[n], False
 
-            if ntoks == max_tokens:
-                break
+                y = mx.array([tokens[n]], mx.uint32)
+                draft_y = y
 
-            y = mx.array([tokens[n]], mx.uint32)
-            draft_y = y
+                # If we accepted all the draft tokens, include the last
+                # draft token in the next draft step since it hasn't been
+                # processed yet by the draft model
+                if n == num_draft:
+                    draft_y = mx.concatenate(
+                        [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
+                    )
 
-            # If we accepted all the draft tokens, include the last
-            # draft token in the next draft step since it hasn't been
-            # processed yet by the draft model
-            if n == num_draft:
-                draft_y = mx.concatenate(
-                    [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
-                )
-
-            if prev_tokens is not None:
-                prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+                _rewind_cache(num_draft, n)
+        finally:
             _rewind_cache(num_draft, n)
-    finally:
-        _rewind_cache(num_draft, n)
 
 
 def stream_generate(
@@ -673,6 +684,11 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    if max_tokens == 0:
+        raise ValueError(
+            "Maximum number of tokens must be non-zero (use -1 for no limit)."
+        )
+
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
@@ -790,12 +806,6 @@ def generate(
     return text
 
 
-def _left_pad_prompts(prompts, max_length=None):
-    if max_length is None:
-        max_length = max(len(p) for p in prompts)
-    return mx.array([[0] * (max_length - len(p)) + p for p in prompts])
-
-
 def _right_pad_prompts(prompts, max_length=None):
     if max_length is None:
         max_length = max(len(p) for p in prompts)
@@ -824,38 +834,6 @@ class BatchStats:
     generation_tps: float = 0
     generation_time: float = 0
     peak_memory: float = 0
-
-
-def _make_cache(model, left_padding, max_kv_size):
-    """
-    Convert a list of regular caches into their corresponding
-    batch-aware caches.
-    """
-
-    def to_batch_cache(c):
-        if type(c) is KVCache:
-            return BatchKVCache(left_padding)
-        elif isinstance(c, ArraysCache):
-            c.left_padding = mx.array(left_padding)
-            return c
-        elif isinstance(c, RotatingKVCache):
-            if c.keep > 0:
-                raise ValueError("RotatingKVCache with keep tokens is not supported.")
-            return BatchRotatingKVCache(c.max_size, left_padding)
-        elif isinstance(c, CacheList):
-            return CacheList(*(to_batch_cache(sub_c) for sub_c in c.caches))
-        else:
-            raise ValueError(f"{type(c)} does not yet support batching")
-
-    if hasattr(model, "make_cache"):
-        cache = model.make_cache()
-        return [to_batch_cache(c) for c in cache]
-    else:
-        if max_kv_size is not None:
-            return [
-                BatchRotatingKVCache(max_kv_size, left_padding) for _ in model.layers
-            ]
-        return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 def _merge_caches(caches):
@@ -895,6 +873,9 @@ def _build_trie(sequences):
         try:
             for tok in seq:
                 node = node.setdefault(tok, {})
+            if node is trie:
+                # An empty pattern would make the root match every token.
+                continue
             node["__match__"] = (tuple(seq), idx)
         except TypeError:
             node = node.setdefault(seq, {})
@@ -1077,6 +1058,10 @@ def make_text_state_machine(tokenizer, stop_words=None):
             [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
         )
 
+    if tokenizer.structural_markers:
+        for w in tokenizer.structural_markers:
+            transitions.setdefault("normal", []).append((w, "normal"))
+
     if stop_words:
         for state_name in set(transitions) | {"normal"}:
             for w in stop_words:
@@ -1107,11 +1092,9 @@ class PromptProcessingBatch:
         caches: List[List[Any]],
         tokens: Optional[List[List[int]]] = None,
         prefill_step_size: int = 2048,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        fallback_sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Sampler]] = None,
+        fallback_sampler: Optional[Sampler] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
         max_tokens: Optional[List[int]] = None,
     ):
@@ -1122,7 +1105,7 @@ class PromptProcessingBatch:
 
         self.prefill_step_size = prefill_step_size
         self.samplers = samplers if samplers is not None else []
-        self.fallback_sampler = fallback_sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.fallback_sampler = fallback_sampler or greedy_sampler
         self.logits_processors = (
             logits_processors if logits_processors is not None else []
         )
@@ -1194,14 +1177,8 @@ class PromptProcessingBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
-            self.samplers = [self.samplers[idx] for idx in keep]
-        else:
-            self.samplers = [None] * len(keep)
-        if any(self.logits_processors):
-            self.logits_processors = [self.logits_processors[idx] for idx in keep]
-        else:
-            self.logits_processors = [[]] * len(keep)
+        self.samplers = [self.samplers[idx] for idx in keep]
+        self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
@@ -1293,7 +1270,7 @@ class PromptProcessingBatch:
     def empty(
         cls,
         model: nn.Module,
-        fallback_sampler: Callable[[mx.array], mx.array],
+        fallback_sampler: Sampler,
         prefill_step_size: int = 2048,
     ):
         return cls(
@@ -1334,11 +1311,9 @@ class GenerationBatch:
         inputs: mx.array,
         prompt_cache: List[Any],
         tokens: List[List[int]],
-        samplers: Optional[List[Callable[[mx.array], mx.array]]],
-        fallback_sampler: Callable[[mx.array], mx.array],
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ],
+        samplers: Optional[List[Sampler]],
+        fallback_sampler: Sampler,
+        logits_processors: Optional[List[List[LogitsProcessor]]],
         stop_matchers: List[StopSequenceMatcher],
         max_tokens: List[int],
     ):
@@ -1471,10 +1446,8 @@ class GenerationBatch:
             for c in self.prompt_cache:
                 c.filter(keep)
         self.tokens = [self.tokens[idx] for idx in keep]
-        if any(self.samplers):
-            self.samplers = [self.samplers[idx] for idx in keep]
-        if any(self.logits_processors):
-            self.logits_processors = [self.logits_processors[idx] for idx in keep]
+        self.samplers = [self.samplers[idx] for idx in keep]
+        self.logits_processors = [self.logits_processors[idx] for idx in keep]
         self.max_tokens = [self.max_tokens[idx] for idx in keep]
         self.stop_matchers = [self.stop_matchers[idx] for idx in keep]
 
@@ -1546,7 +1519,7 @@ class GenerationBatch:
     def empty(
         cls,
         model: nn.Module,
-        fallback_sampler: Callable[[mx.array], mx.array],
+        fallback_sampler: Sampler,
     ):
         return cls(
             model=model,
@@ -1579,10 +1552,8 @@ class BatchGenerator:
         *,
         max_tokens: int = 128,
         stop_tokens: Optional[Sequence[Sequence[int]]] = None,
-        sampler: Optional[Callable[[mx.array], mx.array]] = None,
-        logits_processors: Optional[
-            List[Callable[[mx.array, mx.array], mx.array]]
-        ] = None,
+        sampler: Optional[Sampler] = None,
+        logits_processors: Optional[List[LogitsProcessor]] = None,
         completion_batch_size: int = 32,
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
@@ -1591,7 +1562,7 @@ class BatchGenerator:
     ):
         self.model = model
         self.max_tokens = max_tokens
-        self.sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+        self.sampler = sampler or greedy_sampler
         self.logits_processors = logits_processors or []
         self.uid_count = 0
         self.prefill_step_size = prefill_step_size
@@ -1666,10 +1637,8 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Sampler]] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
     ):
         return self.insert_segments(
@@ -1688,28 +1657,42 @@ class BatchGenerator:
         max_tokens: Optional[List[int]] = None,
         caches: Optional[List[List[Any]]] = None,
         all_tokens: Optional[List[List[int]]] = None,
-        samplers: Optional[List[Callable[[mx.array], mx.array]]] = None,
-        logits_processors: Optional[
-            List[List[Callable[[mx.array, mx.array], mx.array]]]
-        ] = None,
+        samplers: Optional[List[Sampler]] = None,
+        logits_processors: Optional[List[List[LogitsProcessor]]] = None,
         stop_matchers: Optional[List[StopSequenceMatcher]] = None,
     ):
-        uids = []
+        num_segments = len(segments)
 
-        max_tokens = max_tokens or [self.max_tokens] * len(segments)
+        max_tokens = max_tokens or [self.max_tokens] * num_segments
         all_tokens = all_tokens or [[] for _ in segments]
-        samplers = samplers or [None] * len(segments)
+        samplers = samplers or [None] * num_segments
         logits_processors = logits_processors or (
-            [self.logits_processors] * len(segments)
+            [self.logits_processors] * num_segments
         )
-        stop_matchers = stop_matchers or ([self._default_stop_matcher] * len(segments))
+        stop_matchers = stop_matchers or ([self._default_stop_matcher] * num_segments)
 
-        caches = caches or [None] * len(segments)
-        for i in range(len(segments)):
-            if caches[i] is None:
-                caches[i] = self._make_new_cache()
+        caches = caches or [None] * num_segments
 
-        for seq, m, c, at, s, lp, sm in zip(
+        # Validate before touching any state: ``zip`` pairs up to the shortest.
+        opts = {
+            "max_tokens": max_tokens,
+            "caches": caches,
+            "all_tokens": all_tokens,
+            "samplers": samplers,
+            "logits_processors": logits_processors,
+            "stop_matchers": stop_matchers,
+        }
+        for k, v in opts.items():
+            if len(v) != num_segments:
+                raise ValueError(
+                    f"Option {k} must have one entry per segment: expected "
+                    f"{num_segments}, got {len(v)}."
+                )
+
+        uids = list(range(self._uid_count, self._uid_count + num_segments))
+        pending = []
+        for uid, seq, m, c, at, s, lp, sm in zip(
+            uids,
             segments,
             max_tokens,
             caches,
@@ -1718,30 +1701,22 @@ class BatchGenerator:
             logits_processors,
             stop_matchers,
         ):
-            seq = list(seq)
+            seq = [segment for segment in seq if segment]
+            if not seq:
+                raise ValueError(f"Sequence {uid} has an empty prompt.")
+            if m <= 0:
+                raise ValueError(f"Sequence {uid}'s max_tokens must be > 0.")
             if len(seq[-1]) != 1:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
-            self._unprocessed_sequences.append(
-                (self._uid_count, seq, m, c, at, s, lp, sm)
-            )
-            uids.append(self._uid_count)
-            self._uid_count += 1
+            if c is None:
+                c = make_prompt_cache(self.model, self.max_kv_size)
+            pending.append((uid, seq, m, c, at, s, lp, sm))
+
+        self._unprocessed_sequences.extend(pending)
+        self._uid_count += num_segments
 
         return uids
-
-    def _make_new_cache(self):
-        if self.max_kv_size is None:
-            return cache.make_prompt_cache(self.model)
-
-        return [
-            (
-                RotatingKVCache(max_size=self.max_kv_size)
-                if isinstance(ci, KVCache)
-                else ci
-            )
-            for ci in cache.make_prompt_cache(self.model)
-        ]
 
     def _find_uids(self, uids):
         uids = set(uids)
@@ -2175,6 +2150,7 @@ def main():
         verbose=args.verbose,
         sampler=sampler,
         max_kv_size=args.max_kv_size,
+        prefill_step_size=args.prefill_step_size,
         prompt_cache=prompt_cache if using_cache else None,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
