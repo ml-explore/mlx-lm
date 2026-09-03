@@ -1669,9 +1669,7 @@ class BatchGenerator:
 
         max_tokens = max_tokens or [self.max_tokens] * num_segments
         all_tokens = all_tokens or [[] for _ in segments]
-        samplers = _normalize_samplers(
-            samplers, n=num_segments, fallback=self.sampler
-        )
+        samplers = _normalize_samplers(samplers, n=num_segments, fallback=self.sampler)
         logits_processors = _normalize_logits_processors(
             logits_processors or [self.logits_processors] * num_segments,
             n=num_segments,
