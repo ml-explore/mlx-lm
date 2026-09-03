@@ -196,3 +196,15 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            # o_proj's block absmax can be small enough that low-bit fp
+            # quant modes (e.g. nvfp4) underflow their scale encoding,
+            # corrupting dequantization. Keep it safe at 8 bits.
+            if path.endswith("self_attn.o_proj"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
