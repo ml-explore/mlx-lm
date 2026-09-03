@@ -1033,7 +1033,6 @@ class BatchKVCache(_BaseCache):
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
-        mx.eval(self.left_padding)
         min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
