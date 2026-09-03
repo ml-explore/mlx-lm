@@ -359,7 +359,7 @@ class MLXLM(LM):
         for e, (text, opt) in enumerate(zip(completions, options)):
             completions[e] = _rstrip_until(text, opt["until"])
             if self.tokenizer.has_thinking:
-                completions[e] = _lstrip(text, self.tokenizer.think_end)
+                completions[e] = _lstrip(completions[e], self.tokenizer.think_end)
 
         # Gather the completions
         if group.size() > 1:
