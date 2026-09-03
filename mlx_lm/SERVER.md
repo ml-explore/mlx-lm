@@ -41,6 +41,35 @@ curl localhost:8080/v1/chat/completions \
    }'
 ```
 
+### KV Cache Quantization
+
+Use `--kv-bits` to quantize the KV cache. This saves memory on long-context
+generations. For example:
+
+```shell
+mlx_lm.server --model <path_to_model_or_hf_repo> --kv-bits 4
+```
+
+Use `--kv-group-size` to set the group size, and `--quantized-kv-start` to set
+the step at which quantization starts. The first steps stay unquantized to keep
+the accuracy of the prompt processing.
+
+These options are set at startup. You cannot set them per request.
+
+Also decrease `--prefill-step-size` when you use `--kv-bits`. Attention on a
+quantized cache is not fused, so it keeps a score matrix of
+`prefill_step_size x context_length`. With the default step size of 2048, this
+matrix can be larger than the memory that the quantized cache saves. A step
+size of 512 or less keeps the matrix small:
+
+```shell
+mlx_lm.server --model <path_to_model_or_hf_repo> --kv-bits 4 --prefill-step-size 512
+```
+
+> [!NOTE]
+> A quantized KV cache does not support batching. The server processes requests
+> one at a time when you set `--kv-bits`.
+
 ### Request Fields
 
 - `messages`: An array of message objects representing the conversation

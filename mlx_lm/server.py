@@ -33,6 +33,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     StopSequenceMatcher,
     TextStateMachine,
@@ -418,6 +419,15 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
 
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
+        if (
+            model_provider.cli_args.kv_bits is not None
+            and model_provider.cli_args.decode_concurrency > 1
+        ):
+            logging.warning(
+                "A quantized KV cache does not support batching. "
+                "The server processes requests one at a time."
+            )
+
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
@@ -619,7 +629,11 @@ class ResponseGenerator:
         return stop_matcher, text_sm
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and self.cli_args.kv_bits is None
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -931,6 +945,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
 
@@ -1847,6 +1864,28 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization. Defaults to no "
+        "quantization. Batching is not supported with a quantized KV cache, "
+        "so requests are served one at a time when this is set. Also decrease "
+        "--prefill-step-size to keep the peak memory low.",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="When --kv-bits is set, start quantizing the KV cache "
+        "from this step onwards",
     )
     parser.add_argument(
         "--pipeline",
