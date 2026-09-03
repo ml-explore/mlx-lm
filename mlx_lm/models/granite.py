@@ -200,10 +200,14 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            # o_proj's block absmax can be small enough that low-bit fp
-            # quant modes (e.g. nvfp4) underflow their scale encoding,
-            # corrupting dequantization. Keep it safe at 8 bits.
-            if path.endswith("self_attn.o_proj"):
+            # o_proj, down_proj, and lm_head run small enough in block absmax
+            # that low-bit fp quant modes (e.g. nvfp4) underflow their scale
+            # encoding, corrupting dequantization. Keep them safe at 8 bits.
+            if (
+                path.endswith("self_attn.o_proj")
+                or path.endswith("mlp.down_proj")
+                or path == "lm_head"
+            ):
                 return {"group_size": 64, "bits": 8}
             return True
 
