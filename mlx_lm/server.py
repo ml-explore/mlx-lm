@@ -42,6 +42,7 @@ from .generate import (
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
+from .tokenizer_utils import ensure_reasoning_fields
 from .utils import _parse_size, load, sharded_load
 
 
@@ -513,6 +514,8 @@ class ResponseGenerator:
 
             if tokenizer.has_chat_template:
                 process_message_content(messages)
+                if tokenizer.has_thinking:
+                    ensure_reasoning_fields(messages)
                 if tools and not tokenizer.has_tool_calling:
                     logging.warning(
                         "Received tools but model does not support tool calling. "

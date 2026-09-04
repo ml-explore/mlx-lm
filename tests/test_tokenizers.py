@@ -12,6 +12,7 @@ from mlx_lm.tokenizer_utils import (
     TokenizerWrapper,
     _infer_thinking,
     _infer_tool_parser,
+    ensure_reasoning_fields,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -111,7 +112,21 @@ class TestTokenizers(unittest.TestCase):
 
         tokenizer = K2Tokenizer()
         self.assertEqual(_infer_tool_parser(tokenizer), "k2_horizon")
-        self.assertEqual(_infer_thinking(tokenizer)[:2], ("<ifm|think>", "</ifm|think>"))
+        self.assertEqual(
+            _infer_thinking(tokenizer)[:2], ("<ifm|think>", "</ifm|think>")
+        )
+
+    def test_ensure_reasoning_fields(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "assistant", "content": "", "reasoning": "already present"},
+        ]
+
+        ensure_reasoning_fields(messages)
+
+        self.assertEqual(messages[1]["reasoning"], "")
+        self.assertEqual(messages[2]["reasoning"], "already present")
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"

@@ -9,6 +9,28 @@ from typing import Any, Dict, List, Optional
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+_THINKING_FIELDS = (
+    "think",
+    "reasoning",
+    "reasoning_content",
+    "think_fast",
+    "think_faster",
+)
+
+
+def ensure_reasoning_fields(messages: list[dict]) -> None:
+    """Add an empty reasoning field when a thinking template requires one.
+
+    Some model templates reject otherwise valid historical assistant messages
+    when they omit a thinking field. An empty value preserves the message
+    semantics while allowing the template to render the conversation.
+    """
+    for message in messages:
+        if message.get("role") == "assistant" and not any(
+            field in message for field in _THINKING_FIELDS
+        ):
+            message["reasoning"] = ""
+
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.

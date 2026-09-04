@@ -7,13 +7,10 @@ import json
 import re
 from typing import Any
 
-
 tool_call_start = "<ifm|tool_calls>"
 tool_call_end = "</ifm|tool_calls>"
 
-_tool_call_re = re.compile(
-    r"<ifm\|tool_call>(.*?)</ifm\|tool_call>", re.DOTALL
-)
+_tool_call_re = re.compile(r"<ifm\|tool_call>(.*?)</ifm\|tool_call>", re.DOTALL)
 _argument_re = re.compile(
     r"<ifm\|arg_key>\s*(.*?)\s*</ifm\|arg_key>\s*"
     r"(?:<ifm\|arg_type>\s*.*?\s*</ifm\|arg_type>\s*)?"
@@ -42,8 +39,7 @@ def _parse_one(text: str) -> dict[str, Any]:
         raise ValueError("K2-Horizon tool call is missing a function name")
 
     arguments = {
-        match.group(1).strip(): _deserialize(match.group(2))
-        for match in matches
+        match.group(1).strip(): _deserialize(match.group(2)) for match in matches
     }
     return {"name": name.splitlines()[0].strip(), "arguments": arguments}
 
