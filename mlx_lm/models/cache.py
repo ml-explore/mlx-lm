@@ -726,6 +726,9 @@ class ArraysCache(_BaseCache):
         return cache
 
     def empty(self):
+        # Models can create ArraysCache(size=0) for non-attention layers, producing an empty self.cache list
+        if len(self.cache) == 0:
+            return True
         return self.cache[0] is None
 
     @property

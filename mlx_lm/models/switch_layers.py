@@ -198,6 +198,13 @@ class SwitchGLU(nn.Module):
 
         return x.squeeze(-2)
 
+    # quantized experts with SwiGLU; required for quantized ZAYA compatibility
+    def to_quantized(self, group_size: int = 64, bits: int = 4, mode: str = "affine"):
+        """Quantize the SwitchLinear sublayers."""
+        self.gate_proj = self.gate_proj.to_quantized(group_size, bits, mode)
+        self.up_proj = self.up_proj.to_quantized(group_size, bits, mode)
+        self.down_proj = self.down_proj.to_quantized(group_size, bits, mode)
+
 
 class SwitchMLP(nn.Module):
     def __init__(
