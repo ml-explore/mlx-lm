@@ -310,7 +310,7 @@ def generate_step(
     prefill_step_size: int = 2048,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -336,7 +336,7 @@ def generate_step(
           None implies no cache quantization. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
-           when ``kv_bits`` is non-None. Default: ``0``.
+           when ``kv_bits`` is non-None. Default: ``5000``.
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -483,7 +483,7 @@ def speculative_generate_step(
     prefill_step_size: int = 512,
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
-    quantized_kv_start: int = 0,
+    quantized_kv_start: int = DEFAULT_QUANTIZED_KV_START,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -508,7 +508,7 @@ def speculative_generate_step(
           None implies no cache quantization. Default: ``None``.
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
-           when ``kv_bits`` is non-None. Default: ``0``.
+           when ``kv_bits`` is non-None. Default: ``5000``.
 
     Yields:
         Tuple[mx.array, mx.array, bool]: One token, a vector of log probabilities,
