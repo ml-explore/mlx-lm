@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -864,6 +865,10 @@ class ResponseGenerator:
                         # It may have already been removed during
                         # generation
                         batch_results.pop(uid, None)
+
+        del self.model_provider
+        del self.prompt_cache
+        gc.collect()
 
     def _serve_single(self, request):
         rqueue, request, args = request
