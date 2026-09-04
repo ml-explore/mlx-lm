@@ -751,7 +751,7 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
-                        self._serve_single((rqueue, request, args))
+                        self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
                     current_model = args.model
@@ -875,7 +875,7 @@ class ResponseGenerator:
         del self.prompt_cache
         gc.collect()
 
-    def _serve_single(self, request):
+    def _serve_single(self, request, stream):
         rqueue, request, args = request
 
         # Define the progress callback
@@ -931,6 +931,7 @@ class ResponseGenerator:
             stop_state = stop_matcher.make_state()
             for gen in stream_generate(
                 model=model,
+                stream=stream,
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
