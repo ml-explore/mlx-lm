@@ -198,6 +198,19 @@ def build_parser():
         help="Where to read the data from. Default: hf. Options: hf (Hugging Face), s3 (Dolma corpus in S3)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Number of sequences per rank in a micro batch. Overrides the "
+        "experiment config",
+    )
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=None,
+        help="Number of tokens per sequence. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--fsdp-dim",
         type=int,
         default=None,
@@ -244,6 +257,10 @@ def cli():
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     config = load_config(config_path(args.config))
 
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    if args.context_size is not None:
+        config.context_size = args.context_size
     if args.fsdp_dim is not None:
         config.fsdp_dim = args.fsdp_dim
 

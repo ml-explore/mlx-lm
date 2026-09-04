@@ -20,6 +20,9 @@ class ModelArgs:
     init_std: float = 0.02
     rope_scaling_factor: float = 1.0
     original_max_position_embeddings: int = 8192
+    # Quadratic attention
+    partial_rotary_factor: float = 1.0
+    attn_output_gate: bool = False
 
     quadratic_attn_interval: int = 1
     linear_attn_type: str = "gated_delta"
@@ -36,6 +39,11 @@ class ModelArgs:
             raise ValueError(
                 "quadratic_attn_interval counts the layers per full attention "
                 f"layer, so it must be at least 1, got {self.quadratic_attn_interval}"
+            )
+        if not 0 < self.partial_rotary_factor <= 1:
+            raise ValueError(
+                "partial_rotary_factor is the fraction of each head that RoPE "
+                f"rotates, so it must be in (0, 1], got {self.partial_rotary_factor}"
             )
         if self.linear_num_key_heads is None:
             self.linear_num_key_heads = self.num_key_value_heads

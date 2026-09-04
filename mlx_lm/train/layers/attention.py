@@ -77,8 +77,11 @@ class Attention(nn.Module):
         self.n_heads = args.num_attention_heads
         self.n_kv_heads = args.num_key_value_heads
         self.scale = head_dim**-0.5
+        self.output_gate = args.attn_output_gate
 
-        self.q_proj = nn.Linear(dim, self.n_heads * head_dim, bias=False)
+        # With an output gate q_proj emits a gate alongside every query head.
+        q_dim = self.n_heads * head_dim * (2 if self.output_gate else 1)
+        self.q_proj = nn.Linear(dim, q_dim, bias=False)
         self.k_proj = nn.Linear(dim, self.n_kv_heads * head_dim, bias=False)
         self.v_proj = nn.Linear(dim, self.n_kv_heads * head_dim, bias=False)
         self.o_proj = nn.Linear(self.n_heads * head_dim, dim, bias=False)
@@ -86,15 +89,16 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
+        rope_dims = int(head_dim * args.partial_rotary_factor)
         if args.rope_scaling_factor > 1:
             self._rope = YarnRoPE(
-                head_dim,
+                rope_dims,
                 base=args.rope_theta,
                 scaling_factor=args.rope_scaling_factor,
                 original_max_position_embeddings=args.original_max_position_embeddings,
             )
         else:
-            self._rope = nn.RoPE(head_dim, base=args.rope_theta, traditional=False)
+            self._rope = nn.RoPE(rope_dims, base=args.rope_theta, traditional=False)
 
     def __call__(
         self,
@@ -104,7 +108,12 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-        queries = self.q_norm(self.q_proj(x).reshape(B, L, self.n_heads, -1))
+        queries = self.q_proj(x).reshape(B, L, self.n_heads, -1)
+        gate = None
+        if self.output_gate:
+            queries, gate = mx.split(queries, 2, axis=-1)
+
+        queries = self.q_norm(queries)
         keys = self.k_norm(self.k_proj(x).reshape(B, L, self.n_kv_heads, -1))
         values = self.v_proj(x).reshape(B, L, self.n_kv_heads, -1)
 
@@ -123,7 +132,10 @@ class Attention(nn.Module):
         out = mx.fast.scaled_dot_product_attention(
             queries, keys, values, scale=self.scale, mask=mask
         )
-        return self.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
+        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        if gate is not None:
+            out = out * mx.sigmoid(gate.reshape(B, L, -1))
+        return self.o_proj(out)
 
 
 @partial(mx.compile, shapeless=True)
