@@ -1293,6 +1293,111 @@ class TestModels(unittest.TestCase):
         self.assertEqual(caches[3].size(), 6)
         self.assertEqual(caches[4].size(), args.sliding_window)
 
+    def test_step3p7(self):
+        from mlx_lm.models import step3p7
+
+        text_config = dict(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=[10000.0, 10000.0, 10000.0, 10000.0],
+            sliding_window=64,
+            layer_types=[
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            partial_rotary_factors=[0.5, 1.0, 1.0, 0.5],
+            attention_other_setting={
+                "num_attention_heads": 8,
+                "num_attention_groups": 2,
+            },
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        args = step3p7.ModelArgs(model_type="step3p7", text_config=text_config)
+        model = step3p7.Model(args)
+        self.assertIsInstance(model.make_cache()[1], RotatingKVCache)
+        self.model_test_runner(
+            model,
+            args.model_type,
+            text_config["vocab_size"],
+            text_config["num_hidden_layers"],
+        )
+
+    def test_step3p7_sanitize_drops_vision_and_nests_text(self):
+        from mlx_lm.models import step3p7
+
+        text_config = dict(
+            model_type="step3p5",
+            hidden_size=256,
+            num_hidden_layers=4,
+            vocab_size=1024,
+            num_attention_heads=4,
+            num_attention_groups=2,
+            head_dim=64,
+            intermediate_size=512,
+            rms_norm_eps=1e-5,
+            rope_theta=10000.0,
+            sliding_window=64,
+            partial_rotary_factors=[1.0] * 4,
+            use_head_wise_attn_gate=True,
+            moe_num_experts=4,
+            moe_top_k=2,
+            moe_intermediate_size=256,
+            share_expert_dim=256,
+            moe_layers_enum="1,2,3",
+        )
+        args = step3p7.ModelArgs(model_type="step3p7", text_config=text_config)
+        model = step3p7.Model(args)
+
+        weights = {
+            "vision_model.conv1.weight": mx.zeros((4, 4)),
+            "vision_model.transformer.resblocks.0.ln_1.weight": mx.zeros((4,)),
+            "vit_large_projector.weight": mx.zeros((4, 4)),
+            "model.embed_tokens.weight": mx.zeros((1024, 256)),
+            "lm_head.weight": mx.zeros((1024, 256)),
+            "model.norm.weight": mx.ones((256,)),
+            "model.layers.0.self_attn.q_proj.weight": mx.zeros((256, 256)),
+            "model.layers.0.self_attn.q_norm.weight": mx.zeros((64,)),
+            "model.layers.1.moe.gate.weight": mx.zeros((4, 256)),
+            "model.layers.1.moe.router_bias": mx.zeros((4,)),
+            "model.layers.1.moe.gate_proj.weight": mx.zeros((4, 256, 256)),
+            "model.layers.4.enorm.weight": mx.zeros((256,)),
+            "model.layers.4.self_attn.q_proj.weight": mx.zeros((256, 256)),
+        }
+
+        out = model.sanitize(weights)
+
+        self.assertFalse(any(k.startswith("vision_model") for k in out))
+        self.assertFalse(any("vit_large_projector" in k for k in out))
+        self.assertFalse(any("layers.4." in k for k in out))
+
+        self.assertTrue(all(k.startswith("language_model.") for k in out))
+        self.assertIn("language_model.lm_head.weight", out)
+        self.assertIn("language_model.model.embed_tokens.weight", out)
+
+        self.assertIn(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight", out
+        )
+        self.assertIn("language_model.model.layers.1.mlp.gate.gate.weight", out)
+        self.assertIn("language_model.model.layers.1.mlp.gate.router_bias", out)
+
+        self.assertTrue(
+            mx.allclose(out["language_model.model.norm.weight"], mx.full((256,), 2.0))
+        )
+
     def test_cohere(self):
         from mlx_lm.models import cohere
 
