@@ -53,6 +53,13 @@ class ModelArgs(BaseModelArgs):
     indexer_rope_interleave: bool = False
 
 
+# Context length above which prefill switches from dense top-k-masked SDPA to
+# the sparse gather in _sparse_gather_attention. Below this the gather's fixed
+# overhead loses to dense SDPA (measured crossover ~14k on M-series); above it
+# the sparse path wins and keeps growing with context (~9x attention-op at 32k).
+SPARSE_PREFILL_MIN_CONTEXT = 16384
+
+
 class Indexer(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -108,7 +115,21 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
-        scores = scores.sum(axis=1, keepdims=True)
+        if s > 1:
+            # Reduce heads with elementwise adds instead of mx.sum: works around
+            # ml-explore/mlx#3784 (mx.sum over a non-last axis of a large strided
+            # tensor returns all-zeros, e.g. [1, 32, 4096, 131072] at >=128k
+            # context), which silently zeroes the indexer scores and corrupts the
+            # top-k selection past ~128k tokens. At decode (s == 1) the tensor is
+            # far below the trigger threshold, so the fast fused sum is kept.
+            # TODO: revert to scores.sum(axis=1, keepdims=True) once the MLX fix
+            # lands.
+            summed = scores[:, 0:1]
+            for h in range(1, scores.shape[1]):
+                summed = summed + scores[:, h : h + 1]
+            scores = summed
+        else:
+            scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
@@ -177,6 +198,39 @@ class DeepseekV32Attention(nn.Module):
             scaling_config=self.config.rope_scaling,
         )
 
+    def _sparse_gather_attention(
+        self, q_nope, q_pe, kv_latent, k_pe, topk_indices, mask, offset
+    ):
+        """Sparse prefill attention over the index_topk selected KV per query.
+
+        Absorbed-latent form mirroring the L == 1 decode path: embed_q absorbs
+        into the query, attention runs in latent space over only the gathered
+        keys, and unembed_out projects the output. Mathematically identical to
+        the dense top-k-masked path (it attends over the same selected set).
+        The causal constraint is reconstructed from key positions, so no
+        [.., L, S] mask is ever materialized.
+        """
+        b, _, length, _ = q_nope.shape
+        q_latent = self.embed_q(q_nope)  # [B, H, L, kv_lora_rank]
+        ti = topk_indices  # [B, 1, L, K] — one index group shared across heads
+        kvg = mx.stack(
+            [mx.take(kv_latent[i, 0], ti[i, 0], axis=0) for i in range(b)]
+        )
+        kpeg = mx.stack([mx.take(k_pe[i, 0], ti[i, 0], axis=0) for i in range(b)])
+        qn = q_latent.transpose(0, 2, 1, 3)  # [B, L, H, kv_lora_rank]
+        qp = q_pe.transpose(0, 2, 1, 3)  # [B, L, H, qk_rope_head_dim]
+        scores = mx.matmul(qn, kvg.swapaxes(-1, -2))
+        scores = (scores + mx.matmul(qp, kpeg.swapaxes(-1, -2))) * self.scale
+        if mask is not None:
+            # Key at index ti is causally valid for query l iff ti <= offset + l.
+            q_pos = (offset + mx.arange(length)).reshape(1, 1, length, 1)
+            cmask = (ti <= q_pos)[:, 0]  # [B, L, K]
+            neg = mx.array(mx.finfo(scores.dtype).min, scores.dtype)
+            scores = mx.where(cmask[:, :, None, :], scores, neg)
+        w = mx.softmax(scores.astype(mx.float32), axis=-1).astype(kvg.dtype)
+        out_latent = mx.matmul(w, kvg).transpose(0, 2, 1, 3)
+        return self.unembed_out(out_latent)  # [B, H, L, v_head_dim]
+
     def __call__(
         self,
         x: mx.array,
@@ -222,6 +276,20 @@ class DeepseekV32Attention(nn.Module):
                 )
                 if mask is not None:
                     mask = mx.take_along_axis(mask, topk_indices, axis=-1)
+            elif kv_latent.shape[2] >= SPARSE_PREFILL_MIN_CONTEXT:
+                # Long-context prefill: attend over only the index_topk selected
+                # KV per query instead of dense-masking all S keys. Same math as
+                # the masked path below (identical selected set), but O(L * topk)
+                # instead of O(L * S), with transient memory flat in S.
+                output = self._sparse_gather_attention(
+                    q_nope, q_pe, kv_latent, k_pe, topk_indices, mask, offset
+                )
+                if cache is not None and cache[0] is not None:
+                    cache[0].keys = mx.depends(
+                        cache[0].keys, (cache[1].keys, cache[1].values)
+                    )
+                output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+                return self.o_proj(output)
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
