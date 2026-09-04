@@ -54,6 +54,19 @@ class TestMLXLM(unittest.TestCase):
         self.assertEqual(len(call_args_list[1][0][0]), 2)  # Second batch: 2 items
         self.assertEqual(len(call_args_list[2][0][0]), 1)  # Third batch: 1 item
 
+    @patch("mlx_lm.evaluate.batch_generate")
+    def test_generate_strip_until_then_strip_thinking(self, mock_batch_generate):
+        self.mock_tokenizer.has_thinking = True
+        self.mock_tokenizer.think_end = "</think>"
+        mock_batch_generate.return_value.texts = [
+            "<think>scratch</think>answer STOP extra"
+        ]
+        request = MagicMock(args=("prompt", {"until": [" STOP"]}))
+
+        result = self.mlx_lm.generate_until([request])
+
+        self.assertEqual(result, ["answer"])
+
 
 if __name__ == "__main__":
     unittest.main()

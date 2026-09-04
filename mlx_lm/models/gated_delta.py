@@ -599,6 +599,12 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: float | None = None,
 ) -> Tuple[mx.array, mx.array]:
+    """Gated delta rule recurrence.
+
+    Contract: callers fold the ``Dk**-0.5`` readout scale into q before calling
+    (e.g. ``inv_scale = Dk**-0.5; q = inv_scale**2 * rms_norm(q, eps);
+    k = inv_scale * rms_norm(k, eps)``). The helper applies no scale of its own.
+    """
     beta = mx.sigmoid(b)
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)
