@@ -761,5 +761,40 @@ class TestMakeSampler(unittest.TestCase):
         self.assertEqual(token.shape, (1,))
 
 
+class TestModelSwapClearsCache(unittest.TestCase):
+    def test_load_clears_mlx_buffer_pool(self):
+        import argparse
+        from unittest import mock
+
+        from mlx_lm.server import ModelProvider
+
+        args = argparse.Namespace(
+            adapter_path=None,
+            chat_template=None,
+            draft_model=None,
+            model="model-a",
+            pipeline=False,
+            trust_remote_code=False,
+            use_default_chat_template=False,
+        )
+        fake_model = mock.Mock()
+        fake_tokenizer = mock.Mock()
+        fake_tokenizer.chat_template = None
+        fake_tokenizer.default_chat_template = None
+        group = mock.Mock()
+        group.size.return_value = 1
+
+        with (
+            mock.patch("mlx_lm.server.mx.distributed.init", return_value=group),
+            mock.patch("mlx_lm.server.load", return_value=(fake_model, fake_tokenizer)),
+            mock.patch("mlx_lm.server.make_prompt_cache", return_value=[]),
+            mock.patch("mlx_lm.server.mx.clear_cache") as clear_cache,
+        ):
+            provider = ModelProvider(args)
+            provider._load("model-a")
+            provider._load("model-b")
+            self.assertGreaterEqual(clear_cache.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

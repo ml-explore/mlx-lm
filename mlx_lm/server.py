@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -311,11 +312,15 @@ class ModelProvider:
                 "Loading with adapters or draft models not supported in distributed mode"
             )
 
-        # Remove the old model if it exists.
+        # Remove the old model if it exists. Dropping the refs returns the
+        # weights to MLX's buffer pool, not the OS; clear that pool so a
+        # later load of a different model does not keep every previous one.
         self.model_key = None
         self.model = None
         self.tokenizer = None
         self.draft_model = None
+        gc.collect()
+        mx.clear_cache()
 
         # Load the model and tokenizer
         if self.is_distributed:
