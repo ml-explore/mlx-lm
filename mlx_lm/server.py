@@ -866,13 +866,13 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
-    def _serve_single(self, request, stream):
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
         del self.model_provider
         del self.prompt_cache
         gc.collect()
 
+    def _serve_single(self, request, stream):
         rqueue, request, args = request
 
         # Define the progress callback
