@@ -301,6 +301,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
     *,
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
@@ -390,7 +391,7 @@ def generate_step(
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
-        with mx.stream(generation_stream):
+        with mx.stream(stream):
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -415,7 +416,7 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
@@ -450,9 +451,8 @@ def generate_step(
             mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
-
-    with mx.stream(generation_stream):
         mx.async_eval(y, logprobs)
+
         n = 0
         while True:
             if n != max_tokens:
@@ -474,6 +474,7 @@ def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
     draft_model: nn.Module,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
@@ -551,30 +552,25 @@ def speculative_generate_step(
         return y, logprobs
 
     def _step(model, cache, y, n_predict=1):
-        with mx.stream(generation_stream):
-            logits = model(y[None], cache=cache)
-            logits = logits[:, -n_predict:, :]
+        logits = model(y[None], cache=cache)
+        logits = logits[:, -n_predict:, :]
 
-            quantize_cache_fn(cache)
-            if logits_processors:
-                nonlocal prev_tokens
-                out_y, out_logprobs = [], []
-                if n_predict > 1:
-                    y = y[: -(n_predict - 1)]
-                for i in range(n_predict):
-                    prev_tokens = (
-                        mx.concatenate([prev_tokens, y])
-                        if prev_tokens is not None
-                        else y
-                    )
-                    y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
-                    out_y.append(y)
-                    out_logprobs.append(logprobs)
-                return mx.concatenate(out_y, axis=0), mx.concatenate(
-                    out_logprobs, axis=0
+        quantize_cache_fn(cache)
+        if logits_processors:
+            nonlocal prev_tokens
+            out_y, out_logprobs = [], []
+            if n_predict > 1:
+                y = y[: -(n_predict - 1)]
+            for i in range(n_predict):
+                prev_tokens = (
+                    mx.concatenate([prev_tokens, y]) if prev_tokens is not None else y
                 )
-            else:
-                return _process_and_sample(None, logits.squeeze(0))
+                y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
+                out_y.append(y)
+                out_logprobs.append(logprobs)
+            return mx.concatenate(out_y, axis=0), mx.concatenate(out_logprobs, axis=0)
+        else:
+            return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
         while y.size > 1:
@@ -600,7 +596,7 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
-    with mx.stream(generation_stream):
+    with mx.stream(stream):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
@@ -662,6 +658,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -707,7 +704,7 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
+        token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
@@ -716,9 +713,9 @@ def stream_generate(
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
+            prompt, model, draft_model, stream, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
