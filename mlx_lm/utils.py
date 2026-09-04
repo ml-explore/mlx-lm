@@ -830,12 +830,19 @@ def save_model(
         )
 
 
+def _takes_global_scale(module: nn.Module) -> bool:
+    """Only some layers hold an nvfp4 tensor scale."""
+    params = inspect.signature(module.to_quantized).parameters
+    return "global_scale" in params
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
     group_size: Optional[int],
     bits: Optional[int],
     mode: str = "affine",
+    global_scale: bool = False,
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -847,6 +854,8 @@ def quantize_model(
         group_size (Optional[int]): Group size for quantization.
         bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
+        global_scale (bool): Use one ``nvfp4`` tensor scale per expert on the
+          switch layers. Only these layers support it for now.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
@@ -887,6 +896,12 @@ def quantize_model(
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        # The scale is a parameter of the layer, so the config must record it
+        # for the loader to rebuild the same shapes.
+        if global_scale and bool_or_params and _takes_global_scale(module):
+            if not isinstance(bool_or_params, dict):
+                bool_or_params = dict(quant_params)
+            bool_or_params["global_scale"] = True
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
