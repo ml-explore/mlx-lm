@@ -1407,6 +1407,37 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_g9v3(self):
+        from mlx_lm.models import g9v3
+
+        args = g9v3.ModelArgs(
+            model_type="g9v3",
+            vocab_size=130560,
+            hidden_size=2048,
+            num_attention_heads=32,
+            head_dim=128,
+            num_key_value_heads=2,
+            use_gated_attention=False,
+            rope_theta=5000000,
+            rope_scaling=None,
+            first_k_dense_replace=1,
+            intermediate_size=8192,
+            n_routed_experts=320,
+            num_experts_per_tok=32,
+            routed_scaling_factor=3.66,
+            n_group=1,
+            topk_group=1,
+            norm_topk_prob=True,
+            moe_intermediate_size=512,
+            n_shared_experts=1,
+            rms_norm_eps=1e-06,
+            num_hidden_layers=38,
+        )
+        model = g9v3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gpt2(self):
         from mlx_lm.models import gpt2
 
