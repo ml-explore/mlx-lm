@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -16,6 +16,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .generate_utils import BatchCounters, BatchReading, BatchStats
 from .models.cache import (
     QuantizedKVCache,
     TokenBuffer,
@@ -812,30 +813,6 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
 
 
-@dataclass
-class BatchStats:
-    """
-    An data object to hold generation stats.
-
-    Args:
-        prompt_tokens (int): The number of prompt tokens processed.
-        prompt_tps (float): The prompt processing tokens-per-second.
-        prompt_time (float): The time in seconds spent in prompt processing.
-        generation_tokens (int): The number of generated tokens.
-        generation_tps (float): The tokens-per-second for generation.
-        generation_time (float): The time in seconds spent in generation .
-        peak_memory (float): The peak memory used so far in GB.
-    """
-
-    prompt_tokens: int = 0
-    prompt_tps: float = 0
-    prompt_time: float = 0
-    generation_tokens: int = 0
-    generation_tps: float = 0
-    generation_time: float = 0
-    peak_memory: float = 0
-
-
 def _merge_caches(caches):
     batch_cache = []
 
@@ -1589,10 +1566,7 @@ class BatchGenerator:
         self._unprocessed_sequences = deque()
         self._currently_processing = []
 
-        self._prompt_tokens_counter = 0
-        self._prompt_time_counter = 0
-        self._gen_tokens_counter = 0
-        self._steps_counter = 0
+        self._counters = BatchCounters()
 
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
@@ -1615,25 +1589,19 @@ class BatchGenerator:
         self.close()
 
     @contextlib.contextmanager
-    def stats(self, stats=None):
-        stats = stats or BatchStats()
-        self._prompt_tokens_counter = 0
-        self._prompt_time_counter = 0
-        self._gen_tokens_counter = 0
-        tic = time.perf_counter()
+    def stats(self):
+        """The work this generator does while the block runs.
+
+        Readings are taken on entry and exit and subtracted, so nested windows
+        each report their own interval.
+        """
+        stats = BatchStats()
+        start = BatchReading(**asdict(self._counters))
         try:
             yield stats
         finally:
-            toc = time.perf_counter()
-            total_time = toc - tic
-            gen_time = total_time - self._prompt_time_counter
-            stats.prompt_tokens += self._prompt_tokens_counter
-            stats.prompt_time += self._prompt_time_counter
-            stats.prompt_tps = stats.prompt_tokens / stats.prompt_time
-            stats.generation_tokens += self._gen_tokens_counter
-            stats.generation_time += gen_time
-            stats.generation_tps = stats.generation_tokens / stats.generation_time
-            stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
+            end = BatchReading(**asdict(self._counters))
+            stats += BatchReading.between(start, end)
 
     def insert(
         self,
@@ -1828,10 +1796,12 @@ class BatchGenerator:
 
         # Generate tokens first
         if len(self._generation_batch) > 0:
+            tic = time.perf_counter()
             generation_responses = self._generation_batch.next()
-            self._gen_tokens_counter += len(generation_responses)
-            self._steps_counter += 1
-            if self._steps_counter % 512 == 0:
+            self._counters.decode_time += time.perf_counter() - tic
+            self._counters.generation_tokens += len(generation_responses)
+            self._counters.generation_steps += 1
+            if self._counters.generation_steps % 512 == 0:
                 mx.clear_cache()
 
         # Exit early because we already have our hands full with decoding
@@ -1892,11 +1862,10 @@ class BatchGenerator:
             prompt_responses.append(response)
 
         # Process the prompts
-        self._prompt_tokens_counter += sum(len(p) for p in prompts)
+        self._counters.prompt_tokens += sum(len(p) for p in prompts)
         tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
-        toc = time.perf_counter()
-        self._prompt_time_counter += toc - tic
+        self._counters.prompt_time += time.perf_counter() - tic
 
         return prompt_responses, generation_responses
 
