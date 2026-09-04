@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -866,6 +867,12 @@ class ResponseGenerator:
                         batch_results.pop(uid, None)
 
     def _serve_single(self, request, stream):
+        # Make sure the model and prompt cache are destroyed in the generation
+        # thread under same stream.
+        del self.model_provider
+        del self.prompt_cache
+        gc.collect()
+
         rqueue, request, args = request
 
         # Define the progress callback
