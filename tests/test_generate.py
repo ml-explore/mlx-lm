@@ -1002,6 +1002,23 @@ class TestGenerate(unittest.TestCase):
         self.assertFalse(matcher.advance(1))
         self.assertTrue(matcher.advance(2))
 
+    def test_batch_mixes_sequences_with_and_without_processors(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+        prompt = self.tokenizer.encode("hello")
+
+        uid_plain, uid_biased = gen.insert(
+            [prompt, prompt],
+            logits_processors=[None, make_logits_processors({0: 2000.0})],
+        )
+
+        tokens = {uid_plain: [], uid_biased: []}
+        while responses := gen.next_generated():
+            for r in responses:
+                tokens[r.uid].append(r.token)
+
+        self.assertEqual(len(tokens[uid_plain]), 3)
+        self.assertEqual(tokens[uid_biased], [0, 0, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

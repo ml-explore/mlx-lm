@@ -862,6 +862,20 @@ def _extend_cache(cache_a, cache_b):
     return cache_a
 
 
+def _normalize_samplers(samplers, *, n, fallback):
+    """One concrete sampler per sequence."""
+    if not samplers:
+        return [fallback] * n
+    return [fallback if s is None else s for s in samplers]
+
+
+def _normalize_logits_processors(logits_processors, *, n):
+    """One concrete tuple of processors per sequence."""
+    if not logits_processors:
+        return [() for _ in range(n)]
+    return [tuple(lp) if lp else () for lp in logits_processors]
+
+
 def _build_trie(sequences):
     """Build an Aho-Corasick trie from the provided sequences
 
@@ -1126,22 +1140,11 @@ class PromptProcessingBatch:
         return [c.extract(idx) for c in self.prompt_cache]
 
     def extend(self, batch):
-        if not any(self.samplers):
-            self.samplers = [None] * len(self.uids)
-        if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
-        samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
-        logits_processors = (
-            batch.logits_processors
-            if any(batch.logits_processors)
-            else [None] * len(batch.uids)
-        )
-
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
-        self.samplers.extend(samplers)
-        self.logits_processors.extend(logits_processors)
+        self.samplers.extend(batch.samplers)
+        self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.stop_sequences.extend(batch.stop_sequences)
 
@@ -1391,32 +1394,33 @@ class GenerationBatch:
         # Logits processors
         token_context = []
         if any(self.logits_processors):
-            # Update the token context that will be used by the logits processors
-            token_context = [
-                tc.update_and_fetch(inputs[i : i + 1])
-                for i, tc in enumerate(self._token_context)
-            ]
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
-                for processor in self.logits_processors[e]:
-                    sample_logits = processor(token_context[e], sample_logits)
+                # Only sequences with processors need a context.
+                processors = self.logits_processors[e] or ()
+                if processors:
+                    context = self._token_context[e].update_and_fetch(inputs[e : e + 1])
+                    token_context.append(context)
+                    for processor in processors:
+                        sample_logits = processor(context, sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
         # Normalize the logits
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-        # Sample
-        if any(self.samplers):
-            all_samples = []
-            for e in range(len(self.uids)):
-                sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
+        # One batched call when the batch shares a sampler.
+        samplers = [
+            self.fallback_sampler if s is None else s
+            for s in (self.samplers or [None] * len(self.uids))
+        ]
+        if not samplers or all(s is samplers[0] for s in samplers):
+            sampled = (samplers[0] if samplers else self.fallback_sampler)(logprobs)
         else:
-            sampled = self.fallback_sampler(logprobs)
+            sampled = mx.concatenate(
+                [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0
+            )
 
         # Assign the next step to member variables and start computing it
         # asynchronously
@@ -1659,9 +1663,10 @@ class BatchGenerator:
 
         max_tokens = max_tokens or [self.max_tokens] * num_segments
         all_tokens = all_tokens or [[] for _ in segments]
-        samplers = samplers or [None] * num_segments
-        logits_processors = logits_processors or (
-            [self.logits_processors] * num_segments
+        samplers = _normalize_samplers(samplers, n=num_segments, fallback=self.sampler)
+        logits_processors = _normalize_logits_processors(
+            logits_processors or [self.logits_processors] * num_segments,
+            n=num_segments,
         )
         stop_sequences = stop_sequences or (
             [self._default_stop_sequences] * num_segments
