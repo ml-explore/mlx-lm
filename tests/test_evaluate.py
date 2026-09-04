@@ -67,6 +67,7 @@ class TestMLXLM(unittest.TestCase):
         result = self.mlx_lm.generate_until([request])
 
         self.assertEqual(result, ["answer"])
+
     def _make_lm(self, **kwargs):
         with patch("mlx_lm.evaluate.load") as mock_load:
             mock_load.return_value = (self.mock_model, self.mock_tokenizer)
