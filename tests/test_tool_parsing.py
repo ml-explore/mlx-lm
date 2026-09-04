@@ -154,6 +154,11 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_longcat_no_args(self):
+        tool_call = longcat.parse_tool_call("get_current_time\n", None)
+        expected = {"name": "get_current_time", "arguments": {}}
+        self.assertEqual(tool_call, expected)
+
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
         test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"

@@ -53,6 +53,7 @@ class NgramEmbedding(nn.Module):
         self.m = args.ngram_vocab_size_ratio * args.vocab_size
         self.k = args.emb_split_num
         self.n = args.emb_neighbor_num
+        self.eos_token_id = getattr(args, "eos_token_id", None)
 
         self.word_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
 
@@ -124,9 +125,26 @@ class NgramEmbedding(nn.Module):
         x = self.word_embeddings(input_ids)
         vocab_mods = self._vocab_mods
 
+        reach = None
+        if self.eos_token_id is not None:
+            pos = mx.arange(context.shape[-1], dtype=context.dtype)
+            marked = mx.where(context == self.eos_token_id, pos, -1)
+            last_eos = mx.cummax(marked, axis=-1)
+            last_before = mx.concatenate(
+                [
+                    mx.full(last_eos[..., :1].shape, -1, last_eos.dtype),
+                    last_eos[..., :-1],
+                ],
+                axis=-1,
+            )
+            reach = pos - last_before
+
         shifted_ids = {}
         for i in range(2, self.n + 1):
-            shifted_ids[i] = self._shift_right(context, i - 1)
+            shifted = self._shift_right(context, i - 1)
+            if reach is not None:
+                shifted = mx.where(reach > i - 1, shifted, 0)
+            shifted_ids[i] = shifted
 
         for i in range(2, self.n + 1):
             for j in range(self.k):
