@@ -392,7 +392,25 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            # This path has no entry in the per-tensor quantization map but
+            # the checkpoint already carries a quantized weight for it (e.g.
+            # a model's sanitize() can derive and re-quantize tensors, such
+            # as the absorbed MLA projections in deepseek_v3/deepseek_v32/
+            # glm4_moe_lite/kimi_linear/longcat_flash, from a source tensor
+            # that has its own per-tensor bits/group_size override). Infer
+            # the actual packing from the weight/scales shapes instead of
+            # assuming the top-level default, so the module nn.quantize
+            # allocates matches the weight that will be loaded into it.
+            in_dims = m.weight.shape[-1]
+            group_size = in_dims // weights[f"{p}.scales"].shape[-1]
+            bits = (weights[f"{p}.weight"].shape[-1] * 32) // in_dims
+            return {
+                "group_size": group_size,
+                "bits": bits,
+                "mode": quantization.get("mode", "affine"),
+            }
 
         nn.quantize(
             model,
