@@ -774,6 +774,8 @@ class TestGenerationThreadDeath(unittest.TestCase):
         time.sleep(0.05)
         self.assertTrue(rg._generation_failed)
         self.assertFalse(rg.generation_available())
+        with self.assertRaisesRegex(RuntimeError, "generation thread died"):
+            rg.generate(None, None)
 
 
 if __name__ == "__main__":
