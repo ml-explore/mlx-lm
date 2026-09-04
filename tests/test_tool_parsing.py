@@ -305,6 +305,28 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
+        # Multiple tool calls
+        test_case = (
+            "<|tool_call_begin|>functions.search:0<|tool_call_argument_begin|>"
+            '{"query": "weather"}<|tool_call_end|>'
+            "<|tool_call_begin|>functions.read_file:1<|tool_call_argument_begin|>"
+            '{"path": "/tmp/test.txt"}<|tool_call_end|>'
+        )
+        tool_calls = kimi_k2.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "id": "functions.search:0",
+                "name": "search",
+                "arguments": {"query": "weather"},
+            },
+            {
+                "id": "functions.read_file:1",
+                "name": "read_file",
+                "arguments": {"path": "/tmp/test.txt"},
+            },
+        ]
+        self.assertEqual(tool_calls, expected)
+
     def test_k2_horizon(self):
         test_case = (
             "<ifm|tool_calls>"
@@ -351,27 +373,35 @@ class TestToolParsing(unittest.TestCase):
             ],
         )
 
-        # Multiple tool calls
         test_case = (
-            "<|tool_call_begin|>functions.search:0<|tool_call_argument_begin|>"
-            '{"query": "weather"}<|tool_call_end|>'
-            "<|tool_call_begin|>functions.read_file:1<|tool_call_argument_begin|>"
-            '{"path": "/tmp/test.txt"}<|tool_call_end|>'
+            "<ifm|tool_calls>"
+            '<ifm|tool_call>{"name":"ask_user","arguments":'
+            '{"questions":[{"question":"Which color?"}]}}</ifm|tool_call>'
+            "</ifm|tool_calls>"
         )
-        tool_calls = kimi_k2.parse_tool_call(test_case, None)
-        expected = [
-            {
-                "id": "functions.search:0",
-                "name": "search",
-                "arguments": {"query": "weather"},
-            },
-            {
-                "id": "functions.read_file:1",
-                "name": "read_file",
-                "arguments": {"path": "/tmp/test.txt"},
-            },
+        self.assertEqual(
+            k2_horizon.parse_tool_call(test_case, None),
+            [
+                {
+                    "name": "ask_user",
+                    "arguments": {"questions": [{"question": "Which color?"}]},
+                }
+            ],
+        )
+
+    def test_k2_horizon_rejects_truncated_calls(self):
+        test_cases = [
+            "<ifm|tool_call>ask_user\n<ifm|arg_key>questions</ifm|arg_key>",
+            (
+                "ask_user\n"
+                "<ifm|arg_key>questions</ifm|arg_key>"
+                "<ifm|arg_value>[1, 2]"
+            ),
         ]
-        self.assertEqual(tool_calls, expected)
+        for test_case in test_cases:
+            with self.subTest(test_case=test_case):
+                with self.assertRaises(ValueError):
+                    k2_horizon.parse_tool_call(test_case, None)
 
     def test_kimi_k3(self):
         # Typed per-key arguments

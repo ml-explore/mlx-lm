@@ -515,7 +515,7 @@ class ResponseGenerator:
 
             if tokenizer.has_chat_template:
                 process_message_content(messages)
-                if tokenizer.has_thinking:
+                if tokenizer.requires_reasoning_fields:
                     ensure_reasoning_fields(messages)
                 if tools and not tokenizer.has_tool_calling:
                     logging.warning(
