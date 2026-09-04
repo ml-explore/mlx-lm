@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -747,7 +748,7 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
-                        self._serve_single((rqueue, request, args))
+                        self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
                     current_model = args.model
@@ -865,7 +866,13 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
-    def _serve_single(self, request):
+        # Make sure the model and prompt cache are destroyed in the generation
+        # thread under same stream.
+        del self.model_provider
+        del self.prompt_cache
+        gc.collect()
+
+    def _serve_single(self, request, stream):
         rqueue, request, args = request
 
         # Define the progress callback
@@ -921,6 +928,7 @@ class ResponseGenerator:
             stop_state = stop_matcher.make_state()
             for gen in stream_generate(
                 model=model,
+                stream=stream,
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
