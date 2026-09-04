@@ -1017,6 +1017,53 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_granite_sensitive_projections_quantize_to_8bit(self):
+        from mlx_lm.models import granite
+        from mlx_lm.utils import quantize_model
+
+        args = granite.ModelArgs(
+            model_type="granite",
+            hidden_size=64,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            logits_scaling=1.0,
+            attention_multiplier=0.015625,
+            embedding_multiplier=1.0,
+            residual_multiplier=1.0,
+            max_position_embeddings=2048,
+            num_key_value_heads=2,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        )
+        model = granite.Model(args)
+        model, config = quantize_model(
+            model,
+            {"model_type": "granite"},
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+
+        layer = model.model.layers[0]
+        for sensitive in (layer.self_attn.o_proj, layer.mlp.down_proj, model.lm_head):
+            self.assertIsInstance(sensitive, nn.QuantizedLinear)
+            self.assertEqual(sensitive.bits, 8)
+        self.assertIsInstance(layer.self_attn.q_proj, nn.QuantizedLinear)
+        self.assertEqual(layer.self_attn.q_proj.bits, 4)
+        self.assertEqual(
+            config["quantization"]["model.layers.0.self_attn.o_proj"]["bits"], 8
+        )
+        self.assertEqual(
+            config["quantization"]["model.layers.0.mlp.down_proj"]["bits"], 8
+        )
+        self.assertEqual(config["quantization"]["lm_head"]["bits"], 8)
+        self.assertEqual(config["quantization"]["bits"], 4)
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
