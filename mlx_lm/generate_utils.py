@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import mlx.core as mx
 
-__all__ = ["BatchCounters", "BatchReading", "BatchStats"]
+__all__ = ["BatchCounters", "BatchCountersSnapshot", "BatchStats"]
 
 
 def _peak_memory_gb() -> float:
@@ -54,7 +54,7 @@ class BatchCounters:
 
 
 @dataclass(kw_only=True, repr=True)
-class BatchReading(BatchCounters):
+class BatchCountersSnapshot(BatchCounters):
     """
     A generator's counters at a moment in time.
 
@@ -70,7 +70,9 @@ class BatchReading(BatchCounters):
     peak_memory: float = field(default_factory=_peak_memory_gb)
 
     @staticmethod
-    def between(start: "BatchReading", end: "BatchReading") -> "BatchStats":
+    def between(
+        start: "BatchCountersSnapshot", end: "BatchCountersSnapshot"
+    ) -> "BatchStats":
         """The work counted between two readings."""
         return BatchStats(
             prompt_tokens=end.prompt_tokens - start.prompt_tokens,
@@ -90,7 +92,7 @@ class BatchStats(BatchCounters):
     What a generator did over an interval.
 
     ``prompt_time``, ``decode_time`` and ``overhead_time`` partition
-    ``wall_time`` exactly. Use :obj:`BatchReading.between` to make one.
+    ``wall_time`` exactly. Use :obj:`BatchCountersSnapshot.between` to make one.
 
     Args:
         wall_time (float): The duration of the interval.

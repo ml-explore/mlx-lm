@@ -16,7 +16,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
-from .generate_utils import BatchCounters, BatchReading, BatchStats
+from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
 from .models.cache import (
     QuantizedKVCache,
     TokenBuffer,
@@ -1596,12 +1596,12 @@ class BatchGenerator:
         each report their own interval.
         """
         stats = BatchStats()
-        start = BatchReading(**asdict(self._counters))
+        start = BatchCountersSnapshot(**asdict(self._counters))
         try:
             yield stats
         finally:
-            end = BatchReading(**asdict(self._counters))
-            stats += BatchReading.between(start, end)
+            end = BatchCountersSnapshot(**asdict(self._counters))
+            stats += BatchCountersSnapshot.between(start, end)
 
     def insert(
         self,
