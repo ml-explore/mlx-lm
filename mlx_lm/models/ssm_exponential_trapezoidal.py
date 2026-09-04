@@ -30,13 +30,6 @@ def compute_dt_eff(dt: mx.array, lam: mx.array) -> mx.array:
         dt_eff[t] = λ[t]·Δt[t]  +  (1−λ[t+1])·Δt[t+1]
 
     (boundary: last position contributes 0 from the t+1 term.)
-
-    Args:
-        dt:  processed dt (after softplus+clip), shape (batch, seq_len, num_heads).
-        lam: raw λ logits (sigmoid applied here),  shape (batch, seq_len, num_heads).
-
-    Returns:
-        dt_eff of the same shape as dt.
     """
     lam = mx.sigmoid(lam) # (b, l, h) ∈ (0,1)
     dt_gamma = lam * dt # γ_t = λ_t Δt_t
@@ -164,30 +157,7 @@ def ssm_attn(
     step: int = 256,
     _dt_eff: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
-    """SSD-SSM forward pass.
-
-    Args:
-        x: Input of shape (batch_size, seq_len, num_heads, head_dim).
-        dt: Time deltas of shape (seq_len, num_heads,).
-        A_log: State transition of shape (num_heads,).
-        B: Input mixing of shape (batch_size, seq_len, num_groups, n).
-        C: Output mixing of shape (batch_size, seq_len, num_groups, n).
-        D: Residual connection.
-        dt_bias: Bias for time deltas of shape (num_heads,).
-        time_step_limit: Minimum and maximum value for time deltas.
-        mask: Optional multiplicative mask.
-        lengths: Optional lengths of sequences, assumed to be the full length if unspecified.
-        step: Step size for processing x.
-        _dt_eff: Optional pre-computed effective dt for Mamba-3 trapezoidal
-            discretization (output of compute_dt_eff).  When supplied, replaces
-            dt in the *input* weighting term (dtx) while the *decay* term (dtA)
-            continues to use the original processed dt.  Pass None (default) for
-            standard Mamba-2 Exponential-Euler behaviour.
-
-    Code modified from
-    https://github.com/cartesia-ai/edge/blob/main/cartesia-mlx/cartesia_mlx/layers/ssd/ops.py
-
-    """
+    """SSD-SSM forward pass."""
     b, l, h, dh = x.shape
     _, _, g, d = B.shape
 
@@ -308,7 +278,6 @@ def ssm_update(
 
 
 # Mamba-3: exponential-trapezoidal SSM update
-
 def _ssm_decode_trap(
     hidden_states: mx.array,
     A_log: mx.array,
@@ -323,21 +292,7 @@ def _ssm_decode_trap(
     """Single-step trapezoidal recurrence for Mamba-3 autoregressive decode.
 
     h_t = α_t h_{t-1}  +  γ_t (B_t ⊗ x_t)  +  β_t prev_Bx
-    where
-        α_t = exp(dt · A),   γ_t = λ_t · dt,   β_t = (1-λ_t) · dt · α_t
-
-    Args:
-        hidden_states: (batch, 1, num_heads, head_dim)
-        B, C:          (batch, 1, n_groups, state_size)  — BCNorm+bias already applied
-        dt:            processed, (batch, 1, num_heads)
-        lam:           raw logits, (batch, 1, num_heads)
-        state:         (batch, num_heads, head_dim, state_size) or None
-        prev_Bx:       (batch, num_heads, head_dim, state_size) or None
-
-    Returns:
-        y         (batch, 1, num_heads, head_dim)
-        new_state (batch, num_heads, head_dim, state_size)
-        new_Bx    (batch, num_heads, head_dim, state_size) — B_t ⊗ x_t for next step
+    where: α_t = exp(dt · A),   γ_t = λ_t · dt,   β_t = (1-λ_t) · dt · α_t
     """
     b, _, h, dh = hidden_states.shape
     _, _, g, d = B.shape
@@ -397,29 +352,14 @@ def ssm_update_trap(
     Decode (seq_len == 1 and state is not None):
         Uses the Python 3-term recurrence (_ssm_decode_trap).  A dedicated
         Metal kernel for Mamba-3 decode is not yet implemented.
-
-    Args:
-        hidden_states: (batch, seq_len, num_heads, head_dim)
-        B, C:         (batch, seq_len, n_groups, state_size) — BCNorm+biases applied
-        dt:           raw dt logits,  (batch, seq_len, num_heads)
-        dt_bias:      (num_heads,)
-        lam:          raw λ logits,   (batch, seq_len, num_heads)
-        state:        previous SSM state or None
-        prev_Bx:      previous B_{t-1}⊗x_{t-1} for the β term, or None
-
-    Returns:
-        y        (batch, seq_len, num_heads, head_dim)
-        state    (batch, num_heads, head_dim, state_size)
-        prev_Bx  (batch, num_heads, head_dim, state_size)
     """
     b, seq_len, h, dh = hidden_states.shape
     g, d = B.shape[-2:]
     repeats = h // g
 
-    # ---- prefill ----
     if seq_len > 1 or state is None:
         dt_proc = compute_dt(dt, dt_bias, time_step_limit) # (b, l, h)
-        dt_eff = compute_dt_eff(dt_proc, lam) # (b, l, h)
+        dt_eff = compute_dt_eff(dt_proc, lam)  # (b, l, h)
 
         y, state = ssm_attn(
             hidden_states, A_log, B, C, D,
@@ -435,7 +375,6 @@ def ssm_update_trap(
 
         return y, state, prev_Bx
 
-    # ---- single-step decode ----
     dt_proc = compute_dt(dt, dt_bias, time_step_limit)
     return _ssm_decode_trap(
         hidden_states, A_log, B, C, D, dt_proc, lam, state, prev_Bx
