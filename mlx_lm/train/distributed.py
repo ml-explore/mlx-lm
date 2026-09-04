@@ -49,8 +49,15 @@ class Mesh:
 
 
 def init_distributed(fsdp_dim: int = 1) -> Mesh:
-
-    g = mx.distributed.init(backend="nccl")
+    if mx.cuda.is_available():
+        backend = "nccl" if mx.cuda.is_available() else "jaccl"
+    elif mx.metal.is_available():
+        backend = "jaccl"
+    else:
+        raise RuntimeError(
+            "No supported distributed backend available. Please ensure that you have either CUDA or Metal support."
+        )
+    g = mx.distributed.init(backend=backend)
     rank, size = g.rank(), g.size()
 
     if size % fsdp_dim != 0:
