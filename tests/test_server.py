@@ -796,5 +796,20 @@ class TestModelSwapClearsCache(unittest.TestCase):
             self.assertGreaterEqual(clear_cache.call_count, 2)
 
 
+class TestGenerationThreadDeath(unittest.TestCase):
+    def test_generation_unavailable_after_thread_crash(self):
+        import time
+
+        class BoomProvider:
+            def load_default(self):
+                raise RuntimeError("simulated generate crash")
+
+        rg = ResponseGenerator(BoomProvider(), LRUPromptCache())
+        rg.join()
+        time.sleep(0.05)
+        self.assertTrue(rg._generation_failed)
+        self.assertFalse(rg.generation_available())
+
+
 if __name__ == "__main__":
     unittest.main()

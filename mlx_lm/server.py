@@ -432,8 +432,25 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_failed = False
+        self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
+
+    def _run_generate(self):
+        try:
+            self._generate()
+        except Exception:
+            logging.exception("mlx_lm.server generation thread died")
+            self._generation_failed = True
+            try:
+                while True:
+                    rqueue, _, _ = self.requests.get_nowait()
+                    rqueue.put(RuntimeError("generation thread died"))
+            except QueueEmpty:
+                pass
+
+    def generation_available(self):
+        return self._generation_thread.is_alive() and not self._generation_failed
 
     def stop_and_join(self):
         self._stop = True
@@ -983,6 +1000,8 @@ class ResponseGenerator:
         generation_args: GenerationArguments,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
+        if not self.generation_available():
+            raise RuntimeError("generation thread died")
         response_queue = Queue()
         self.requests.put((response_queue, request, generation_args))
 
@@ -1608,6 +1627,12 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
+        if not self.response_generator.generation_available():
+            self._set_completion_headers(503)
+            self.end_headers()
+            self.wfile.write('{"status": "generation_unavailable"}'.encode())
+            self.wfile.flush()
+            return
         self._set_completion_headers(200)
         self.end_headers()
 
@@ -1618,6 +1643,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /v1/models endpoint.
         """
+        if not self.response_generator.generation_available():
+            self._set_completion_headers(503)
+            self.end_headers()
+            self.wfile.write(
+                '{"error": {"message": "generation thread died", "type": "server_error"}}'.encode()
+            )
+            self.wfile.flush()
+            return
         self._set_completion_headers(200)
         self.end_headers()
 
