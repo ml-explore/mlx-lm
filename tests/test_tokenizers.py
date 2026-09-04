@@ -10,6 +10,8 @@ from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
+    _infer_thinking,
+    _infer_tool_parser,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -94,6 +96,22 @@ class TestTokenizers(unittest.TestCase):
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
+
+    def test_k2_horizon_markers(self):
+        class K2Tokenizer:
+            chat_template = "<ifm|tool_calls><ifm|tool_call>"
+
+            def get_vocab(self):
+                return {
+                    "<ifm|think>": 1,
+                    "</ifm|think>": 2,
+                    "<ifm|tool_calls>": 3,
+                    "</ifm|tool_calls>": 4,
+                }
+
+        tokenizer = K2Tokenizer()
+        self.assertEqual(_infer_tool_parser(tokenizer), "k2_horizon")
+        self.assertEqual(_infer_thinking(tokenizer)[:2], ("<ifm|think>", "</ifm|think>"))
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"

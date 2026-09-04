@@ -258,6 +258,9 @@ def _infer_thinking(tokenizer):
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
         ("<|think:start|>", "<|think:end|>"),
+        ("<ifm|think>", "</ifm|think>"),
+        ("<ifm|think_fast>", "</ifm|think_fast>"),
+        ("<ifm|think_faster>", "</ifm|think_faster>"),
     ]
 
     # Single token thinking modes
@@ -614,6 +617,8 @@ def _infer_tool_parser(tokenizer):
         return "longcat"
     elif "<arg_key>" in chat_template:
         return "glm47"
+    elif "<ifm|tool_calls>" in chat_template and "<ifm|tool_call>" in chat_template:
+        return "k2_horizon"
     elif "<|tool_list_start|>" in chat_template:
         return "pythonic"
     elif (
