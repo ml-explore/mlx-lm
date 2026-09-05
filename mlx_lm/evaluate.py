@@ -208,8 +208,8 @@ class MLXLM(LM):
             # If the entire prompt got truncated ignore the question
             if prefix_l == 0:
                 long_completions += 1
-                all_scores.extend([-float("inf")] * len(rs))
-                all_is_greedy.extend([False] * len(rs))
+                scores.extend([-float("inf")] * len(rs))
+                is_greedy.extend([False] * len(rs))
                 continue
 
             # model scoring, returns num_requests x (logp, is_greedy, length).
@@ -342,8 +342,9 @@ class MLXLM(LM):
         ]
 
         # TODO consider multi-token, per-prompt stop conditions
+        # lm-eval names the per-task generation cap "max_gen_toks".
         max_tokens = [
-            self._max_tokens or opt.get("max_gen_tokens", DEFAULT_MAX_TOKENS)
+            self._max_tokens or opt.get("max_gen_toks", DEFAULT_MAX_TOKENS)
             for opt in options
         ]
 
@@ -354,6 +355,8 @@ class MLXLM(LM):
             max_tokens=max_tokens,
             verbose=True,
             sampler=self._sampler,
+            prefill_batch_size=self._batch_size,
+            completion_batch_size=self._batch_size,
         ).texts
 
         for e, (text, opt) in enumerate(zip(completions, options)):
@@ -405,7 +408,13 @@ def main():
     parser.add_argument(
         "--output-dir", default=".", help="Output directory for result files."
     )
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Maximum number of sequences processed at once, both when "
+        "scoring and when generating.",
+    )
     parser.add_argument("--num-shots", type=int, default=None, help="Number of shots")
     parser.add_argument(
         "--max-tokens",

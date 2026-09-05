@@ -986,6 +986,69 @@ class TestGenerate(unittest.TestCase):
         state, matched = StopSequenceMatcher.match(state, trie, 7)
         self.assertTrue(matched)
 
+    def test_batch_mixes_sequences_with_and_without_processors(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+        prompt = self.tokenizer.encode("hello")
+
+        uid_plain, uid_biased = gen.insert(
+            [prompt, prompt],
+            logits_processors=[None, make_logits_processors({0: 2000.0})],
+        )
+
+        tokens = {uid_plain: [], uid_biased: []}
+        while responses := gen.next_generated():
+            for r in responses:
+                tokens[r.uid].append(r.token)
+
+        self.assertEqual(len(tokens[uid_plain]), 3)
+        self.assertEqual(tokens[uid_biased], [0, 0, 0])
+
+    def test_batch_stats_empty_window(self):
+        gen = BatchGenerator(self.model)
+        with gen.stats() as stats:
+            pass
+
+        self.assertEqual(stats.prompt_tps, 0.0)
+        self.assertEqual(stats.generation_tps, 0.0)
+        self.assertEqual(stats.decode_tps, 0.0)
+
+    def test_batch_stats_windows_nest(self):
+        gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello world")
+
+        with gen.stats() as outer:
+            gen.insert([prompt])
+            while gen.next_generated():
+                pass
+
+            with gen.stats() as inner:
+                gen.insert([prompt])
+                while gen.next_generated():
+                    pass
+
+        self.assertGreater(inner.generation_tokens, 0)
+        self.assertEqual(outer.generation_tokens, 2 * inner.generation_tokens)
+        self.assertGreater(inner.prompt_tokens, 0)
+        self.assertEqual(outer.prompt_tokens, 2 * inner.prompt_tokens)
+        self.assertGreaterEqual(outer.wall_time, inner.wall_time)
+
+    def test_batch_stats_time_partitions(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+
+        with gen.stats() as stats:
+            gen.insert([self.tokenizer.encode("hello world")])
+            while gen.next_generated():
+                pass
+
+        self.assertGreater(stats.prompt_time, 0.0)
+        self.assertGreater(stats.decode_time, 0.0)
+        self.assertGreaterEqual(stats.overhead_time, 0.0)
+        self.assertAlmostEqual(
+            stats.prompt_time + stats.decode_time + stats.overhead_time,
+            stats.wall_time,
+            places=6,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
