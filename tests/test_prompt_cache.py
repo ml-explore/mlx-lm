@@ -513,6 +513,16 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(mask[0].squeeze().tolist(), [True, True, True])
         self.assertEqual(mask[1].squeeze().tolist(), [False, True, True])
 
+    def test_batch_kv_cache_offset_not_mutated_in_place(self):
+        cache = BatchKVCache(left_padding=[0])
+        captured = cache.offset
+        k, v = mx.zeros((1, 1, 4, 8)), mx.zeros((1, 1, 4, 8))
+        cache.update_and_fetch(k, v)
+        # Capturing offset before update_and_fetch must keep the pre-update
+        # value. In-place mx.array += would corrupt RoPE in gemma3n (#1806).
+        self.assertEqual(int(captured.item()), 0)
+        self.assertEqual(int(cache.offset.item()), 4)
+
         # Test extension
         cache_a = BatchKVCache(left_padding=[2, 1, 2])
         cache_b = BatchKVCache(left_padding=[3, 0])

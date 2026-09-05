@@ -967,7 +967,7 @@ class BatchKVCache(_BaseCache):
             else:
                 self.keys, self.values = new_k, new_v
 
-        self.offset += keys.shape[2]
+        self.offset = self.offset + keys.shape[2]
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
@@ -981,7 +981,7 @@ class BatchKVCache(_BaseCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding
+            self.offset = self.offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
@@ -991,7 +991,7 @@ class BatchKVCache(_BaseCache):
             padding = self._right_padding
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
-            self.offset -= padding
+            self.offset = self.offset - padding
             self.left_padding += padding
             self._right_padding = None
 
@@ -1014,7 +1014,7 @@ class BatchKVCache(_BaseCache):
     def trim(self, n):
         n = min(self._idx, n)
         self._idx -= n
-        self.offset -= n
+        self.offset = self.offset - n
         return n
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
@@ -1198,7 +1198,7 @@ class BatchRotatingKVCache(_BaseCache):
                 self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
                 self.values = dynamic_roll(self.values, roll[:, None], axis=2)
                 self.left_padding += roll
-                self.offset -= roll
+                self.offset = self.offset - roll
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
@@ -1207,7 +1207,7 @@ class BatchRotatingKVCache(_BaseCache):
                 self.left_padding -= trim_size
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
-        self.offset += keys.shape[2]
+        self.offset = self.offset + keys.shape[2]
         self._offset += keys.shape[2]
         self._idx = self.keys.shape[2]
 
@@ -1261,7 +1261,7 @@ class BatchRotatingKVCache(_BaseCache):
         self.keys[..., self._idx : self._idx + S, :] = keys
         self.values[..., self._idx : self._idx + S, :] = values
         self._offset += S
-        self.offset += S
+        self.offset = self.offset + S
         self._idx += S
 
         # Make sure left_padding and offset are evaluated
@@ -1288,7 +1288,7 @@ class BatchRotatingKVCache(_BaseCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding
+            self.offset = self.offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._lengths = mx.array(lengths) + self.offset
@@ -1299,7 +1299,7 @@ class BatchRotatingKVCache(_BaseCache):
             self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
             self.values = dynamic_roll(self.values, roll[:, None], axis=2)
             self.left_padding += roll
-            self.offset -= roll
+            self.offset = self.offset - roll
             self._lengths = None
 
     @property
@@ -1332,7 +1332,7 @@ class BatchRotatingKVCache(_BaseCache):
         n = min(self._offset, n)
         self._offset -= n
         self._idx -= n
-        self.offset -= n
+        self.offset = self.offset - n
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
