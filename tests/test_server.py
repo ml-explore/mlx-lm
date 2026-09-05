@@ -9,7 +9,7 @@ import unittest
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine
+from mlx_lm.generate import TextStateMachine, make_text_state_machine
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
@@ -187,6 +187,27 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(s, "tool")
         state, _, s = sm.step(state, "</tool>")
         self.assertEqual(s, "normal")
+
+    def test_multiple_reasoning_markers(self):
+        class Tokenizer:
+            has_thinking = True
+            thinking_markers = (
+                ("<ifm|think>", "</ifm|think>"),
+                ("<ifm|think_fast>", "</ifm|think_fast>"),
+                ("<ifm|think_faster>", "</ifm|think_faster>"),
+            )
+            has_tool_calling = False
+            structural_markers = ()
+
+        sm = make_text_state_machine(Tokenizer())
+        for think_start, think_end in Tokenizer.thinking_markers:
+            state = sm.make_state()
+            state, text, current = sm.step(state, think_start)
+            self.assertEqual((text, current), ("", "reasoning"))
+            state, text, current = sm.step(state, "hidden")
+            self.assertEqual((text, current), ("hidden", "reasoning"))
+            state, text, current = sm.step(state, think_end)
+            self.assertEqual((text, current), ("", "normal"))
 
     def test_empty_end_marker_stays_in_tool_on_discard(self):
         # Models with an empty tool_call_end (e.g. Mistral) never leave "tool";

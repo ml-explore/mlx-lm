@@ -5,6 +5,7 @@ from mlx_lm.tool_parsers import (
     gemma4,
     glm47,
     json_tools,
+    k2_horizon,
     kimi_k2,
     kimi_k3,
     longcat,
@@ -325,6 +326,82 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_k2_horizon(self):
+        test_case = (
+            "<ifm|tool_calls>"
+            "<ifm|tool_call>ask_user\n"
+            "<ifm|arg_key>questions</ifm|arg_key>\n"
+            "<ifm|arg_type>array</ifm|arg_type>\n"
+            '<ifm|arg_value>[{"question":"Which color?",'
+            '"options":["red","blue"]}]</ifm|arg_value>\n'
+            "</ifm|tool_call>"
+            "</ifm|tool_calls>"
+        )
+        tool_calls = k2_horizon.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {
+                    "name": "ask_user",
+                    "arguments": {
+                        "questions": [
+                            {"question": "Which color?", "options": ["red", "blue"]}
+                        ]
+                    },
+                }
+            ],
+        )
+
+        test_case = (
+            "<ifm|tool_calls>"
+            "<ifm|tool_call>first\n"
+            "<ifm|arg_key>value</ifm|arg_key>"
+            "<ifm|arg_value>1</ifm|arg_value>"
+            "</ifm|tool_call>"
+            "<ifm|tool_call>second\n"
+            "<ifm|arg_key>value</ifm|arg_key>"
+            "<ifm|arg_value>2</ifm|arg_value>"
+            "</ifm|tool_call>"
+            "</ifm|tool_calls>"
+        )
+        self.assertEqual(
+            k2_horizon.parse_tool_call(test_case, None),
+            [
+                {"name": "first", "arguments": {"value": 1}},
+                {"name": "second", "arguments": {"value": 2}},
+            ],
+        )
+
+        test_case = (
+            "<ifm|tool_calls>"
+            '<ifm|tool_call>{"name":"ask_user","arguments":'
+            '{"questions":[{"question":"Which color?"}]}}</ifm|tool_call>'
+            "</ifm|tool_calls>"
+        )
+        self.assertEqual(
+            k2_horizon.parse_tool_call(test_case, None),
+            [
+                {
+                    "name": "ask_user",
+                    "arguments": {"questions": [{"question": "Which color?"}]},
+                }
+            ],
+        )
+
+    def test_k2_horizon_rejects_truncated_calls(self):
+        test_cases = [
+            "<ifm|tool_call>ask_user\n<ifm|arg_key>questions</ifm|arg_key>",
+            (
+                "ask_user\n"
+                "<ifm|arg_key>questions</ifm|arg_key>"
+                "<ifm|arg_value>[1, 2]"
+            ),
+        ]
+        for test_case in test_cases:
+            with self.subTest(test_case=test_case):
+                with self.assertRaises(ValueError):
+                    k2_horizon.parse_tool_call(test_case, None)
 
     def test_kimi_k3(self):
         # Typed per-key arguments

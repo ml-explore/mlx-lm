@@ -10,6 +10,9 @@ from mlx_lm.tokenizer_utils import (
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
+    _infer_thinking,
+    _infer_tool_parser,
+    ensure_reasoning_fields,
 )
 from mlx_lm.utils import load_tokenizer
 
@@ -94,6 +97,66 @@ class TestTokenizers(unittest.TestCase):
         tokenizer_repo = "mlx-community/Llama-3.2-1B-Instruct-4bit"
         tokenizer = load_tokenizer(tokenizer_repo)
         self.assertFalse(tokenizer.has_tool_calling)
+
+    def test_k2_horizon_markers(self):
+        class K2Tokenizer:
+            chat_template = "<ifm|tool_calls><ifm|tool_call>"
+            eos_token_id = 0
+
+            def get_vocab(self):
+                return {
+                    "<ifm|think>": 1,
+                    "</ifm|think>": 2,
+                    "<ifm|tool_calls>": 3,
+                    "</ifm|tool_calls>": 4,
+                    "<ifm|think_fast>": 5,
+                    "</ifm|think_fast>": 6,
+                    "<ifm|think_faster>": 7,
+                    "</ifm|think_faster>": 8,
+                }
+
+            def encode(self, text, add_special_tokens=False):
+                return [self.get_vocab().get(text, 99)]
+
+            def apply_chat_template(self, *args, **kwargs):
+                return []
+
+        tokenizer = K2Tokenizer()
+        self.assertEqual(_infer_tool_parser(tokenizer), "k2_horizon")
+        self.assertEqual(
+            _infer_thinking(tokenizer)[:2], ("<ifm|think>", "</ifm|think>")
+        )
+        wrapper = TokenizerWrapper(
+            tokenizer,
+            tool_call_start="<ifm|tool_calls>",
+            tool_call_end="</ifm|tool_calls>",
+        )
+        self.assertEqual(
+            wrapper.thinking_markers,
+            (
+                ("<ifm|think>", "</ifm|think>"),
+                ("<ifm|think_fast>", "</ifm|think_fast>"),
+                ("<ifm|think_faster>", "</ifm|think_faster>"),
+            ),
+        )
+        self.assertEqual(wrapper.rfind_think_start([1, 2, 5, 6, 7]), 4)
+        self.assertEqual(wrapper.rfind_think_end([1, 2, 5, 6, 7]), 3)
+        self.assertTrue(wrapper.requires_reasoning_fields)
+
+        wrapper = TokenizerWrapper(tokenizer)
+        self.assertFalse(wrapper.requires_reasoning_fields)
+
+    def test_ensure_reasoning_fields(self):
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "", "tool_calls": []},
+            {"role": "assistant", "content": "", "reasoning": "already present"},
+        ]
+
+        ensure_reasoning_fields(messages)
+
+        self.assertEqual(messages[1]["reasoning"], "")
+        self.assertEqual(messages[2]["reasoning"], "already present")
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"

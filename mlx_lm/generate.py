@@ -1033,10 +1033,9 @@ def make_text_state_machine(tokenizer, stop_words=None):
     transitions = {}
 
     if tokenizer.has_thinking:
-        transitions.setdefault("normal", []).append(
-            (tokenizer.think_start, "reasoning")
-        )
-        transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+        for think_start, think_end in tokenizer.thinking_markers:
+            transitions.setdefault("normal", []).append((think_start, "reasoning"))
+            transitions.setdefault("reasoning", []).append((think_end, "normal"))
 
     if tokenizer.has_tool_calling:
         transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))

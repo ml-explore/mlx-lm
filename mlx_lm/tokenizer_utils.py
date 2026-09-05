@@ -9,6 +9,28 @@ from typing import Any, Dict, List, Optional
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+_THINKING_FIELDS = (
+    "think",
+    "reasoning",
+    "reasoning_content",
+    "think_fast",
+    "think_faster",
+)
+
+
+def ensure_reasoning_fields(messages: list[dict]) -> None:
+    """Add an empty reasoning field when a thinking template requires one.
+
+    Some model templates reject otherwise valid historical assistant messages
+    when they omit a thinking field. An empty value preserves the message
+    semantics while allowing the template to render the conversation.
+    """
+    for message in messages:
+        if message.get("role") == "assistant" and not any(
+            field in message for field in _THINKING_FIELDS
+        ):
+            message["reasoning"] = ""
+
 
 class StreamingDetokenizer:
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -252,46 +274,77 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         cls._byte_decoder = char_to_bytes
 
 
-def _infer_thinking(tokenizer):
+def _infer_thinking_markers(tokenizer):
     vocab = tokenizer.get_vocab()
     THINK_TOKENS = [
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
         ("<|think:start|>", "<|think:end|>"),
     ]
+    IFM_THINK_TOKENS = [
+        ("<ifm|think>", "</ifm|think>"),
+        ("<ifm|think_fast>", "</ifm|think_fast>"),
+        ("<ifm|think_faster>", "</ifm|think_faster>"),
+    ]
 
-    # Single token thinking modes
+    # Preserve the existing first-match behavior for standard thinking models.
     for think_start, think_end in THINK_TOKENS:
         if think_start in vocab and think_end in vocab:
-            return (
-                think_start,
-                think_end,
-                (vocab[think_start],),
-                (vocab[think_end],),
+            return [
+                (
+                    think_start,
+                    think_end,
+                    (vocab[think_start],),
+                    (vocab[think_end],),
+                )
+            ]
+
+    # K2-Horizon supports all three reasoning efforts in one tokenizer.
+    markers = []
+    for think_start, think_end in IFM_THINK_TOKENS:
+        if think_start in vocab and think_end in vocab:
+            markers.append(
+                (
+                    think_start,
+                    think_end,
+                    (vocab[think_start],),
+                    (vocab[think_end],),
+                )
             )
+    if markers:
+        return markers
 
     # Multi token thinking modes
     if "<|channel>" in vocab and "<channel|>" in vocab:
         think_start = "<|channel>thought"
         think_end = "<channel|>"
-        return (
-            think_start,
-            think_end,
-            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
-            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
-        )
+        return [
+            (
+                think_start,
+                think_end,
+                tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+                tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+            )
+        ]
 
     if _is_xtml_vocab(vocab):
         think_start = "<|open|>think<|sep|>"
         think_end = "<|close|>think<|sep|>"
-        return (
-            think_start,
-            think_end,
-            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
-            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
-        )
+        return [
+            (
+                think_start,
+                think_end,
+                tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+                tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+            )
+        ]
 
-    return (None, None, None, None)
+    return []
+
+
+def _infer_thinking(tokenizer):
+    markers = _infer_thinking_markers(tokenizer)
+    return markers[0] if markers else (None, None, None, None)
 
 
 def _is_xtml_vocab(vocab):
@@ -349,12 +402,19 @@ class TokenizerWrapper:
             if eos_token_ids is not None
             else {tokenizer.eos_token_id}
         )
-        (
-            self._think_start,
-            self._think_end,
-            self._think_start_tokens,
-            self._think_end_tokens,
-        ) = _infer_thinking(tokenizer)
+        self._thinking_markers = _infer_thinking_markers(tokenizer)
+        if self._thinking_markers:
+            (
+                self._think_start,
+                self._think_end,
+                self._think_start_tokens,
+                self._think_end_tokens,
+            ) = self._thinking_markers[0]
+        else:
+            self._think_start = None
+            self._think_end = None
+            self._think_start_tokens = None
+            self._think_end_tokens = None
         self._structural_markers = _infer_structural_markers(tokenizer)
 
         self._chat_template = chat_template
@@ -367,6 +427,7 @@ class TokenizerWrapper:
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
+        self._requires_reasoning_fields = tool_call_start == "<ifm|tool_calls>"
         self._tool_call_start_tokens = None
         self._tool_call_end_tokens = None
         if tool_call_start is not None:
@@ -419,25 +480,41 @@ class TokenizerWrapper:
                     return i
         return -1
 
+    def _find_thinking(self, tokens, marker_index, start=None, end=None, reverse=False):
+        matches = [
+            self._find(
+                tokens,
+                marker[marker_index],
+                start=start,
+                end=end,
+                reverse=reverse,
+            )
+            for marker in self._thinking_markers
+        ]
+        matches = [match for match in matches if match >= 0]
+        if not matches:
+            return -1
+        return max(matches) if reverse else min(matches)
+
     def find_think_start(self, tokens, start=None, end=None):
-        return self._find(tokens, self._think_start_tokens, start=start, end=end)
+        return self._find_thinking(tokens, 2, start=start, end=end)
 
     def rfind_think_start(self, tokens, start=None, end=None):
-        return self._find(
-            tokens, self._think_start_tokens, start=start, end=end, reverse=True
-        )
+        return self._find_thinking(tokens, 2, start=start, end=end, reverse=True)
 
     def find_think_end(self, tokens, start=None, end=None):
-        return self._find(tokens, self._think_end_tokens, start=start, end=end)
+        return self._find_thinking(tokens, 3, start=start, end=end)
 
     def rfind_think_end(self, tokens, start=None, end=None):
-        return self._find(
-            tokens, self._think_end_tokens, start=start, end=end, reverse=True
-        )
+        return self._find_thinking(tokens, 3, start=start, end=end, reverse=True)
 
     @property
     def has_thinking(self):
-        return self._think_start is not None
+        return bool(self._thinking_markers)
+
+    @property
+    def thinking_markers(self):
+        return tuple((marker[0], marker[1]) for marker in self._thinking_markers)
 
     @property
     def think_start(self):
@@ -498,6 +575,10 @@ class TokenizerWrapper:
     @property
     def tool_parser(self):
         return self._tool_parser
+
+    @property
+    def requires_reasoning_fields(self):
+        return self._requires_reasoning_fields
 
     @property
     def detokenizer(self):
@@ -614,6 +695,8 @@ def _infer_tool_parser(tokenizer):
         return "longcat"
     elif "<arg_key>" in chat_template:
         return "glm47"
+    elif "<ifm|tool_calls>" in chat_template and "<ifm|tool_call>" in chat_template:
+        return "k2_horizon"
     elif "<|tool_list_start|>" in chat_template:
         return "pythonic"
     elif (
