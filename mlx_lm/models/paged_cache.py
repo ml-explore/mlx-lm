@@ -454,6 +454,23 @@ class PagedKVCache(_BaseCache):
         self._append(keys, values)
         return self.gather()
 
+    def update_and_attend(self, queries, keys, values, *, scale, mask=None):
+        attention = getattr(self.pool, "attention", None)
+        if attention is not None and queries.shape[2] == 1 and mask is None:
+            self._append(keys, values)
+            return attention(
+                queries,
+                self.pool.keys,
+                self.pool.values,
+                self.device_page_ids()[None],
+                mx.array([self.offset], dtype=mx.uint32),
+                scale=scale,
+            )
+        keys, values = self.update_and_fetch(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask
+        )
+
     def gather(self):
         self._ensure_live()
         if not self._page_ids:
@@ -557,6 +574,12 @@ class PagedKVCache(_BaseCache):
         return self.pool.keys, self.pool.values
 
 
+@dataclass(frozen=True)
+class _PagedDecodeMask:
+    array: mx.array
+    offsets: tuple
+
+
 class BatchPagedKVCache(_BaseCache):
     """Reference batch view over independent paged sequence caches."""
 
@@ -632,7 +655,7 @@ class BatchPagedKVCache(_BaseCache):
         if keys.dtype != self.pool.dtype or values.dtype != self.pool.dtype:
             raise ValueError("key and value dtype must match the pool")
 
-    def update_and_fetch(self, keys: mx.array, values: mx.array):
+    def update_and_fetch(self, keys: mx.array, values: mx.array, *, gather_output=True):
         self._validate_update(keys, values)
         # Check the whole batch before any row consumes pages or advances.
         with self.pool._reservation_lock:
@@ -668,9 +691,11 @@ class BatchPagedKVCache(_BaseCache):
                         available_pages=available,
                         pool_generation=self.pool.generation,
                     )
-            return self._update_and_fetch(keys, values)
+            return self._update_and_fetch(keys, values, gather_output=gather_output)
 
-    def _update_and_fetch(self, keys: mx.array, values: mx.array):
+    def _update_and_fetch(
+        self, keys: mx.array, values: mx.array, *, gather_output=True
+    ):
         self._validate_update(keys, values)
         step_tokens = keys.shape[2]
         history = self.gather() if self._remaining_lengths is not None else None
@@ -690,7 +715,45 @@ class BatchPagedKVCache(_BaseCache):
                 mx.concatenate([history_keys, keys], axis=2),
                 mx.concatenate([history_values, values], axis=2),
             )
-        return self.gather()
+        return self.gather() if gather_output else None
+
+    def update_and_attend(self, queries, keys, values, *, scale, mask=None):
+        attention = getattr(self.pool, "attention", None)
+        causal = isinstance(mask, _PagedDecodeMask) and mask.offsets == tuple(
+            c.offset for c in self.caches
+        )
+        if isinstance(mask, _PagedDecodeMask):
+            mask = mask.array
+        if (
+            attention is not None
+            and queries.shape[2] == 1
+            and self._remaining_lengths is None
+            and (mask is None or causal)
+        ):
+            self.update_and_fetch(keys, values, gather_output=False)
+            versions = tuple((id(c), c._page_table_version) for c in self.caches)
+            if versions != self._block_table_versions:
+                width = max(len(c._page_ids) for c in self.caches)
+                self._block_tables = mx.array(
+                    [
+                        c._page_ids + [0] * (width - len(c._page_ids))
+                        for c in self.caches
+                    ],
+                    dtype=mx.uint32,
+                )
+                self._block_table_versions = versions
+            return attention(
+                queries,
+                self.pool.keys,
+                self.pool.values,
+                self._block_tables,
+                mx.array([c.offset for c in self.caches], dtype=mx.uint32),
+                scale=scale,
+            )
+        keys, values = self.update_and_fetch(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries, keys, values, scale=scale, mask=mask
+        )
 
     def gather(self):
         self._ensure_live()
@@ -789,12 +852,19 @@ class BatchPagedKVCache(_BaseCache):
     def make_mask(self, num_queries: int, return_array: bool = False, **kwargs):
         self._ensure_live()
         left_padding = mx.array([self.size() - cache.offset for cache in self.caches])
-        return create_causal_mask(
+        mask = create_causal_mask(
             num_queries,
             offset=self.size(),
             left_padding=left_padding,
             **kwargs,
         )
+        if (
+            num_queries == 1
+            and not kwargs.get("window_size")
+            and getattr(self.pool, "attention", None) is not None
+        ):
+            return _PagedDecodeMask(mask, tuple(c.offset for c in self.caches))
+        return mask
 
     def empty(self):
         self._ensure_live()

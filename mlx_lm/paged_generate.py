@@ -9,13 +9,32 @@ from .models.paged_cache import QwenHybridPagedKVCacheManager
 
 
 class PagedBatchGenerator(BatchGenerator):
-    def __init__(self, model, *, capacity_pages, page_size=256, **kwargs):
+    def __init__(
+        self, model, *, capacity_pages, page_size=256, paged_attention=False, **kwargs
+    ):
         self._admissions = {}
         if kwargs.get("max_kv_size") is not None:
             raise ValueError("Paged KV does not support a rotating max_kv_size")
         self.cache_manager = QwenHybridPagedKVCacheManager(
             model, capacity_pages=capacity_pages, page_size=page_size
         )
+        if paged_attention:
+            from eco_paged_attention import _paged_attention
+
+            text_model = getattr(model, "language_model", model)
+            for layer, pool in zip(text_model.layers, self.cache_manager._pools):
+                if pool is None:
+                    continue
+                if (
+                    pool.key_head_dim != 256
+                    or layer.self_attn.num_attention_heads
+                    not in (
+                        6 * pool.num_kv_heads,
+                        8 * pool.num_kv_heads,
+                    )
+                ):
+                    raise ValueError("ECO paged attention requires D256 and GQA 6 or 8")
+                pool.attention = _paged_attention
         super().__init__(model, **kwargs)
         with mx.stream(self.stream):
             self.cache_manager.materialize()

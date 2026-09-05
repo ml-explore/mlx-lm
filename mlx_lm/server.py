@@ -791,6 +791,9 @@ class ResponseGenerator:
                         generator_options = dict(
                             capacity_pages=self.cli_args.paged_kv_pages,
                             page_size=self.cli_args.paged_kv_page_size,
+                            paged_attention=getattr(
+                                self.cli_args, "paged_attention", False
+                            ),
                         )
                     try:
                         batch_generator = generator_class(
@@ -1789,6 +1792,11 @@ def run(
 def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
+        "--paged-attention",
+        action="store_true",
+        help="Use the optional ECO decode extension with paged KV",
+    )
+    parser.add_argument(
         "--paged-kv-pages",
         type=int,
         default=0,
@@ -1935,6 +1943,8 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    if args.paged_attention and not args.paged_kv_pages:
+        parser.error("--paged-attention requires --paged-kv-pages")
     if args.paged_kv_pages < 0 or args.paged_kv_page_size <= 0:
         parser.error(
             "paged-kv-pages must be nonnegative and paged-kv-page-size positive"
