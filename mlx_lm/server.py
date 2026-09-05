@@ -35,9 +35,8 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
-    StopSequenceMatcher,
     TextStateMachine,
-    make_stop_matcher,
+    make_stop_sequences,
     make_text_state_machine,
     stream_generate,
 )
@@ -608,20 +607,20 @@ class ResponseGenerator:
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
+        """Make (and cache) a StopSequences and TextStateMachine."""
         cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        stop_matcher = make_stop_matcher(tokenizer, stop_words)
+        stop_sequences = make_stop_sequences(tokenizer, stop_words)
         text_sm = make_text_state_machine(tokenizer, stop_words)
 
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_matcher, text_sm)
+        self._state_machine_cache[cache_key] = (stop_sequences, text_sm)
 
-        return stop_matcher, text_sm
+        return stop_sequences, text_sm
 
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
@@ -683,7 +682,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_matcher, text_sm = self._make_state_machine(
+                    stop_sequences, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         tokenizer,
                         args.stop_words,
@@ -721,7 +720,7 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        stop_matchers=[stop_matcher],
+                        stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -891,7 +890,7 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_matcher, text_sm = self._make_state_machine(
+            stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
@@ -929,7 +928,8 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
-            stop_state = stop_matcher.make_state()
+            # Own matcher: the automaton is cached across requests.
+            stop_matcher = stop_sequences.matcher()
             for gen in stream_generate(
                 model=model,
                 stream=stream,
@@ -947,10 +947,7 @@ class ResponseGenerator:
                 finish_reason = gen.finish_reason
 
                 # Token-level stop word detection
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, gen.token
-                )
-                if matched:
+                if stop_matcher.advance(gen.token):
                     finish_reason = "stop"
 
                 rqueue.put(
