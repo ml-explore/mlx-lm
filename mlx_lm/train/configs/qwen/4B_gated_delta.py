@@ -27,7 +27,6 @@ def model_config():
     config.partial_rotary_factor = 0.25
     config.attn_output_gate = True
 
-    # Gated delta net: four value heads per key head.
     config.linear_num_key_heads = 16
     config.linear_num_value_heads = 32
     config.linear_key_head_dim = 128

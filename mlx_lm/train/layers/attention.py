@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Any, Optional, Tuple
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -143,81 +143,7 @@ def _compute_g(A_log: mx.array, a: mx.array, dt_bias: mx.array) -> mx.array:
     return mx.exp(-mx.exp(A_log.astype(mx.float32)) * nn.softplus(a + dt_bias))
 
 
-@mx.compile
-def _gated_delta_step(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    beta: mx.array,
-    state: mx.array,
-    mask: Optional[mx.array] = None,
-) -> Tuple[mx.array, mx.array]:
-    """One step of the recurrence.
-
-    Shapes: q, k [B, H, Dk]; v [B, H, Dv]; g, beta [B, H]; state [B, H, Dv, Dk].
-    """
-    old_state = state
-    state = state * g[..., None, None]
-    kv_mem = (state * k[..., None, :]).sum(axis=-1)
-    delta = (v - kv_mem) * beta[..., None]
-    state = state + k[..., None, :] * delta[..., None]
-    y = (state * q[..., None, :]).sum(axis=-1)
-    if mask is not None:
-        state = mx.where(mask[:, None, None, None], state, old_state)
-    return y.astype(q.dtype), state
-
-
-def gated_delta_update(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    a: mx.array,
-    b: mx.array,
-    A_log: mx.array,
-    dt_bias: mx.array,
-    state: Optional[mx.array] = None,
-    mask: Optional[mx.array] = None,
-) -> Tuple[mx.array, mx.array]:
-    """Run the gated delta rule over a sequence.
-
-    The recurrence is a sequential scan over the T steps, which keeps it
-    differentiable.
-
-    Shapes: q, k [B, T, Hk, Dk]; v [B, T, Hv, Dv]; a, b [B, T, Hv];
-    mask [B, T]; state [B, Hv, Dv, Dk].
-    Returns y [B, T, Hv, Dv] and the state after the last step.
-    """
-    B, T, Hk, Dk = q.shape
-    Hv, Dv = v.shape[-2:]
-    if state is None:
-        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
-
-    beta = mx.sigmoid(b)
-    g = _compute_g(A_log, a, dt_bias)
-
-    # The key heads are grouped, so each one serves several value heads.
-    if (repeats := Hv // Hk) > 1:
-        q = mx.repeat(q, repeats, -2)
-        k = mx.repeat(k, repeats, -2)
-
-    ys = []
-    for t in range(T):
-        y, state = _gated_delta_step(
-            q[:, t],
-            k[:, t],
-            v[:, t],
-            g[:, t],
-            beta[:, t],
-            state,
-            None if mask is None else mask[:, t],
-        )
-        ys.append(y)
-    return mx.stack(ys, axis=1), state
-
-
 class GatedDeltaNet(nn.Module):
-    """Linear attention with a gated delta rule, as in Qwen3.5."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -307,16 +233,15 @@ class GatedDeltaNet(nn.Module):
         q = (self.inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = self.inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
+        gamma = _compute_g(self.A_log, a, self.dt_bias)
+        out, state = mx.fast.gated_delta_update(
             q,
             k,
             v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
+            gamma,
+            mx.sigmoid(b),
+            initial_state=state,
+            mask=mask,
         )
 
         if cache is not None:
