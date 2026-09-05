@@ -3748,6 +3748,192 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def test_gemma4_assistant(self):
+        from mlx_lm.models import gemma4_assistant
+
+        args = gemma4_assistant.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_assistant",
+                "backbone_hidden_size": 16,
+                "num_centroids": 4,
+                "centroid_intermediate_top_k": 2,
+                "use_ordered_embeddings": True,
+                "vocab_size": 8,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "vocab_size": 8,
+                    "rms_norm_eps": 1e-6,
+                    "max_position_embeddings": 128,
+                    "layer_types": ["full_attention", "sliding_attention"],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                    },
+                },
+            }
+        )
+        model = gemma4_assistant.Model(args)
+        # Initialize the centroid lookup buffer to a valid permutation for
+        # testing. In production this is loaded from the checkpoint via
+        # `Model.sanitize` which renames `token_ordering` → `_token_ordering`.
+        model.masked_embedding._token_ordering = mx.arange(8, dtype=mx.int32)
+
+        B, L, Lt, BH, H, HD = 2, 3, 5, 16, 8, 4
+        inputs_embeds = mx.random.uniform(shape=(B, L, 2 * BH))
+        shared_kv = {
+            lt: (
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+            )
+            for lt in ("full_attention", "sliding_attention")
+        }
+        position_ids = mx.array([[Lt - 1]] * B)
+
+        for dt in (mx.float32, mx.float16):
+            # Underscore-prefixed `_token_ordering` is excluded from
+            # parameters(), so this tree_map cast does NOT corrupt the
+            # int32 gather indices.
+            model.update(tree_map(lambda p: p.astype(dt), model.parameters()))
+            shared_kv_dt = {
+                lt: (k.astype(dt), v.astype(dt)) for lt, (k, v) in shared_kv.items()
+            }
+            last_hidden, logits = model(
+                inputs_embeds.astype(dt), shared_kv_dt, position_ids=position_ids
+            )
+            self.assertEqual(last_hidden.shape, (B, L, BH))
+            self.assertEqual(last_hidden.dtype, dt)
+            self.assertEqual(logits.shape, (B, L, args.vocab_size))
+            self.assertEqual(logits.dtype, dt)
+
+        # make_cache raises NotImplementedError (assistant owns no KV cache;
+        # caller must pass target's shared_kv_states to __call__).
+        with self.assertRaises(NotImplementedError):
+            model.make_cache()
+
+        # quant_predicate excludes centroids
+        self.assertFalse(model.quant_predicate("masked_embedding.centroids", None))
+        self.assertTrue(model.quant_predicate("pre_projection", None))
+
+        # Pickle / deepcopy compatibility (mlx-lm convention)
+        copy.deepcopy(model)
+
+    def test_gemma4_assistant_no_ordered_embeddings(self):
+        from mlx_lm.models import gemma4_assistant
+
+        args = gemma4_assistant.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_assistant",
+                "backbone_hidden_size": 16,
+                "num_centroids": 4,
+                "centroid_intermediate_top_k": 2,
+                "use_ordered_embeddings": False,  # ← flipped
+                "vocab_size": 8,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "vocab_size": 8,
+                    "rms_norm_eps": 1e-6,
+                    "max_position_embeddings": 128,
+                    "layer_types": ["full_attention", "sliding_attention"],
+                    "rope_parameters": {
+                        "full_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default",
+                            "partial_rotary_factor": 1.0,
+                        },
+                    },
+                },
+            }
+        )
+        model = gemma4_assistant.Model(args)
+        self.assertIsNone(model.masked_embedding)
+
+        B, L, Lt, BH, HD = 2, 3, 5, 16, 4
+        inputs_embeds = mx.random.uniform(shape=(B, L, 2 * BH))
+        shared_kv = {
+            lt: (
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+                mx.random.uniform(shape=(B, 2, Lt, HD)),
+            )
+            for lt in ("full_attention", "sliding_attention")
+        }
+        last_hidden, logits = model(
+            inputs_embeds, shared_kv, position_ids=mx.array([[Lt - 1]] * B)
+        )
+        self.assertEqual(last_hidden.shape, (B, L, BH))
+        self.assertEqual(logits.shape, (B, L, args.vocab_size))
+
+    def test_gemma4_assistant_published_checkpoint_forward_shapes(self):
+        """Opt-in network test: load the real mlx-community drafter and run
+        a single forward pass with synthetic K/V matching the real target's
+        shapes. Skipped by default; set ``MLX_LM_RUN_NETWORK_TESTS=1`` to run.
+        """
+        import os
+
+        if not os.environ.get("MLX_LM_RUN_NETWORK_TESTS"):
+            self.skipTest("network test; set MLX_LM_RUN_NETWORK_TESTS=1 to enable")
+        from huggingface_hub import snapshot_download
+
+        from mlx_lm import load
+
+        snapshot_download("mlx-community/gemma-4-E4B-it-assistant-bf16")
+        model, _ = load("mlx-community/gemma-4-E4B-it-assistant-bf16")
+        self.assertEqual(len(model.layers), 4)
+        self.assertEqual(model.args.text_config["hidden_size"], 256)
+        self.assertEqual(model.args.backbone_hidden_size, 2560)
+        self.assertEqual(model.args.num_centroids, 2048)
+
+        # Real config: full_attention layers use global_head_dim=512,
+        # sliding_attention layers use head_dim=256. The drafter dispatches
+        # per layer_type, so shared_kv head_dim must match each.
+        B, Lt = 1, 16
+        n_kv_heads = 2
+        full_head_dim = (
+            model.args.text_config.get("global_head_dim")
+            or model.args.text_config["head_dim"]
+        )
+        sliding_head_dim = model.args.text_config["head_dim"]
+        shared_kv = {
+            "full_attention": (
+                mx.zeros((B, n_kv_heads, Lt, full_head_dim)),
+                mx.zeros((B, n_kv_heads, Lt, full_head_dim)),
+            ),
+            "sliding_attention": (
+                mx.zeros((B, n_kv_heads, Lt, sliding_head_dim)),
+                mx.zeros((B, n_kv_heads, Lt, sliding_head_dim)),
+            ),
+        }
+        inputs_embeds = mx.zeros((B, 1, 2 * 2560))
+        last_hidden, logits = model(
+            inputs_embeds, shared_kv, position_ids=mx.array([[Lt - 1]])
+        )
+        self.assertEqual(last_hidden.shape, (B, 1, 2560))
+        self.assertEqual(logits.shape, (B, 1, 262144))
+
 
 if __name__ == "__main__":
     unittest.main()
