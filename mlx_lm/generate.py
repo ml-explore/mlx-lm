@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -16,6 +16,7 @@ import mlx.nn as nn
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
+from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
 from .models.cache import (
     QuantizedKVCache,
     TokenBuffer,
@@ -301,6 +302,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
     *,
     max_tokens: int = 256,
     sampler: Optional[Sampler] = None,
@@ -390,7 +392,7 @@ def generate_step(
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
 
-        with mx.stream(generation_stream):
+        with mx.stream(stream):
             logits = _model_call(
                 input_tokens=input_tokens[None],
                 input_embeddings=(
@@ -415,7 +417,7 @@ def generate_step(
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
 
-    with mx.stream(generation_stream):
+    with mx.stream(stream):
         total_prompt_tokens = (
             len(input_embeddings) if input_embeddings is not None else len(prompt)
         )
@@ -450,9 +452,8 @@ def generate_step(
             mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
-
-    with mx.stream(generation_stream):
         mx.async_eval(y, logprobs)
+
         n = 0
         while True:
             if n != max_tokens:
@@ -474,6 +475,7 @@ def speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
     draft_model: nn.Module,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
@@ -551,30 +553,25 @@ def speculative_generate_step(
         return y, logprobs
 
     def _step(model, cache, y, n_predict=1):
-        with mx.stream(generation_stream):
-            logits = model(y[None], cache=cache)
-            logits = logits[:, -n_predict:, :]
+        logits = model(y[None], cache=cache)
+        logits = logits[:, -n_predict:, :]
 
-            quantize_cache_fn(cache)
-            if logits_processors:
-                nonlocal prev_tokens
-                out_y, out_logprobs = [], []
-                if n_predict > 1:
-                    y = y[: -(n_predict - 1)]
-                for i in range(n_predict):
-                    prev_tokens = (
-                        mx.concatenate([prev_tokens, y])
-                        if prev_tokens is not None
-                        else y
-                    )
-                    y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
-                    out_y.append(y)
-                    out_logprobs.append(logprobs)
-                return mx.concatenate(out_y, axis=0), mx.concatenate(
-                    out_logprobs, axis=0
+        quantize_cache_fn(cache)
+        if logits_processors:
+            nonlocal prev_tokens
+            out_y, out_logprobs = [], []
+            if n_predict > 1:
+                y = y[: -(n_predict - 1)]
+            for i in range(n_predict):
+                prev_tokens = (
+                    mx.concatenate([prev_tokens, y]) if prev_tokens is not None else y
                 )
-            else:
-                return _process_and_sample(None, logits.squeeze(0))
+                y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
+                out_y.append(y)
+                out_logprobs.append(logprobs)
+            return mx.concatenate(out_y, axis=0), mx.concatenate(out_logprobs, axis=0)
+        else:
+            return _process_and_sample(None, logits.squeeze(0))
 
     def _prefill(model, cache, y):
         while y.size > 1:
@@ -600,7 +597,7 @@ def speculative_generate_step(
             ys.append(y)
         return mx.concatenate(ys)
 
-    with mx.stream(generation_stream):
+    with mx.stream(stream):
         draft_y = _prefill(draft_model, draft_cache, y)
         y = _prefill(model, model_cache, y)
 
@@ -662,6 +659,7 @@ def stream_generate(
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    stream: mx.Stream | mx.ThreadLocalStream = generation_stream,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -707,7 +705,7 @@ def stream_generate(
 
     if draft_model is None:
         kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
+        token_generator = generate_step(prompt, model, stream, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
@@ -716,9 +714,9 @@ def stream_generate(
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
+            prompt, model, draft_model, stream, **kwargs
         )
-    with wired_limit(model, [generation_stream]):
+    with wired_limit(model, [stream]):
         tic = time.perf_counter()
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
@@ -812,30 +810,6 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
 
 
-@dataclass
-class BatchStats:
-    """
-    An data object to hold generation stats.
-
-    Args:
-        prompt_tokens (int): The number of prompt tokens processed.
-        prompt_tps (float): The prompt processing tokens-per-second.
-        prompt_time (float): The time in seconds spent in prompt processing.
-        generation_tokens (int): The number of generated tokens.
-        generation_tps (float): The tokens-per-second for generation.
-        generation_time (float): The time in seconds spent in generation .
-        peak_memory (float): The peak memory used so far in GB.
-    """
-
-    prompt_tokens: int = 0
-    prompt_tps: float = 0
-    prompt_time: float = 0
-    generation_tokens: int = 0
-    generation_tps: float = 0
-    generation_time: float = 0
-    peak_memory: float = 0
-
-
 def _merge_caches(caches):
     batch_cache = []
 
@@ -860,6 +834,20 @@ def _extend_cache(cache_a, cache_b):
     for ca, cb in zip(cache_a, cache_b):
         ca.extend(cb)
     return cache_a
+
+
+def _normalize_samplers(samplers, *, n, fallback):
+    """One concrete sampler per sequence."""
+    if not samplers:
+        return [fallback] * n
+    return [fallback if s is None else s for s in samplers]
+
+
+def _normalize_logits_processors(logits_processors, *, n):
+    """One concrete tuple of processors per sequence."""
+    if not logits_processors:
+        return [() for _ in range(n)]
+    return [tuple(lp) if lp else () for lp in logits_processors]
 
 
 def _build_trie(sequences):
@@ -1127,22 +1115,11 @@ class PromptProcessingBatch:
         return [c.extract(idx) for c in self.prompt_cache]
 
     def extend(self, batch):
-        if not any(self.samplers):
-            self.samplers = [None] * len(self.uids)
-        if not any(self.logits_processors):
-            self.logits_processors = [None] * len(self.uids)
-        samplers = batch.samplers if any(batch.samplers) else [None] * len(batch.uids)
-        logits_processors = (
-            batch.logits_processors
-            if any(batch.logits_processors)
-            else [None] * len(batch.uids)
-        )
-
         self.uids.extend(batch.uids)
         self.prompt_cache = _extend_cache(self.prompt_cache, batch.prompt_cache)
         self.tokens.extend(batch.tokens)
-        self.samplers.extend(samplers)
-        self.logits_processors.extend(logits_processors)
+        self.samplers.extend(batch.samplers)
+        self.logits_processors.extend(batch.logits_processors)
         self.max_tokens.extend(batch.max_tokens)
         self.stop_matchers.extend(batch.stop_matchers)
 
@@ -1392,32 +1369,33 @@ class GenerationBatch:
         # Logits processors
         token_context = []
         if any(self.logits_processors):
-            # Update the token context that will be used by the logits processors
-            token_context = [
-                tc.update_and_fetch(inputs[i : i + 1])
-                for i, tc in enumerate(self._token_context)
-            ]
             processed_logits = []
             for e in range(len(self.uids)):
                 sample_logits = logits[e : e + 1]
-                for processor in self.logits_processors[e]:
-                    sample_logits = processor(token_context[e], sample_logits)
+                # Only sequences with processors need a context.
+                processors = self.logits_processors[e] or ()
+                if processors:
+                    context = self._token_context[e].update_and_fetch(inputs[e : e + 1])
+                    token_context.append(context)
+                    for processor in processors:
+                        sample_logits = processor(context, sample_logits)
                 processed_logits.append(sample_logits)
             logits = mx.concatenate(processed_logits, axis=0)
 
         # Normalize the logits
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
 
-        # Sample
-        if any(self.samplers):
-            all_samples = []
-            for e in range(len(self.uids)):
-                sample_sampler = self.samplers[e] or self.fallback_sampler
-                sampled = sample_sampler(logprobs[e : e + 1])
-                all_samples.append(sampled)
-            sampled = mx.concatenate(all_samples, axis=0)
+        # One batched call when the batch shares a sampler.
+        samplers = [
+            self.fallback_sampler if s is None else s
+            for s in (self.samplers or [None] * len(self.uids))
+        ]
+        if not samplers or all(s is samplers[0] for s in samplers):
+            sampled = (samplers[0] if samplers else self.fallback_sampler)(logprobs)
         else:
-            sampled = self.fallback_sampler(logprobs)
+            sampled = mx.concatenate(
+                [s(logprobs[e : e + 1]) for e, s in enumerate(samplers)], axis=0
+            )
 
         # Assign the next step to member variables and start computing it
         # asynchronously
@@ -1585,10 +1563,7 @@ class BatchGenerator:
         self._unprocessed_sequences = deque()
         self._currently_processing = []
 
-        self._prompt_tokens_counter = 0
-        self._prompt_time_counter = 0
-        self._gen_tokens_counter = 0
-        self._steps_counter = 0
+        self._counters = BatchCounters()
 
         if mx.metal.is_available():
             self._old_wired_limit = mx.set_wired_limit(
@@ -1611,25 +1586,19 @@ class BatchGenerator:
         self.close()
 
     @contextlib.contextmanager
-    def stats(self, stats=None):
-        stats = stats or BatchStats()
-        self._prompt_tokens_counter = 0
-        self._prompt_time_counter = 0
-        self._gen_tokens_counter = 0
-        tic = time.perf_counter()
+    def stats(self):
+        """The work this generator does while the block runs.
+
+        Readings are taken on entry and exit and subtracted, so nested windows
+        each report their own interval.
+        """
+        stats = BatchStats()
+        start = BatchCountersSnapshot(**asdict(self._counters))
         try:
             yield stats
         finally:
-            toc = time.perf_counter()
-            total_time = toc - tic
-            gen_time = total_time - self._prompt_time_counter
-            stats.prompt_tokens += self._prompt_tokens_counter
-            stats.prompt_time += self._prompt_time_counter
-            stats.prompt_tps = stats.prompt_tokens / stats.prompt_time
-            stats.generation_tokens += self._gen_tokens_counter
-            stats.generation_time += gen_time
-            stats.generation_tps = stats.generation_tokens / stats.generation_time
-            stats.peak_memory = max(stats.peak_memory, mx.get_peak_memory() / 1e9)
+            end = BatchCountersSnapshot(**asdict(self._counters))
+            stats += BatchCountersSnapshot.between(start, end)
 
     def insert(
         self,
@@ -1665,9 +1634,10 @@ class BatchGenerator:
 
         max_tokens = max_tokens or [self.max_tokens] * num_segments
         all_tokens = all_tokens or [[] for _ in segments]
-        samplers = samplers or [None] * num_segments
-        logits_processors = logits_processors or (
-            [self.logits_processors] * num_segments
+        samplers = _normalize_samplers(samplers, n=num_segments, fallback=self.sampler)
+        logits_processors = _normalize_logits_processors(
+            logits_processors or [self.logits_processors] * num_segments,
+            n=num_segments,
         )
         stop_matchers = stop_matchers or ([self._default_stop_matcher] * num_segments)
 
@@ -1823,10 +1793,12 @@ class BatchGenerator:
 
         # Generate tokens first
         if len(self._generation_batch) > 0:
+            tic = time.perf_counter()
             generation_responses = self._generation_batch.next()
-            self._gen_tokens_counter += len(generation_responses)
-            self._steps_counter += 1
-            if self._steps_counter % 512 == 0:
+            self._counters.decode_time += time.perf_counter() - tic
+            self._counters.generation_tokens += len(generation_responses)
+            self._counters.generation_steps += 1
+            if self._counters.generation_steps % 512 == 0:
                 mx.clear_cache()
 
         # Exit early because we already have our hands full with decoding
@@ -1887,11 +1859,10 @@ class BatchGenerator:
             prompt_responses.append(response)
 
         # Process the prompts
-        self._prompt_tokens_counter += sum(len(p) for p in prompts)
+        self._counters.prompt_tokens += sum(len(p) for p in prompts)
         tic = time.perf_counter()
         self._prompt_batch.prompt(prompts)
-        toc = time.perf_counter()
-        self._prompt_time_counter += toc - tic
+        self._counters.prompt_time += time.perf_counter() - tic
 
         return prompt_responses, generation_responses
 

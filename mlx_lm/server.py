@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -303,6 +304,13 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -312,10 +320,7 @@ class ModelProvider:
             )
 
         # Remove the old model if it exists.
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
+        self.reset()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -747,7 +752,7 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
-                        self._serve_single((rqueue, request, args))
+                        self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
                     current_model = args.model
@@ -865,7 +870,13 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
-    def _serve_single(self, request):
+        # Make sure the model and prompt cache are destroyed in the generation
+        # thread under same stream.
+        self.model_provider.reset()
+        del self.prompt_cache
+        gc.collect()
+
+    def _serve_single(self, request, stream):
         rqueue, request, args = request
 
         # Define the progress callback
@@ -921,6 +932,7 @@ class ResponseGenerator:
             stop_state = stop_matcher.make_state()
             for gen in stream_generate(
                 model=model,
+                stream=stream,
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
