@@ -39,6 +39,8 @@ jobs:
         run: |
           uv venv --python 3.10
           uv pip install -e ".[test]"
+      - name: Install paged attention extension
+        run: uv pip install ./extensions/eco-paged-attention
       - name: Run tests
         env:
           METAL_DEVICE_WRAPPER_TYPE: 1

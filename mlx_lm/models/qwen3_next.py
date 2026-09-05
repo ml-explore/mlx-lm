@@ -145,14 +145,20 @@ class Qwen3NextAttention(nn.Module):
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
             keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
-        )
+        if cache is not None and hasattr(cache, "update_and_attend"):
+            output = cache.update_and_attend(
+                queries, keys, values, scale=self.scale, mask=mask
+            )
+        else:
+            if cache is not None:
+                keys, values = cache.update_and_fetch(keys, values)
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output * mx.sigmoid(gate))
