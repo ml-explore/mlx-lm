@@ -304,6 +304,13 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -313,10 +320,7 @@ class ModelProvider:
             )
 
         # Remove the old model if it exists.
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
+        self.reset()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -868,7 +872,7 @@ class ResponseGenerator:
 
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
-        del self.model_provider
+        self.model_provider.reset()
         del self.prompt_cache
         gc.collect()
 
