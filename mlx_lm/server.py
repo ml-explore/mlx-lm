@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Thread
+from threading import Lock, Thread
 from typing import (
     Any,
     Callable,
@@ -319,8 +319,12 @@ class ModelProvider:
                 "Loading with adapters or draft models not supported in distributed mode"
             )
 
-        # Remove the old model if it exists.
+        # Remove the old model if it exists. Dropping the refs returns the
+        # weights to MLX's buffer pool, not the OS; clear that pool so a
+        # later load of a different model does not keep every previous one.
         self.reset()
+        gc.collect()
+        mx.clear_cache()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -432,8 +436,28 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_failed = False
+        self._generation_lock = Lock()
+        self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
+
+    def _run_generate(self):
+        try:
+            self._generate()
+        except Exception:
+            logging.exception("mlx_lm.server generation thread died")
+            with self._generation_lock:
+                self._generation_failed = True
+                try:
+                    while True:
+                        rqueue, _, _ = self.requests.get_nowait()
+                        rqueue.put(RuntimeError("generation thread died"))
+                except QueueEmpty:
+                    pass
+
+    def generation_available(self):
+        with self._generation_lock:
+            return self._generation_thread.is_alive() and not self._generation_failed
 
     def stop_and_join(self):
         self._stop = True
@@ -444,7 +468,7 @@ class ResponseGenerator:
 
     @property
     def is_healthy(self):
-        return self._generation_thread.is_alive()
+        return self.generation_available()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -995,7 +1019,10 @@ class ResponseGenerator:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         response_queue = Queue()
-        self.requests.put((response_queue, request, generation_args))
+        with self._generation_lock:
+            if not (self._generation_thread.is_alive() and not self._generation_failed):
+                raise RuntimeError("generation thread died")
+            self.requests.put((response_queue, request, generation_args))
 
         def _inner():
             while True:
@@ -1633,6 +1660,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /v1/models endpoint.
         """
+        if not self.response_generator.generation_available():
+            self._set_completion_headers(503)
+            self.end_headers()
+            self.wfile.write(
+                '{"error": {"message": "generation thread died", "type": "server_error"}}'.encode()
+            )
+            self.wfile.flush()
+            return
         self._set_completion_headers(200)
         self.end_headers()
 
