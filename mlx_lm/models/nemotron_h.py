@@ -1,8 +1,9 @@
 # Copyright © 2025 Apple Inc.
 
+from copy import copy
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -56,13 +57,58 @@ class ModelArgs(BaseModelArgs):
     time_step_limit: Optional[Tuple[float, float]] = None
     time_step_min: Optional[float] = None
     time_step_max: Optional[float] = None
+    block_configs: Optional[List[Dict[str, Any]]] = None
 
     # Map from layers_block_type names to single-char pattern codes
     _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
 
+    @classmethod
+    def from_dict(cls, params):
+        params = dict(params)
+        if params.get("num_hidden_layers") is None:
+            blocks = params.get("block_configs") or params.get("layers_block_type")
+            if blocks is not None:
+                params["num_hidden_layers"] = len(blocks)
+        return super().from_dict(params)
+
     def __post_init__(self):
         if self.time_step_limit is None:
-            self.time_step_limit = (0.0, float("inf"))
+            lower_limit = (
+                self.time_step_min
+                if self.model_type == "nemotron_h_puzzle"
+                and self.time_step_min is not None
+                else 0.0
+            )
+            self.time_step_limit = (lower_limit, float("inf"))
+
+        if self.block_configs is not None:
+            if len(self.block_configs) != self.num_hidden_layers:
+                raise ValueError(
+                    "block_configs must contain one entry per hidden layer: "
+                    f"got {len(self.block_configs)} entries for "
+                    f"{self.num_hidden_layers} layers"
+                )
+            block_types = []
+            for layer_idx, config in enumerate(self.block_configs):
+                block_type = config.get("block_type")
+                if block_type not in self._block_type_to_char:
+                    raise ValueError(
+                        f"Puzzle block {layer_idx} has unsupported block_type "
+                        f"{block_type!r}; expected one of "
+                        f"{sorted(self._block_type_to_char)}"
+                    )
+                block_types.append(block_type)
+                if block_type == "moe":
+                    missing = {
+                        "moe_intermediate_size",
+                        "num_experts_per_tok",
+                    } - config.keys()
+                    if missing:
+                        raise ValueError(
+                            f"Puzzle MoE block {layer_idx} is missing "
+                            f"{sorted(missing)}"
+                        )
+            self.layers_block_type = block_types
 
         # Normalize to hybrid_override_pattern (single-char list)
         if self.hybrid_override_pattern is None and self.layers_block_type is not None:
@@ -71,6 +117,34 @@ class ModelArgs(BaseModelArgs):
             ]
         if self.hybrid_override_pattern is not None:
             self.num_hidden_layers = len(self.hybrid_override_pattern)
+
+    def for_layer(self, layer_idx: int):
+        """Return a shallow config copy with Puzzle blockwise values applied."""
+        if self.block_configs is None:
+            return self
+
+        layer_args = copy(self)
+        block_config = self.block_configs[layer_idx]
+        for name in ("moe_intermediate_size", "num_experts_per_tok"):
+            if name in block_config:
+                setattr(layer_args, name, block_config[name])
+        return layer_args
+
+
+class NemotronHRMSNorm(nn.Module):
+    """Reference-compatible RMSNorm with float32 reduction and scaling."""
+
+    def __init__(self, hidden_size: int, eps: float):
+        super().__init__()
+        self.eps = eps
+        self.weight = mx.ones(hidden_size)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        input_dtype = x.dtype
+        x = x.astype(mx.float32)
+        variance = mx.mean(mx.square(x), axis=-1, keepdims=True)
+        x = x * mx.rsqrt(variance + self.eps)
+        return (self.weight.astype(mx.float32) * x).astype(input_dtype)
 
 
 class MambaRMSNormGated(nn.Module):
@@ -112,9 +186,11 @@ class NemotronHMamba2Mixer(nn.Module):
             bias=args.use_conv_bias,
         )
 
+        self.is_puzzle = args.model_type == "nemotron_h_puzzle"
+        projection_bias = args.use_bias if self.is_puzzle else args.mamba_proj_bias
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
         self.in_proj = nn.Linear(
-            self.hidden_size, projection_size, bias=args.mamba_proj_bias
+            self.hidden_size, projection_size, bias=projection_bias
         )
 
         self.dt_bias = mx.ones(self.num_heads)
@@ -128,7 +204,7 @@ class NemotronHMamba2Mixer(nn.Module):
             group_size=group_size,
         )
         self.out_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
+            self.intermediate_size, self.hidden_size, bias=projection_bias
         )
 
     def _conv(
@@ -175,6 +251,23 @@ class NemotronHMamba2Mixer(nn.Module):
         mask: Optional[mx.array],
     ) -> mx.array:
         batch_size, seq_len, _ = hidden_states.shape
+        output_dtype = hidden_states.dtype
+
+        if self.is_puzzle:
+            # NVIDIA promotes the state-space operands and A_log
+            # exponentiation to float32, but computes softplus(dt + dt_bias)
+            # in the projected activation dtype. Preserve that boundary to
+            # match the Puzzle reference implementation.
+            hidden_states = hidden_states.astype(mx.float32)
+            B = B.astype(mx.float32)
+            C = C.astype(mx.float32)
+            A_log = self.A_log.astype(mx.float32)
+            D = self.D.astype(mx.float32)
+            dt_bias = self.dt_bias.astype(dt.dtype)
+        else:
+            A_log = self.A_log
+            D = self.D.astype(hidden_states.dtype)
+            dt_bias = self.dt_bias
 
         hidden_states = hidden_states.reshape(
             batch_size, seq_len, self.num_heads, self.head_dim
@@ -189,19 +282,22 @@ class NemotronHMamba2Mixer(nn.Module):
 
         y, state = ssm_update(
             hidden_states,
-            self.A_log,
+            A_log,
             B,
             C,
-            self.D.astype(hidden_states.dtype),
+            D,
             dt,
-            self.dt_bias,
+            dt_bias,
             state,
             self.time_step_limit,
-            mask,
+            mask=mask,
+            promote_dt=not self.is_puzzle,
         )
         if cache:
             cache[1] = state
 
+        if self.is_puzzle:
+            y = y.astype(output_dtype)
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
     def __call__(
@@ -354,12 +450,19 @@ class MoEGate(nn.Module):
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_group = config.n_group
         self.topk_group = config.topk_group
+        self.is_puzzle = config.model_type == "nemotron_h_puzzle"
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, x):
+        if self.is_puzzle:
+            # Puzzle selects among 512 experts and computes router logits in
+            # float32 before top-k selection.
+            router_logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        else:
+            router_logits = x @ self.weight.T
         return group_expert_select(
-            x @ self.weight.T,
+            router_logits,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,
@@ -427,7 +530,10 @@ class NemotronHMoE(nn.Module):
 class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, block_type: str):
         super().__init__()
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
+        norm_cls = (
+            NemotronHRMSNorm if args.model_type == "nemotron_h_puzzle" else nn.RMSNorm
+        )
+        self.norm = norm_cls(args.hidden_size, eps=args.layer_norm_epsilon)
 
         self.block_type = block_type
 
@@ -460,10 +566,13 @@ class NemotronHModel(nn.Module):
         super().__init__()
         self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            NemotronHBlock(args, block_type)
-            for block_type in args.hybrid_override_pattern
+            NemotronHBlock(args.for_layer(layer_idx), block_type)
+            for layer_idx, block_type in enumerate(args.hybrid_override_pattern or [])
         ]
-        self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
+        norm_cls = (
+            NemotronHRMSNorm if args.model_type == "nemotron_h_puzzle" else nn.RMSNorm
+        )
+        self.norm_f = norm_cls(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
         self.ssm_idx = 0
         for b in args.hybrid_override_pattern:
@@ -535,7 +644,23 @@ class Model(nn.Module):
                 caches.append(KVCache())
         return caches
 
+    @property
+    def quant_predicate(self):
+        if self.model_type != "nemotron_h_puzzle":
+            return lambda _path, _module: True
+        # Puzzle's 131k-token output projection is unusually sensitive to
+        # low-bit affine quantization. Quantizing it at 4 bits produced
+        # unrelated and repetitive generations while the same checkpoint
+        # generated correctly with the BF16 head restored.
+        return lambda path, _: path != "lm_head"
+
     def sanitize(self, weights):
+        # Official Hugging Face Puzzle checkpoints use ``model.*`` while MLX's
+        # Nemotron-H implementation names the same module ``backbone.*``.
+        weights = {
+            (f"backbone.{k[6:]}" if k.startswith("model.") else k): v
+            for k, v in weights.items()
+        }
         weights = {k: v for (k, v) in weights.items() if not k.startswith("mtp.")}
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
