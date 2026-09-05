@@ -1648,6 +1648,66 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_glm_moe_dsa(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern="FSFSFS",
+        )
+        self.assertEqual(
+            args.indexer_types,
+            ["full", "shared", "full", "shared", "full", "shared"],
+        )
+        model = glm_moe_dsa.Model(args)
+
+        has_indexer = [l.self_attn.indexer is not None for l in model.model.layers]
+        self.assertEqual(has_indexer, [True, False, True, False, True, False])
+
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        cache = make_prompt_cache(model)
+        logits = model(prompt, cache=cache)
+        self.assertEqual(logits.shape, (1, 8, args.vocab_size))
+        nxt = mx.argmax(logits[0, -1:, :], keepdims=True)
+        logits = model(nxt, cache=cache)
+        self.assertEqual(logits.shape, (1, 1, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        mx.eval([c.state for c in cache])
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
