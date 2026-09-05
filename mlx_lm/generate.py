@@ -230,7 +230,7 @@ def wired_limit(model: nn.Module, streams: Optional[List[mx.Stream]] = None):
     async eval could be running pass in the streams to synchronize with prior
     to exiting the context manager.
     """
-    if not mx.metal.is_available():
+    if not mx.metal.is_available() or mx.default_device() != mx.gpu:
         try:
             yield
         finally:
@@ -1565,7 +1565,7 @@ class BatchGenerator:
 
         self._counters = BatchCounters()
 
-        if mx.metal.is_available():
+        if mx.metal.is_available() and mx.default_device() == mx.gpu:
             self._old_wired_limit = mx.set_wired_limit(
                 mx.device_info()["max_recommended_working_set_size"]
             )
