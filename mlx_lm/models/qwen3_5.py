@@ -13,7 +13,7 @@ from .base import (
     create_attention_mask,
     create_ssm_mask,
 )
-from .cache import ArraysCache, KVCache
+from .cache import KVCache, RecurrentCache
 from .gated_delta import gated_delta_update
 from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
@@ -134,7 +134,7 @@ class GatedDeltaNet(nn.Module):
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
+        cache: Optional[RecurrentCache] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -146,25 +146,17 @@ class GatedDeltaNet(nn.Module):
         b = self.in_proj_b(inputs)
         a = self.in_proj_a(inputs)
 
-        if cache is not None and cache[0] is not None:
-            conv_state = cache[0]
+        if mask is not None:
+            qkv = mx.where(mask[..., None], qkv, 0)
+
+        if cache is not None:
+            conv_input = cache.update_conv_input(0, qkv)
         else:
             conv_state = mx.zeros(
                 (B, self.conv_kernel_size - 1, self.conv_dim),
                 dtype=inputs.dtype,
             )
-
-        if mask is not None:
-            qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
+            conv_input = mx.concatenate([conv_state, qkv], axis=1)
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -176,12 +168,11 @@ class GatedDeltaNet(nn.Module):
             )
         ]
 
-        state = cache[1] if cache else None
         inv_scale = k.shape[-1] ** -0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
-        out, state = gated_delta_update(
+        out, states = gated_delta_update(
             q,
             k,
             v,
@@ -189,14 +180,14 @@ class GatedDeltaNet(nn.Module):
             b,
             self.A_log,
             self.dt_bias,
-            state,
+            cache[1] if cache is not None else None,
             mask,
             use_kernel=not self.training,
+            return_num_states=(None if cache is None else cache.max_size),
         )
 
         if cache is not None:
-            cache[1] = state
-            cache.advance(S)
+            cache.update_ssm_states(states)
 
         out = self.norm(out, z)
         out = self.out_proj(out.reshape(B, S, -1))
@@ -343,7 +334,14 @@ class TextModel(nn.Module):
         return self.model.pipeline_layers
 
     def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+        return [
+            (
+                RecurrentCache(1, self.args.linear_conv_kernel_dim, max_size=20)
+                if l.is_linear
+                else KVCache()
+            )
+            for l in self.layers
+        ]
 
     def sanitize(self, weights):
         has_unsanitized_conv1d = any(
