@@ -627,6 +627,8 @@ def _infer_tool_parser(tokenizer):
         return "mistral"
     elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
         return "json_tools"
+    elif "<function name=" in chat_template and "<param name=" in chat_template:
+        return "minicpm5"
     return None
 
 
