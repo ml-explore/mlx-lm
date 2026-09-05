@@ -1,5 +1,5 @@
-from setuptools import setup
 from mlx import extension
+from setuptools import setup
 
 setup(
     name="eco-paged-attention",

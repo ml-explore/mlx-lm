@@ -1,7 +1,9 @@
 """ECO D256 GQA decode extension for MLX 0.32.2."""
 
 import math
+
 import mlx.core as mx
+
 from . import _ext
 
 

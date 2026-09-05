@@ -72,6 +72,13 @@ class DummyModelProvider:
     def load_default(self):
         return self.load("default_model", None, "default_model")
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
 
 class MockCache:
     def __init__(self, value, is_trimmable: bool = True):
@@ -321,6 +328,18 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_generation_thread_exit_releases_model(self):
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        provider = response_generator.model_provider
+        response_generator.stop_and_join()
+
+        # The weights are dropped even though this frame still holds the
+        # provider, and the args survive for request handler threads.
+        self.assertIsNone(provider.model)
+        self.assertIsNone(provider.tokenizer)
+        self.assertFalse(provider.is_batchable)
+        self.assertIsNotNone(response_generator.cli_args.allowed_origins)
+
     def test_make_state_machine_empty_tool_call_end(self):
         class FakeTokenizer:
             has_thinking = False
@@ -368,6 +387,18 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+
+    def test_health_endpoint(self):
+        url = f"http://localhost:{self.port}/health"
+
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+        self.response_generator.stop_and_join()
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "unavailable"})
 
 
 class TestServerWithDraftModel(unittest.TestCase):

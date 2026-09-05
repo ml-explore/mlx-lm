@@ -306,6 +306,13 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -315,10 +322,7 @@ class ModelProvider:
             )
 
         # Remove the old model if it exists.
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
+        self.reset()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -439,6 +443,10 @@ class ResponseGenerator:
 
     def join(self):
         self._generation_thread.join()
+
+    @property
+    def is_healthy(self):
+        return self._generation_thread.is_alive()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -927,7 +935,7 @@ class ResponseGenerator:
             batch_generator.close()
         for result in batch_results.values():
             result["rqueue"].put(RuntimeError("Server stopped"))
-        del self.model_provider
+        self.model_provider.reset()
         del self.prompt_cache
         gc.collect()
 
@@ -1675,10 +1683,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
-        self._set_completion_headers(200)
+        is_healthy = self.response_generator.is_healthy
+        status_code = 200 if is_healthy else 503
+        status = "ok" if is_healthy else "unavailable"
+
+        self._set_completion_headers(status_code)
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.write(json.dumps({"status": status}).encode())
         self.wfile.flush()
 
     def handle_models_request(self):

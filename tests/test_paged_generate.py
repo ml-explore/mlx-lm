@@ -3,11 +3,11 @@ import unittest
 from unittest.mock import patch
 
 import mlx.core as mx
+import test_paged_cache
 
 from mlx_lm.generate import BatchGenerator
 from mlx_lm.models.paged_cache import PageAllocationError, RequestCapacityError
 from mlx_lm.paged_generate import PagedBatchGenerator
-import test_paged_cache
 
 
 class TestPagedGenerator(unittest.TestCase):

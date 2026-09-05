@@ -1,11 +1,13 @@
 import unittest
 from dataclasses import replace
 from unittest.mock import patch
+
 import mlx.core as mx
-from eco_paged_attention import paged_attention
 import test_paged_generate
-from mlx_lm.models.qwen3_5 import TextModel
+from eco_paged_attention import paged_attention
+
 from mlx_lm.models.paged_cache import BatchPagedKVCache
+from mlx_lm.models.qwen3_5 import TextModel
 from mlx_lm.paged_generate import PagedBatchGenerator
 
 
