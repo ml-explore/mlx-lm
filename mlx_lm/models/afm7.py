@@ -359,7 +359,7 @@ class AFMModel(nn.Module):
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, cache=c)
 
-        keys, values = cache[-1].state
+        keys, values = cache[-1].keys_and_values()
         for layer in self.kv_reuse_layers:
             h = layer(h, keys, values, mask)
 
