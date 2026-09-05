@@ -13,6 +13,7 @@ from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
     StopSequenceMatcher,
+    _build_trie,
     batch_generate,
     generate,
     generate_step,
@@ -38,6 +39,28 @@ class TestGenerate(unittest.TestCase):
         text = generate(
             self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
         )
+
+    def test_generate_step_processor_sees_prefilled_prompt(self):
+        # prefill_step_size=2 over a 4-token prompt leaves one token for _step,
+        # so the processor only sees the whole prompt if prefill contributes.
+        prompt = mx.array([2, 5, 7, 9])
+        histories = []
+
+        def record_history(tokens, logits):
+            histories.append(tokens.tolist())
+            return logits
+
+        list(
+            generate_step(
+                prompt,
+                self.model,
+                max_tokens=1,
+                prefill_step_size=2,
+                logits_processors=[record_history],
+            )
+        )
+
+        self.assertEqual(histories[0], [2, 5, 7, 9])
 
     def test_generate_with_logit_bias(self):
         logit_bias = {0: 2000.0, 1: -20.0}
@@ -927,6 +950,41 @@ class TestGenerate(unittest.TestCase):
             future = pool.submit(run_on_worker)
             tokens = future.result(timeout=30)
         self.assertGreater(len(tokens), 0)
+
+    def test_stream_generate_rejects_zero_max_tokens(self):
+        with self.assertRaises(ValueError):
+            next(stream_generate(self.model, self.tokenizer, "hello", max_tokens=0))
+
+        gen = stream_generate(self.model, self.tokenizer, "hello", max_tokens=-1)
+        self.assertIsNotNone(next(gen).token)
+        gen.close()
+
+    def test_insert_validates_atomically(self):
+        gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello")
+
+        # A short option list must raise, not drop the third prompt.
+        with self.assertRaises(ValueError) as ctx:
+            gen.insert([prompt, prompt, prompt], max_tokens=[2, 2])
+        self.assertIn("max_tokens", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            gen.insert([prompt, prompt], max_tokens=[2, 0])
+        with self.assertRaises(ValueError):
+            gen.insert([[]])
+
+        # Nothing was enqueued and the uid counter did not advance.
+        self.assertEqual(len(gen._unprocessed_sequences), 0)
+        self.assertEqual(gen.insert([prompt]), [0])
+
+    def test_build_trie_ignores_empty_sequences(self):
+        trie = _build_trie([[], [7]])
+
+        state = trie
+        state, matched = StopSequenceMatcher.match(state, trie, 3)
+        self.assertFalse(matched)
+        state, matched = StopSequenceMatcher.match(state, trie, 7)
+        self.assertTrue(matched)
 
 
 if __name__ == "__main__":

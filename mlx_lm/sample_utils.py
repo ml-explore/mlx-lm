@@ -6,6 +6,9 @@ from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
 
+Sampler = Callable[[mx.array], mx.array]
+LogitsProcessor = Callable[[mx.array, mx.array], mx.array]
+
 
 def make_sampler(
     temp: float = 0.0,
@@ -16,7 +19,7 @@ def make_sampler(
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.1,
     xtc_special_tokens: List[int] = [],
-) -> Callable[[mx.array], mx.array]:
+) -> Sampler:
     """
     Make a sampler function for use with ``generate_step``.
 
@@ -40,15 +43,15 @@ def make_sampler(
 
 
     Returns:
-        Callable[mx.array, mx.array]:
+        Sampler:
             A sampler which takes log-probabilities and returns tokens.
     """
     if temp == 0:
-        return lambda x: mx.argmax(x, axis=-1)
+        return greedy_sampler
 
     # Create sampler chain
     sampling_methods = []
-    if top_p > 0 and top_p < 1.0:
+    if 0 < top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
     if min_p != 0.0:
         sampling_methods.append(lambda x: apply_min_p(x, min_p, min_tokens_to_keep))
@@ -60,7 +63,7 @@ def make_sampler(
         sampling_methods.append(lambda x: apply_top_k(x, top_k))
 
     # Apply the sampling methods
-    def sampler(logprobs):
+    def sampler(logprobs: mx.array) -> mx.array:
         for method in sampling_methods:
             logprobs = method(logprobs)
         # Return the sampled token
@@ -77,7 +80,7 @@ def make_logits_processors(
     presence_context_size: Optional[int] = 20,
     frequency_penalty: Optional[float] = None,
     frequency_context_size: Optional[int] = 20,
-):
+) -> List[LogitsProcessor]:
     """
     Make logits processors for use with ``generate_step``.
 
@@ -98,7 +101,7 @@ def make_logits_processors(
         logit_bias (dictionary, optional): Additive logit bias.
 
     Returns:
-        List[Callable[[mx.array, mx.array], mx.array]]:
+        List[LogitsProcessor]:
             A list of logits processors. Each processor in the list is a
             callable which takes an array of tokens and an array of logits
             and returns the updated logits.
@@ -124,6 +127,10 @@ def make_logits_processors(
             logits_processors.append(make_penalty(penalty, context_size))
 
     return logits_processors
+
+
+def greedy_sampler(logprobs: mx.array) -> mx.array:
+    return mx.argmax(logprobs, axis=-1)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
@@ -194,7 +201,7 @@ def apply_min_p(
         tokens_to_remove = mx.put_along_axis(
             tokens_to_remove,
             top_indices,
-            False,
+            mx.array(False),
             axis=-1,
         )
 
@@ -212,7 +219,7 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     Returns:
         token selected based on the top-p criterion.
     """
-    # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L449-L460
+    # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L527-L539
     probs = mx.exp(logprobs)
     # sort in ascending order
     sorted_indices = mx.argsort(logprobs, axis=-1)
@@ -220,21 +227,12 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
 
     cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
 
-    # Rearrange cumulative probs back to original order
-    inverse_indices = mx.put_along_axis(
-        mx.zeros_like(sorted_indices),
-        sorted_indices,
-        mx.arange(sorted_indices.shape[-1], dtype=sorted_indices.dtype),
-        axis=-1,
+    # Scatter the keep mask back into vocabulary order.
+    sorted_keep = cumulative_probs > 1 - top_p
+    keep = mx.put_along_axis(
+        mx.zeros_like(sorted_keep), sorted_indices, sorted_keep, axis=-1
     )
-    cumulative_probs = mx.take_along_axis(cumulative_probs, inverse_indices, axis=-1)
-
-    # select tokens with cumulative probs below threshold
-    return mx.where(
-        cumulative_probs > 1 - top_p,
-        logprobs,
-        -float("inf"),
-    )
+    return mx.where(keep, logprobs, -float("inf"))
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
@@ -277,8 +275,8 @@ def apply_xtc(
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
-def categorical_sampling(logits, temp):
-    return mx.random.categorical(logits * (1 / temp))
+def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
+    return mx.random.categorical(logits * (1.0 / temp))
 
 
 def make_repetition_penalty(penalty: float, context_size: int = 20):

@@ -78,6 +78,23 @@ class TestSampleUtils(unittest.TestCase):
             actual_probs.tolist(), [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
         )
 
+    def test_apply_min_p_min_tokens_to_keep(self):
+        # min_tokens_to_keep > 1 must execute (regression: bare Python
+        # False passed to mx.put_along_axis raised TypeError) and must
+        # keep exactly that many candidates under an aggressive filter.
+        probs = mx.array([0.7, 0.2, 0.05, 0.05])[None]
+        logits = mx.log(probs)
+        new_logits = apply_min_p(logits, 0.9, min_tokens_to_keep=2)
+        kept = (new_logits > -float("inf")).sum().item()
+        self.assertEqual(kept, 2)
+
+        # Batch mode
+        probs = mx.array([[0.9, 0.05, 0.03, 0.02], [0.4, 0.3, 0.2, 0.1]])
+        logits = mx.log(probs)
+        new_logits = apply_min_p(logits, 0.99, min_tokens_to_keep=3)
+        kept_per_row = (new_logits > -float("inf")).sum(axis=-1).tolist()
+        self.assertEqual(kept_per_row, [3, 3])
+
     def test_apply_top_k(self):
         probs = mx.array([0.9, 0.0, 0.0, 0.1])[None]
         logits = mx.log(probs)

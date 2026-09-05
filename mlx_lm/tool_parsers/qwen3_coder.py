@@ -87,10 +87,12 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
-    end_index = function_call_str.index(">")
-    function_name = function_call_str[:end_index]
+    name_match = re.match(r"\s*([^\s<>]+)>?", function_call_str)
+    if name_match is None:
+        raise ValueError("No function name provided.")
+    function_name = name_match.group(1)
     param_config = _get_arguments_config(function_name, tools)
-    parameters = function_call_str[end_index + 1 :]
+    parameters = function_call_str[name_match.end() :]
     param_dict = {}
     for match_text in _parameter_regex.findall(parameters):
         idx = match_text.index(">")

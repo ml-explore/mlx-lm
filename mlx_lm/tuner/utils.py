@@ -54,6 +54,14 @@ def linear_to_lora_layers(
         use_dora (bool): If True, uses DoRA instead of LoRA.
           Default: ``False``
     """
+    if "scale" not in config:
+        hint = ""
+        if "alpha" in config:
+            hint = (
+                " Found 'alpha' instead — mlx-lm's LoRA config uses 'scale', "
+                "not 'alpha' (unlike some other LoRA frameworks). See LORA.md."
+            )
+        raise KeyError(f"LoRA config is missing required key 'scale'.{hint}")
 
     def to_lora(layer):
         if not use_dora and hasattr(layer, "to_lora"):
