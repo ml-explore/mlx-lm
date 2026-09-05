@@ -42,6 +42,8 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.paged_cache import PageAllocationError, RequestCapacityError
+from .paged_generate import PagedBatchGenerator
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import _parse_size, load, sharded_load
 
@@ -665,6 +667,16 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
+                if getattr(self.cli_args, "paged_kv_pages", 0) and (
+                    args.seed is not None or self._is_distributed
+                ):
+                    rqueue.put(
+                        ValueError(
+                            "Paged KV requires unseeded, local batching without a draft model"
+                        )
+                    )
+                    continue
+
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
@@ -708,17 +720,28 @@ class ResponseGenerator:
                         prompt=prompt,
                         prompt_cache_count=prompt_cache_count,
                     )
+                    try:
+                        for attempt in range(2):
+                            try:
+                                (uid,) = batch_generator.insert_segments(
+                                    segments=[segments],
+                                    max_tokens=[args.max_tokens],
+                                    caches=[cache],
+                                    all_tokens=[prompt[:prompt_cache_count]],
+                                    samplers=[_make_sampler(args, tokenizer)],
+                                    logits_processors=[_make_logits_processors(args)],
+                                    stop_matchers=[stop_matcher],
+                                )
+                                break
+                            except PageAllocationError:
+                                if attempt:
+                                    raise
+                                self.prompt_cache.trim_to(n_sequences=0)
+                    except Exception as e:
+                        rqueue.put(e)
+                        del cache
+                        continue
                     rqueue.put(ctx)
-
-                    (uid,) = batch_generator.insert_segments(
-                        segments=[segments],
-                        max_tokens=[args.max_tokens],
-                        caches=[cache],
-                        all_tokens=[prompt[:prompt_cache_count]],
-                        samplers=[_make_sampler(args, tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
-                        stop_matchers=[stop_matcher],
-                    )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
@@ -748,6 +771,11 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
+                        if getattr(self.cli_args, "paged_kv_pages", 0):
+                            rqueue.put(
+                                ValueError("Paged KV requires a batchable model")
+                            )
+                            continue
                         self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
@@ -755,13 +783,27 @@ class ResponseGenerator:
                     current_tokenizer = tokenizer
                     current_model_key = self.model_provider.model_key
                     batch_results = {}
-                    batch_generator = BatchGenerator(
-                        model,
-                        completion_batch_size=self.cli_args.decode_concurrency,
-                        prefill_batch_size=self.cli_args.prompt_concurrency,
-                        prefill_step_size=self.cli_args.prefill_step_size,
-                        stream=generation_stream,
-                    )
+                    generator_class = BatchGenerator
+                    generator_options = {}
+                    if getattr(self.cli_args, "paged_kv_pages", 0):
+                        self.prompt_cache.trim_to(n_sequences=0)
+                        generator_class = PagedBatchGenerator
+                        generator_options = dict(
+                            capacity_pages=self.cli_args.paged_kv_pages,
+                            page_size=self.cli_args.paged_kv_page_size,
+                        )
+                    try:
+                        batch_generator = generator_class(
+                            model,
+                            completion_batch_size=self.cli_args.decode_concurrency,
+                            prefill_batch_size=self.cli_args.prompt_concurrency,
+                            prefill_step_size=self.cli_args.prefill_step_size,
+                            stream=generation_stream,
+                            **generator_options,
+                        )
+                    except Exception as e:
+                        rqueue.put(e)
+                        continue
                     unprocessed_requests.append((rqueue, request, args))
                     continue
 
@@ -787,7 +829,17 @@ class ResponseGenerator:
 
                 uids_to_remove = []
                 for _ in self._time_budget:
-                    prompt_responses, gen_responses = batch_generator.next()
+                    try:
+                        prompt_responses, gen_responses = batch_generator.next()
+                    except Exception as e:
+                        for result in batch_results.values():
+                            result["rqueue"].put(e)
+                        batch_results.clear()
+                        batch_generator.close()
+                        batch_generator = None
+                        drain_batch = False
+                        uids_to_remove.clear()
+                        break
                     if not prompt_responses and not gen_responses:
                         break
 
@@ -868,6 +920,10 @@ class ResponseGenerator:
 
         # Make sure the model and prompt cache are destroyed in the generation
         # thread under same stream.
+        if batch_generator is not None:
+            batch_generator.close()
+        for result in batch_results.values():
+            result["rqueue"].put(RuntimeError("Server stopped"))
         del self.model_provider
         del self.prompt_cache
         gc.collect()
@@ -1382,7 +1438,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            status = (
+                413
+                if isinstance(e, RequestCapacityError)
+                else 429 if isinstance(e, PageAllocationError) else 404
+            )
+            self._set_completion_headers(status)
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
@@ -1728,6 +1789,18 @@ def run(
 def main():
     parser = argparse.ArgumentParser(description="MLX Http Server.")
     parser.add_argument(
+        "--paged-kv-pages",
+        type=int,
+        default=0,
+        help="Pages per full-attention layer; 0 uses the default cache",
+    )
+    parser.add_argument(
+        "--paged-kv-page-size",
+        type=int,
+        default=256,
+        help="Tokens per page for opt-in Qwen3.5 paged caching",
+    )
+    parser.add_argument(
         "--model",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
@@ -1862,6 +1935,10 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    if args.paged_kv_pages < 0 or args.paged_kv_page_size <= 0:
+        parser.error(
+            "paged-kv-pages must be nonnegative and paged-kv-page-size positive"
+        )
     if mx.metal.is_available():
         wired_limit = mx.device_info()["max_recommended_working_set_size"]
         mx.set_wired_limit(wired_limit)

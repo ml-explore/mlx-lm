@@ -435,7 +435,7 @@ def generate_step(
                 ),
             )
             quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
+            _eval_cache_state(prompt_cache)
             if logits_processors and len(processed) > 0:
                 tokens = (
                     mx.concat([tokens, processed]) if tokens is not None else processed
@@ -577,7 +577,7 @@ def speculative_generate_step(
             n_to_process = min(prefill_step_size, y.size - 1)
             model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
-            mx.eval([c.state for c in cache])
+            _eval_cache_state(cache)
             y = y[n_to_process:]
             mx.clear_cache()
         return y
@@ -847,6 +847,10 @@ def _merge_caches(caches):
                 f"{type(caches[0][i])} does not yet support batching with history"
             )
     return batch_cache
+
+
+def _eval_cache_state(cache):
+    mx.eval([c.eval_state if hasattr(c, "eval_state") else c.state for c in cache])
 
 
 def _extend_cache(cache_a, cache_b):
@@ -1219,7 +1223,7 @@ class PromptProcessingBatch:
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
-            mx.eval([c.state for c in self.prompt_cache])
+            _eval_cache_state(self.prompt_cache)
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
 
@@ -1227,7 +1231,7 @@ class PromptProcessingBatch:
         if max_padding > 0:
             for c in self.prompt_cache:
                 c.finalize()
-            mx.eval([c.state for c in self.prompt_cache])
+            _eval_cache_state(self.prompt_cache)
             mx.clear_cache()
 
     def generate(self, tokens: List[List[int]]):
