@@ -626,7 +626,7 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
-        # None can not be seralized so return empty array instead
+        # None can not be serialized so return empty array instead
         left_padding = mx.array([]) if self.left_padding is None else self.left_padding
         lengths = mx.array([]) if self.lengths is None else self.lengths
         return self.cache, left_padding, lengths
