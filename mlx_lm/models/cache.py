@@ -15,6 +15,7 @@ from .base import create_causal_mask
 def make_prompt_cache(
     model: nn.Module,
     max_kv_size: Optional[int] = None,
+    compression_ratio: Optional[float] = None,
 ) -> List[Any]:
     """
     Construct the model's cache for use in generation.
@@ -27,6 +28,10 @@ def make_prompt_cache(
         max_kv_size (Optional[int]): If provided and the model does not have a
             ``make_cache`` method, a ``RotatingKVCache`` is used with a maximum
             size of ``max_kv_size``
+        compression_ratio (Optional[float]): If provided and the model does not
+            have a ``make_cache`` method, a ``CompressedKVCache`` is used that
+            compresses the KV cache after prefill by evicting this fraction of
+            tokens. E.g. ``0.5`` keeps the 50% most distinctive tokens.
     """
     if hasattr(model, "make_cache"):
         return model.make_cache()
@@ -36,8 +41,19 @@ def make_prompt_cache(
         return [
             RotatingKVCache(max_size=max_kv_size, keep=4) for _ in range(num_layers)
         ]
+    elif compression_ratio is not None and compression_ratio > 0.0:
+        return [
+            CompressedKVCache(compression_ratio=compression_ratio)
+            for _ in range(num_layers)
+        ]
     else:
         return [KVCache() for _ in range(num_layers)]
+
+
+def compress_prompt_cache(cache: List[Any]) -> None:
+    for c in cache:
+        if hasattr(c, "compress"):
+            c.compress()
 
 
 def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
@@ -405,6 +421,76 @@ class KVCache(_BaseCache):
         if self.keys is None:
             return 0
         return self.keys.nbytes + self.values.nbytes
+
+
+class CompressedKVCache(KVCache):
+    """KV cache with post-prefill compression using the KeyDiff algorithm.
+
+    Based on KeyDiffPress from `kvpress <https://github.com/NVIDIA/kvpress>`_.
+
+    Args:
+        compression_ratio (float): Fraction of tokens to evict. Default: ``0.0``.
+        n_sink (int): Number of initial tokens to always retain. Default: ``4``.
+    """
+
+    def __init__(self, compression_ratio: float = 0.0, n_sink: int = 4):
+        super().__init__()
+        self.compression_ratio = compression_ratio
+        self.n_sink = n_sink
+        self._compressed = False
+
+    def compress(self):
+        """Compress the cache in-place by evicting redundant tokens."""
+        if self._compressed or self.keys is None or self.compression_ratio <= 0.0:
+            return
+
+        keys = self.keys[..., : self.offset, :]
+        values = self.values[..., : self.offset, :]
+        S = keys.shape[2]
+
+        n_kept = max(int(S * (1.0 - self.compression_ratio)), self.n_sink + 1)
+        if n_kept >= S:
+            self._compressed = True
+            return
+
+        # Score by cosine dissimilarity to the mean key
+        key_norms = mx.linalg.norm(keys, axis=-1, keepdims=True)
+        norm_k = keys / (key_norms + 1e-8)
+        anchor = mx.mean(norm_k, axis=2, keepdims=True)
+        scores = -(norm_k * anchor).sum(axis=-1)
+
+        # Protect sink tokens
+        max_score = mx.max(scores)
+        scores = mx.concatenate(
+            [
+                mx.broadcast_to(max_score + 1, scores[..., : self.n_sink].shape),
+                scores[..., self.n_sink :],
+            ],
+            axis=-1,
+        )
+
+        # Keep the top-k most distinctive tokens in sequence order
+        neg_scores = -scores
+        indices = mx.argpartition(neg_scores, kth=n_kept - 1, axis=-1)[..., :n_kept]
+        indices = mx.sort(indices, axis=-1)
+
+        idx_expanded = mx.expand_dims(indices, axis=-1)
+        self.keys = mx.take_along_axis(keys, idx_expanded, axis=2)
+        self.values = mx.take_along_axis(values, idx_expanded, axis=2)
+        self.offset = n_kept
+        self._compressed = True
+
+    @property
+    def meta_state(self):
+        return tuple(
+            map(str, (self.compression_ratio, self.n_sink, int(self._compressed)))
+        )
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.compression_ratio = float(v[0])
+        self.n_sink = int(v[1])
+        self._compressed = bool(int(v[2]))
 
 
 class RotatingKVCache(_BaseCache):

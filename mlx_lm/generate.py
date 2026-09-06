@@ -21,6 +21,7 @@ from .models.cache import (
     QuantizedKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
+    compress_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
@@ -313,6 +314,7 @@ def generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    compression_ratio: Optional[float] = None,
     prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
     input_embeddings: Optional[mx.array] = None,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
@@ -339,6 +341,10 @@ def generate_step(
         kv_group_size (int): Group size for KV cache quantization. Default: ``64``.
         quantized_kv_start (int): Step to begin using a quantized KV cache.
            when ``kv_bits`` is non-None. Default: ``0``.
+        compression_ratio (float, optional): Fraction of KV cache tokens to
+           evict after prefill using importance-based compression. E.g. ``0.5``
+           keeps the 50% most distinctive tokens. Default: ``None`` (no
+           compression).
         prompt_progress_callback (Callable[[int, int], None]): A call-back which takes the
            prompt tokens processed so far and the total number of prompt tokens.
         input_embeddings (mx.array, optional): Input embeddings to use instead of or in
@@ -368,6 +374,7 @@ def generate_step(
         prompt_cache = make_prompt_cache(
             model,
             max_kv_size=max_kv_size,
+            compression_ratio=compression_ratio,
         )
 
     prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
@@ -449,6 +456,12 @@ def generate_step(
                 if input_embeddings is not None
                 else input_embeddings
             )
+            mx.clear_cache()
+
+        # Compress the KV cache if using CompressedKVCache
+        if compression_ratio is not None and compression_ratio > 0.0:
+            compress_prompt_cache(prompt_cache)
+            mx.eval([c.state for c in prompt_cache])
             mx.clear_cache()
 
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
