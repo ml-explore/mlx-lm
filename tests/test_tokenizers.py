@@ -72,6 +72,63 @@ class TestTokenizers(unittest.TestCase):
         tokenizer._detokenizer = NaiveStreamingDetokenizer(tokenizer)
         self.check_tokenizer(tokenizer)
 
+    def test_detokenizer_not_rebuilt_per_access(self):
+        """Accessing .detokenizer must not re-read the vocabulary.
+
+        The detokenizer is handed out per stream, but everything it holds
+        besides the state ``reset()`` installs is immutable and derived from
+        the tokenizer. Rebuilding it per access costs O(vocab) on the first
+        token of every generation.
+        """
+        tokenizer = load_tokenizer("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        inner = tokenizer._tokenizer
+        original_get_vocab = type(inner).get_vocab
+        calls = []
+
+        def counting_get_vocab(self, *args, **kwargs):
+            calls.append(1)
+            return original_get_vocab(self, *args, **kwargs)
+
+        type(inner).get_vocab = counting_get_vocab
+        try:
+            tokenizer.detokenizer
+            after_first = len(calls)
+            for _ in range(9):
+                tokenizer.detokenizer
+            self.assertEqual(len(calls), after_first)
+        finally:
+            type(inner).get_vocab = original_get_vocab
+
+    def test_detokenizers_are_independent(self):
+        """Two detokenizers share the token map but never each other's state."""
+        tokenizer = load_tokenizer("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        first, second = tokenizer.detokenizer, tokenizer.detokenizer
+        self.assertIsNot(first, second)
+        # `assertIs` would dump the whole vocabulary into the failure message.
+        self.assertTrue(
+            first.tokenmap is second.tokenmap,
+            "the immutable token map should be shared between detokenizers",
+        )
+
+        a_tokens = tokenizer.encode("hello\nworld")
+        b_tokens = tokenizer.encode('{"a":3.5}')
+        first.reset()
+        second.reset()
+        a_text = b_text = ""
+        for i in range(max(len(a_tokens), len(b_tokens))):
+            if i < len(a_tokens):
+                first.add_token(a_tokens[i])
+                a_text += first.last_segment
+            if i < len(b_tokens):
+                second.add_token(b_tokens[i])
+                b_text += second.last_segment
+        first.finalize()
+        second.finalize()
+        a_text += first.last_segment
+        b_text += second.last_segment
+        self.assertEqual(a_text, tokenizer.decode(a_tokens))
+        self.assertEqual(b_text, tokenizer.decode(b_tokens))
+
     def test_special_tokens(self):
         tokenizer_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
         tokenizer = load_tokenizer(tokenizer_repo)

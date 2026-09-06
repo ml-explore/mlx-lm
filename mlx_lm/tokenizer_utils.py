@@ -1,3 +1,4 @@
+import copy
 import importlib
 import json
 import warnings
@@ -451,8 +452,22 @@ class TokenizerWrapper:
     def detokenizer(self):
         """
         Get a stateful streaming detokenizer.
+
+        The detokenizer's per-stream state is exactly what ``reset()``
+        installs; everything else it holds (the id-to-token map, the byte
+        decoder) is derived from the tokenizer and immutable. Building one
+        prototype per wrapper and handing out shallow copies keeps every
+        stream independent while materialising the vocabulary only once --
+        rebuilding it per call costs O(vocab) on the first token of every
+        generation.
         """
-        return self._detokenizer_class(self)
+        prototype = self.__dict__.get("_detokenizer_prototype")
+        if prototype is None:
+            prototype = self._detokenizer_class(self)
+            self.__dict__["_detokenizer_prototype"] = prototype
+        detokenizer = copy.copy(prototype)
+        detokenizer.reset()
+        return detokenizer
 
     def __getattr__(self, attr):
         if attr == "detokenizer":
