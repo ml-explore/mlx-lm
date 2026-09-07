@@ -121,11 +121,13 @@ def group_expert_select(
         scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
         group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        group_idx = mx.stop_gradient(group_idx)
         scores = mx.put_along_axis(scores, group_idx, mx.array(0.0), axis=-2)
         scores = mx.flatten(scores, -2, -1)
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)

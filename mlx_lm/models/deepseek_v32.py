@@ -111,9 +111,10 @@ class Indexer(nn.Module):
         scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
-        return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
+        indices = mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
             ..., -self.index_topk :
         ]
+        return mx.stop_gradient(indices)
 
 
 class DeepseekV32Attention(nn.Module):
@@ -308,6 +309,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)

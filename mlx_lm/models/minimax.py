@@ -183,6 +183,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
         k = self.num_experts_per_tok
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)

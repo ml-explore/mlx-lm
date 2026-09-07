@@ -288,6 +288,7 @@ class MoEGate(nn.Module):
             group_scores = scores.max(axis=-1, keepdims=True)
             k = self.n_group - self.topk_group
             group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+            group_idx = mx.stop_gradient(group_idx)
             scores = mx.put_along_axis(
                 scores, group_idx, mx.array(0.0, scores.dtype), axis=-2
             )
@@ -295,6 +296,7 @@ class MoEGate(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(scores, inds, axis=-1)
         scores = scores * self.routed_scaling_factor
 

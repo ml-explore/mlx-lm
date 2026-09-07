@@ -174,6 +174,7 @@ class SwitchGLU(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
+        indices = mx.stop_gradient(indices)
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
@@ -183,8 +184,6 @@ class SwitchGLU(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
         x_up = self.up_proj(x, idx, sorted_indices=do_sort)
         x_gate = self.gate_proj(x, idx, sorted_indices=do_sort)
         x = self.down_proj(
@@ -215,6 +214,7 @@ class SwitchMLP(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
+        indices = mx.stop_gradient(indices)
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
@@ -224,8 +224,6 @@ class SwitchMLP(nn.Module):
         inv_order = None
         if do_sort:
             x, idx, inv_order = _gather_sort(x, indices)
-        if self.training:
-            idx = mx.stop_gradient(idx)
         x = self.fc1(x, idx, sorted_indices=do_sort)
         x = self.activation(x)
         x = self.fc2(x, idx, sorted_indices=do_sort)
