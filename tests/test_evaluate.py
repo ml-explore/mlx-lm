@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
@@ -54,6 +55,40 @@ class TestMLXLM(unittest.TestCase):
         self.assertEqual(len(call_args_list[0][0][0]), 2)  # First batch: 2 items
         self.assertEqual(len(call_args_list[1][0][0]), 2)  # Second batch: 2 items
         self.assertEqual(len(call_args_list[2][0][0]), 1)  # Third batch: 1 item
+
+    def test_loglikelihood_rolling_mixed_lengths_is_independent_of_batch_size(self):
+        class Tokenizer:
+            chat_template = None
+
+            def encode(self, text, add_special_tokens=True):
+                return [int(token) for token in text.split()]
+
+        class Model:
+            def make_cache(self):
+                return []
+
+            def __call__(self, inputs, cache=None):
+                logits = mx.arange(11, dtype=mx.float32)
+                return mx.broadcast_to(logits, (*inputs.shape, logits.shape[0]))
+
+        lm = MLXLM.__new__(MLXLM)
+        lm._model = Model()
+        lm.tokenizer = Tokenizer()
+        lm.use_chat_template = False
+        lm._batch_size = 2
+
+        # The first request is padded only when scored in a mixed-length batch.
+        requests = [
+            SimpleNamespace(args=("1 2 3 4",)),
+            SimpleNamespace(args=("5 6 7 8 9 10",)),
+        ]
+        batched_scores = lm.loglikelihood_rolling(requests)
+
+        lm._batch_size = 1
+        single_scores = [lm.loglikelihood_rolling([request])[0] for request in requests]
+
+        self.assertAlmostEqual(batched_scores[0], single_scores[0])
+        self.assertAlmostEqual(batched_scores[1], single_scores[1])
 
     @patch("mlx_lm.evaluate.batch_generate")
     def test_generate_strip_until_then_strip_thinking(self, mock_batch_generate):
