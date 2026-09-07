@@ -25,7 +25,6 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     hidden_size: int
     intermediate_size: int
-    num_hidden_layers: int
     max_position_embeddings: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -42,6 +41,10 @@ class ModelArgs(BaseModelArgs):
     use_conv_bias: bool
     hybrid_override_pattern: Optional[List[str]] = None
     layers_block_type: Optional[List[str]] = None
+    layer_types: Optional[List[str]] = None
+    # Derived from the block list when the config leaves it out, which is what
+    # transformers does: there the layer count is a property of layers_block_type.
+    num_hidden_layers: Optional[int] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     moe_shared_expert_intermediate_size: Optional[int] = None
@@ -57,20 +60,44 @@ class ModelArgs(BaseModelArgs):
     time_step_min: Optional[float] = None
     time_step_max: Optional[float] = None
 
-    # Map from layers_block_type names to single-char pattern codes
-    _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
+    # Map from layers_block_type names to single-char pattern codes. Both the
+    # current spelling and the legacy one are accepted, since a checkpoint may
+    # have been saved by either version of transformers.
+    _block_type_to_char = {
+        "linear_attention": "M",
+        "mamba": "M",
+        "conv": "M",
+        "full_attention": "*",
+        "attention": "*",
+        "moe": "E",
+        "mlp": "-",
+    }
 
     def __post_init__(self):
         if self.time_step_limit is None:
             self.time_step_limit = (0.0, float("inf"))
 
         # Normalize to hybrid_override_pattern (single-char list)
-        if self.hybrid_override_pattern is None and self.layers_block_type is not None:
+        block_types = self.layers_block_type or self.layer_types
+        if self.hybrid_override_pattern is None and block_types is not None:
+            unknown = sorted(set(block_types) - self._block_type_to_char.keys())
+            if unknown:
+                raise ValueError(
+                    f"Unsupported layers_block_type {unknown}, expected any of "
+                    f"{sorted(self._block_type_to_char)}."
+                )
             self.hybrid_override_pattern = [
-                self._block_type_to_char[t] for t in self.layers_block_type
+                self._block_type_to_char[t] for t in block_types
             ]
         if self.hybrid_override_pattern is not None:
+            # The block list is authoritative for the layer count; transformers
+            # treats num_hidden_layers as deprecated for this architecture.
             self.num_hidden_layers = len(self.hybrid_override_pattern)
+        else:
+            raise ValueError(
+                "The config must have layers_block_type or hybrid_override_pattern "
+                "to describe the layer stack."
+            )
 
 
 class MambaRMSNormGated(nn.Module):
