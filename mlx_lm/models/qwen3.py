@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import shard_linear
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import _rank_sizes
 from .rope_utils import initialize_rope
 
 
@@ -190,24 +191,59 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
-        for layer in self.model.layers:
-            # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
+        rank = group.rank()
 
-            # Shard the MLP
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            n_heads = attn.n_heads
+            n_kv_heads = attn.n_kv_heads
+            ratio = n_heads // n_kv_heads
+            # q_proj's pre-shard output rows are always n_heads * head_dim,
+            # for both plain and quantized linears (quantization only packs
+            # the input/column axis, not the output/row axis).
+            head_dim = attn.q_proj.weight.shape[0] // n_heads
+
+            # Distribute whole KV-head *groups* (each covering `ratio`
+            # query heads) across ranks, rather than distributing q_proj's
+            # and k_proj's/v_proj's output features independently. This
+            # keeps n_heads_local an exact multiple of n_kv_heads_local on
+            # every rank even when n_heads/n_kv_heads/N don't divide evenly
+            # among each other, so grouped-query-attention's local repeat
+            # of KV heads stays correct after uneven sharding.
+            kv_head_sizes = _rank_sizes(n_kv_heads, N)
+            if any(s == 0 for s in kv_head_sizes):
+                zero_ranks = [i for i, s in enumerate(kv_head_sizes) if s == 0]
+                raise ValueError(
+                    f"Cannot shard {self.args.model_type}'s {n_kv_heads} KV head(s) "
+                    f"across {N} ranks: rank(s) {zero_ranks} would get zero heads."
+                )
+            q_head_sizes = [s * ratio for s in kv_head_sizes]
+            q_sizes = [s * head_dim for s in q_head_sizes]
+            kv_sizes = [s * head_dim for s in kv_head_sizes]
+
+            # Shard the self attention. o_proj's input sizes must match
+            # q_proj's output sizes exactly (same per-rank partition of the
+            # n_heads * head_dim dimension) so the local contraction before
+            # all_sum is consistent.
+            attn.q_proj = shard_linear(
+                attn.q_proj, "all-to-sharded", group=group, sizes=q_sizes
+            )
+            attn.k_proj = shard_linear(
+                attn.k_proj, "all-to-sharded", group=group, sizes=kv_sizes
+            )
+            attn.v_proj = shard_linear(
+                attn.v_proj, "all-to-sharded", group=group, sizes=kv_sizes
+            )
+            attn.o_proj = shard_linear(
+                attn.o_proj, "sharded-to-all", group=group, sizes=q_sizes
+            )
+            attn.n_heads = q_head_sizes[rank]
+            attn.n_kv_heads = kv_head_sizes[rank]
+
+            # Shard the MLP. No head-alignment constraint here, so the
+            # generic remainder-aware (group_size-blocked for quantized
+            # layers) automatic split in shard_linear/distributed.py is
+            # used directly.
             layer.mlp.gate_proj = shard_linear(
                 layer.mlp.gate_proj, "all-to-sharded", group=group
             )

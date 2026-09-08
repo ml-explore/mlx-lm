@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import shard_linear
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .pipeline import PipelineMixin, _rank_sizes
 from .rope_utils import initialize_rope
 
 
@@ -148,7 +149,7 @@ class TransformerBlock(nn.Module):
         return out
 
 
-class LlamaModel(nn.Module):
+class LlamaModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -181,18 +182,44 @@ class LlamaModel(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
-        if self.swa_idx is not None:
-            swa_mask = create_attention_mask(
-                h, cache[self.swa_idx], window_size=self.sliding_window
-            )
+        # Build the full-attention / sliding-window masks from whichever
+        # layers this rank actually owns (fa_idx/swa_idx are computed over
+        # the full, unsharded layer list at __init__ time and are no longer
+        # valid once pipeline() has truncated self.layers).
+        fa_mask = None
+        swa_mask = None
+        for c, layer in zip(cache, self.pipeline_layers):
+            if layer.use_sliding:
+                if swa_mask is None:
+                    swa_mask = create_attention_mask(
+                        h, c, window_size=self.sliding_window
+                    )
+            elif fa_mask is None:
+                fa_mask = create_attention_mask(h, c)
 
-        for layer, cache in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = swa_mask if layer.use_sliding else fa_mask
-            h = layer(h, mask, cache=cache)
+            h = layer(h, mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache and cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -231,24 +258,59 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
-        for layer in self.model.layers:
-            # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
+        rank = group.rank()
 
-            # Shard the MLP
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            n_heads = attn.n_heads
+            n_kv_heads = attn.n_kv_heads
+            ratio = n_heads // n_kv_heads
+            # q_proj's pre-shard output rows are always n_heads * head_dim,
+            # for both plain and quantized linears (quantization only packs
+            # the input/column axis, not the output/row axis).
+            head_dim = attn.q_proj.weight.shape[0] // n_heads
+
+            # Distribute whole KV-head *groups* (each covering `ratio`
+            # query heads) across ranks, rather than distributing q_proj's
+            # and k_proj's/v_proj's output features independently. This
+            # keeps n_heads_local an exact multiple of n_kv_heads_local on
+            # every rank even when n_heads/n_kv_heads/N don't divide evenly
+            # among each other, so grouped-query-attention's local repeat
+            # of KV heads stays correct after uneven sharding.
+            kv_head_sizes = _rank_sizes(n_kv_heads, N)
+            if any(s == 0 for s in kv_head_sizes):
+                zero_ranks = [i for i, s in enumerate(kv_head_sizes) if s == 0]
+                raise ValueError(
+                    f"Cannot shard {self.args.model_type}'s {n_kv_heads} KV head(s) "
+                    f"across {N} ranks: rank(s) {zero_ranks} would get zero heads."
+                )
+            q_head_sizes = [s * ratio for s in kv_head_sizes]
+            q_sizes = [s * head_dim for s in q_head_sizes]
+            kv_sizes = [s * head_dim for s in kv_head_sizes]
+
+            # Shard the self attention. o_proj's input sizes must match
+            # q_proj's output sizes exactly (same per-rank partition of the
+            # n_heads * head_dim dimension) so the local contraction before
+            # all_sum is consistent.
+            attn.q_proj = shard_linear(
+                attn.q_proj, "all-to-sharded", group=group, sizes=q_sizes
+            )
+            attn.k_proj = shard_linear(
+                attn.k_proj, "all-to-sharded", group=group, sizes=kv_sizes
+            )
+            attn.v_proj = shard_linear(
+                attn.v_proj, "all-to-sharded", group=group, sizes=kv_sizes
+            )
+            attn.o_proj = shard_linear(
+                attn.o_proj, "sharded-to-all", group=group, sizes=q_sizes
+            )
+            attn.n_heads = q_head_sizes[rank]
+            attn.n_kv_heads = kv_head_sizes[rank]
+
+            # Shard the MLP. No head-alignment constraint here, so the
+            # generic remainder-aware (group_size-blocked for quantized
+            # layers) automatic split in shard_linear/distributed.py is
+            # used directly.
             layer.mlp.gate_proj = shard_linear(
                 layer.mlp.gate_proj, "all-to-sharded", group=group
             )
@@ -261,7 +323,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [
