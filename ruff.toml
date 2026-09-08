@@ -1,8 +1,6 @@
-# Ruff is used only as a dead-code / correctness linter here; formatting is
-# handled by black and import order by isort.
 [lint]
 select = ["F"]  # pyflakes: unused imports and variables, undefined names, ...
 
 [lint.per-file-ignores]
-# Package initialisers re-export names for the public API.
+# Package initializers re-export names for the public API.
 "**/__init__.py" = ["F401"]
