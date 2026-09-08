@@ -110,8 +110,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, _ = sm.flush(state)
         full = text + rest
         self.assertEqual(full, "hi body bye")
 
@@ -123,9 +123,9 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
-        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
-        state, rest, s = sm.flush(state)
+        state, t1, _ = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, _ = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, _ = sm.flush(state)
         full = t1 + t2 + rest
         self.assertEqual(full, "call1call2")
 
@@ -166,8 +166,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hello STOP world")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hello STOP world")
+        state, rest, _ = sm.flush(state)
         self.assertEqual(text + rest, "hello  world")
 
     def test_reasoning_to_tool_transition(self):

@@ -111,35 +111,35 @@ class TestModels(unittest.TestCase):
         cache = RotatingKVCache(max_size=18)
 
         x = mx.random.uniform(shape=(1, h, 8, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 8)
         self.assertEqual(cache.offset, 8)
 
         x = mx.random.uniform(shape=(1, h, 1, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 9)
         self.assertEqual(cache.offset, 9)
         self.assertTrue(mx.allclose(x, k[..., 8:9, :]))
 
         x = mx.random.uniform(shape=(1, h, 2, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 11)
         self.assertEqual(cache.offset, 11)
         self.assertTrue(mx.allclose(x, k[..., 9:11, :]))
 
         x = mx.random.uniform(shape=(1, h, 3, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 14)
         self.assertEqual(cache.offset, 14)
         self.assertTrue(mx.allclose(x, k[..., 11:14, :]))
 
         x = mx.random.uniform(shape=(1, h, 6, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(cache.offset, 20)
         self.assertTrue(mx.allclose(x, k[..., -6:, :]))
 
         x = mx.random.uniform(shape=(1, h, 2, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
 
@@ -1379,11 +1379,12 @@ class TestModels(unittest.TestCase):
         x = mx.ones((1, args.intermediate_size))
         A = -mx.ones((args.intermediate_size, args.state_size))
 
-        with (
-            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
-            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
-        ):
-            y, state = block.ssm_step(x, A)
+        # Not combined: a parenthesised multi-context `with` needs py3.9
+        with mock.patch.object(  # noqa: SIM117
+            mx.fast, "rms_norm", wraps=mx.fast.rms_norm
+        ) as rms_norm:
+            with mock.patch.object(mx, "ones", wraps=mx.ones) as ones:
+                y, state = block.ssm_step(x, A)
 
         mx.eval(y, state)
         self.assertEqual(rms_norm.call_count, 3)

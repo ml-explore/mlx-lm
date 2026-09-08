@@ -1003,14 +1003,14 @@ class TextStateMachine:
     @staticmethod
     def flush(state):
         """Emit the remaining buffer (use on finish_reason="length")."""
-        s, n, states, buf = state
+        s, _, states, buf = state
         trie = states[s][0] if s is not None else None
         return (s, trie, states, ""), buf, s
 
     @staticmethod
     def discard(state):
         """Drop the remaining buffer (use on finish_reason="stop")."""
-        s, n, states, buf = state
+        s, _, states, _ = state
         trie = states[s][0] if s is not None else None
         return (s, trie, states, ""), s
 
