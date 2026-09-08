@@ -28,8 +28,8 @@ import mlx.nn as nn
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
-    except ImportError:
-        raise ImportError("Run `pip install modelscope` to use ModelScope.")
+    except ImportError as e:
+        raise ImportError("Run `pip install modelscope` to use ModelScope.") from e
 else:
     from huggingface_hub import snapshot_download
 
@@ -200,9 +200,9 @@ def _get_classes(config: dict):
         model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except ImportError:
+    except ImportError as e:
         msg = f"Model type {model_type} not supported."
-        raise ValueError(msg)
+        raise ValueError(msg) from e
 
     return arch.Model, arch.ModelArgs
 

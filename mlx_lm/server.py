@@ -1211,8 +1211,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
-            except ValueError:
-                raise ValueError("logit_bias must be a dict of int to float")
+            except ValueError as e:
+                raise ValueError("logit_bias must be a dict of int to float") from e
 
     def generate_response(
         self,

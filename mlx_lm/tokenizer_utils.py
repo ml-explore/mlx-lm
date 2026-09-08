@@ -649,7 +649,9 @@ def load(
             try:
                 tokenizer_content = json.load(fid)
             except JSONDecodeError as e:
-                raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
+                raise JSONDecodeError(
+                    "Failed to parse tokenizer.json", e.doc, e.pos
+                ) from e
 
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):

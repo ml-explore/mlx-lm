@@ -1,5 +1,5 @@
 [lint]
-select = ["F", "B007", "PLW0127"]  # pyflakes: unused imports and variables, undefined names, ...
+select = ["F", "B007", "B904", "PLW0127"]  # pyflakes: unused imports and variables, undefined names, ...
 
 [lint.per-file-ignores]
 # Package initializers re-export names for the public API.

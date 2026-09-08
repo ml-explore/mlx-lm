@@ -243,8 +243,8 @@ def load_hf_dataset(
             for n in names
         ]
 
-    except exceptions.DatasetNotFoundError:
-        raise ValueError(f"Not found Hugging Face dataset: {data_id} .")
+    except exceptions.DatasetNotFoundError as e:
+        raise ValueError(f"Not found Hugging Face dataset: {data_id} .") from e
 
     return train, valid, test
 
