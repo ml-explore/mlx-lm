@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -34,9 +35,8 @@ from huggingface_hub import scan_cache_dir
 from ._version import __version__
 from .generate import (
     BatchGenerator,
-    StopSequenceMatcher,
     TextStateMachine,
-    make_stop_matcher,
+    make_stop_sequences,
     make_text_state_machine,
     stream_generate,
 )
@@ -303,6 +303,13 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -312,10 +319,7 @@ class ModelProvider:
             )
 
         # Remove the old model if it exists.
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
+        self.reset()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -436,6 +440,10 @@ class ResponseGenerator:
 
     def join(self):
         self._generation_thread.join()
+
+    @property
+    def is_healthy(self):
+        return self._generation_thread.is_alive()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -603,20 +611,20 @@ class ResponseGenerator:
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
+        """Make (and cache) a StopSequences and TextStateMachine."""
         cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        stop_matcher = make_stop_matcher(tokenizer, stop_words)
+        stop_sequences = make_stop_sequences(tokenizer, stop_words)
         text_sm = make_text_state_machine(tokenizer, stop_words)
 
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_matcher, text_sm)
+        self._state_machine_cache[cache_key] = (stop_sequences, text_sm)
 
-        return stop_matcher, text_sm
+        return stop_sequences, text_sm
 
     def _is_batchable(self, args):
         return self.model_provider.is_batchable and args.seed is None
@@ -678,7 +686,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_matcher, text_sm = self._make_state_machine(
+                    stop_sequences, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         tokenizer,
                         args.stop_words,
@@ -716,7 +724,7 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        stop_matchers=[stop_matcher],
+                        stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -747,7 +755,7 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
-                        self._serve_single((rqueue, request, args))
+                        self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
                     current_model = args.model
@@ -865,7 +873,13 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
-    def _serve_single(self, request):
+        # Make sure the model and prompt cache are destroyed in the generation
+        # thread under same stream.
+        self.model_provider.reset()
+        del self.prompt_cache
+        gc.collect()
+
+    def _serve_single(self, request, stream):
         rqueue, request, args = request
 
         # Define the progress callback
@@ -880,7 +894,7 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_matcher, text_sm = self._make_state_machine(
+            stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
@@ -918,9 +932,11 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
-            stop_state = stop_matcher.make_state()
+            # Own matcher: the automaton is cached across requests.
+            stop_matcher = stop_sequences.matcher()
             for gen in stream_generate(
                 model=model,
+                stream=stream,
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
@@ -935,10 +951,7 @@ class ResponseGenerator:
                 finish_reason = gen.finish_reason
 
                 # Token-level stop word detection
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, gen.token
-                )
-                if matched:
+                if stop_matcher.advance(gen.token):
                     finish_reason = "stop"
 
                 rqueue.put(
@@ -1603,10 +1616,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
-        self._set_completion_headers(200)
+        is_healthy = self.response_generator.is_healthy
+        status_code = 200 if is_healthy else 503
+        status = "ok" if is_healthy else "unavailable"
+
+        self._set_completion_headers(status_code)
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.write(json.dumps({"status": status}).encode())
         self.wfile.flush()
 
     def handle_models_request(self):
