@@ -1,3 +1,5 @@
+# Copyright © 2024 Apple Inc.
+
 import re
 from enum import IntEnum
 from pathlib import Path

@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 import unittest
 from unittest.mock import MagicMock, patch
 

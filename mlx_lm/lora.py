@@ -1,3 +1,5 @@
+# Copyright © 2024 Apple Inc.
+
 import argparse
 import math
 import os
