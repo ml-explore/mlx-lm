@@ -12,7 +12,7 @@ from mlx_lm.generate import (
     DEFAULT_PREFILL_STEP_SIZE,
     BatchGenerator,
     GenerationResponse,
-    StopSequenceMatcher,
+    StopSequences,
     batch_generate,
     generate,
     generate_step,
@@ -525,17 +525,17 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
-    def test_batch_generate_with_stop_matchers(self):
-        """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
+    def test_batch_generate_with_stop_sequences(self):
+        """Per-sequence stop_sequences stop on different tokens."""
         batch_gen = BatchGenerator(
             self.model,
             max_tokens=10,
         )
         prompt = self.tokenizer.encode("hello")
 
-        sm_0 = StopSequenceMatcher([[0]])
-        sm_1 = StopSequenceMatcher([[1]])
-        sm_2 = StopSequenceMatcher([[2]])
+        ss_0 = StopSequences([[0]])
+        ss_1 = StopSequences([[1]])
+        ss_2 = StopSequences([[2]])
 
         processor_0 = make_logits_processors({0: 2000.0})
         processor_1 = make_logits_processors({1: 2000.0})
@@ -544,7 +544,7 @@ class TestGenerate(unittest.TestCase):
         uid0, uid1, uid2 = batch_gen.insert(
             [prompt, prompt, prompt],
             logits_processors=[processor_0, processor_1, processor_2],
-            stop_matchers=[sm_0, sm_1, sm_2],
+            stop_sequences=[ss_0, ss_1, ss_2],
         )
 
         responses = batch_gen.next_generated()
@@ -949,6 +949,121 @@ class TestGenerate(unittest.TestCase):
             future = pool.submit(run_on_worker)
             tokens = future.result(timeout=30)
         self.assertGreater(len(tokens), 0)
+
+    def test_stream_generate_rejects_zero_max_tokens(self):
+        with self.assertRaises(ValueError):
+            next(stream_generate(self.model, self.tokenizer, "hello", max_tokens=0))
+
+        gen = stream_generate(self.model, self.tokenizer, "hello", max_tokens=-1)
+        self.assertIsNotNone(next(gen).token)
+        gen.close()
+
+    def test_insert_validates_atomically(self):
+        gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello")
+
+        # A short option list must raise, not drop the third prompt.
+        with self.assertRaises(ValueError) as ctx:
+            gen.insert([prompt, prompt, prompt], max_tokens=[2, 2])
+        self.assertIn("max_tokens", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            gen.insert([prompt, prompt], max_tokens=[2, 0])
+        with self.assertRaises(ValueError):
+            gen.insert([[]])
+
+        # Nothing was enqueued and the uid counter did not advance.
+        self.assertEqual(len(gen._unprocessed_sequences), 0)
+        self.assertEqual(gen.insert([prompt]), [0])
+
+    def test_build_trie_ignores_empty_sequences(self):
+        matcher = StopSequences([[], [7]]).matcher()
+
+        self.assertFalse(matcher.advance(3))
+        self.assertTrue(matcher.advance(7))
+
+    def test_stop_sequences_matchers_are_independent(self):
+        stop_sequences = StopSequences([[1, 2]])
+
+        a = stop_sequences.matcher()
+        b = stop_sequences.matcher()
+
+        self.assertFalse(a.advance(1))
+        # b is untouched, so a lone 2 is not a match for it.
+        self.assertFalse(b.advance(2))
+        self.assertTrue(a.advance(2))
+
+    def test_stop_sequences_matcher_fails_back(self):
+        matcher = StopSequences([[1, 1, 2]]).matcher()
+
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertTrue(matcher.advance(2))
+
+    def test_batch_mixes_sequences_with_and_without_processors(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+        prompt = self.tokenizer.encode("hello")
+
+        uid_plain, uid_biased = gen.insert(
+            [prompt, prompt],
+            logits_processors=[None, make_logits_processors({0: 2000.0})],
+        )
+
+        tokens = {uid_plain: [], uid_biased: []}
+        while responses := gen.next_generated():
+            for r in responses:
+                tokens[r.uid].append(r.token)
+
+        self.assertEqual(len(tokens[uid_plain]), 3)
+        self.assertEqual(tokens[uid_biased], [0, 0, 0])
+
+    def test_batch_stats_empty_window(self):
+        gen = BatchGenerator(self.model)
+        with gen.stats() as stats:
+            pass
+
+        self.assertEqual(stats.prompt_tps, 0.0)
+        self.assertEqual(stats.generation_tps, 0.0)
+        self.assertEqual(stats.decode_tps, 0.0)
+
+    def test_batch_stats_windows_nest(self):
+        gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello world")
+
+        with gen.stats() as outer:
+            gen.insert([prompt])
+            while gen.next_generated():
+                pass
+
+            with gen.stats() as inner:
+                gen.insert([prompt])
+                while gen.next_generated():
+                    pass
+
+        self.assertGreater(inner.generation_tokens, 0)
+        self.assertEqual(outer.generation_tokens, 2 * inner.generation_tokens)
+        self.assertGreater(inner.prompt_tokens, 0)
+        self.assertEqual(outer.prompt_tokens, 2 * inner.prompt_tokens)
+        self.assertGreaterEqual(outer.wall_time, inner.wall_time)
+
+    def test_batch_stats_time_partitions(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+
+        with gen.stats() as stats:
+            gen.insert([self.tokenizer.encode("hello world")])
+            while gen.next_generated():
+                pass
+
+        self.assertGreater(stats.prompt_time, 0.0)
+        self.assertGreater(stats.decode_time, 0.0)
+        self.assertGreaterEqual(stats.overhead_time, 0.0)
+        self.assertAlmostEqual(
+            stats.prompt_time + stats.decode_time + stats.overhead_time,
+            stats.wall_time,
+            places=6,
+        )
 
 
 if __name__ == "__main__":
