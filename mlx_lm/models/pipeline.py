@@ -22,8 +22,7 @@ class PipelineMixin:
         self.pipeline_size = group.size()
         if split is None:
             # Even split; the low ranks get the extra layers.
-            base = len(self.layers) // self.pipeline_size
-            extra = len(self.layers) - base * self.pipeline_size
+            base, extra = divmod(len(self.layers), self.pipeline_size)
             split = [base + (1 if r < extra else 0) for r in range(self.pipeline_size)]
         if len(split) != self.pipeline_size:
             raise ValueError(

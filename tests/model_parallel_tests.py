@@ -6,6 +6,25 @@ import unittest
 import mlx.core as mx
 
 import mlx_lm
+from mlx_lm.models import qwen3_moe
+from mlx_lm.models.pipeline import PipelineMixin
+
+
+class Group:
+    def __init__(self, rank, size):
+        self._rank, self._size = rank, size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+class Stage(PipelineMixin):
+    def __init__(self, num_layers):
+        super().__init__()
+        self.layers = list(range(num_layers))
 
 
 class TestModelParallel(unittest.TestCase):
@@ -167,23 +186,6 @@ class TestModelParallel(unittest.TestCase):
                 self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
 
     def test_pipeline_layer_assignment(self):
-        from mlx_lm.models.pipeline import PipelineMixin
-
-        class Group:
-            def __init__(self, rank, size):
-                self._rank, self._size = rank, size
-
-            def rank(self):
-                return self._rank
-
-            def size(self):
-                return self._size
-
-        class Stage(PipelineMixin):
-            def __init__(self, num_layers):
-                super().__init__()
-                self.layers = list(range(num_layers))
-
         def assignment(num_layers, size, split=None):
             blocks = []
             for rank in range(size):
@@ -214,11 +216,11 @@ class TestModelParallel(unittest.TestCase):
         self.assertEqual(sorted(l for b in blocks for l in b), list(range(10)))
 
         # A bad split is an error, not a silent bad assignment.
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "3 entries for group size 2"):
             assignment(4, 2, split=[1, 1, 2])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "positive and sum to 4 layers"):
             assignment(4, 2, split=[0, 4])
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "positive and sum to 4 layers"):
             assignment(4, 2, split=[2, 3])
 
     def test_pipeline_uneven_model(self):
@@ -244,22 +246,12 @@ class TestModelParallel(unittest.TestCase):
             "tie_word_embeddings": False,
         }
 
-        class Group:
-            def __init__(self, rank, size):
-                self._rank, self._size = rank, size
-
-            def rank(self):
-                return self._rank
-
-            def size(self):
-                return self._size
-
-        arch = importlib.import_module("mlx_lm.models.qwen3_moe")
-        args = arch.ModelArgs.from_dict(config)
+        size = 2
+        args = qwen3_moe.ModelArgs.from_dict(config)
         assigned = []
-        for rank in range(2):
-            model = arch.Model(args)
-            model.model.pipeline(Group(rank, 2))
+        for rank in range(size):
+            model = qwen3_moe.Model(args)
+            model.model.pipeline(Group(rank, size))
             assigned.extend(
                 i for i, l in enumerate(model.model.layers) if l is not None
             )
