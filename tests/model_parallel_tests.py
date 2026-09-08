@@ -5,7 +5,7 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.models import qwen3_moe
+from mlx_lm.models import deepseek_v32, qwen3_moe
 from mlx_lm.models.pipeline import PipelineMixin
 
 
@@ -169,6 +169,29 @@ class TestModelParallel(unittest.TestCase):
                 "max_position_embeddings": 256,
                 "tie_word_embeddings": False,
             },
+            {
+                "model_type": "deepseek_v32",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "index_head_dim": 16,
+                "index_n_heads": 2,
+                "index_topk": 4,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "kv_lora_rank": 8,
+                "q_lora_rank": 8,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+                "qk_nope_head_dim": 16,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 256,
+            },
         ]
         mx.random.seed(0)
         for config in test_configs:
@@ -246,15 +269,40 @@ class TestModelParallel(unittest.TestCase):
         }
 
         size = 2
-        args = qwen3_moe.ModelArgs.from_dict(config)
-        assigned = []
-        for rank in range(size):
-            model = qwen3_moe.Model(args)
-            model.model.pipeline(Group(rank, size))
-            assigned.extend(
-                i for i, l in enumerate(model.model.layers) if l is not None
-            )
-        self.assertEqual(sorted(assigned), list(range(7)))
+        dsv32_config = {
+            "model_type": "deepseek_v32",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "index_head_dim": 16,
+            "index_n_heads": 2,
+            "index_topk": 4,
+            "intermediate_size": 128,
+            "moe_intermediate_size": 32,
+            "num_hidden_layers": 7,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "n_shared_experts": 1,
+            "n_routed_experts": 4,
+            "kv_lora_rank": 8,
+            "q_lora_rank": 8,
+            "qk_rope_head_dim": 8,
+            "v_head_dim": 16,
+            "qk_nope_head_dim": 16,
+            "num_experts_per_tok": 2,
+            "first_k_dense_replace": 1,
+            "max_position_embeddings": 256,
+        }
+        for arch, arch_config in ((qwen3_moe, config), (deepseek_v32, dsv32_config)):
+            with self.subTest(model_type=arch_config["model_type"]):
+                args = arch.ModelArgs.from_dict(arch_config)
+                assigned = []
+                for rank in range(size):
+                    model = arch.Model(args)
+                    model.model.pipeline(Group(rank, size))
+                    assigned.extend(
+                        i for i, l in enumerate(model.model.layers) if l is not None
+                    )
+                self.assertEqual(sorted(assigned), list(range(7)))
 
 
 if __name__ == "__main__":
