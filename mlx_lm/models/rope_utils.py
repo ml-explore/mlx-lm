@@ -16,8 +16,8 @@ class SuScaledRoPE(nn.Module):
         original_max_position_embeddings: int = 4096,
         short_factor: Union[List[float], float] = 1.0,
         long_factor: Union[List[float], float] = 1.0,
-        short_mscale: float = None,
-        long_mscale: float = None,
+        short_mscale: Optional[float] = None,
+        long_mscale: Optional[float] = None,
     ):
         """
         Su Scaled Rotary Embedding layer.
@@ -78,7 +78,7 @@ class Llama3RoPE(nn.Module):
         max_position_embeddings: int = 2048,
         traditional: bool = False,
         base: float = 10000,
-        scaling_config: dict = None,
+        scaling_config: Optional[dict] = None,
     ):
         super().__init__()
         self.dims = dims

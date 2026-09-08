@@ -90,7 +90,7 @@ def convert(
     q_bits: Optional[int] = None,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
-    upload_repo: str = None,
+    upload_repo: Optional[str] = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
     quant_predicate: Optional[

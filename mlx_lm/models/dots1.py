@@ -160,7 +160,10 @@ class Dots1TopkRouter(nn.Module):
 
 class Dots1MLP(nn.Module):
     def __init__(
-        self, args: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        args: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
 

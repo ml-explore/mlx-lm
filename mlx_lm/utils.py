@@ -245,7 +245,7 @@ DEFAULT_ALLOW_PATTERNS = [
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
-    allow_patterns: List[str] = None,
+    allow_patterns: Optional[List[str]] = None,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
