@@ -1033,7 +1033,7 @@ class BatchKVCache(_BaseCache):
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -1059,6 +1059,7 @@ class BatchKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        dtype = (self.keys if self.keys is not None else other.keys).dtype
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
@@ -1066,8 +1067,8 @@ class BatchKVCache(_BaseCache):
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1088,7 +1089,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
-        padding = self.left_padding[idx].item()
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
@@ -1397,14 +1399,15 @@ class BatchRotatingKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        dtype = (self.keys if self.keys is not None else other.keys).dtype
 
         def pad(c):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
