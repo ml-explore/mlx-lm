@@ -443,7 +443,7 @@ class DeepseekV32Model(PipelineMixin, nn.Module):
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(
-            h, cache[0][0] if cache[0] else None, return_array=True
+            h, cache[0][0] if cache and cache[0] else None, return_array=True
         )
 
         # Receive from the previous process in the pipeline
@@ -456,7 +456,7 @@ class DeepseekV32Model(PipelineMixin, nn.Module):
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            if cache[-1] is not None:
+            if cache and cache[-1] is not None:
                 cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
 
         # Broadcast h while keeping it in the graph
