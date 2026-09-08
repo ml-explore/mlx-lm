@@ -295,7 +295,7 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             if l >= self.args.first_k_dense_replace:
-                for n, m in [
+                for _, m in [
                     ("w1", "gate_proj"),
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),

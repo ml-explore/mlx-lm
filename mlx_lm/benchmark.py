@@ -125,7 +125,7 @@ def main():
     prompt = prompts[0]
 
     def single_bench():
-        for response in stream_generate(
+        for _ in stream_generate(
             model,
             tokenizer,
             prompt,

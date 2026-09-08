@@ -447,7 +447,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for e, block in enumerate(tqdm(model.layers)):
+    for block in tqdm(model.layers):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)

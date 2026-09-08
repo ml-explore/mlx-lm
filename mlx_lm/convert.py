@@ -40,7 +40,7 @@ def mixed_quant_predicate_builder(
         raise ValueError("Model does not have expected keys for mixed quant.")
 
     # Look for the layer index location in the path:
-    for layer_location, k in enumerate(down_keys[0].split(".")):
+    for layer_location, k in enumerate(down_keys[0].split(".")):  # noqa: B007
         if k.isdigit():
             break
     num_layers = len(model.layers)

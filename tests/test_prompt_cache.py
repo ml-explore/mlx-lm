@@ -625,6 +625,7 @@ class TestPromptCache(unittest.TestCase):
         left_padding = mx.array([1, 2])
         for c, lc in zip(cache, loaded_cache):
             self.assertTrue(mx.array_equal(c.left_padding, left_padding))
+            self.assertTrue(mx.array_equal(lc.left_padding, left_padding))
 
     def test_rotating_cache_updates(self):
         cache = RotatingKVCache(max_size=8)

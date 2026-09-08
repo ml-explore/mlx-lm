@@ -71,8 +71,8 @@ def estimate_sensitivities(
         lambda x: mx.zeros(x.shape, dtype=gradient_accum_dtype),
         q_model.trainable_parameters(),
     )
-    for e, s in tqdm(
-        enumerate(range(0, len(data), batch_size)),
+    for s in tqdm(
+        range(0, len(data), batch_size),
         total=len(data) // batch_size,
         desc="Estimating sensitivities",
     ):

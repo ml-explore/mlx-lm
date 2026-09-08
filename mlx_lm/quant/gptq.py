@@ -66,8 +66,8 @@ def gptq_quantize(
     model.update_modules(tree_unflatten(layers))
 
     # Evaluate the Hessians for all quantizable layers
-    for e, s in tqdm(
-        enumerate(range(0, len(data), batch_size)),
+    for s in tqdm(
+        range(0, len(data), batch_size),
         total=len(data) // batch_size,
         desc="Computing Hessians",
     ):
@@ -150,7 +150,7 @@ def gptq_quantize(
     config = {"bits": bits, "group_size": group_size}
     fallback_config = {"bits": fallback_bits, "group_size": fallback_group_size}
     q_layers = []
-    for e, (k, l) in enumerate(layers):
+    for k, l in layers:
         if hasattr(l, "to_quantized"):
             config[k] = fallback_config
             q_layers.append((k, l.to_quantized(**fallback_config)))

@@ -141,7 +141,8 @@ class ConcatenatedDataset:
         self._len = sum(len(d) for d in self._data)
 
     def __getitem__(self, idx: int):
-        for data_idx, data in enumerate(self._data):
+        # `data_idx` is read after the loop
+        for data_idx, data in enumerate(self._data):  # noqa: B007
             j = idx - len(data)
             if j < 0:
                 break

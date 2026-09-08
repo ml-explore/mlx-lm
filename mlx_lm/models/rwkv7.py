@@ -436,7 +436,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
-        for k, v in weights.items():
+        for k in weights:
             if "k_k" in k or "k_a" in k or "g_norm" in k:
                 weights[k] = weights[k].reshape(
                     self.args.hidden_size // self.args.head_dim, self.args.head_dim
