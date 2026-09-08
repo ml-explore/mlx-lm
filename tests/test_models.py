@@ -2934,7 +2934,6 @@ class TestModels(unittest.TestCase):
                 "num_attention_heads": 4,
                 "rms_norm_eps": 1e-5,
                 "vocab_size": 1000,
-                "head_dim": 32,
                 "num_key_value_heads": 2,
                 "intermediate_size_mlp": 128,
                 "rope_theta": 1000.0,
