@@ -260,9 +260,18 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
-            return weights
-        for l in range(self.args.num_hidden_layers):
+        # Presence-based, not a fixed layer-0 probe: under pipeline
+        # sharding, a rank only downloads its own local layers' weight
+        # files, so a raw (unstacked-experts) checkpoint may have no
+        # layer-0 key at all even though its own local layers still need
+        # stacking — a layer-0-only gate would skip them entirely.
+        local_moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.up_proj.weight")
+        )
+        for l in local_moe_layers:
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
