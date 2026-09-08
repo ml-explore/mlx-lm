@@ -8,6 +8,7 @@ from mlx_lm.tool_parsers import (
     kimi_k2,
     kimi_k3,
     longcat,
+    minicpm5,
     minimax_m2,
     mistral,
     pythonic,
@@ -56,6 +57,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
                 mistral,
+            ),
+            (
+                '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>',
+                minicpm5,
             ),
         ]
 
@@ -126,6 +131,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'get_current_temperature[ARGS]{"location": "London"}',
                 mistral,
+            ),
+            (
+                '<function name="get_current_temperature"><param name="location">London</param></function>',
+                minicpm5,
             ),
         ]
         tools = [
@@ -443,6 +452,68 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_minicpm5(self):
+        # Multiple tool calls
+        test_case = (
+            '<function name="search"><param name="query">weather</param></function>'
+            '<function name="read_file"><param name="path">/tmp/test.txt</param></function>'
+        )
+        tool_calls = minicpm5.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "search")
+        self.assertEqual(tool_calls[0]["arguments"], {"query": "weather"})
+        self.assertEqual(tool_calls[1]["name"], "read_file")
+        self.assertEqual(tool_calls[1]["arguments"], {"path": "/tmp/test.txt"})
+
+        # Numeric argument (not string type from schema)
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "multiply",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "number"},
+                            "b": {"type": "number"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>'
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "multiply")
+        self.assertEqual(tool_call["arguments"]["a"], 12234585)
+        self.assertEqual(tool_call["arguments"]["b"], 48838483920)
+
+        # CDATA block for string with special chars
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = '<function name="write"><param name="content"><![CDATA[hello & world <foo>]]></param></function>'
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "write")
+        self.assertEqual(tool_call["arguments"]["content"], "hello & world <foo>")
+
+        # Empty arguments
+        test_case = '<function name="ping"></function>'
+        tool_call = minicpm5.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "ping")
+        self.assertEqual(tool_call["arguments"], {})
 
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""

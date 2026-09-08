@@ -621,6 +621,8 @@ def _infer_tool_parser(tokenizer):
         or "<tool_call>\n<function=" in chat_template
     ):
         return "qwen3_coder"
+    elif "<function name=" in chat_template:
+        return "minicpm5"
     elif "<|tool_calls_section_begin|>" in chat_template:
         return "kimi_k2"
     elif "[TOOL_CALLS]" in chat_template:
