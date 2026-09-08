@@ -18,7 +18,7 @@ def make_sampler(
     top_k: int = 0,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.1,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Sampler:
     """
     Make a sampler function for use with ``generate_step``.
@@ -50,6 +50,7 @@ def make_sampler(
         return greedy_sampler
 
     # Create sampler chain
+    xtc_special_tokens = [] if xtc_special_tokens is None else xtc_special_tokens
     sampling_methods = []
     if 0 < top_p < 1.0:
         sampling_methods.append(lambda x: apply_top_p(x, top_p))
