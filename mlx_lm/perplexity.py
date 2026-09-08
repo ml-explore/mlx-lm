@@ -1,4 +1,5 @@
 # Copyright © 2025 Apple Inc.
+
 """
 Evaluate perplexity (PPL) of MLX models.
 """
