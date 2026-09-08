@@ -14,6 +14,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 
 from ..cli_ui import TrainUI, rprint
+from ..utils import maybe_set_recommended_wired_limit
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
@@ -227,8 +228,7 @@ def train(
     iterate_batches: callable = iterate_batches,
     training_callback: TrainingCallback = None,
 ):
-    if mx.metal.is_available():
-        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    _ = maybe_set_recommended_wired_limit()
     world = mx.distributed.init()
     world_size = world.size()
     rank = world.rank()

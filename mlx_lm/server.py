@@ -40,7 +40,12 @@ from .generate import (
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import _parse_size, load, sharded_load
+from .utils import (
+    _parse_size,
+    load,
+    maybe_set_recommended_wired_limit,
+    sharded_load,
+)
 
 
 def get_system_fingerprint():
@@ -1867,9 +1872,7 @@ def main():
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_wired_limit(wired_limit)
+    _ = maybe_set_recommended_wired_limit()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),

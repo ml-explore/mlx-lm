@@ -63,6 +63,22 @@ MODEL_ARCHITECTURE_REMAPPING = {
 MAX_FILE_SIZE_GB = 5
 
 
+def can_run_metal():
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
+def maybe_set_recommended_wired_limit() -> Optional[int]:
+    """Set the wired limit to the recommended size.
+
+    Returns the previous limit, or ``None`` if the device reports no
+    recommended size.
+    """
+    max_rec_size = mx.device_info().get("max_recommended_working_set_size")
+    if max_rec_size is None:
+        return None
+    return mx.set_wired_limit(max_rec_size)
+
+
 def _parse_size(x):
     sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
     split = 0
