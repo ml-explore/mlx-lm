@@ -1,3 +1,5 @@
+target-version = "py38"
+
 [lint]
 select = ["B006", "B007", "B904", "F", "PLW0127"]  # pyflakes: unused imports and variables, undefined names, ...
 
