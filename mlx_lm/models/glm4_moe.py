@@ -1,8 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional
 
 import mlx.core as mx

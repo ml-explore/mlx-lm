@@ -120,7 +120,7 @@ def convert(
 
     if isinstance(quant_predicate, str):
         if q_mode != "affine":
-            raise ValueError(f"Quant predicates only support 'affine' quantization.")
+            raise ValueError("Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
             quant_predicate,
             model,
@@ -220,7 +220,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help="Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
         type=str,
         required=False,

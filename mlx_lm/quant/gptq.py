@@ -14,7 +14,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 from tqdm import tqdm
 
-from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     compute_bits_per_weight,

@@ -42,13 +42,11 @@ def compute_dwq_targets(
         if rank == 0:
             path = path / split
             path.mkdir(parents=True, exist_ok=True)
-        for i, (batch, _) in (
-            pbar := tqdm(
-                enumerate(iterate_batches(data, batch_size, max_seq_length, seed=seed)),
-                total=len(data) // batch_size,
-                desc=f"Computing targets for {split}",
-                disable=rank != 0,
-            )
+        for i, (batch, _) in tqdm(
+            enumerate(iterate_batches(data, batch_size, max_seq_length, seed=seed)),
+            total=len(data) // batch_size,
+            desc=f"Computing targets for {split}",
+            disable=rank != 0,
         ):
             batch = batch[:, :-1]
             logits = model(batch)

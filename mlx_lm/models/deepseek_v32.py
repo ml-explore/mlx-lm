@@ -547,7 +547,6 @@ class Model(nn.Module):
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
             prefix = f"model.layers.{l}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
-                layer = self.model.layers[l].self_attn.embed_q
                 quantized = f"{prefix}.kv_b_proj.scales" in weights
                 v = weights.pop(f"{prefix}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim

@@ -156,7 +156,7 @@ def main():
     print(f"Model loaded: {total_params/1e6:.1f}M parameters")
 
     # Load evaluation data
-    print(f"\nLoading dataset...")
+    print("\nLoading dataset...")
     print(f"  Sequence length: {args.sequence_length}")
 
     data = load_data(
@@ -187,7 +187,7 @@ def main():
     print(f"Tokens per second: {tokens_evaluated / eval_time:.0f}")
 
     # Additional statistics
-    print(f"\nDataset statistics:")
+    print("\nDataset statistics:")
     print(f"  Total samples: {len(data)}")
     print(f"  Total tokens: {data.size}")
 

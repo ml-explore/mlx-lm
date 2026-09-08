@@ -22,9 +22,7 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -639,7 +637,6 @@ class ResponseGenerator:
         self.model_provider.load_default()
 
         current_model = None
-        current_sampling = None
         current_tokenizer = None
         current_model_key = None
         batch_generator = None
@@ -784,7 +781,6 @@ class ResponseGenerator:
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
-                        current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()

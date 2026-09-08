@@ -14,7 +14,6 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
-    Response,
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,

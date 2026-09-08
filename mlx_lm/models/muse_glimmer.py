@@ -13,8 +13,8 @@
 #   * scaleless RMSNorm applied to the token embeddings
 #   * "centered" RMSNorm (output = norm(x) * (1 + weight)) on the four
 #     per-block norms; standard RMSNorm on the final norm
-from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from dataclasses import dataclass
+from typing import List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn

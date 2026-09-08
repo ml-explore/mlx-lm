@@ -1,7 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import mlx.core as mx
-
 
 class PipelineMixin:
     def __init__(self):

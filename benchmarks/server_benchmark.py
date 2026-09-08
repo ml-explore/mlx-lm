@@ -13,9 +13,8 @@ import asyncio
 import json
 import math
 import time
-from collections import defaultdict
 from itertools import cycle
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import aiohttp
 from tqdm import tqdm
@@ -181,7 +180,6 @@ async def run_benchmark(
     prompt_cycle = cycle(prompts)
     semaphore = asyncio.Semaphore(concurrency)
     results = []
-    request_times = []
     bar = tqdm(total=total_requests)
 
     async def worker():

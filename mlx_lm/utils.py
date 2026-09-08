@@ -121,7 +121,6 @@ def _transform_awq_weights(
             pack_factor = 32 // bits
             in_features, packed_out = qweight.shape
             out_features = packed_out * pack_factor
-            n_groups = in_features // group_size
 
             # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
             unpacked_weight = _unpack_awq_weights(qweight)
@@ -616,7 +615,7 @@ def sharded_load(
 
         local_files = set()
         for k, _ in tree_flatten(model.parameters()):
-            if file_name := weight_index.get(k, None) is None:
+            if weight_index.get(k, None) is None:
                 raise ValueError(
                     "Pipeline loading is only supported for MLX converted models."
                 )

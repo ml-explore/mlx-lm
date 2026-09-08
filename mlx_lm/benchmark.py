@@ -7,7 +7,7 @@ import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.utils import pipeline_load, sharded_load
+from mlx_lm.utils import sharded_load
 
 
 def setup_arg_parser():
@@ -173,7 +173,7 @@ def main():
 
     results = [(k, avg(k)) for k in report_keys]
     results = [f"{k}={v:.3f}" for k, v in results]
-    rprint(f"Averages: " + ", ".join(results))
+    rprint("Averages: " + ", ".join(results))
 
 
 if __name__ == "__main__":

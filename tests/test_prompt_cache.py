@@ -179,7 +179,7 @@ class TestPromptCache(unittest.TestCase):
         loaded = load_prompt_cache(cache_file)
 
         # Try to make a mask
-        mask = loaded[0].make_mask(4)
+        loaded[0].make_mask(4)
 
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer

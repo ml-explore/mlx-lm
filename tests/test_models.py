@@ -12,7 +12,6 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
-    ArraysCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,

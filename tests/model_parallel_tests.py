@@ -5,8 +5,6 @@ import unittest
 
 import mlx.core as mx
 
-import mlx_lm
-
 
 class TestModelParallel(unittest.TestCase):
 

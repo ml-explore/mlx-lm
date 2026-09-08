@@ -3,9 +3,7 @@
 import argparse
 import copy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Dict
-from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
