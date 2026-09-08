@@ -309,6 +309,5 @@ def convert_to_gguf(
         for k, v in weights.items()
     }
 
-    output_file_path = output_file_path
     mx.save_gguf(output_file_path, weights, metadata)
     print(f"Converted GGUF model saved as: {output_file_path}")
