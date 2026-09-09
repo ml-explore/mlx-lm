@@ -111,16 +111,8 @@ class Indexer(nn.Module):
         scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
-        # The top-k indices are an integer selection and carry no gradient.
-        # Stop gradients here so that when training (e.g. LoRA) with
-        # sequences longer than index_topk, autograd does not request an
-        # indices VJP from the scatter/gather ops that consume them
-        # ("Cannot calculate VJP with respect to indices").
-        return mx.stop_gradient(
-            mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
-                ..., -self.index_topk :
-            ]
-        )
+        indices = mx.argpartition(scores, kth=-self.index_topk, axis=-1)
+        return mx.stop_gradient(indices[..., -self.index_topk :])
 
 
 class DeepseekV32Attention(nn.Module):
@@ -215,10 +207,6 @@ class DeepseekV32Attention(nn.Module):
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
-            # Also stop gradients at the point of use: if the indices ever
-            # arrive through a traced boundary (e.g. as a checkpointed
-            # function input with grad_checkpoint), the producer-side
-            # stop_gradient is not visible to the re-traced graph.
             topk_indices = mx.stop_gradient(topk_indices)
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
