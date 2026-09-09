@@ -2,22 +2,18 @@
 
 import concurrent.futures
 import random
-import threading
 import unittest
 from typing import List
 
 import mlx.core as mx
 
 from mlx_lm.generate import (
-    DEFAULT_PREFILL_STEP_SIZE,
     BatchGenerator,
     GenerationResponse,
     StopSequences,
     batch_generate,
     generate,
     generate_step,
-    generation_stream,
-    setup_arg_parser,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -35,9 +31,7 @@ class TestGenerate(unittest.TestCase):
 
     def test_generate(self):
         # Simple test that generation runs
-        text = generate(
-            self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
-        )
+        generate(self.model, self.tokenizer, "hello", max_tokens=5, verbose=False)
 
     def test_generate_step_processor_sees_prefilled_prompt(self):
         # prefill_step_size=2 over a 4-token prompt leaves one token for _step,
@@ -397,7 +391,7 @@ class TestGenerate(unittest.TestCase):
             logits_processors=processors,
         )
         prompt = self.tokenizer.encode("hello")
-        uids = batch_gen.insert([prompt])
+        batch_gen.insert([prompt])
         response = batch_gen.next_generated()[0]
         logprobs = response.logprobs
         self.assertEqual(logprobs[0].item(), 0.0)
@@ -501,7 +495,7 @@ class TestGenerate(unittest.TestCase):
             sampler=lambda _: mx.array([1]),
         )
         prompt = self.tokenizer.encode("hello")
-        uids = batch_gen.insert([prompt])
+        batch_gen.insert([prompt])
         response = batch_gen.next_generated()[0]
         self.assertEqual(response.token, 1)
 

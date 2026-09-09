@@ -10,11 +10,10 @@ import mlx.core as mx
 import requests
 
 from mlx_lm.generate import TextStateMachine
-from mlx_lm.models.cache import KVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
-    Response,
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
@@ -23,7 +22,7 @@ from mlx_lm.utils import load
 
 
 class DummyModelProvider:
-    def __init__(self, with_draft=False):
+    def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.model_key = (HF_MODEL_PATH, None)
@@ -56,6 +55,9 @@ class DummyModelProvider:
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
                 "allowed_origins": ["*"],
+                "kv_bits": kv_bits,
+                "kv_group_size": 64,
+                "quantized_kv_start": quantized_kv_start,
             },
         )
 
@@ -111,8 +113,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, _ = sm.flush(state)
         full = text + rest
         self.assertEqual(full, "hi body bye")
 
@@ -124,9 +126,9 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
-        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
-        state, rest, s = sm.flush(state)
+        state, t1, _ = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, _ = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, _ = sm.flush(state)
         full = t1 + t2 + rest
         self.assertEqual(full, "call1call2")
 
@@ -167,8 +169,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hello STOP world")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hello STOP world")
+        state, rest, _ = sm.flush(state)
         self.assertEqual(text + rest, "hello  world")
 
     def test_reasoning_to_tool_transition(self):
@@ -544,6 +546,63 @@ class TestServerWithDraftModel(unittest.TestCase):
         # Ensure both generated content
         self.assertIsNotNone(first_response_body["choices"][0]["message"]["content"])
         self.assertIsNotNone(second_response_body["choices"][0]["message"]["content"])
+
+
+class TestServerKVCacheQuantization(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.model_provider = DummyModelProvider(kv_bits=4, quantized_kv_start=0)
+        cls.prompt_cache = LRUPromptCache()
+        cls.response_generator = ResponseGenerator(cls.model_provider, cls.prompt_cache)
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def test_quantized_kv_disables_batching(self):
+        args = type("args", (object,), {"seed": None})
+        self.assertFalse(self.response_generator._is_batchable(args))
+
+    def test_completion_quantizes_the_cache(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        prompt = "Once upon a time"
+        response = requests.post(
+            url,
+            json={"model": "default_model", "prompt": prompt, "max_tokens": 8},
+        )
+        self.assertIn("choices", json.loads(response.text))
+
+        tokens = self.model_provider.tokenizer.encode(prompt)
+        cache, _ = self.prompt_cache.fetch_nearest_cache(
+            self.model_provider.model_key, tokens
+        )
+        self.assertIsNotNone(cache)
+        for c in cache:
+            self.assertIsInstance(c, QuantizedKVCache)
+            self.assertEqual(c.bits, 4)
+            self.assertEqual(c.group_size, 64)
+
+
+class TestServerWithoutKVCacheQuantization(unittest.TestCase):
+    def test_batching_stays_enabled(self):
+        prompt_cache = LRUPromptCache()
+        response_generator = ResponseGenerator(DummyModelProvider(), prompt_cache)
+        try:
+            args = type("args", (object,), {"seed": None})
+            self.assertTrue(response_generator._is_batchable(args))
+        finally:
+            response_generator.stop_and_join()
 
 
 class TestKeepalive(unittest.TestCase):

@@ -1,4 +1,5 @@
 # Copyright © 2024 Apple Inc.
+
 import copy
 import importlib
 import unittest
@@ -12,7 +13,6 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
-    ArraysCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
@@ -112,35 +112,35 @@ class TestModels(unittest.TestCase):
         cache = RotatingKVCache(max_size=18)
 
         x = mx.random.uniform(shape=(1, h, 8, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 8)
         self.assertEqual(cache.offset, 8)
 
         x = mx.random.uniform(shape=(1, h, 1, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 9)
         self.assertEqual(cache.offset, 9)
         self.assertTrue(mx.allclose(x, k[..., 8:9, :]))
 
         x = mx.random.uniform(shape=(1, h, 2, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 11)
         self.assertEqual(cache.offset, 11)
         self.assertTrue(mx.allclose(x, k[..., 9:11, :]))
 
         x = mx.random.uniform(shape=(1, h, 3, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(k.shape[2], 14)
         self.assertEqual(cache.offset, 14)
         self.assertTrue(mx.allclose(x, k[..., 11:14, :]))
 
         x = mx.random.uniform(shape=(1, h, 6, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(cache.offset, 20)
         self.assertTrue(mx.allclose(x, k[..., -6:, :]))
 
         x = mx.random.uniform(shape=(1, h, 2, d))
-        k, v = cache.update_and_fetch(x, x)
+        k, _ = cache.update_and_fetch(x, x)
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
 
@@ -1101,6 +1101,84 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_plamo3(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            model_type="plamo3",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-5,
+            vocab_size=100,
+            window_size=8,
+            sliding_window_pattern=2,
+        )
+        model = plamo3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_plamo3_attention_cache_rope_policy(self):
+        from mlx_lm.models import plamo3
+
+        class CountingRoPE:
+            def __init__(self, rope):
+                self.rope = rope
+                self.calls = []
+
+            def __call__(self, x, *args, **kwargs):
+                self.calls.append((tuple(x.shape), kwargs.get("offset")))
+                return self.rope(x, *args, **kwargs)
+
+        args = plamo3.ModelArgs(
+            model_type="plamo3",
+            hidden_size=32,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=8,
+            window_size=8,
+            sliding_window_pattern=2,
+        )
+
+        hidden = mx.random.uniform(shape=(1, 3, args.hidden_size))
+        next_hidden = mx.random.uniform(shape=(1, 1, args.hidden_size))
+
+        full_attention = plamo3.Attention(args, layer_idx=1)
+        full_rope = CountingRoPE(full_attention.rope)
+        full_attention.rope = full_rope
+        full_cache = KVCache()
+        mx.eval(full_attention(hidden, cache=full_cache))
+
+        full_rope.calls.clear()
+        mx.eval(full_attention(next_hidden, cache=full_cache))
+        self.assertEqual(
+            full_rope.calls,
+            [
+                ((1, args.num_attention_heads, 1, args.head_dim), 3),
+                ((1, args.num_key_value_heads, 1, args.head_dim), 3),
+            ],
+        )
+
+        sliding_attention = plamo3.Attention(args, layer_idx=0)
+        sliding_rope = CountingRoPE(sliding_attention.rope)
+        sliding_attention.rope = sliding_rope
+        sliding_cache = RotatingKVCache(max_size=args.window_size + 1)
+        mx.eval(sliding_attention(hidden, cache=sliding_cache))
+
+        sliding_rope.calls.clear()
+        mx.eval(sliding_attention(next_hidden, cache=sliding_cache))
+        self.assertEqual(
+            sliding_rope.calls,
+            [
+                ((1, args.num_attention_heads, 1, args.head_dim), 3),
+                ((1, args.num_key_value_heads, 1, args.head_dim), 3),
+            ],
+        )
+
     def test_stablelm(self):
         from mlx_lm.models import stablelm
 
@@ -1380,11 +1458,12 @@ class TestModels(unittest.TestCase):
         x = mx.ones((1, args.intermediate_size))
         A = -mx.ones((args.intermediate_size, args.state_size))
 
-        with (
-            mock.patch.object(mx.fast, "rms_norm", wraps=mx.fast.rms_norm) as rms_norm,
-            mock.patch.object(mx, "ones", wraps=mx.ones) as ones,
-        ):
-            y, state = block.ssm_step(x, A)
+        # Not combined: a parenthesised multi-context `with` needs py3.9
+        with mock.patch.object(  # noqa: SIM117
+            mx.fast, "rms_norm", wraps=mx.fast.rms_norm
+        ) as rms_norm:
+            with mock.patch.object(mx, "ones", wraps=mx.ones) as ones:
+                y, state = block.ssm_step(x, A)
 
         mx.eval(y, state)
         self.assertEqual(rms_norm.call_count, 3)
@@ -2954,7 +3033,6 @@ class TestModels(unittest.TestCase):
                 "num_attention_heads": 4,
                 "rms_norm_eps": 1e-5,
                 "vocab_size": 1000,
-                "head_dim": 32,
                 "num_key_value_heads": 2,
                 "intermediate_size_mlp": 128,
                 "rope_theta": 1000.0,

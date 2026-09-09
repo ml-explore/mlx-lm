@@ -39,9 +39,7 @@ class TestTunerTrainer(unittest.TestCase):
             data = [(d, 0) for d in data]
 
             samples = set()
-            for i, (b, l) in enumerate(
-                iterate_batches(data, batch, 1, comm_group=group)
-            ):
+            for b, _ in iterate_batches(data, batch, 1, comm_group=group):
                 samples.add(tuple(mx.flatten(b).tolist()))
 
             ref_batches = mx.arange(128).reshape(-1, batch).tolist()
