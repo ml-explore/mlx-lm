@@ -111,10 +111,8 @@ class Indexer(nn.Module):
         scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
-        indices = mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
-            ..., -self.index_topk :
-        ]
-        return mx.stop_gradient(indices)
+        indices = mx.argpartition(scores, kth=-self.index_topk, axis=-1)
+        return mx.stop_gradient(indices[..., -self.index_topk :])
 
 
 class DeepseekV32Attention(nn.Module):
@@ -209,6 +207,7 @@ class DeepseekV32Attention(nn.Module):
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
+            topk_indices = mx.stop_gradient(topk_indices)
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
                 kv_latent = mx.take_along_axis(
