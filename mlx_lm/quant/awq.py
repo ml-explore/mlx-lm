@@ -3,9 +3,7 @@
 import argparse
 import copy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Dict
-from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -449,7 +447,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for e, block in enumerate(tqdm(model.layers)):
+    for block in tqdm(model.layers):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)

@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 import os
 from functools import partial
 from typing import Optional, Tuple

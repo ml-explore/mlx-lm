@@ -179,7 +179,7 @@ class TestPromptCache(unittest.TestCase):
         loaded = load_prompt_cache(cache_file)
 
         # Try to make a mask
-        mask = loaded[0].make_mask(4)
+        loaded[0].make_mask(4)
 
     def test_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
@@ -625,6 +625,7 @@ class TestPromptCache(unittest.TestCase):
         left_padding = mx.array([1, 2])
         for c, lc in zip(cache, loaded_cache):
             self.assertTrue(mx.array_equal(c.left_padding, left_padding))
+            self.assertTrue(mx.array_equal(lc.left_padding, left_padding))
 
     def test_rotating_cache_updates(self):
         cache = RotatingKVCache(max_size=8)
