@@ -515,6 +515,409 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["name"], "ping")
         self.assertEqual(tool_call["arguments"], {})
 
+    @staticmethod
+    def _weather_tools():
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "date": {"type": "string"},
+                        },
+                        "required": ["city"],
+                    },
+                },
+            }
+        ]
+
+    def _run_state_machine(self, model_output, chunk_size=3):
+        """Replicate the server's tool-call collection path (server.py).
+
+        The text state machine strips the ``<function`` / ``</function>``
+        markers and the payload between them is collected while in the "tool"
+        state, exactly as done by the OpenAI-compatible server. This exercises
+        the real ``mlx_lm.generate`` machinery rather than only calling
+        ``parse_tool_call`` directly.
+        """
+        from mlx_lm.generate import TextStateMachine, make_text_state_machine
+
+        class _Tokenizer:
+            has_thinking = False
+            has_tool_calling = True
+            tool_call_start = "<function"
+            tool_call_end = "</function>"
+            structural_markers = ()
+
+        sm = make_text_state_machine(_Tokenizer())
+        state = sm.make_state("normal")
+        tool_text = ""
+        tool_calls = []
+        prev_state = "normal"
+        text = ""
+        for i in range(0, len(model_output), chunk_size):
+            state, clean_text, current_state = TextStateMachine.step(
+                state, model_output[i : i + chunk_size]
+            )
+            if current_state == "tool":
+                tool_text += clean_text
+            elif current_state == "normal":
+                if prev_state == "tool":
+                    tool_calls.append(tool_text)
+                    tool_text = ""
+                text += clean_text
+            prev_state = current_state
+
+        # Trailing tool text (e.g. truncated at finish_reason="length").
+        if prev_state == "tool" and tool_text:
+            tool_calls.append(tool_text)
+        return tool_calls, text
+
+    def test_minicpm5_payload_format(self):
+        """parse_tool_call consumes the state-machine payload directly.
+
+        The tokenizer text state machine strips the <function/</function>
+        markers, so callers pass only the payload between them. This is the
+        format the parser must accept — not only complete XML blocks.
+        """
+        payload = 'name="get_weather"><param name="city">Tokyo</param>'
+        tool_call = minicpm5.parse_tool_call(payload, self._weather_tools())
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+        )
+
+    def test_minicpm5_integration_state_machine(self):
+        """Single call with text before/after through the real state machine."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            }
+        ]
+        model_output = (
+            "Sure, I'll look that up.\n"
+            '<function name="search"><param name="query">weather</param></function>\n'
+            "It looks sunny."
+        )
+        tool_calls, text = self._run_state_machine(model_output)
+        self.assertEqual(len(tool_calls), 1)
+        self.assertIn("Sure, I'll look that up.", text)
+        self.assertIn("It looks sunny.", text)
+        parsed = minicpm5.parse_tool_call(tool_calls[0], tools)
+        self.assertEqual(parsed, {"name": "search", "arguments": {"query": "weather"}})
+
+    def test_minicpm5_integration_multiple_calls(self):
+        """Multiple calls split by the state machine each parse correctly."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"path": {"type": "string"}},
+                        "required": ["path"],
+                    },
+                },
+            },
+        ]
+        model_output = (
+            '<function name="search"><param name="query">weather</param></function>'
+            '<function name="read_file"><param name="path">/tmp/test.txt</param></function>'
+        )
+        tool_calls, _ = self._run_state_machine(model_output)
+        self.assertEqual(len(tool_calls), 2)
+        parsed = [minicpm5.parse_tool_call(tc, tools) for tc in tool_calls]
+        self.assertEqual(
+            parsed,
+            [
+                {"name": "search", "arguments": {"query": "weather"}},
+                {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+            ],
+        )
+
+    def test_minicpm5_integration_truncated(self):
+        """A call cut off at finish_reason='length' (trailing tool text).
+
+        With a schema the truncated call is rejected; without one the function
+        name is salvaged and incomplete parameters are not fabricated.
+        """
+        model_output = '<function name="get_weather"><param name="city">To'
+        tool_calls, _ = self._run_state_machine(model_output)
+        self.assertEqual(len(tool_calls), 1)
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(tool_calls[0], self._weather_tools())
+        parsed = minicpm5.parse_tool_call(tool_calls[0], None)
+        self.assertEqual(parsed["name"], "get_weather")
+        self.assertEqual(parsed["arguments"], {})
+
+    def test_minicpm5_typed_parameters(self):
+        """Schema-driven deserialization for typed params (review #5)."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "book",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "count": {"type": "integer"},
+                            "price": {"type": "number"},
+                            "in_stock": {"type": "boolean"},
+                            "tags": {"type": "array"},
+                            "metadata": {"type": "object"},
+                            "note": {},
+                            "empty": {"type": "null"},
+                        },
+                        "required": ["title"],
+                    },
+                },
+            }
+        ]
+        test_case = (
+            '<function name="book">'
+            '<param name="title">The Hobbit &amp; friends</param>'
+            '<param name="count">2</param>'
+            '<param name="price">19.99</param>'
+            '<param name="in_stock">true</param>'
+            '<param name="tags">["fiction", "classic"]</param>'
+            '<param name="metadata">{"pages": 310}</param>'
+            '<param name="note">{"looks": "like json"}</param>'
+            '<param name="empty">null</param>'
+            "</function>"
+        )
+        arguments = minicpm5.parse_tool_call(test_case, tools)["arguments"]
+        self.assertEqual(arguments["title"], "The Hobbit & friends")
+        self.assertEqual(arguments["count"], 2)
+        self.assertEqual(arguments["price"], 19.99)
+        self.assertIs(arguments["in_stock"], True)
+        self.assertEqual(arguments["tags"], ["fiction", "classic"])
+        self.assertEqual(arguments["metadata"], {"pages": 310})
+        # No declared type: preserved as a string, JSON-looking or not.
+        self.assertEqual(arguments["note"], '{"looks": "like json"}')
+        self.assertIsNone(arguments["empty"])
+
+    def test_minicpm5_integer_accepts_whole_number_floats(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "book",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "count": {"type": "integer"},
+                        },
+                        "required": ["title"],
+                    },
+                },
+            }
+        ]
+        tool_call = minicpm5.parse_tool_call(
+            '<function name="book"><param name="title">x</param>'
+            '<param name="count">1.0</param></function>',
+            tools,
+        )
+        self.assertEqual(tool_call["arguments"]["count"], 1)
+
+    def test_minicpm5_malformed_typed_value_rejected(self):
+        """A value that does not match its declared type is rejected (review #5)."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "book",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "count": {"type": "integer"},
+                        },
+                        "required": ["title"],
+                    },
+                },
+            }
+        ]
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(
+                '<function name="book"><param name="title">x</param>'
+                '<param name="count">abc</param></function>',
+                tools,
+            )
+
+    def test_minicpm5_strings_preserved_without_schema(self):
+        """Without a schema, values are preserved as strings (review #4).
+
+        Numeric- or JSON-looking text must not be silently coerced when the
+        parser has no evidence about the parameter type.
+        """
+        test_case = (
+            '<function name="echo">'
+            '<param name="message">123</param>'
+            '<param name="code">00123</param>'
+            '<param name="payload">{"a": 1}</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call["arguments"],
+            {"message": "123", "code": "00123", "payload": '{"a": 1}'},
+        )
+
+    def test_minicpm5_unknown_function_rejected(self):
+        """Calls to functions outside the requested tool schema are rejected."""
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(
+                '<function name="not_a_requested_tool"><param name="x">1</param></function>',
+                self._weather_tools(),
+            )
+
+    def test_minicpm5_unknown_parameter_dropped(self):
+        """Parameters absent from the schema are dropped (vLLM semantics)."""
+        test_case = (
+            '<function name="get_weather">'
+            '<param name="city">Tokyo</param>'
+            '<param name="made_up_argument">foo</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, self._weather_tools())
+        self.assertEqual(tool_call["arguments"], {"city": "Tokyo"})
+
+    def test_minicpm5_unknown_parameters_do_not_satisfy_required(self):
+        """Dropped unknown params cannot satisfy required params."""
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(
+                '<function name="get_weather"><param name="made_up_argument">foo</param></function>',
+                self._weather_tools(),
+            )
+
+    def test_minicpm5_missing_required_parameter_rejected(self):
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(
+                '<function name="get_weather"><param name="date">2024-06-27</param></function>',
+                self._weather_tools(),
+            )
+
+    def test_minicpm5_duplicate_parameter_rejected(self):
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call(
+                '<function name="get_weather">'
+                '<param name="city">Tokyo</param>'
+                '<param name="city">Osaka</param>'
+                "</function>",
+                self._weather_tools(),
+            )
+
+    def test_minicpm5_tokenizer_space_variants(self):
+        """SentencePiece/GPT decoders may emit \u0120/\u010a (review #9)."""
+        test_case = (
+            '<function\u0120name="get_weather">'
+            '<param\u0120name="city">Tokyo</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, self._weather_tools())
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+        )
+        test_case = (
+            '<function name="get_weather">\u010a'
+            '<param name="city">Tokyo</param>\u010a'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, self._weather_tools())
+        self.assertEqual(tool_call["arguments"], {"city": "Tokyo"})
+
+    def test_minicpm5_collapsed_tags(self):
+        """Model output that collapses tag names/attributes is normalized."""
+        test_case = (
+            '<functionname="get_weather">'
+            '<paramname="city">Tokyo</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, self._weather_tools())
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+        )
+
+    def test_minicpm5_cdata_whitespace_preserved(self):
+        """CDATA content is taken verbatim so whitespace survives (review #8)."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"content": {"type": "string"}},
+                        "required": ["content"],
+                    },
+                },
+            }
+        ]
+        test_case = (
+            '<function name="write">'
+            '<param name="content"><![CDATA[    def foo():\n        pass\n]]></param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(
+            tool_call["arguments"]["content"], "    def foo():\n        pass\n"
+        )
+
+    def test_minicpm5_not_a_tool_call_raises(self):
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call("random text that is not a tool call", None)
+
+    def test_minicpm5_autodetection(self):
+        """Auto-detection requires a MiniCPM5-specific template marker."""
+        from mlx_lm.tokenizer_utils import _infer_tool_parser
+
+        class _Tokenizer:
+            def __init__(self, chat_template):
+                self.chat_template = chat_template
+
+            def get_vocab(self):
+                return {}
+
+        # The real MiniCPM5 chat template carries this system-prompt sentence
+        # together with the <function ...> XML tool-call markers.
+        tokenizer = _Tokenizer(
+            "{%- if tools %}# Tools\n\n"
+            "You are provided with function signatures within <tools></tools> "
+            "XML tags:\n<tools>...<function name=\"' ~ tool_call.name ~ '\">"
+            "...</function>..."
+        )
+        self.assertEqual(_infer_tool_parser(tokenizer), "minicpm5")
+
+        # A template that merely contains <function name= must NOT match.
+        tokenizer = _Tokenizer(
+            "{% if not tools %}<function name='x'></function>{% endif %}"
+        )
+        self.assertNotEqual(_infer_tool_parser(tokenizer), "minicpm5")
+
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""
         tools = [

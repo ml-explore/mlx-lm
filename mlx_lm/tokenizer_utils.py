@@ -621,7 +621,14 @@ def _infer_tool_parser(tokenizer):
         or "<tool_call>\n<function=" in chat_template
     ):
         return "qwen3_coder"
-    elif "<function name=" in chat_template:
+    elif (
+        "<function name=" in chat_template
+        and "You are provided with function signatures within" in chat_template
+    ):
+        # MiniCPM5's chat template instructs the model to emit XML tool calls
+        # inside <function ...> blocks and carries this exact system-prompt
+        # sentence, so require it in addition to the generic <function name=
+        # marker to avoid misclassifying unrelated templates.
         return "minicpm5"
     elif "<|tool_calls_section_begin|>" in chat_template:
         return "kimi_k2"
