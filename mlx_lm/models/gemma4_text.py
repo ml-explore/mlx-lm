@@ -473,7 +473,7 @@ class Gemma4TextModel(nn.Module):
             #
             #   match_counts = (distance < eps).sum(-1)
             #
-            input_ids = mx.stop_gradient(mx.argmin(distance, -1))
+            input_ids = mx.stop_gradient(mx.argmin(distance, axis=-1))
 
         result = self.embed_tokens_per_layer(input_ids)
         result = result * self.embed_tokens_per_layer_scale

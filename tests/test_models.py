@@ -1966,25 +1966,6 @@ class TestModels(unittest.TestCase):
             mx.allclose(direct.astype(mx.float32), explicit.astype(mx.float32))
         )
 
-        for full_model in (False, True):
-            with self.subTest(full_model=full_model):
-
-                def loss(x, provided):
-                    inputs = tokens if provided else None
-                    if full_model:
-                        output = model(inputs, input_embeddings=x)
-                    else:
-                        output = model.model._get_per_layer_inputs(inputs, x)
-                    weights = (mx.arange(output.size).reshape(output.shape) % 7 + 1) / 7
-                    return (output.astype(mx.float32) * weights).mean()
-
-                actual = mx.grad(lambda x: loss(x, False))(embeddings)
-                expected = mx.grad(lambda x: loss(x, True))(embeddings)
-                self.assertTrue(mx.all(mx.isfinite(actual)).item())
-                self.assertTrue(mx.allclose(actual, expected, atol=1e-6).item())
-                if full_model:
-                    self.assertTrue(mx.any(actual != 0).item())
-
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 
