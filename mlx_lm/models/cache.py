@@ -64,7 +64,7 @@ def save_prompt_cache(
             return (i, mx.array(data))
         elif isinstance(data, str):
             scalars.append((i, "string"))
-            return (i, mx.array([c for c in data.encode("utf-8")]))
+            return (i, mx.array([ord(char) for char in data]))
         elif data is None:
             scalars.append((i, "none"))
             return (i, mx.array([]))
