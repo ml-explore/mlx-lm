@@ -111,8 +111,9 @@ class Indexer(nn.Module):
         scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
-        indices = mx.argpartition(scores, kth=-self.index_topk, axis=-1)
-        return mx.stop_gradient(indices[..., -self.index_topk :])
+        return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
+            ..., -self.index_topk :
+        ]
 
 
 class DeepseekV32Attention(nn.Module):
