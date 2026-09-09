@@ -66,7 +66,7 @@ def _build_tool_maps(tools: list[Any] | None):
     ``required_params`` maps tool name -> the set of required param names.
     """
     tool_names: set[str] = set()
-    type_by_param: dict[str, dict[str, str]] = {}
+    type_by_param: dict[str, dict[str, str | None]] = {}
     required_params: dict[str, set[str]] = {}
 
     for tool in tools or []:
@@ -120,6 +120,8 @@ def _convert_argument(
       rejected rather than silently kept as strings.
     - Without a schema there is no evidence about any field, so values are
       preserved as strings instead of assuming they are structured.
+    - Unsupported schema forms (type unions, ``anyOf``/``oneOf``) are preserved
+      as strings; only the types above are converted.
     """
     if not has_schema or arg_type is None or arg_type in _STRING_TYPES:
         return value_text
@@ -159,17 +161,17 @@ def _collect_arguments(
     func_name: str,
     raw_params: list[tuple[str | None, str]],
     tool_names: set[str],
-    type_by_param: dict[str, dict[str, str]],
+    type_by_param: dict[str, dict[str, str | None]],
     required_params: dict[str, set[str]],
 ) -> dict[str, Any] | None:
-    """Validate a function call against the tool schemas and build arguments.
+    """Filter and validate a function call against the tool schemas.
 
     Returns the validated ``arguments`` dict, or ``None`` when the call is not
     a valid tool call: unknown function name, parameter without a name,
-    duplicate parameter, missing required parameter, or a value that does not
-    match its declared schema type. When a schema is available, parameters
-    that are not declared in it are dropped (consistent with the vLLM
-    reference parser) — they cannot be validated, so they are never emitted.
+    duplicate parameter, missing required parameter, or a retained value that
+    does not match its declared type. When a schema is available, parameters
+    absent from it are dropped first (consistent with the vLLM reference
+    parser) — the semantics are filter, then validate.
     """
     if not func_name:
         return None
@@ -211,7 +213,7 @@ def _collect_arguments(
 def _parse_function_block(
     block: str,
     tool_names: set[str],
-    type_by_param: dict[str, dict[str, str]],
+    type_by_param: dict[str, dict[str, str | None]],
     required_params: dict[str, set[str]],
 ) -> dict | None:
     """Parse a single ``<function name="...">...</function>`` block.
@@ -278,13 +280,15 @@ def parse_tool_call(text: str, tools: list[Any] | None = None):
     vLLM-style extract path) are also accepted and normalized to the same
     form, so the parser never has to guess whether the markers were stripped.
 
-    Tool calls are validated against ``tools`` when supplied: unknown function
-    names are rejected, parameters absent from the schema are dropped,
-    duplicate parameters and missing required parameters are rejected, and
-    each value is converted according to its declared schema type (strings stay
-    strings, typed fields are deserialized and validated). Without a schema,
-    values are preserved as strings. Malformed or truncated calls raise
-    ``ValueError`` so callers can skip them.
+    When ``tools`` is supplied, arguments are filtered and validated against
+    the schemas: unknown function names are rejected, parameters absent from a
+    schema are dropped, duplicate parameters and missing required parameters
+    are rejected, and each value is converted according to its declared schema
+    type (string types stay strings, typed fields are deserialized and
+    validated). Without a schema (``tools=None``) every value is preserved as
+    a string — numbers are not coerced since there is no evidence about the
+    type. Pass the tool schemas to enable type-aware conversion. Malformed or
+    truncated calls raise ``ValueError`` so callers can skip them.
 
     Returns a single dict for one call, or a list of dicts for several calls.
     """

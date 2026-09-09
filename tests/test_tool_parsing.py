@@ -787,6 +787,29 @@ class TestToolParsing(unittest.TestCase):
             {"message": "123", "code": "00123", "payload": '{"a": 1}'},
         )
 
+    def test_minicpm5_string_type_keeps_json_looking_value(self):
+        """A declared string parameter keeps JSON-looking text as a string."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "send",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                    },
+                },
+            }
+        ]
+        test_case = (
+            '<function name="send">'
+            '<param name="message">{"foo": "bar"}</param>'
+            "</function>"
+        )
+        tool_call = minicpm5.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["message"], '{"foo": "bar"}')
+
     def test_minicpm5_unknown_function_rejected(self):
         """Calls to functions outside the requested tool schema are rejected."""
         with self.assertRaises(ValueError):
