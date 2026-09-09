@@ -1,8 +1,8 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map
@@ -90,6 +90,8 @@ def quantized_scaled_dot_product_attention(
             q_indices = mx.arange(kL - qL, kL)
             k_indices = mx.arange(kL)
             mask = q_indices[:, None] >= k_indices[None]
+        if n_repeats > 1 and mask.ndim > 3:
+            mask = mx.expand_dims(mask, -3)
         if mask.dtype == mx.bool_:
             scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
         else:

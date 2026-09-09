@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import copy
 from collections import deque
@@ -40,7 +40,9 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
-def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
+def save_prompt_cache(
+    file_name: str, cache: List[Any], metadata: Optional[Dict[str, str]] = None
+):
     """
     Save a pre-computed prompt cache to a file.
 
@@ -50,6 +52,7 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
+    metadata = {} if metadata is None else metadata
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
@@ -623,11 +626,16 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
-        return self.cache
+        # None can not be seralized so return empty array instead
+        left_padding = mx.array([]) if self.left_padding is None else self.left_padding
+        lengths = mx.array([]) if self.lengths is None else self.lengths
+        return self.cache, left_padding, lengths
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        self.cache, left_padding, lengths = v
+        self.left_padding = left_padding if left_padding.size > 0 else None
+        self.lengths = lengths if lengths.size > 0 else None
 
     def filter(self, batch_indices):
         """
@@ -739,11 +747,15 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        # Maintain the cache below the chunk size.
+        if self.keys is None:
+            return
+        valid = self.offset - self.start_position
+        if valid > self.chunk_size:
+            trim = valid - self.chunk_size
+            self.start_position += trim
+            self.keys = self.keys[..., trim:valid, :]
+            self.values = self.values[..., trim:valid, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position
@@ -1024,7 +1036,7 @@ class BatchKVCache(_BaseCache):
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -1050,6 +1062,7 @@ class BatchKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        dtype = (self.keys if self.keys is not None else other.keys).dtype
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
@@ -1057,8 +1070,8 @@ class BatchKVCache(_BaseCache):
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1079,7 +1092,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
-        padding = self.left_padding[idx].item()
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
@@ -1388,14 +1402,15 @@ class BatchRotatingKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        dtype = (self.keys if self.keys is not None else other.keys).dtype
 
         def pad(c):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
@@ -1493,7 +1508,8 @@ class TokenBuffer:
 
     step = 256
 
-    def __init__(self, tokens=[]):
+    def __init__(self, tokens=None):
+        tokens = [] if tokens is None else tokens
         self._buffer = mx.array(tokens, dtype=mx.int32)
         self._size = len(tokens)
 
@@ -1628,9 +1644,11 @@ class LRUPromptCache:
         cache_type: str
 
     class CacheOrder:
-        def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
-            self._ordering = ordering
-            self._lrus = {k: deque() for k in ordering}
+        def __init__(self, ordering: Optional[List[str]] = None):
+            self._ordering = (
+                ["assistant", "user", "system"] if ordering is None else ordering
+            )
+            self._lrus = {k: deque() for k in self._ordering}
 
         def __len__(self):
             return sum(len(lru) for lru in self._lrus.values())
