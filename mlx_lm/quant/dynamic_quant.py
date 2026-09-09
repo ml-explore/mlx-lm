@@ -7,7 +7,6 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
 
@@ -72,8 +71,8 @@ def estimate_sensitivities(
         lambda x: mx.zeros(x.shape, dtype=gradient_accum_dtype),
         q_model.trainable_parameters(),
     )
-    for e, s in tqdm(
-        enumerate(range(0, len(data), batch_size)),
+    for s in tqdm(
+        range(0, len(data), batch_size),
         total=len(data) // batch_size,
         desc="Estimating sensitivities",
     ):
@@ -182,10 +181,19 @@ def main():
         choices=["float32", "bfloat16"],
         help="What type to use to accumulate the gradients for the sensitivities",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     args = parser.parse_args()
 
-    group = mx.distributed.init()
-    model, tokenizer, config = load(args.model, return_config=True)
+    mx.distributed.init()
+    model, tokenizer, config = load(
+        args.model,
+        return_config=True,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     if args.sensitivities is None:
         mx.random.seed(args.seed)
