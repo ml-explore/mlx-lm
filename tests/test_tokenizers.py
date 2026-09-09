@@ -120,5 +120,6 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(find(prompt, [THINK_START], start=0), 1)
         self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
 
+
 if __name__ == "__main__":
     unittest.main()
