@@ -173,11 +173,11 @@ class SwitchGLU(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
-        indices = mx.stop_gradient(indices)
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
         # of different experts is in order.
+        indices = mx.stop_gradient(indices)
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
@@ -213,11 +213,11 @@ class SwitchMLP(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
-        indices = mx.stop_gradient(indices)
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access
         # of different experts is in order.
+        indices = mx.stop_gradient(indices)
         do_sort = indices.size >= 64
         idx = indices
         inv_order = None
