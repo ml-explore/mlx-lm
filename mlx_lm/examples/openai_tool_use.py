@@ -1,4 +1,5 @@
 # Copyright © 2025 Apple Inc.
+
 """
 This is an example of tool use with mlx_lm and the OpenAI client.
 

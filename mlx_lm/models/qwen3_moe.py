@@ -5,9 +5,11 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -120,21 +122,30 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
 
+        self.sharding_group = None
+
     def __call__(
         self,
         x: mx.array,
     ) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         gates = self.gate(x)
         gates = mx.softmax(gates, axis=-1, precise=True)
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
 
         return y
 
@@ -171,7 +182,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3MoeModel(nn.Module):
+class Qwen3MoeModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -196,13 +207,30 @@ class Qwen3MoeModel(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             h = layer(h, mask, c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -245,6 +273,52 @@ class Model(nn.Module):
                     weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
         return weights
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        for layer in self.model.layers:
+            # Shard the self attention
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.k_proj = shard_linear(
+                layer.self_attn.k_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.v_proj = shard_linear(
+                layer.self_attn.v_proj, "all-to-sharded", group=group
+            )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            # Shard the dense MLP layers
+            if isinstance(layer.mlp, MLP):
+                layer.mlp.gate_proj = shard_linear(
+                    layer.mlp.gate_proj, "all-to-sharded", group=group
+                )
+                layer.mlp.down_proj = shard_linear(
+                    layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+                layer.mlp.up_proj = shard_linear(
+                    layer.mlp.up_proj, "all-to-sharded", group=group
+                )
+
+            # Shard the MoE. Shard in place since the MoE should be responsible
+            # for aggregating the results. The router (gate) stays replicated.
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+
     @property
     def quant_predicate(self):
         def predicate(path, _):
@@ -256,4 +330,4 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers

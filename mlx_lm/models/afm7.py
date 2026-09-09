@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
-from typing import Any, Dict, Optional, Union
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -172,7 +172,6 @@ class Attention(nn.Module):
         self.head_dim = head_dim = args.hidden_dim // n_heads
         self.scale = head_dim**-0.5
 
-        qkv_dim = (n_heads + 2 * n_kv_heads) * head_dim
         self.qkv_proj = FusedLinear(
             dim, [n_heads * head_dim] + 2 * [n_kv_heads * head_dim]
         )
