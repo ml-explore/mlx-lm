@@ -38,6 +38,7 @@ from .generate import (
     SequenceStateMachine,
     stream_generate,
 )
+from .harmony import has_harmony_format, parse_harmony_response
 from .models.cache import (
     LRUPromptCache,
     make_prompt_cache,
@@ -1295,6 +1296,24 @@ class APIHandler(BaseHTTPRequestHandler):
             dict: A dictionary containing the response, in the same format as
               OpenAI's API.
         """
+        # gpt-oss-family models emit OpenAI's "harmony" multi-channel format
+        # (<|channel|>NAME<|message|>BODY<|end|>...), which the reasoning-split
+        # state machine above never detects (it only matches a single fixed
+        # start/end token pair, e.g. <think>/</think> — harmony's <|channel|>
+        # is one token shared across every channel boundary, with the channel
+        # name generated as ordinary text). Unpatched, raw channel markers
+        # land verbatim in message.content. Only applied when NOT streaming:
+        # the harmony parser needs the fully-accumulated text to correctly
+        # attribute a channel's content, which only the non-streaming path
+        # ever has in `text`; streaming-safe incremental splitting is a
+        # follow-up. See mlx_lm.harmony and ml-explore/mlx-lm#875.
+        if not self.stream and text:
+            tokenizer = self.response_generator.model_provider.tokenizer
+            if tokenizer is not None and has_harmony_format(tokenizer):
+                text, harmony_reasoning = parse_harmony_response(text)
+                if harmony_reasoning:
+                    reasoning_text = (reasoning_text or "") + harmony_reasoning
+
         token_logprobs = token_logprobs or []
         top_logprobs = top_tokens or []
         tool_calls = tool_calls or []
