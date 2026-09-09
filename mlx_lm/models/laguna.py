@@ -192,6 +192,7 @@ class MoEGate(nn.Module):
         inds = mx.argpartition(-scores_for_selection, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
+        inds = mx.stop_gradient(inds)
         weights = mx.take_along_axis(scores, inds, axis=-1)
         weights = weights / weights.sum(axis=-1, keepdims=True)
         return inds, weights

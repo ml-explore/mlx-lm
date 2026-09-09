@@ -219,6 +219,7 @@ class LongcatFlashTopkRouter(nn.Module):
         topk_indices = mx.argpartition(corrected_scores, kth=-self.top_k, axis=-1)[
             ..., -self.top_k :
         ]
+        topk_indices = mx.stop_gradient(topk_indices)
         topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
 
         if self.norm_topk_prob:
