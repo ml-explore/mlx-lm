@@ -205,15 +205,28 @@ class TestTunerTrainer(unittest.TestCase):
 
     def test_group_expert_select_backward(self):
         # This gate reads scores back with take_along_axis, outside the switch layers.
-        from mlx_lm.models.deepseek_v3 import group_expert_select
+        import importlib
 
         bias = mx.zeros((8,))
+        for name in (
+            "deepseek_v3",
+            "deepseek_v32",
+            "dots1",
+            "exaone_moe",
+            "glm4_moe",
+            "glm4_moe_lite",
+            "mimo_v2_flash",
+            "nemotron_h",
+        ):
+            with self.subTest(model=name):
+                module = importlib.import_module(f"mlx_lm.models.{name}")
+                select = module.group_expert_select
 
-        def loss_fn(gates):
-            _, scores = group_expert_select(gates, bias, 2, 2, 1, 1.0, True)
-            return scores.sum()
+                def loss_fn(gates):
+                    _, scores = select(gates, bias, 2, 2, 1, 1.0, True)
+                    return scores.sum()
 
-        mx.eval(mx.grad(loss_fn)(mx.random.normal((2, 3, 8))))
+                mx.eval(mx.grad(loss_fn)(mx.random.normal((2, 3, 8))))
 
     def test_gemma4_per_layer_inputs_backward(self):
         # With embeddings instead of token ids, the lookup gathers with argmin output.
