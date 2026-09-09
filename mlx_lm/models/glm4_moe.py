@@ -1,8 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
@@ -110,7 +108,10 @@ class Attention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -320,7 +321,7 @@ class Model(nn.Module):
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [

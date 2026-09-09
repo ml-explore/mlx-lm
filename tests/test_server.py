@@ -14,7 +14,6 @@ from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
-    Response,
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
@@ -72,6 +71,13 @@ class DummyModelProvider:
     def load_default(self):
         return self.load("default_model", None, "default_model")
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
 
 class MockCache:
     def __init__(self, value, is_trimmable: bool = True):
@@ -104,8 +110,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, _ = sm.flush(state)
         full = text + rest
         self.assertEqual(full, "hi body bye")
 
@@ -117,9 +123,9 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
-        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
-        state, rest, s = sm.flush(state)
+        state, t1, _ = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, _ = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, _ = sm.flush(state)
         full = t1 + t2 + rest
         self.assertEqual(full, "call1call2")
 
@@ -160,8 +166,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hello STOP world")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hello STOP world")
+        state, rest, _ = sm.flush(state)
         self.assertEqual(text + rest, "hello  world")
 
     def test_reasoning_to_tool_transition(self):
@@ -321,6 +327,18 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_generation_thread_exit_releases_model(self):
+        response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
+        provider = response_generator.model_provider
+        response_generator.stop_and_join()
+
+        # The weights are dropped even though this frame still holds the
+        # provider, and the args survive for request handler threads.
+        self.assertIsNone(provider.model)
+        self.assertIsNone(provider.tokenizer)
+        self.assertFalse(provider.is_batchable)
+        self.assertIsNotNone(response_generator.cli_args.allowed_origins)
+
     def test_make_state_machine_empty_tool_call_end(self):
         class FakeTokenizer:
             has_thinking = False
@@ -330,6 +348,7 @@ class TestServer(unittest.TestCase):
             tool_call_start_tokens = (100,)
             tool_call_end_tokens = ()
             eos_token_ids = [2]
+            structural_markers = ()
 
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"
@@ -337,7 +356,7 @@ class TestServer(unittest.TestCase):
             def encode(self, text, add_special_tokens=False):
                 return []
 
-        stop_matcher, text_sm = self.response_generator._make_state_machine(
+        stop_sequences, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],
@@ -351,9 +370,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(clean_text, "hellobody")
 
         # Verify EOS stops via the stop matcher
-        stop_state = stop_matcher.make_state()
-        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
-        self.assertTrue(matched)
+        self.assertTrue(stop_sequences.matcher().advance(2))
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
@@ -367,6 +384,18 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+
+    def test_health_endpoint(self):
+        url = f"http://localhost:{self.port}/health"
+
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+        self.response_generator.stop_and_join()
+        response = requests.get(url)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json(), {"status": "unavailable"})
 
 
 class TestServerWithDraftModel(unittest.TestCase):
