@@ -135,6 +135,19 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(model.custom_attribute, "This is a custom model")
         self.assertTrue(hasattr(model, "qwenWeights"))
 
+    def test_get_classes_remaps_bailing_v3_architecture(self):
+        from mlx_lm.models import bailing_moe_v3
+
+        model_cls, args_cls = utils._get_classes(
+            {
+                "model_type": "bailing_hybrid",
+                "architectures": ["BailingMoeV3ForCausalLM"],
+            }
+        )
+
+        self.assertIs(model_cls, bailing_moe_v3.Model)
+        self.assertIs(args_cls, bailing_moe_v3.ModelArgs)
+
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
 
