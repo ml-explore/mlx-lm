@@ -1,0 +1,8 @@
+target-version = "py38"
+
+[lint]
+select = ["B006", "B007", "B904", "CPY001", "F", "PLW0127"]  # pyflakes: unused imports and variables, undefined names, ...
+
+[lint.per-file-ignores]
+# Package initializers re-export names for the public API.
+"**/__init__.py" = ["F401"]

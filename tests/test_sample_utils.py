@@ -1,8 +1,20 @@
+# Copyright © 2024 Apple Inc.
+
+import threading
 import unittest
 
 import mlx.core as mx
 
-from mlx_lm.sample_utils import apply_min_p, apply_top_k, apply_top_p, apply_xtc
+from mlx_lm.sample_utils import (
+    apply_min_p,
+    apply_top_k,
+    apply_top_p,
+    apply_xtc,
+    make_frequency_penalty,
+    make_logits_processors,
+    make_presence_penalty,
+    make_sampler,
+)
 
 
 class TestSampleUtils(unittest.TestCase):
@@ -68,6 +80,23 @@ class TestSampleUtils(unittest.TestCase):
             actual_probs.tolist(), [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
         )
 
+    def test_apply_min_p_min_tokens_to_keep(self):
+        # min_tokens_to_keep > 1 must execute (regression: bare Python
+        # False passed to mx.put_along_axis raised TypeError) and must
+        # keep exactly that many candidates under an aggressive filter.
+        probs = mx.array([0.7, 0.2, 0.05, 0.05])[None]
+        logits = mx.log(probs)
+        new_logits = apply_min_p(logits, 0.9, min_tokens_to_keep=2)
+        kept = (new_logits > -float("inf")).sum().item()
+        self.assertEqual(kept, 2)
+
+        # Batch mode
+        probs = mx.array([[0.9, 0.05, 0.03, 0.02], [0.4, 0.3, 0.2, 0.1]])
+        logits = mx.log(probs)
+        new_logits = apply_min_p(logits, 0.99, min_tokens_to_keep=3)
+        kept_per_row = (new_logits > -float("inf")).sum(axis=-1).tolist()
+        self.assertEqual(kept_per_row, [3, 3])
+
     def test_apply_top_k(self):
         probs = mx.array([0.9, 0.0, 0.0, 0.1])[None]
         logits = mx.log(probs)
@@ -115,6 +144,91 @@ class TestSampleUtils(unittest.TestCase):
         probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
         new_probs = mx.softmax(apply_xtc(mx.log(probs), 0, 0.1, [0]), -1)
         self.assertTrue(mx.allclose(new_probs, probs))
+
+        # Test that the threshold is computed per row in a batch
+        probs = mx.array([[0.6, 0.25, 0.1, 0.05], [0.9, 0.05, 0.03, 0.02]])
+        batched = mx.softmax(apply_xtc(mx.log(probs), 1, 0.2, []), -1)
+        for i in range(probs.shape[0]):
+            alone = mx.softmax(apply_xtc(mx.log(probs[i : i + 1]), 1, 0.2, []), -1)
+            self.assertTrue(mx.allclose(batched[i : i + 1], alone))
+
+    def test_presence_penalty(self):
+        # Token appears multiple times - penalty applied once
+        tokens = mx.array([0, 0, 0, 1, 1])
+        logits = mx.zeros((1, 4))
+        processor = make_presence_penalty(0.5, context_size=5)
+        result = processor(tokens, logits)
+        # Token 0 appears 3 times, token 1 appears 2 times - both penalized once
+        self.assertAlmostEqual(result[0, 0].item(), -0.5)
+        self.assertAlmostEqual(result[0, 1].item(), -0.5)
+        # Tokens not in context not penalized
+        self.assertAlmostEqual(result[0, 2].item(), 0.0)
+        self.assertAlmostEqual(result[0, 3].item(), 0.0)
+
+    def test_frequency_penalty(self):
+        # Token appears multiple times - penalty applied proportionally
+        tokens = mx.array([0, 0, 0, 1, 1])
+        logits = mx.zeros((1, 4))
+        processor = make_frequency_penalty(0.5, context_size=5)
+        result = processor(tokens, logits)
+        # Token 0 appears 3 times -> 3 * 0.5 = 1.5 penalty
+        self.assertAlmostEqual(result[0, 0].item(), -1.5)
+        # Token 1 appears 2 times -> 2 * 0.5 = 1.0 penalty
+        self.assertAlmostEqual(result[0, 1].item(), -1.0)
+        # Tokens not in context not penalized
+        self.assertAlmostEqual(result[0, 2].item(), 0.0)
+        self.assertAlmostEqual(result[0, 3].item(), 0.0)
+
+    def test_make_logits_processors(self):
+        # Create processors with all three penalty types
+        tokens = mx.array([0, 0, 0, 1, 1])
+        # Use non-zero logits so repetition penalty has effect
+        logits = mx.array([[1.0, 0.5, 0.0, -0.5]])
+        processors = make_logits_processors(
+            repetition_penalty=1.5,
+            repetition_context_size=5,
+            presence_penalty=0.5,
+            presence_context_size=5,
+            frequency_penalty=0.25,
+            frequency_context_size=5,
+        )
+        # Apply all processors
+        for processor in processors:
+            logits = processor(tokens, logits)
+        # Token 0 (appears 3x): 1.0/1.5 - 0.5 - 0.75 = -0.5833
+        # Token 1 (appears 2x): 0.5/1.5 - 0.5 - 0.5 = -0.6667
+        # Token 2 (not in context): 0.0 (no penalty)
+        # Token 3 (not in context): -0.5 (no penalty)
+        self.assertAlmostEqual(logits[0, 0].item(), -0.5833, places=4)
+        self.assertAlmostEqual(logits[0, 1].item(), -0.6667, places=4)
+        self.assertAlmostEqual(logits[0, 2].item(), 0.0, places=4)
+        self.assertAlmostEqual(logits[0, 3].item(), -0.5, places=4)
+
+    def test_sampler_prng_across_threads(self):
+        sampler = make_sampler(temp=1.0)
+        logits = mx.random.normal((1, 128))
+        mx.eval(logits)
+
+        results = {}
+
+        def worker():
+            tokens = [sampler(logits).item() for _ in range(16)]
+            results["tokens_differ"] = len(set(tokens)) > 1
+
+            mx.random.seed(1234)
+            a = sampler(logits).item()
+            mx.random.seed(1234)
+            b = sampler(logits).item()
+            results["seed_reproducible"] = a == b
+
+            mx.clear_streams()
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        self.assertTrue(results["tokens_differ"])
+        self.assertTrue(results["seed_reproducible"])
 
 
 if __name__ == "__main__":

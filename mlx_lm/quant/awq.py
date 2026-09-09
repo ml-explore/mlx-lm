@@ -3,9 +3,7 @@
 import argparse
 import copy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Dict
-from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -452,7 +450,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for e, block in enumerate(tqdm(model.layers)):
+    for block in tqdm(model.layers):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)
@@ -547,6 +545,11 @@ def main():
     parser.add_argument("--sequence-length", type=int, default=512)
     parser.add_argument("--n-grid", type=int, default=20)
     parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     args = parser.parse_args()
 
     group = mx.distributed.init()
@@ -557,7 +560,12 @@ def main():
 
     mx.random.seed(args.seed)
 
-    model, tokenizer, config = load(args.model, lazy=True, return_config=True)
+    model, tokenizer, config = load(
+        args.model,
+        lazy=True,
+        return_config=True,
+        trust_remote_code=args.trust_remote_code,
+    )
 
     model_type = config["model_type"]
     if (awq_config := AWQ_MODEL_CONFIGS.get(model_type, None)) is None:

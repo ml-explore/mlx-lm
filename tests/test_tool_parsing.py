@@ -1,11 +1,14 @@
+# Copyright © 2026 Apple Inc.
+
 import unittest
-from pathlib import Path
 
 from mlx_lm.tool_parsers import (
     function_gemma,
+    gemma4,
     glm47,
     json_tools,
     kimi_k2,
+    kimi_k3,
     longcat,
     minimax_m2,
     mistral,
@@ -15,10 +18,10 @@ from mlx_lm.tool_parsers import (
 
 
 class TestToolParsing(unittest.TestCase):
-
     def test_parsers(self):
         test_cases = [
             ("call:multiply{a:12234585,b:48838483920}", function_gemma),
+            ("call:multiply{a:12234585,b:48838483920}", gemma4),
             (
                 '{"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}',
                 glm47,
@@ -91,6 +94,10 @@ class TestToolParsing(unittest.TestCase):
                 function_gemma,
             ),
             (
+                'call:get_current_temperature{location:<|"|>London<|"|>}',
+                gemma4,
+            ),
+            (
                 'get_current_temperature<arg_key>location</arg_key><arg_value>"London"</arg_value>',
                 glm47,
             ),
@@ -149,6 +156,140 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_pythonic_single_quoted_args_with_commas(self):
+        # LFM2.5 emits single-quoted strings; embedded commas must not truncate
+        test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
+        tool_call = pythonic.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "write")
+        self.assertEqual(tool_call["arguments"]["filePath"], "/tmp/hello.py")
+        self.assertEqual(tool_call["arguments"]["content"], "# Hello, world!")
+
+        # Double-quoted still works
+        test_case = '[search(query="hello, world")]'
+        tool_call = pythonic.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["arguments"]["query"], "hello, world")
+
+    def test_qwen3_coder_single_quoted_params(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filters": {"type": "object"},
+                            "tags": {"type": "array"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        # single-quoted dict (python-style, not valid JSON)
+        test_case = (
+            "<function=search>"
+            "<parameter=filters>{'category': 'books', 'in_stock': True}</parameter>"
+            "<parameter=tags>['fiction', 'new']</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "search")
+        self.assertEqual(
+            tool_call["arguments"]["filters"],
+            {"category": "books", "in_stock": True},
+        )
+        self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+        # valid JSON (double-quoted) should still work
+        test_case = (
+            "<function=search>"
+            '<parameter=filters>{"category": "books"}</parameter>'
+            '<parameter=tags>["fiction", "new"]</parameter>'
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
+        self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+    def test_gemma4(self):
+        # Nested object
+        test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "configure")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"settings": {"enabled": True, "name": "test"}},
+        )
+
+        # Array of strings
+        test_case = 'call:tag{items:[<|"|>foo<|"|>,<|"|>bar<|"|>]}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "tag")
+        self.assertEqual(tool_call["arguments"], {"items": ["foo", "bar"]})
+
+        # Mixed types
+        test_case = 'call:search{query:<|"|>hello world<|"|>,limit:10,verbose:false}'
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "search")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"query": "hello world", "limit": 10, "verbose": False},
+        )
+
+        # Multiple tool calls in a single block (no delimiter between them)
+        test_case = (
+            'call:glob{pattern:<|"|>README*.md<|"|>}'
+            'call:glob{pattern:<|"|>CONTRIBUTING.md<|"|>}'
+        )
+        tool_calls = gemma4.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "glob")
+        self.assertEqual(tool_calls[0]["arguments"], {"pattern": "README*.md"})
+        self.assertEqual(tool_calls[1]["name"], "glob")
+        self.assertEqual(tool_calls[1]["arguments"], {"pattern": "CONTRIBUTING.md"})
+
+        # Multiple tool calls with nested args
+        test_case = (
+            'call:search{query:<|"|>weather<|"|>,limit:5}'
+            'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
+        )
+        tool_calls = gemma4.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(tool_calls[0]["name"], "search")
+        self.assertEqual(
+            tool_calls[0]["arguments"],
+            {"query": "weather", "limit": 5},
+        )
+        self.assertEqual(tool_calls[1]["name"], "configure")
+        self.assertEqual(
+            tool_calls[1]["arguments"],
+            {"settings": {"enabled": True, "name": "test"}},
+        )
+
+        # Hyphenated function name (e.g. manim-video)
+        test_case = (
+            'call:manim-video{mode:<|"|>plan<|"|>,prompt:<|"|>explain KV caching<|"|>}'
+        )
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "manim-video")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"mode": "plan", "prompt": "explain KV caching"},
+        )
+
+        # Braces inside a string argument (e.g. code snippets or markdown in content)
+        test_case = (
+            'call:skill_manage{action:<|"|>create<|"|>,'
+            'content:<|"|>use a dict like {key: value} in your code<|"|>}'
+        )
+        tool_call = gemma4.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "skill_manage")
+        self.assertEqual(tool_call["arguments"]["action"], "create")
+        self.assertIn("{", tool_call["arguments"]["content"])
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
@@ -186,6 +327,206 @@ class TestToolParsing(unittest.TestCase):
             },
         ]
         self.assertEqual(tool_calls, expected)
+
+    def test_kimi_k3(self):
+        # Typed per-key arguments
+        test_case = (
+            '<|open|>call tool="multiply" index="1"<|sep|>'
+            '<|open|>argument key="a" type="number"<|sep|>12234585<|close|>argument<|sep|>'
+            '<|open|>argument key="b" type="number"<|sep|>48838483920<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # String argument stays raw, other types decode as JSON
+        test_case = (
+            '<|open|>call tool="search" index="1"<|sep|>'
+            '<|open|>argument key="query" type="string"<|sep|>{"not": "json"}<|close|>argument<|sep|>'
+            '<|open|>argument key="limit" type="number"<|sep|>5<|close|>argument<|sep|>'
+            '<|open|>argument key="safe" type="boolean"<|sep|>true<|close|>argument<|sep|>'
+            '<|open|>argument key="filters" type="array"<|sep|>["a", "b"]<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "name": "search",
+                "arguments": {
+                    "query": '{"not": "json"}',
+                    "limit": 5,
+                    "safe": True,
+                    "filters": ["a", "b"],
+                },
+            }
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Raw JSON object block
+        test_case = (
+            '<|open|>call tool="get_weather" index="1"<|sep|>'
+            '<|open|>json type="object"<|sep|>{"city": "Tokyo"}<|close|>json<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+        self.assertEqual(tool_calls, expected)
+
+        # Multiple calls in one tools section, escaped attribute values
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="echo&amp;log" index="2"<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "say", "arguments": {"text": "hi"}},
+            {"name": "echo&log", "arguments": {}},
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Malformed call (missing tool name) does not discard valid siblings
+        test_case = (
+            '<|open|>call index="1"<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="say" index="2"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Valid call followed by a call with a bad JSON block
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="broken" index="2"<|sep|>'
+            '<|open|>json type="object"<|sep|>{not json<|close|>json<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Truncated trailing call after a complete one
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="cut" index="2"<|sep|>'
+            '<|open|>argument key="x" type="num'
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Nothing parseable still raises
+        with self.assertRaises(ValueError):
+            kimi_k3.parse_tool_call(
+                '<|open|>call index="1"<|sep|><|close|>call<|sep|>', None
+            )
+
+    def test_minimax_m2(self):
+        test_case = (
+            '<invoke name="search">\n'
+            '<parameter name="query">weather</parameter>\n'
+            "</invoke>\n"
+            '<invoke name="read_file">\n'
+            '<parameter name="path">/tmp/test.txt</parameter>\n'
+            "</invoke>"
+        )
+        expected = [
+            {"name": "search", "arguments": {"query": "weather"}},
+            {"name": "read_file", "arguments": {"path": "/tmp/test.txt"}},
+        ]
+        tool_calls = minimax_m2.parse_tool_call(test_case, None)
+        self.assertEqual(expected, tool_calls)
+
+    def test_qwen3_coder_iso_date(self):
+        """Qwen3 coder parser should not crash on ISO 8601 dates."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "schedule",
+                    "description": "Schedule a task",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["name", "deadline"],
+                        "properties": {
+                            "name": {"type": "string"},
+                            "deadline": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=schedule>\n"
+            "<parameter=name>\n"
+            "deploy\n"
+            "</parameter>\n"
+            "<parameter=deadline>\n"
+            "2025-06-15T10:30:00Z\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
+        # parse_tool_call returns dict, not list
+        self.assertEqual(tool_calls["name"], "schedule")
+        self.assertEqual(tool_calls["arguments"]["name"], "deploy")
+        self.assertEqual(tool_calls["arguments"]["deadline"], "2025-06-15T10:30:00Z")
+
+    def test_qwen3_coder_partial_number(self):
+        """Qwen3 coder parser should handle partial number-like strings."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "log",
+                    "description": "Log a message",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["msg"],
+                        "properties": {
+                            "msg": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=log>\n"
+            "<parameter=msg>\n"
+            "version 3.10.5-beta\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
+        # parse_tool_call returns dict, not list
+        self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
+
+    def test_qwen3_coder_missing_function_tag_close(self):
+        """Recover the function name when the model drops the ">" after it."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Get the current time",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        # Missing ">" after the name plus an orphan "</parameter>"
+        test_case = "<function=get_current_time\n</parameter>\n</function>"
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "get_current_time")
+        self.assertEqual(tool_call["arguments"], {})
 
 
 if __name__ == "__main__":

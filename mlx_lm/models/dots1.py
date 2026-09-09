@@ -1,7 +1,6 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -161,7 +160,10 @@ class Dots1TopkRouter(nn.Module):
 
 class Dots1MLP(nn.Module):
     def __init__(
-        self, args: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        args: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
 
@@ -296,7 +298,7 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             if l >= self.args.first_k_dense_replace:
-                for n, m in [
+                for _, m in [
                     ("w1", "gate_proj"),
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),

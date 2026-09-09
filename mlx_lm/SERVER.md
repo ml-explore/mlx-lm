@@ -30,6 +30,26 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
+### KV Cache Quantization
+
+Use `--kv-bits` to quantize the KV cache and save memory on long-context
+generations:
+
+```shell
+mlx_lm.server --model <path_to_model_or_hf_repo> --kv-bits 4 --prefill-step-size 512
+```
+
+Attention on a quantized cache is not fused, so it keeps a score matrix of
+`prefill_step_size x context_length`. Decrease `--prefill-step-size`, or the
+matrix can be larger than the memory that the quantized cache saves.
+
+Use `--kv-group-size` for the group size and `--quantized-kv-start` for the
+token position at which quantization starts (default `5000`).
+
+> [!NOTE]
+> A quantized KV cache does not support batching. The server processes requests
+> one at a time when you set `--kv-bits`.
+
 You can make a request to the model by running:
 
 ```shell
@@ -72,11 +92,23 @@ curl localhost:8080/v1/chat/completions \
 - `min_p`: (Optional) A float specifying the min-p sampling parameter.
   Defaults to `0.0` (disabled).
 
-- `repetition_penalty`: (Optional) Applies a penalty to repeated tokens.
-  Defaults to `1.0`.
+- `repetition_penalty`: (Optional) Applies a multiplicative penalty to repeated
+  tokens. Defaults to `0.0` (disabled).
 
 - `repetition_context_size`: (Optional) The size of the context window for
   applying repetition penalty. Defaults to `20`.
+
+- `presence_penalty`: (Optional) Applies an additive penalty to tokens
+  that appeared before. Defaults to `0.0` (disabled).
+
+- `presence_context_size`: (Optional) The size of the context window for
+  applying presence penalty. Defaults to `20`.
+
+- `frequency_penalty`: (Optional) Applies an additive penalty proportional to
+  how many times a token appeared previously. Defaults to `0.0` (disabled).
+
+- `frequency_context_size`: (Optional) The size of the context window for
+  applying frequency penalty. Defaults to `20`.
 
 - `logit_bias`: (Optional) A dictionary mapping token IDs to their bias
   values. Defaults to `None`.

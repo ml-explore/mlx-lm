@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-import math
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -198,7 +197,6 @@ class Mamba(nn.Module):
         BCdt = self.bcdt_proj(x)
         B, C, dt = mx.split(BCdt, [self.d_state, self.d_state * 2], axis=-1)
 
-        A = -mx.exp(self.A_log.astype(mx.float32))  # (num_heads,)
         dt = mx.fast.rms_norm(dt, self.dt_norm_weight, self.config.rms_norm_eps)
         B = mx.fast.rms_norm(B, self.B_norm_weight, self.config.rms_norm_eps)
         C = mx.fast.rms_norm(C, self.C_norm_weight, self.config.rms_norm_eps)

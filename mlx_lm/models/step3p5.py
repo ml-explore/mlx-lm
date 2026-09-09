@@ -10,7 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwiGLU, SwitchGLU
 
@@ -394,7 +394,14 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [KVCache() for _ in self.layers]
+        return [
+            (
+                RotatingKVCache(max_size=self.args.sliding_window)
+                if layer.is_sliding
+                else KVCache()
+            )
+            for layer in self.layers
+        ]
 
     def sanitize(self, weights):
         remappings = [

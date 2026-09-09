@@ -1,12 +1,13 @@
 # Copyright © 2025 Apple Inc.
 
 import argparse
+import time
 
 import mlx.core as mx
 
 from mlx_lm import batch_generate, load, stream_generate
 from mlx_lm.generate import DEFAULT_MODEL
-from mlx_lm.utils import pipeline_load, sharded_load
+from mlx_lm.utils import sharded_load
 
 
 def setup_arg_parser():
@@ -60,6 +61,23 @@ def setup_arg_parser():
         action="store_true",
         help="Quantize activations using the same quantization config as the corresponding layer.",
     )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prefill processing (default: 2048)",
+    )
+    parser.add_argument(
+        "--delay",
+        type=int,
+        default=0,
+        help="Delay between each test in seconds (default: 0)",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer/model loading.",
+    )
     return parser
 
 
@@ -81,7 +99,11 @@ def main():
 
     if group.size() > 1:
         model, tokenizer, config = sharded_load(
-            model_path, pipeline_group, tensor_group, return_config=True
+            model_path,
+            pipeline_group,
+            tensor_group,
+            return_config=True,
+            trust_remote_code=args.trust_remote_code,
         )
     else:
         model, tokenizer, config = load(
@@ -89,6 +111,7 @@ def main():
             return_config=True,
             tokenizer_config={"trust_remote_code": True},
             model_config={"quantize_activations": args.quantize_activations},
+            trust_remote_code=args.trust_remote_code,
         )
 
     # Empty to avoid early stopping
@@ -102,15 +125,23 @@ def main():
     prompt = prompts[0]
 
     def single_bench():
-        for response in stream_generate(
-            model, tokenizer, prompt, max_tokens=generation_tokens
+        for _ in stream_generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
         ):
             pass
         return response
 
     def batch_bench():
         return batch_generate(
-            model, tokenizer, prompts, max_tokens=generation_tokens
+            model,
+            tokenizer,
+            prompts,
+            max_tokens=generation_tokens,
+            prefill_step_size=args.prefill_step_size,
         ).stats
 
     if batch_size == 1:
@@ -125,10 +156,15 @@ def main():
     rprint(f"Timing with {prompt_tokens=}, {generation_tokens=}, {batch_size=}.")
     responses = []
     for i in range(args.num_trials):
+        if args.delay > 0:
+            time.sleep(args.delay)
+        tic = time.perf_counter()
         response = _bench()
+        toc = time.perf_counter()
         responses.append(response)
         results = [(k, getattr(response, k)) for k in report_keys]
         results = [f"{k}={v:.3f}" for k, v in results]
+        results.append(f"total_time={toc - tic:.3f}")
         rprint(f"Trial {i+1}:  " + ", ".join(results))
 
     def avg(k):
@@ -137,7 +173,7 @@ def main():
 
     results = [(k, avg(k)) for k in report_keys]
     results = [f"{k}={v:.3f}" for k, v in results]
-    rprint(f"Averages: " + ", ".join(results))
+    rprint("Averages: " + ", ".join(results))
 
 
 if __name__ == "__main__":
