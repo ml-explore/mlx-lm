@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import copy
 import glob
@@ -28,8 +28,8 @@ import mlx.nn as nn
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
-    except ImportError:
-        raise ImportError("Run `pip install modelscope` to use ModelScope.")
+    except ImportError as e:
+        raise ImportError("Run `pip install modelscope` to use ModelScope.") from e
 else:
     from huggingface_hub import snapshot_download
 
@@ -137,7 +137,6 @@ def _transform_awq_weights(
             pack_factor = 32 // bits
             in_features, packed_out = qweight.shape
             out_features = packed_out * pack_factor
-            n_groups = in_features // group_size
 
             # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
             unpacked_weight = _unpack_awq_weights(qweight)
@@ -217,9 +216,9 @@ def _get_classes(config: dict):
         model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except ImportError:
+    except ImportError as e:
         msg = f"Model type {model_type} not supported."
-        raise ValueError(msg)
+        raise ValueError(msg) from e
 
     return arch.Model, arch.ModelArgs
 
@@ -262,7 +261,7 @@ DEFAULT_ALLOW_PATTERNS = [
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
-    allow_patterns: List[str] = None,
+    allow_patterns: Optional[List[str]] = None,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -632,7 +631,7 @@ def sharded_load(
 
         local_files = set()
         for k, _ in tree_flatten(model.parameters()):
-            if file_name := weight_index.get(k, None) is None:
+            if weight_index.get(k, None) is None:
                 raise ValueError(
                     "Pipeline loading is only supported for MLX converted models."
                 )

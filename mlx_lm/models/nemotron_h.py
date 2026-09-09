@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
@@ -183,9 +182,8 @@ class NemotronHMamba2Mixer(nn.Module):
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         if cache:
             state = cache[1]
-            lengths = cache.lengths
         else:
-            state, lengths = None, None
+            state = None
 
         y, state = ssm_update(
             hidden_states,

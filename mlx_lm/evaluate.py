@@ -201,7 +201,6 @@ class MLXLM(LM):
             # compute truncation length
             max_tokens = self._max_tokens or DEFAULT_MAX_TOKENS
             truncation = max(0, max_completed_l - max_tokens - 1)
-            orig_prefix_l = len(prefix)
             prefix_l = max(len(prefix) - truncation, 0)
             prefix = prefix[len(prefix) - prefix_l :]
 

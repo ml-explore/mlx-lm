@@ -5,7 +5,6 @@ import unittest
 
 import mlx.core as mx
 
-import mlx_lm
 from mlx_lm.models import qwen3_moe
 from mlx_lm.models.pipeline import PipelineMixin
 

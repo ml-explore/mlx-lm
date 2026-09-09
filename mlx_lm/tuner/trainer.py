@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -183,7 +184,7 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     clear_cache_threshold: int = 0,
-    progress_callback: callable = None,
+    progress_callback: Optional[callable] = None,
 ):
     model.eval()
     all_losses = mx.array(0.0)
