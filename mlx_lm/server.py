@@ -426,15 +426,6 @@ def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
 
 class ResponseGenerator:
     def __init__(self, model_provider: ModelProvider, prompt_cache: LRUPromptCache):
-        if (
-            model_provider.cli_args.kv_bits is not None
-            and model_provider.cli_args.decode_concurrency > 1
-        ):
-            logging.warning(
-                "A quantized KV cache does not support batching. "
-                "The server processes requests one at a time."
-            )
-
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
@@ -1887,23 +1878,22 @@ def main():
         "--kv-bits",
         type=int,
         default=None,
-        help="Number of bits for KV cache quantization. Defaults to no "
-        "quantization. Batching is not supported with a quantized KV cache, "
-        "so requests are served one at a time when this is set. Also decrease "
-        "--prefill-step-size to keep the peak memory low.",
+        help="Number of bits for KV cache quantization (e.g., 4 or 8). "
+        "Reduces memory usage for long contexts. Disables batching, so "
+        "requests are served one at a time. Default: None (full precision)",
     )
     parser.add_argument(
         "--kv-group-size",
         type=int,
         default=64,
-        help="Group size for KV cache quantization",
+        help="Group size for KV cache quantization (default: 64)",
     )
     parser.add_argument(
         "--quantized-kv-start",
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
-        help="When --kv-bits is set, start quantizing the KV cache "
-        "from this step onwards",
+        help="Token position to start KV cache quantization "
+        f"(default: {DEFAULT_QUANTIZED_KV_START})",
     )
     parser.add_argument(
         "--pipeline",
