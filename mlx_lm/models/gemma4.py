@@ -5,7 +5,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_unflatten
 
 from . import gemma4_text
 from .base import BaseModelArgs
