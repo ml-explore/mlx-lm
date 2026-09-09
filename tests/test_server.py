@@ -14,7 +14,6 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
-    Response,
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
@@ -114,8 +113,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hi <tool_call>body</tool_call> bye")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hi <tool_call>body</tool_call> bye")
+        state, rest, _ = sm.flush(state)
         full = text + rest
         self.assertEqual(full, "hi body bye")
 
@@ -127,9 +126,9 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, t1, s = sm.step(state, "<tool_call>call1</tool_call>")
-        state, t2, s = sm.step(state, "<tool_call>call2</tool_call>")
-        state, rest, s = sm.flush(state)
+        state, t1, _ = sm.step(state, "<tool_call>call1</tool_call>")
+        state, t2, _ = sm.step(state, "<tool_call>call2</tool_call>")
+        state, rest, _ = sm.flush(state)
         full = t1 + t2 + rest
         self.assertEqual(full, "call1call2")
 
@@ -170,8 +169,8 @@ class TestTextStateMachine(unittest.TestCase):
             }
         )
         state = sm.make_state()
-        state, text, s = sm.step(state, "hello STOP world")
-        state, rest, s = sm.flush(state)
+        state, text, _ = sm.step(state, "hello STOP world")
+        state, rest, _ = sm.flush(state)
         self.assertEqual(text + rest, "hello  world")
 
     def test_reasoning_to_tool_transition(self):
@@ -360,7 +359,7 @@ class TestServer(unittest.TestCase):
             def encode(self, text, add_special_tokens=False):
                 return []
 
-        stop_matcher, text_sm = self.response_generator._make_state_machine(
+        stop_sequences, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],
@@ -374,9 +373,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(clean_text, "hellobody")
 
         # Verify EOS stops via the stop matcher
-        stop_state = stop_matcher.make_state()
-        stop_state, matched = stop_matcher.match(stop_state, stop_matcher._trie, 2)
-        self.assertTrue(matched)
+        self.assertTrue(stop_sequences.matcher().advance(2))
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"
