@@ -231,7 +231,7 @@ class ConcatenateKVCache(_BaseCache):
         return True
 
     def trim(self, n):
-        n = min(self.offset, n)
+        n = min(self.offset, max(0, n))
         self.offset -= n
         return n
 
@@ -321,7 +321,7 @@ class QuantizedKVCache(_BaseCache):
         return True
 
     def trim(self, n):
-        n = min(self.offset, n)
+        n = min(self.offset, max(0, n))
         self.offset -= n
         return n
 
@@ -389,7 +389,7 @@ class KVCache(_BaseCache):
         return True
 
     def trim(self, n):
-        n = min(self.offset, n)
+        n = min(self.offset, max(0, n))
         self.offset -= n
         return n
 
@@ -545,7 +545,7 @@ class RotatingKVCache(_BaseCache):
         return self.offset < self.max_size
 
     def trim(self, n):
-        n = min(self.offset, n)
+        n = min(self.offset, max(0, n))
         self.offset -= n
         self._idx -= n
         return n
