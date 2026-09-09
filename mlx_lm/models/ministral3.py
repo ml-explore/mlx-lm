@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
@@ -174,8 +174,8 @@ class LanguageModel(PipelineMixin, nn.Module):
                 self.swa_idx = e
                 break
 
-    def pipeline(self, group):
-        super().pipeline(group)
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
         self.fa_idx = None
         self.swa_idx = None
         for e, l in enumerate(self.pipeline_layers):

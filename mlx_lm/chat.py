@@ -1,9 +1,10 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import argparse
 
 import mlx.core as mx
 
+from .cli_ui import ChatUI
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -15,6 +16,7 @@ DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
+DEFAULT_PREFILL_STEP_SIZE = 2048
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 
 
@@ -52,7 +54,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--xtc-threshold",
         type=float,
-        default=0.0,
+        default=0.1,
         help="Thresold the probs of each next token candidate to be sampled by XTC",
     )
     parser.add_argument(
@@ -66,6 +68,13 @@ def setup_arg_parser():
         type=int,
         help="Set the maximum key-value cache size",
         default=None,
+    )
+    parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=DEFAULT_PREFILL_STEP_SIZE,
+        help="Number of prompt tokens to process at a time. Smaller values "
+        f"lower peak memory during prefill (default: {DEFAULT_PREFILL_STEP_SIZE})",
     )
     parser.add_argument(
         "--max-tokens",
@@ -96,70 +105,68 @@ def main():
     pipeline_group = group if args.pipeline else None
     tensor_group = group if not args.pipeline else None
 
-    def rprint(*args, **kwargs):
-        if rank == 0:
-            print(*args, **kwargs)
-
     mx.random.seed(args.seed)
 
     if group.size() > 1:
         if args.adapter_path:
             parser.error("Adapters not supported in distributed mode")
-        model, tokenizer = sharded_load(args.model, pipeline_group, tensor_group)
+        model, tokenizer = sharded_load(
+            args.model,
+            pipeline_group,
+            tensor_group,
+            trust_remote_code=args.trust_remote_code,
+        )
     else:
         model, tokenizer = load(
             args.model,
             adapter_path=args.adapter_path,
-            tokenizer_config={
-                "trust_remote_code": True if args.trust_remote_code else None
-            },
+            tokenizer_config={"trust_remote_code": args.trust_remote_code},
+            trust_remote_code=args.trust_remote_code,
         )
 
-    def print_help():
-        rprint("The command list:")
-        rprint("- 'q' to exit")
-        rprint("- 'r' to reset the chat")
-        rprint("- 'h' to display these commands")
-
-    rprint(f"[INFO] Starting chat session with {args.model}.")
-    print_help()
-    prompt_cache = make_prompt_cache(model, args.max_kv_size)
-    while True:
-        query = input(">> " if rank == 0 else "")
-        if query == "q":
-            break
-        if query == "r":
-            prompt_cache = make_prompt_cache(model, args.max_kv_size)
-            continue
-        if query == "h":
-            print_help()
-            continue
-        messages = []
-        if args.system_prompt is not None:
-            messages.append({"role": "system", "content": args.system_prompt})
-        messages.append({"role": "user", "content": query})
-        prompt = tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-        )
-        for response in stream_generate(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=args.max_tokens,
-            sampler=make_sampler(
-                args.temp,
-                args.top_p,
-                xtc_threshold=args.xtc_threshold,
-                xtc_probability=args.xtc_probability,
-                xtc_special_tokens=(
-                    tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+    with ChatUI(args, rank=rank) as ui:
+        prompt_cache = make_prompt_cache(model, args.max_kv_size)
+        while True:
+            query = ui.prompt()
+            if query == "q":
+                ui.say_bye()
+                break
+            if query == "r":
+                prompt_cache = make_prompt_cache(model, args.max_kv_size)
+                ui.say_reset()
+                continue
+            if query == "h":
+                ui.say_help()
+                continue
+            messages = []
+            if args.system_prompt is not None:
+                messages.append({"role": "system", "content": args.system_prompt})
+            messages.append({"role": "user", "content": query})
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+            )
+            last_response = None
+            for response in stream_generate(
+                model,
+                tokenizer,
+                prompt,
+                max_tokens=args.max_tokens,
+                sampler=make_sampler(
+                    args.temp,
+                    args.top_p,
+                    xtc_threshold=args.xtc_threshold,
+                    xtc_probability=args.xtc_probability,
+                    xtc_special_tokens=(
+                        tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+                    ),
                 ),
-            ),
-            prompt_cache=prompt_cache,
-        ):
-            rprint(response.text, flush=True, end="")
-        rprint()
+                prompt_cache=prompt_cache,
+                prefill_step_size=args.prefill_step_size,
+            ):
+                ui.stream_token(response.text)
+                last_response = response
+            ui.end_turn(last_response)
 
 
 if __name__ == "__main__":
