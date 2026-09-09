@@ -85,7 +85,7 @@ def main():
     args = parser.parse_args()
 
     # Building tokenizer_config
-    tokenizer_config = {"trust_remote_code": True if args.trust_remote_code else None}
+    tokenizer_config = {"trust_remote_code": args.trust_remote_code}
     if args.eos_token is not None:
         tokenizer_config["eos_token"] = args.eos_token
 
@@ -93,6 +93,7 @@ def main():
         args.model,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
+        trust_remote_code=args.trust_remote_code,
     )
 
     args.prompt = sys.stdin.read() if args.prompt == "-" else args.prompt

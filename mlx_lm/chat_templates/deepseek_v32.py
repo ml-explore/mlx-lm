@@ -2,7 +2,6 @@
 
 import copy
 import json
-import re
 from inspect import isfunction
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -333,6 +332,10 @@ def encode_messages(
 def apply_chat_template(
     messages, continue_final_message=False, add_generation_prompt=False, **kwargs
 ):
+    if "enable_thinking" in kwargs:
+        kwargs["thinking_mode"] = (
+            "thinking" if kwargs.pop("enable_thinking") else "chat"
+        )
     out = encode_messages(messages, **kwargs)
     if continue_final_message and add_generation_prompt:
         raise ValueError(

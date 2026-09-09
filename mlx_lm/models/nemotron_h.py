@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
@@ -61,8 +60,8 @@ class ModelArgs(BaseModelArgs):
     _block_type_to_char = {"mamba": "M", "attention": "*", "moe": "E", "mlp": "-"}
 
     def __post_init__(self):
-        if self.time_step_limit is None and self.time_step_min is not None:
-            self.time_step_limit = (self.time_step_min, float("inf"))
+        if self.time_step_limit is None:
+            self.time_step_limit = (0.0, float("inf"))
 
         # Normalize to hybrid_override_pattern (single-char list)
         if self.hybrid_override_pattern is None and self.layers_block_type is not None:
@@ -183,9 +182,8 @@ class NemotronHMamba2Mixer(nn.Module):
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         if cache:
             state = cache[1]
-            lengths = cache.lengths
         else:
-            state, lengths = None, None
+            state = None
 
         y, state = ssm_update(
             hidden_states,
