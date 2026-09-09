@@ -291,10 +291,7 @@ class TestToolParsing(unittest.TestCase):
         self.assertIn("{", tool_call["arguments"]["content"])
 
     def test_mistral(self):
-        # Single call with trailing natural-language text. Mistral has no
-        # tool_call_end token, so trailing tokens land in the same segment and
-        # must be ignored rather than fed to json.loads (which raises
-        # "Extra data").
+        # Single call with trailing natural-language text.
         test_case = 'get_weather[ARGS]{"city": "Paris"}\n\nLet me check that.'
         tool_call = mistral.parse_tool_call(test_case, None)
         self.assertEqual(
@@ -303,16 +300,16 @@ class TestToolParsing(unittest.TestCase):
 
         # Multiple (parallel) tool calls concatenated into one segment,
         # separated by the "[TOOL_CALLS]" marker. These must all be returned as
-        # a list rather than dropped.
+        # a list rather than dropped. Hyphens are legal in tool names.
         test_case = (
-            'get_weather[ARGS]{"city": "Paris"}'
+            'get-weather[ARGS]{"city": "Paris"}'
             '[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
         )
         tool_calls = mistral.parse_tool_call(test_case, None)
         self.assertIsInstance(tool_calls, list)
         self.assertEqual(len(tool_calls), 2)
         self.assertEqual(
-            tool_calls[0], {"name": "get_weather", "arguments": {"city": "Paris"}}
+            tool_calls[0], {"name": "get-weather", "arguments": {"city": "Paris"}}
         )
         self.assertEqual(
             tool_calls[1], {"name": "get_weather", "arguments": {"city": "Tokyo"}}
