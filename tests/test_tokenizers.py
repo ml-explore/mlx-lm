@@ -67,7 +67,9 @@ class TestTokenizers(unittest.TestCase):
 
         # Try one with a naive detokenizer
         tokenizer = load_tokenizer("mlx-community/Llama-3.2-1B-Instruct-4bit")
-        tokenizer._detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        tokenizer._detokenizer = detokenizer
+        self.assertEqual(tokenizer.detokenizer, detokenizer)
         self.check_tokenizer(tokenizer)
 
     def test_special_tokens(self):

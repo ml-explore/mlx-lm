@@ -702,6 +702,7 @@ def stream_generate(
         prompt = mx.array(prompt)
 
     detokenizer = tokenizer.detokenizer
+    detokenizer.reset()
 
     kwargs["max_tokens"] = max_tokens
 

@@ -503,12 +503,12 @@ class TokenizerWrapper:
         """
         Get a stateful streaming detokenizer.
         """
-        return self._detokenizer_class(self)
+        if not hasattr(self, "_detokenizer"):
+            self._detokenizer = self._detokenizer_class(self)
+        return self._detokenizer
 
     def __getattr__(self, attr):
-        if attr == "detokenizer":
-            return self._detokenizer
-        elif attr == "eos_token_ids":
+        if attr == "eos_token_ids":
             return self._eos_token_ids
         elif attr.startswith("_"):
             return self.__getattribute__(attr)
