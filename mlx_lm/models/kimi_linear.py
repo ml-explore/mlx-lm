@@ -108,6 +108,7 @@ def _group_expert_select(
         scores = mx.flatten(scores, -2, -1)
 
     inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
 
     if top_k > 1 and renormalize:
@@ -350,8 +351,11 @@ class KimiDeltaAttention(nn.Module):
         v = v_conv.reshape(B, T, self.num_heads, self.head_dim)
 
         inv_scale = self.scale
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # Match the reference l2norm: x / sqrt(sum(x^2) + 1e-6). rms_norm adds
+        # eps to mean(x^2), so the equivalent eps is 1e-6 / head_dim.
+        eps = 1e-6 / self.head_dim
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, eps)
 
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim

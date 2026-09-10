@@ -1,11 +1,14 @@
+# Copyright © 2024 Apple Inc.
+
 import importlib
+import inspect
 import json
-import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
 class StreamingDetokenizer:
@@ -255,6 +258,7 @@ def _infer_thinking(tokenizer):
     THINK_TOKENS = [
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
+        ("<|think:start|>", "<|think:end|>"),
     ]
 
     # Single token thinking modes
@@ -278,7 +282,48 @@ def _infer_thinking(tokenizer):
             tuple(tokenizer.encode(think_end, add_special_tokens=False)),
         )
 
+    if _is_xtml_vocab(vocab):
+        think_start = "<|open|>think<|sep|>"
+        think_end = "<|close|>think<|sep|>"
+        return (
+            think_start,
+            think_end,
+            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+        )
+
     return (None, None, None, None)
+
+
+def _is_xtml_vocab(vocab):
+    return all(
+        t in vocab for t in ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
+    )
+
+
+def _infer_structural_markers(tokenizer):
+    if _is_xtml_vocab(tokenizer.get_vocab()):
+        return (
+            "<|open|>response<|sep|>",
+            "<|close|>response<|sep|>",
+            "<|close|>message<|sep|>",
+        )
+    return ()
+
+
+def _infer_thinking_kwarg(tokenizer):
+    custom_renderer = (
+        getattr(type(tokenizer), "apply_chat_template", None)
+        is not PreTrainedTokenizerBase.apply_chat_template
+    )
+    if custom_renderer:
+        try:
+            params = inspect.signature(type(tokenizer).apply_chat_template).parameters
+            if "thinking" in params and "enable_thinking" not in params:
+                return "thinking", custom_renderer
+        except (ValueError, TypeError):
+            pass
+    return "enable_thinking", custom_renderer
 
 
 class TokenizerWrapper:
@@ -300,21 +345,23 @@ class TokenizerWrapper:
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
-        self._eos_token_ids = (
-            set(eos_token_ids)
-            if eos_token_ids is not None
-            else {tokenizer.eos_token_id}
-        )
+        self._eos_token_ids = set(eos_token_ids or [])
+        if tokenizer.eos_token_id is not None:
+            self._eos_token_ids.add(tokenizer.eos_token_id)
         (
             self._think_start,
             self._think_end,
             self._think_start_tokens,
             self._think_end_tokens,
         ) = _infer_thinking(tokenizer)
+        self._structural_markers = _infer_structural_markers(tokenizer)
 
         self._chat_template = chat_template
+        self._thinking_kwarg, has_custom_renderer = _infer_thinking_kwarg(tokenizer)
         self.has_chat_template = (
-            tokenizer.chat_template is not None or chat_template is not None
+            tokenizer.chat_template is not None
+            or chat_template is not None
+            or has_custom_renderer
         )
         self._tool_parser = tool_parser
         self._tool_call_start = tool_call_start
@@ -330,8 +377,10 @@ class TokenizerWrapper:
             )
 
     def apply_chat_template(self, *args, tokenize=True, **kwargs):
-        if "enable_thinking" not in kwargs:
-            kwargs["enable_thinking"] = self.has_thinking
+        if self._thinking_kwarg != "enable_thinking" and "enable_thinking" in kwargs:
+            kwargs[self._thinking_kwarg] = kwargs.pop("enable_thinking")
+        if self._thinking_kwarg not in kwargs:
+            kwargs[self._thinking_kwarg] = self.has_thinking
 
         if self._chat_template is not None:
             out = self._chat_template(*args, **kwargs)
@@ -442,6 +491,10 @@ class TokenizerWrapper:
         return self._tool_call_end_tokens
 
     @property
+    def structural_markers(self):
+        return self._structural_markers
+
+    @property
     def tool_parser(self):
         return self._tool_parser
 
@@ -500,7 +553,7 @@ class NewlineTokenizer(PreTrainedTokenizerFast):
         return [self._postprocess_text(d) for d in decoded]
 
 
-AutoTokenizer.register("NewlineTokenizer", fast_tokenizer_class=NewlineTokenizer)
+AutoTokenizer.register(NewlineTokenizer, fast_tokenizer_class=NewlineTokenizer)
 
 
 def _match(a, b):
@@ -543,9 +596,12 @@ def _is_bpe_decoder(decoder):
     return isinstance(decoder, dict) and decoder.get("type", None) == "ByteLevel"
 
 
-def _infer_tool_parser(chat_template):
-    """Attempt to auto-infer a tool parser from the chat template."""
+def _infer_tool_parser(tokenizer):
+    """Attempt to auto-infer a tool parser from the chat template or vocab."""
+    chat_template = tokenizer.chat_template
     if not isinstance(chat_template, str):
+        if _is_xtml_vocab(tokenizer.get_vocab()):
+            return "kimi_k3"
         return None
     elif "<minimax:tool_call>" in chat_template:
         return "minimax_m2"
@@ -593,7 +649,9 @@ def load(
             try:
                 tokenizer_content = json.load(fid)
             except JSONDecodeError as e:
-                raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
+                raise JSONDecodeError(
+                    "Failed to parse tokenizer.json", e.doc, e.pos
+                ) from e
 
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
@@ -606,7 +664,6 @@ def load(
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
-    tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -621,9 +678,8 @@ def load(
         ).apply_chat_template
 
     tool_parser_type = tokenizer_config.get(
-        "tool_parser_type", _infer_tool_parser(tokenizer.chat_template)
+        "tool_parser_type", _infer_tool_parser(tokenizer)
     )
-
     if tool_parser_type is not None:
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
         tool_parser = tool_module.parse_tool_call

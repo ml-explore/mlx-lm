@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import copy
 import glob
@@ -8,6 +8,7 @@ import json
 import os
 import resource
 import shutil
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -27,8 +28,8 @@ import mlx.nn as nn
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
-    except ImportError:
-        raise ImportError("Run `pip install modelscope` to use ModelScope.")
+    except ImportError as e:
+        raise ImportError("Run `pip install modelscope` to use ModelScope.") from e
 else:
     from huggingface_hub import snapshot_download
 
@@ -52,20 +53,41 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+}
+
+MODEL_ARCHITECTURE_REMAPPING = {
+    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
 }
 
 MAX_FILE_SIZE_GB = 5
 
 
+def can_run_metal():
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
+def maybe_set_recommended_wired_limit() -> Optional[int]:
+    """Set the wired limit to the recommended size.
+
+    Returns the previous limit, or ``None`` if the device reports no
+    recommended size.
+    """
+    max_rec_size = mx.device_info().get("max_recommended_working_set_size")
+    if max_rec_size is None:
+        return None
+    return mx.set_wired_limit(max_rec_size)
+
+
 def _parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
     split = 0
     for xi in x:
         if not (xi.isdigit() or xi == "."):
             break
         split += 1
-    digits = float(x[:split])
+    digits = Decimal(x[:split])
     size = (x[split:]).strip().upper()
     return int(digits * sizes[size])
 
@@ -116,7 +138,6 @@ def _transform_awq_weights(
             pack_factor = 32 // bits
             in_features, packed_out = qweight.shape
             out_features = packed_out * pack_factor
-            n_groups = in_features // group_size
 
             # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
             unpacked_weight = _unpack_awq_weights(qweight)
@@ -184,12 +205,21 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            model_type = remapped
+            break
+    else:
+        model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except ImportError:
+    except ImportError as e:
         msg = f"Model type {model_type} not supported."
-        raise ValueError(msg)
+        raise ValueError(msg) from e
 
     return arch.Model, arch.ModelArgs
 
@@ -216,10 +246,23 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+DEFAULT_ALLOW_PATTERNS = [
+    "*.json",
+    "model*.safetensors",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
-    allow_patterns: List[str] = None,
+    allow_patterns: Optional[List[str]] = None,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -235,17 +278,7 @@ def _download(
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        allow_patterns = allow_patterns or [
-            "*.json",
-            "model*.safetensors",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ]
+        allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -258,7 +291,16 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    # Restrict to the same patterns that `_download` fetches so the snapshot
+    # completeness check does not fail on files that were never downloaded
+    # (e.g. `.gitattributes`), which would raise an IncompleteSnapshotError.
+    return Path(
+        snapshot_download(
+            hf_repo,
+            local_files_only=True,
+            allow_patterns=DEFAULT_ALLOW_PATTERNS,
+        )
+    )
 
 
 def load_config(model_path: Path) -> dict:
@@ -392,7 +434,12 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            if quantization_config.get("format") == "nvfp4-pack-quantized":
+                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+            elif quantization_config.get("format") == "mxfp4-pack-quantized":
+                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            else:
+                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -585,7 +632,7 @@ def sharded_load(
 
         local_files = set()
         for k, _ in tree_flatten(model.parameters()):
-            if file_name := weight_index.get(k, None) is None:
+            if weight_index.get(k, None) is None:
                 raise ValueError(
                     "Pipeline loading is only supported for MLX converted models."
                 )
@@ -967,7 +1014,7 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
+    save_model(dst_path, model, donate_model=donate_model)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 

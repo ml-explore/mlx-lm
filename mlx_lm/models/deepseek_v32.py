@@ -105,7 +105,9 @@ class Indexer(nn.Module):
         k = self.rope(k, offset=offset)
 
         if cache is not None:
-            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
+            k, _ = cache.update_and_fetch(k, k)
+            # Avoid unevaluated graph growing infinitely
+            cache.values = mx.zeros_like(cache.keys)
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
@@ -260,6 +262,7 @@ class DeepseekV32Attention(nn.Module):
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
+            topk_indices = mx.stop_gradient(topk_indices)
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
                 kv_latent = mx.take_along_axis(
@@ -330,7 +333,10 @@ class DeepseekV32Attention(nn.Module):
 
 class DeepseekV32MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -374,6 +380,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
@@ -603,7 +610,7 @@ class Model(nn.Module):
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
@@ -613,7 +620,6 @@ class Model(nn.Module):
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
             prefix = f"model.layers.{l}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
-                layer = self.model.layers[l].self_attn.embed_q
                 quantized = f"{prefix}.kv_b_proj.scales" in weights
                 v = weights.pop(f"{prefix}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
@@ -688,7 +694,7 @@ class Model(nn.Module):
             # Shard the MoE. Shard in place since the MoE should be responsible
             # for aggregating the results.
             else:
-                layer.mlp.sharding_group = group = group
+                layer.mlp.sharding_group = group
                 shard_inplace(
                     layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
                 )

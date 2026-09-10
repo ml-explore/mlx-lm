@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import copy
 from collections import deque
@@ -40,7 +40,9 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
-def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
+def save_prompt_cache(
+    file_name: str, cache: List[Any], metadata: Optional[Dict[str, str]] = None
+):
     """
     Save a pre-computed prompt cache to a file.
 
@@ -50,11 +52,29 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
-    cache_data = [c.state for c in cache]
-    cache_info = [c.meta_state for c in cache]
-    cache_data = dict(tree_flatten(cache_data))
+    scalars = [""]  # must be non-empty otherwise tree_flatten drops it
+
+    # Convert scalars to mx.array so they can be serialized
+    def map_data(item):
+        i, data = item
+        if isinstance(data, mx.array):
+            return item
+        elif isinstance(data, (int, float, bool)):
+            scalars.append((i, "scalar"))
+            return (i, mx.array(data))
+        elif isinstance(data, str):
+            scalars.append((i, "string"))
+            return (i, mx.array([ord(char) for char in data]))
+        elif data is None:
+            scalars.append((i, "none"))
+            return (i, mx.array([]))
+        else:
+            raise ValueError(f"Model state is not serializable: {data}")
+
+    cache_data = tree_flatten([c.state for c in cache])
+    cache_data = dict(map(map_data, cache_data))
     cache_classes = [type(c).__name__ for c in cache]
-    cache_metadata = [cache_info, metadata, cache_classes]
+    cache_metadata = [metadata or {}, cache_classes, scalars]
     cache_metadata = dict(tree_flatten(cache_metadata))
     mx.save_safetensors(file_name, cache_data, cache_metadata)
 
@@ -73,13 +93,20 @@ def load_prompt_cache(file_name, return_metadata=False):
             the metadata if requested.
     """
     arrays, cache_metadata = mx.load(file_name, return_metadata=True)
-    arrays = tree_unflatten(list(arrays.items()))
     cache_metadata = tree_unflatten(list(cache_metadata.items()))
-    info, metadata, classes = cache_metadata
-    cache = [
-        globals()[c].from_state(state, meta_state)
-        for c, state, meta_state in zip(classes, arrays, info)
-    ]
+    metadata, classes, scalars = cache_metadata
+    for pos, type in scalars[1:]:
+        array = arrays[pos]
+        if type == "scalar":
+            arrays[pos] = array.item()
+        elif type == "string":
+            arrays[pos] = "".join(chr(i) for i in array.tolist())
+        elif type == "none":
+            arrays[pos] = None
+        else:
+            raise ValueError(f"[load_prompt_cache] Unknown type {type}")
+    arrays = tree_unflatten(list(arrays.items()))
+    cache = [globals()[c].from_state(state) for c, state in zip(classes, arrays)]
     if return_metadata:
         return cache, metadata
     return cache
@@ -134,15 +161,6 @@ class _BaseCache:
         if v is not None and v:
             raise ValueError("This cache has no state but a state was set.")
 
-    @property
-    def meta_state(self):
-        return ""
-
-    @meta_state.setter
-    def meta_state(self, v):
-        if v is not None and v:
-            raise ValueError("This cache has no meta_state but a meta_state was set.")
-
     def is_trimmable(self):
         return False
 
@@ -167,11 +185,10 @@ class _BaseCache:
         raise NotImplementedError("Cache sub-class must implement this.")
 
     @classmethod
-    def from_state(cls, state, meta_state):
+    def from_state(cls, state):
         # Create an instance of cls without calling __init__
         obj = cls.__new__(cls)
         obj.state = state
-        obj.meta_state = meta_state
         return obj
 
 
@@ -196,7 +213,9 @@ class ConcatenateKVCache(_BaseCache):
             self.keys = mx.concatenate([self.keys, keys], axis=-2)
             self.values = mx.concatenate([self.values, values], axis=-2)
         self.offset = self.keys.shape[-2]
+        return self.keys_and_values()
 
+    def keys_and_values(self):
         return self.keys, self.values
 
     @property
@@ -280,10 +299,9 @@ class QuantizedKVCache(_BaseCache):
             self.keys[i][..., prev : self.offset, :] = keys[i]
             self.values[i][..., prev : self.offset, :] = values[i]
 
-        return tree_map(lambda x: x[..., : self.offset, :], (self.keys, self.values))
+        return self.keys_and_values()
 
-    @property
-    def state(self):
+    def keys_and_values(self):
         if self.offset == self.keys[0].shape[2]:
             return self.keys, self.values
         else:
@@ -291,17 +309,13 @@ class QuantizedKVCache(_BaseCache):
                 lambda x: x[..., : self.offset, :], (self.keys, self.values)
             )
 
+    @property
+    def state(self):
+        return self.keys, self.values, self.offset, self.group_size, self.bits
+
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.offset, self.group_size, self.bits)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        self.keys, self.values, self.offset, self.group_size, self.bits = v
 
     def is_trimmable(self):
         return True
@@ -352,25 +366,24 @@ class KVCache(_BaseCache):
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
         self.values[..., prev : self.offset, :] = values
-        return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        if self.offset < self.keys.shape[2]:
+            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
+        else:
+            return self.keys, self.values
 
     def size(self):
         return self.offset
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
-            return self.keys, self.values
-        else:
-            return (
-                self.keys[..., : self.offset, :],
-                self.values[..., : self.offset, :],
-            )
+        return self.keys, self.values, self.offset
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.keys, self.values, self.offset = v
 
     def is_trimmable(self):
         return True
@@ -504,40 +517,29 @@ class RotatingKVCache(_BaseCache):
         self.offset += S
         self._idx += S
 
-        # If the buffer is not full, slice off the end
-        if self.offset < self.max_size:
-            return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
-        return self.keys, self.values
+        return self.keys_and_values()
 
     def update_and_fetch(self, keys, values):
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
 
-    def size(self):
-        return min(self.offset, self.max_size)
-
-    @property
-    def state(self):
+    def keys_and_values(self):
         if self.offset < self.keys.shape[2]:
             return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
         else:
             return self.keys, self.values
 
-    @state.setter
-    def state(self, v):
-        self.keys, self.values = v
+    def size(self):
+        return min(self.offset, self.max_size)
 
     @property
-    def meta_state(self):
-        return tuple(map(str, (self.keep, self.max_size, self.offset, self._idx)))
+    def state(self):
+        return self.keys, self.values, self.offset, self.keep, self.max_size, self._idx
 
-    @meta_state.setter
-    def meta_state(self, v):
-        self.keep, self.max_size, self.offset, self._idx = map(
-            int,
-            v,
-        )
+    @state.setter
+    def state(self, v):
+        self.keys, self.values, self.offset, self.keep, self.max_size, self._idx = v
 
     def is_trimmable(self):
         return self.offset < self.max_size
@@ -592,16 +594,10 @@ class RotatingKVCache(_BaseCache):
 
 
 class ArraysCache(_BaseCache):
-    def __new__(cls, *args, **kwargs):
-        instance = super().__new__(cls)
-        instance.left_padding = None
-        instance.lengths = None
-        return instance
-
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
-        if left_padding:
-            self.left_padding = mx.array(left_padding)
+        self.left_padding = mx.array(left_padding) if left_padding else None
+        self.lengths = None
 
     @property
     def batch_size(self):
@@ -623,11 +619,11 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
-        return self.cache
+        return self.cache, self.left_padding, self.lengths
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        self.cache, self.left_padding, self.lengths = v
 
     def filter(self, batch_indices):
         """
@@ -739,11 +735,15 @@ class ChunkedKVCache(_BaseCache):
         self.start_position = 0
 
     def maybe_trim_front(self):
-        # Maintain the cache below the chunk size
-        if self.keys is not None and self.keys.shape[2] >= self.chunk_size:
-            self.start_position += self.keys.shape[2] - self.chunk_size
-            self.keys = self.keys[..., -self.chunk_size :, :]
-            self.values = self.values[..., -self.chunk_size :, :]
+        # Maintain the cache below the chunk size.
+        if self.keys is None:
+            return
+        valid = self.offset - self.start_position
+        if valid > self.chunk_size:
+            trim = valid - self.chunk_size
+            self.start_position += trim
+            self.keys = self.keys[..., trim:valid, :]
+            self.values = self.values[..., trim:valid, :]
 
     def update_and_fetch(self, keys, values):
         prev = self.offset - self.start_position
@@ -768,22 +768,19 @@ class ChunkedKVCache(_BaseCache):
         end = self.offset - self.start_position
         self.keys[..., prev:end, :] = keys
         self.values[..., prev:end, :] = values
+        return self.keys_and_values()
+
+    def keys_and_values(self):
+        end = self.offset - self.start_position
         return self.keys[..., :end, :], self.values[..., :end, :]
 
     @property
     def state(self):
-        if self.offset == self.keys.shape[2]:
-            return self.keys, self.values
-        else:
-            return (
-                self.keys[..., : self.offset, :],
-                self.values[..., : self.offset, :],
-            )
+        return self.keys, self.values, self.offset, self.chunk_size, self.start_position
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        self.keys, self.values, self.offset, self.chunk_size, self.start_position = v
 
     def is_trimmable(self):
         return True
@@ -792,14 +789,6 @@ class ChunkedKVCache(_BaseCache):
         n = min(self.offset - self.start_position, n)
         self.offset -= n
         return n
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.chunk_size, self.start_position)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.chunk_size, self.start_position = map(int, v)
 
     def empty(self):
         return self.keys is None
@@ -828,24 +817,11 @@ class CacheList(_BaseCache):
 
     @property
     def state(self):
-        return [c.state for c in self.caches]
+        return [(c.state, type(c).__name__) for c in self.caches]
 
     @state.setter
     def state(self, v):
-        for c, s in zip(self.caches, v):
-            c.state = s
-
-    @property
-    def meta_state(self):
-        return (
-            [type(c).__name__ for c in self.caches],
-            [c.meta_state for c in self.caches],
-        )
-
-    @meta_state.setter
-    def meta_state(self, v):
-        for c, m in zip(self.caches, v[1]):
-            c.meta_state = m
+        self.caches = [globals()[c].from_state(s) for s, c in v]
 
     def filter(self, batch_indices):
         """
@@ -890,14 +866,6 @@ class CacheList(_BaseCache):
     @property
     def nbytes(self):
         return sum(c.nbytes for c in self.caches)
-
-    @classmethod
-    def from_state(cls, state, meta_state):
-        obj = cls.__new__(cls)
-        obj.caches = [
-            globals()[c].from_state(s, m) for s, c, m in zip(state, *meta_state)
-        ]
-        return obj
 
 
 def dynamic_roll(x, shifts, axis):
@@ -958,10 +926,13 @@ class BatchKVCache(_BaseCache):
             else:
                 self.keys, self.values = new_k, new_v
 
-        self.offset += keys.shape[2]
+        self.offset = self.offset + keys.shape[2]
         self._idx += keys.shape[2]
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
+        return self.keys_and_values()
+
+    def keys_and_values(self):
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
@@ -972,7 +943,7 @@ class BatchKVCache(_BaseCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding
+            self.offset = self.offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
@@ -982,22 +953,17 @@ class BatchKVCache(_BaseCache):
             padding = self._right_padding
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
-            self.offset -= padding
+            self.offset = self.offset - padding
             self.left_padding += padding
             self._right_padding = None
 
     @property
     def state(self):
-        k, v = self.keys, self.values
-        if self._idx < k.shape[2]:
-            k = k[..., : self._idx, :]
-            v = v[..., : self._idx, :]
-        return k, v, self.offset, self.left_padding
+        return self.keys, self.values, self.offset, self.left_padding, self._idx
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.left_padding = v
-        self._idx = self.keys.shape[2]
+        self.keys, self.values, self.offset, self.left_padding, self._idx = v
 
     def is_trimmable(self):
         return True
@@ -1005,7 +971,7 @@ class BatchKVCache(_BaseCache):
     def trim(self, n):
         n = min(self._idx, n)
         self._idx -= n
-        self.offset -= n
+        self.offset = self.offset - n
         return n
 
     def make_mask(self, N: int, return_array: bool = False, **kwargs):
@@ -1024,7 +990,7 @@ class BatchKVCache(_BaseCache):
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -1050,6 +1016,7 @@ class BatchKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        dtype = (self.keys if self.keys is not None else other.keys).dtype
 
         # Pad the keys and values so they are right-justified
         # with the index and the same size
@@ -1057,8 +1024,8 @@ class BatchKVCache(_BaseCache):
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
             left = max_idx - c._idx
             right = max_size - k.shape[2] - left
             if right < 0:
@@ -1079,7 +1046,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
-        padding = self.left_padding[idx].item()
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
@@ -1187,7 +1155,7 @@ class BatchRotatingKVCache(_BaseCache):
                 self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
                 self.values = dynamic_roll(self.values, roll[:, None], axis=2)
                 self.left_padding += roll
-                self.offset -= roll
+                self.offset = self.offset - roll
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
@@ -1196,7 +1164,7 @@ class BatchRotatingKVCache(_BaseCache):
                 self.left_padding -= trim_size
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
-        self.offset += keys.shape[2]
+        self.offset = self.offset + keys.shape[2]
         self._offset += keys.shape[2]
         self._idx = self.keys.shape[2]
 
@@ -1250,24 +1218,27 @@ class BatchRotatingKVCache(_BaseCache):
         self.keys[..., self._idx : self._idx + S, :] = keys
         self.values[..., self._idx : self._idx + S, :] = values
         self._offset += S
-        self.offset += S
+        self.offset = self.offset + S
         self._idx += S
 
         # Make sure left_padding and offset are evaluated
         self.keys = mx.depends(self.keys, (self.left_padding, self.offset))
 
-        # If the buffer is not full, slice off the end
-        if self._offset < self.max_size:
-            return (
-                self.keys[..., : self._offset, :],
-                self.values[..., : self._offset, :],
-            )
-        return self.keys, self.values
+        return self.keys_and_values()
 
     def update_and_fetch(self, keys, values):
         if keys.shape[2] == 1:
             return self._update_in_place(keys, values)
         return self._update_concat(keys, values)
+
+    def keys_and_values(self):
+        if self._offset < self.keys.shape[2]:
+            return (
+                self.keys[..., : self._offset, :],
+                self.values[..., : self._offset, :],
+            )
+        else:
+            return self.keys, self.values
 
     def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
         if left_padding is not None:
@@ -1277,7 +1248,7 @@ class BatchRotatingKVCache(_BaseCache):
                 )
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
-            self.offset -= left_padding
+            self.offset = self.offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._lengths = mx.array(lengths) + self.offset
@@ -1288,31 +1259,34 @@ class BatchRotatingKVCache(_BaseCache):
             self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
             self.values = dynamic_roll(self.values, roll[:, None], axis=2)
             self.left_padding += roll
-            self.offset -= roll
+            self.offset = self.offset - roll
             self._lengths = None
 
     @property
     def state(self):
-        k, v = self.keys, self.values
-        if self._offset < k.shape[2]:
-            k, v = k[..., : self._offset, :], v[..., : self._offset, :]
-        return k, v, self.offset, self.left_padding
+        return (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self.max_size,
+            self._offset,
+            self._idx,
+            self.rotated,
+        )
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.left_padding = v
-
-    @property
-    def meta_state(self):
-        return tuple(map(str, (self.max_size, self._offset, self._idx, self.rotated)))
-
-    @meta_state.setter
-    def meta_state(self, v):
-        self.max_size, self._offset, self._idx = map(
-            int,
-            v[:3],
-        )
-        self.rotated = bool(v[3])
+        (
+            self.keys,
+            self.values,
+            self.offset,
+            self.left_padding,
+            self.max_size,
+            self._offset,
+            self._idx,
+            self.rotated,
+        ) = v
 
     def is_trimmable(self):
         return self._offset < self.max_size
@@ -1321,7 +1295,7 @@ class BatchRotatingKVCache(_BaseCache):
         n = min(self._offset, n)
         self._offset -= n
         self._idx -= n
-        self.offset -= n
+        self.offset = self.offset - n
         return n
 
     def to_quantized(self, group_size: int = 64, bits: int = 4) -> QuantizedKVCache:
@@ -1388,14 +1362,15 @@ class BatchRotatingKVCache(_BaseCache):
             B, H, L2, D = other.keys.shape
             M = other.values.shape[3]
         max_size = max(L1, L2)
+        dtype = (self.keys if self.keys is not None else other.keys).dtype
 
         def pad(c):
             left = max_idx - c._idx
             k, v = c.keys, c.values
             if k is None:
                 Bc = c.offset.shape[0]
-                k = mx.array([]).reshape(Bc, H, 0, D)
-                v = mx.array([]).reshape(Bc, H, 0, M)
+                k = mx.zeros((Bc, H, 0, D), dtype=dtype)
+                v = mx.zeros((Bc, H, 0, M), dtype=dtype)
             right = max_size - k.shape[2] - left
             if right < 0:
                 k = k[..., :right, :]
@@ -1493,7 +1468,8 @@ class TokenBuffer:
 
     step = 256
 
-    def __init__(self, tokens=[]):
+    def __init__(self, tokens=None):
+        tokens = [] if tokens is None else tokens
         self._buffer = mx.array(tokens, dtype=mx.int32)
         self._size = len(tokens)
 
@@ -1628,9 +1604,11 @@ class LRUPromptCache:
         cache_type: str
 
     class CacheOrder:
-        def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
-            self._ordering = ordering
-            self._lrus = {k: deque() for k in ordering}
+        def __init__(self, ordering: Optional[List[str]] = None):
+            self._ordering = (
+                ["assistant", "user", "system"] if ordering is None else ordering
+            )
+            self._lrus = {k: deque() for k in self._ordering}
 
         def __len__(self):
             return sum(len(lru) for lru in self._lrus.values())

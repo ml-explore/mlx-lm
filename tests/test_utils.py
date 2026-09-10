@@ -59,6 +59,17 @@ class TestUtils(unittest.TestCase):
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
 
+    def test_parse_size(self):
+        self.assertEqual(utils._parse_size("1024"), 1024)
+        self.assertEqual(utils._parse_size("20G"), 20_000_000_000)
+        self.assertEqual(utils._parse_size("512M"), 512_000_000)
+        self.assertEqual(utils._parse_size("4.1MB"), 4_100_000)
+        self.assertEqual(utils._parse_size("4.1M"), 4_100_000)
+        self.assertEqual(utils._parse_size("4.1GB"), 4_100_000_000)
+        self.assertEqual(utils._parse_size("8.2MB"), 8_200_000)
+        self.assertEqual(utils._parse_size("16.9GB"), 16_900_000_000)
+        self.assertEqual(utils._parse_size("2.7GB"), 2_700_000_000)
+
     def test_quantize(self):
         from mlx_lm.models import llama
 
@@ -123,6 +134,19 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(hasattr(model, "custom_attribute"))
         self.assertEqual(model.custom_attribute, "This is a custom model")
         self.assertTrue(hasattr(model, "qwenWeights"))
+
+    def test_get_classes_remaps_bailing_v3_architecture(self):
+        from mlx_lm.models import bailing_moe_v3
+
+        model_cls, args_cls = utils._get_classes(
+            {
+                "model_type": "bailing_hybrid",
+                "architectures": ["BailingMoeV3ForCausalLM"],
+            }
+        )
+
+        self.assertIs(model_cls, bailing_moe_v3.Model)
+        self.assertIs(args_cls, bailing_moe_v3.ModelArgs)
 
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
