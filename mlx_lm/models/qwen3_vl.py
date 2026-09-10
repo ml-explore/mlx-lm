@@ -42,6 +42,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))
+        weights.pop("visual", None)
         weights.pop("vision_tower", None)
         # Newer HF checkpoints nest both towers under a top-level "model".
         if language_model := weights.get("model", {}).get("language_model"):
