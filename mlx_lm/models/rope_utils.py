@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import math
 from typing import List, Optional, Union
@@ -16,8 +16,8 @@ class SuScaledRoPE(nn.Module):
         original_max_position_embeddings: int = 4096,
         short_factor: Union[List[float], float] = 1.0,
         long_factor: Union[List[float], float] = 1.0,
-        short_mscale: float = None,
-        long_mscale: float = None,
+        short_mscale: Optional[float] = None,
+        long_mscale: Optional[float] = None,
     ):
         """
         Su Scaled Rotary Embedding layer.
@@ -58,10 +58,8 @@ class SuScaledRoPE(nn.Module):
         self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
-        x = x[...]
-        x[..., : self.dim] = self._scale * x[..., : self.dim]
         return mx.fast.rope(
-            x,
+            x.at[..., : self.dim].multiply(self._scale),
             self.dim,
             traditional=False,
             base=None,
@@ -78,7 +76,7 @@ class Llama3RoPE(nn.Module):
         max_position_embeddings: int = 2048,
         traditional: bool = False,
         base: float = 10000,
-        scaling_config: dict = None,
+        scaling_config: Optional[dict] = None,
     ):
         super().__init__()
         self.dims = dims
@@ -183,8 +181,7 @@ class YarnRoPE(nn.Module):
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
-            x = x[...]
-            x[..., : self.dims] = self.mscale * x[..., : self.dims]
+            x = x.at[..., : self.dims].multiply(self.mscale)
         return mx.fast.rope(
             x,
             self.dims,

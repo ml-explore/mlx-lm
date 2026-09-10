@@ -1,10 +1,8 @@
 # Copyright © 2024 Apple Inc.
 
 import math
-import sys
 import unittest
 from contextlib import contextmanager
-from io import StringIO
 from unittest.mock import ANY, MagicMock
 
 import mlx.core as mx
@@ -12,7 +10,7 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten
 
-from mlx_lm import lora, tuner, utils
+from mlx_lm import tuner, utils
 from mlx_lm.tuner.dora import DoRAEmbedding, DoRALinear
 from mlx_lm.tuner.lora import LoRAEmbedding, LoRALinear
 from mlx_lm.tuner.trainer import evaluate
@@ -284,7 +282,6 @@ class TestDora(unittest.TestCase):
         )
 
         # Recomputes m when changing Linear
-        inital_m = dora_lin.m
         lin = nn.Linear(10, 10)
         dora_lin.set_linear(lin)
         self.assertTrue(mx.allclose(dora_lin.m, mx.linalg.norm(lin.weight, axis=1)))

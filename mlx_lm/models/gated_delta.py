@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 import os
 from functools import partial
 from typing import Optional, Tuple
@@ -743,6 +745,12 @@ def gated_delta_update(
     use_kernel: bool = True,
     lower_bound: float | None = None,
 ) -> Tuple[mx.array, mx.array]:
+    """Gated delta rule recurrence.
+
+    Contract: callers fold the ``Dk**-0.5`` readout scale into q before calling
+    (e.g. ``inv_scale = Dk**-0.5; q = inv_scale**2 * rms_norm(q, eps);
+    k = inv_scale * rms_norm(k, eps)``). The helper applies no scale of its own.
+    """
     beta = mx.sigmoid(b)
     if lower_bound is None:
         g = compute_g(A_log, a, dt_bias)
@@ -753,6 +761,12 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if not use_kernel or mx.default_device() != mx.gpu or not mx.metal.is_available():
+    if (
+        not use_kernel
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or k.shape[-1] < 32
+        or k.shape[-1] % 32 != 0
+    ):
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
