@@ -1707,13 +1707,15 @@ class TestModels(unittest.TestCase):
         )
         model = mistral3.Model(args)
         self.model_test_runner(
-            model, args.model_type, text_config["vocab_size"], text_config["num_hidden_layers"]
+            model,
+            args.model_type,
+            text_config["vocab_size"],
+            text_config["num_hidden_layers"],
         )
 
         # Test that cache construction works with sliding attention
         cache = make_prompt_cache(model)
         self.assertEqual(len(cache), text_config["num_hidden_layers"])
-
 
     def test_deepseek(self):
         from mlx_lm.models import deepseek
