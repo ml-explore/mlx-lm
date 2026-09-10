@@ -390,13 +390,19 @@ class TestPromptCache(unittest.TestCase):
             mx.random.normal(shape=(1, 2, 7, 4)), mx.random.normal(shape=(1, 2, 7, 4))
         )
 
+        def compare_keys_and_values(a, b):
+            ka, va = a.keys_and_values()
+            kb, vb = b.keys_and_values()
+            self.assertTrue(mx.array_equal(ka, kb))
+            self.assertTrue(mx.array_equal(va, vb))
+
         merged_cache = CacheList.merge((c1, c2))
         c1_ex = merged_cache.extract(0)
         self.assertTrue(mx.array_equal(c1_ex[0][0], c1[0][0]))
-        self.assertTrue(mx.array_equal(c1_ex[1].state[0], c1[1].state[0]))
+        compare_keys_and_values(c1_ex[1], c1[1])
         c2_ex = merged_cache.extract(1)
         self.assertTrue(mx.array_equal(c2_ex[0][0], c2[0][0]))
-        self.assertTrue(mx.array_equal(c2_ex[1].state[0], c2[1].state[0]))
+        compare_keys_and_values(c2_ex[1], c2[1])
 
     def test_make_mask_with_cache(self):
         # For 1 time step with no cache, don't need a mask
@@ -507,11 +513,21 @@ class TestPromptCache(unittest.TestCase):
         cache.filter([0, 1])
 
         # In this case filtering left shifts the cache so it has zero padding
-        self.assertEqual(cache.state[0].shape, (2, 1, 2, 8))
+        self.assertEqual(cache.keys_and_values()[0].shape, (2, 1, 2, 8))
 
         mask = cache.make_mask(1)
         self.assertEqual(mask[0].squeeze().tolist(), [True, True, True])
         self.assertEqual(mask[1].squeeze().tolist(), [False, True, True])
+
+    def test_batch_kv_cache_offset_not_mutated_in_place(self):
+        cache = BatchKVCache(left_padding=[0])
+        captured = cache.offset
+        k, v = mx.zeros((1, 1, 4, 8)), mx.zeros((1, 1, 4, 8))
+        cache.update_and_fetch(k, v)
+        # Capturing offset before update_and_fetch must keep the pre-update
+        # value. In-place mx.array += would corrupt RoPE in gemma3n (#1806).
+        self.assertEqual(int(captured.item()), 0)
+        self.assertEqual(int(cache.offset.item()), 4)
 
         # Test extension
         cache_a = BatchKVCache(left_padding=[2, 1, 2])
@@ -626,6 +642,8 @@ class TestPromptCache(unittest.TestCase):
         for c, lc in zip(cache, loaded_cache):
             self.assertTrue(mx.array_equal(c.left_padding, left_padding))
             self.assertTrue(mx.array_equal(lc.left_padding, left_padding))
+            if isinstance(c, BatchRotatingKVCache):
+                self.assertEqual(c.rotated, lc.rotated)
 
     def test_rotating_cache_updates(self):
         cache = RotatingKVCache(max_size=8)
