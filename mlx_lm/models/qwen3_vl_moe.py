@@ -41,9 +41,7 @@ class Model(nn.Module):
         weights.pop("visual", None)
         # Newer HF checkpoints nest the language model under
         # ``model.language_model.*`` and keep ``lm_head`` at the top level.
-        if (
-            language_model := weights.get("model", {}).get("language_model")
-        ) is not None:
+        if language_model := weights.get("model", {}).get("language_model"):
             lm_head = weights["lm_head"]
         else:
             language_model = weights["language_model"]["model"]
