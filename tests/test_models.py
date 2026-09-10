@@ -3876,60 +3876,37 @@ class TestModels(unittest.TestCase):
 
 
 class TestVLSanitize(unittest.TestCase):
-    """Vision-language model sanitize() must strip the vision tower for the
-    HuggingFace ForConditionalGeneration checkpoint layout, where vision
-    weights ship under ``model.visual.*`` (or ``model.vision_tower.*``) and the
-    language model under ``model.language_model.*`` — not the bare
-    ``visual`` / ``vision_tower`` / ``language_model.*`` prefixes the sanitize
-    helpers were written against.
-    """
-
-    # HF Qwen3_5MoeForConditionalGeneration layout (Ornith-1.0, etc.).
-    HF_VL_WEIGHTS = {
-        "model.visual.pos_embed.weight": None,
+    # Newer layout
+    HF_WEIGHTS = {
         "model.visual.blocks.0.attn.qkv.weight": None,
         "model.visual.merger.norm.weight": None,
-        "model.language_model.model.embed_tokens.weight": None,
-        "model.language_model.model.layers.0.self_attn.q_proj.weight": None,
-        "model.language_model.model.layers.0.mlp.experts.gate_up_proj.weight": None,
-        "model.language_model.model.layers.0.mlp.experts.down_proj.weight": None,
-        "model.language_model.lm_head.weight": None,
-        "language_model.lm_head.weight": None,
+        "model.language_model.embed_tokens.weight": None,
+        "model.language_model.layers.0.self_attn.q_proj.weight": None,
+        "model.language_model.norm.weight": None,
+        "lm_head.weight": None,
     }
 
-    def _qwen3_moe_text_config(self):
-        return {
-            "model_type": "qwen3_moe",
-            "num_hidden_layers": 1,
-            "num_experts": 4,
-            "num_experts_per_tok": 2,
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "moe_intermediate_size": 16,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 8,
-            "vocab_size": 100,
-            "rms_norm_eps": 1e-6,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 4,
-            "linear_num_key_heads": 2,
-            "linear_key_head_dim": 8,
-            "linear_value_head_dim": 8,
-            "linear_conv_kernel_dim": 4,
-            "tie_word_embeddings": False,
-            "decoder_sparse_step": 1,
-            "mlp_only_layers": [],
-            "rope_theta": 100000.0,
-            "max_position_embeddings": 4096,
-            "norm_topk_prob": True,
-        }
+    # Older layout
+    LEGACY_WEIGHTS = {
+        "visual.blocks.0.attn.qkv.weight": None,
+        "model.embed_tokens.weight": None,
+        "model.layers.0.self_attn.q_proj.weight": None,
+        "model.norm.weight": None,
+        "lm_head.weight": None,
+    }
 
-    def _qwen2_text_config(self):
-        return {
-            "model_type": "qwen2",
-            "num_hidden_layers": 1,
+    def _assert_sanitized(self, result):
+        self.assertEqual([k for k in result if "visual" in k], [])
+        self.assertEqual([k for k in result if "vision_tower" in k], [])
+        self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", result)
+        self.assertIn("language_model.model.embed_tokens.weight", result)
+        self.assertIn("language_model.lm_head.weight", result)
+
+    def _text_config(self, model_type, **extra):
+        config = {
+            "model_type": model_type,
             "hidden_size": 32,
+            "num_hidden_layers": 1,
             "intermediate_size": 64,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
@@ -3940,76 +3917,49 @@ class TestVLSanitize(unittest.TestCase):
             "rope_theta": 100000.0,
             "max_position_embeddings": 4096,
         }
+        config.update(extra)
+        return config
 
-    def _qwen3_text_config(self):
-        return {
-            "model_type": "qwen3",
-            "num_hidden_layers": 1,
-            "hidden_size": 32,
-            "intermediate_size": 64,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 8,
-            "vocab_size": 100,
-            "rms_norm_eps": 1e-6,
-            "tie_word_embeddings": False,
-            "rope_theta": 100000.0,
-            "max_position_embeddings": 4096,
-        }
-
-    def test_qwen3_vl_moe_strips_model_visual_prefix(self):
-        from mlx_lm.models.qwen3_vl_moe import Model, ModelArgs
-
-        args = ModelArgs(
-            model_type="qwen3_vl_moe",
-            text_config=self._qwen3_moe_text_config(),
-        )
-        model = Model(args)
-        result = model.sanitize(dict(self.HF_VL_WEIGHTS))
-
-        visual = [k for k in result if "visual" in k or "vision_tower" in k]
-        self.assertEqual(
-            visual, [], f"vision keys leaked into sanitized weights: {visual}"
-        )
-        # The language model tensors must survive, re-rooted under language_model.*.
-        self.assertIn(
-            "language_model.model.layers.0.self_attn.q_proj.weight",
-            result,
-        )
-
-    def test_qwen3_vl_strips_model_visual_prefix(self):
-        from mlx_lm.models.qwen3_vl import Model, ModelArgs
-
-        args = ModelArgs(
-            model_type="qwen3_vl",
-            text_config=self._qwen3_text_config(),
-        )
-        model = Model(args)
-        result = model.sanitize(dict(self.HF_VL_WEIGHTS))
-
-        visual = [k for k in result if "visual" in k or "vision_tower" in k]
-        self.assertEqual(
-            visual, [], f"vision keys leaked into sanitized weights: {visual}"
-        )
-        self.assertIn(
-            "language_model.model.layers.0.self_attn.q_proj.weight",
-            result,
-        )
-
-    def test_qwen2_vl_strips_model_visual_prefix(self):
+    def test_qwen2_vl(self):
         from mlx_lm.models.qwen2_vl import Model, ModelArgs
 
-        args = ModelArgs(
-            model_type="qwen2_vl",
-            text_config=self._qwen2_text_config(),
+        model = Model(
+            ModelArgs(model_type="qwen2_vl", text_config=self._text_config("qwen2"))
         )
-        model = Model(args)
-        result = model.sanitize(dict(self.HF_VL_WEIGHTS))
+        for name, weights in (
+            ("hf", self.HF_WEIGHTS),
+            ("legacy", self.LEGACY_WEIGHTS),
+        ):
+            with self.subTest(layout=name):
+                self._assert_sanitized(model.sanitize(dict(weights)))
 
-        visual = [k for k in result if "visual" in k or "vision_tower" in k]
-        self.assertEqual(
-            visual, [], f"vision keys leaked into sanitized weights: {visual}"
+    def test_qwen3_vl(self):
+        from mlx_lm.models.qwen3_vl import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(model_type="qwen3_vl", text_config=self._text_config("qwen3"))
         )
+        for name, weights in (
+            ("hf", self.HF_WEIGHTS),
+            ("legacy", self.LEGACY_WEIGHTS),
+        ):
+            with self.subTest(layout=name):
+                self._assert_sanitized(model.sanitize(dict(weights)))
+
+    def test_qwen3_vl_moe(self):
+        from mlx_lm.models.qwen3_vl_moe import Model, ModelArgs
+
+        text_config = self._text_config(
+            "qwen3_moe",
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            moe_intermediate_size=16,
+            norm_topk_prob=True,
+        )
+        model = Model(ModelArgs(model_type="qwen3_vl_moe", text_config=text_config))
+        self._assert_sanitized(model.sanitize(dict(self.HF_WEIGHTS)))
 
 
 if __name__ == "__main__":
