@@ -115,19 +115,9 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
+        # TODO(michalk8): remove once ml-explore/mlx#3784 is merged
         if s > 1:
-            # Reduce heads with elementwise adds instead of mx.sum: works around
-            # ml-explore/mlx#3784 (mx.sum over a non-last axis of a large strided
-            # tensor returns all-zeros, e.g. [1, 32, 4096, 131072] at >=128k
-            # context), which silently zeroes the indexer scores and corrupts the
-            # top-k selection past ~128k tokens. At decode (s == 1) the tensor is
-            # far below the trigger threshold, so the fast fused sum is kept.
-            # TODO: revert to scores.sum(axis=1, keepdims=True) once the MLX fix
-            # lands.
-            summed = scores[:, 0:1]
-            for h in range(1, scores.shape[1]):
-                summed = summed + scores[:, h : h + 1]
-            scores = summed
+            scores = sum(scores[:, h : h + 1] for h in range(scores.shape[1]))
         else:
             scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
@@ -213,9 +203,7 @@ class DeepseekV32Attention(nn.Module):
         b, _, length, _ = q_nope.shape
         q_latent = self.embed_q(q_nope)  # [B, H, L, kv_lora_rank]
         ti = topk_indices  # [B, 1, L, K] — one index group shared across heads
-        kvg = mx.stack(
-            [mx.take(kv_latent[i, 0], ti[i, 0], axis=0) for i in range(b)]
-        )
+        kvg = mx.stack([mx.take(kv_latent[i, 0], ti[i, 0], axis=0) for i in range(b)])
         kpeg = mx.stack([mx.take(k_pe[i, 0], ti[i, 0], axis=0) for i in range(b)])
         qn = q_latent.transpose(0, 2, 1, 3)  # [B, L, H, kv_lora_rank]
         qp = q_pe.transpose(0, 2, 1, 3)  # [B, L, H, qk_rope_head_dim]
