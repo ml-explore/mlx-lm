@@ -187,6 +187,79 @@ class TestTunerTrainer(unittest.TestCase):
         )
         self._assert_backward(model)
 
+    def test_switch_layers_backward(self):
+        # indices.size >= 64 takes the sorted branch, which indexes with argsort output.
+        from mlx_lm.models.switch_layers import SwitchGLU, SwitchMLP
+
+        for cls in (SwitchGLU, SwitchMLP):
+            with self.subTest(layer=cls.__name__):
+                layer = cls(8, 16, 4)
+                x = mx.random.normal((4, 9, 8))
+
+                def loss_fn(x):
+                    gates = x.sum(-1, keepdims=True) + mx.arange(4)
+                    inds = mx.argpartition(-gates, kth=1, axis=-1)[..., :2]
+                    return layer(x, inds).sum()
+
+                mx.eval(mx.grad(loss_fn)(x))
+
+    def test_group_expert_select_backward(self):
+        # This gate reads scores back with take_along_axis, outside the switch layers.
+        import importlib
+
+        bias = mx.zeros((8,))
+        for name in (
+            "deepseek_v3",
+            "deepseek_v32",
+            "dots1",
+            "exaone_moe",
+            "glm4_moe",
+            "glm4_moe_lite",
+            "mimo_v2_flash",
+            "nemotron_h",
+        ):
+            with self.subTest(model=name):
+                module = importlib.import_module(f"mlx_lm.models.{name}")
+                select = module.group_expert_select
+
+                def loss_fn(gates):
+                    _, scores = select(gates, bias, 2, 2, 1, 1.0, True)
+                    return scores.sum()
+
+                mx.eval(mx.grad(loss_fn)(mx.random.normal((2, 3, 8))))
+
+    def test_gemma4_per_layer_inputs_backward(self):
+        # With embeddings instead of token ids, the lookup gathers with argmin output.
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_text",
+                "vocab_size": 32,
+                "hidden_size": 8,
+                "num_hidden_layers": 1,
+                "intermediate_size": 16,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "num_global_key_value_heads": 1,
+                "head_dim": 8,
+                "global_head_dim": 8,
+                "sliding_window": 8,
+                "sliding_window_pattern": 1,
+                "layer_types": ["full_attention"],
+                "hidden_size_per_layer_input": 4,
+                "num_kv_shared_layers": 0,
+                "tie_word_embeddings": True,
+            }
+        )
+        model = gemma4_text.Model(args).model
+        embeddings = mx.random.normal((1, 3, args.hidden_size))
+
+        def loss_fn(x):
+            return model._get_per_layer_inputs(None, x).sum()
+
+        mx.eval(mx.grad(loss_fn)(embeddings))
+
 
 if __name__ == "__main__":
     unittest.main()
