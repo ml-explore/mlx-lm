@@ -494,27 +494,27 @@ class Model(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        # Presence-based, not a fixed layer-0 probe: under pipeline
-        # sharding, a rank only downloads its own local layers' weight
-        # files, so a raw (unstacked-experts) checkpoint may have no
-        # layer-0 key at all even though its own local layers still need
-        # stacking. Likewise, only stack the layers actually present
-        # locally — iterating every layer in the config would KeyError
-        # popping a layer this rank doesn't own.
-        local_moe_layers = sorted(
+        # Presence-based, not a fixed layer-0 probe: whether layer 0 is
+        # an MoE layer is config-driven (decoder_sparse_step,
+        # mlp_only_layers), so a layer-0-only gate would wrongly skip
+        # stacking for every layer on any config where it isn't. Also
+        # only stack the layers actually present in weights — iterating
+        # every layer in the config would KeyError popping a layer whose
+        # key isn't in weights at all.
+        moe_layers = sorted(
             int(k.split(".")[2])
             for k in weights
             if k.startswith("model.layers.")
             and k.endswith(".mlp.experts.0.up_proj.weight")
         )
-        if not local_moe_layers:
+        if not moe_layers:
             return weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        for l in local_moe_layers:
+        for l in moe_layers:
             prefix = f"model.layers.{l}.mlp"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 to_join = [
