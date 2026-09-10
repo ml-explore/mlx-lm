@@ -44,12 +44,9 @@ class Model(nn.Module):
         weights = tree_unflatten(list(weights.items()))
         weights.pop("visual", None)
         weights.pop("vision_tower", None)
-        # HF ForConditionalGeneration nests the language model under
-        # ``model.language_model.*`` and vision under ``model.visual.*``.
-        nested = weights.pop("model", None)
-        if isinstance(nested, dict):
-            if isinstance(nested.get("language_model"), dict):
-                weights["language_model"] = nested["language_model"]
+        # Newer HF checkpoints nest both towers under a top-level "model".
+        if language_model := weights.get("model", {}).get("language_model"):
+            weights["model"] = language_model
         weights = dict(tree_flatten(weights))
 
         sanitized = {}
