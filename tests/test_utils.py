@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -202,6 +203,88 @@ class TestUtils(unittest.TestCase):
                 "language_model.model.per_layer_model_projection",
                 loaded_config["quantization"],
             )
+
+            logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+            mx.eval(logits)
+            self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
+    def test_load_model_with_mixed_bit_derived_mla_projection(self):
+        # Regression test for a mismatch that only shows up with a
+        # non-uniform per-tensor quantization map: deepseek_v3's sanitize()
+        # derives embed_q/unembed_out from kv_b_proj and re-quantizes them
+        # at kv_b_proj's own bits, but those derived paths never appear in
+        # the per-tensor quantization map (the converter never saw them),
+        # so load_model must infer their true bits from the saved weight
+        # shapes rather than assume the global default.
+        from mlx_lm.models import deepseek_v3
+
+        args = deepseek_v3.ModelArgs(
+            model_type="deepseek_v3",
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=2,
+            n_group=1,
+            topk_group=1,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            kv_lora_rank=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=32,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+            rope_scaling={
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "factor": 40,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "original_max_position_embeddings": 4096,
+                "type": "yarn",
+            },
+        )
+        model = deepseek_v3.Model(args)
+        model, config = utils.quantize_model(
+            model, dataclasses.asdict(args), group_size=32, bits=4
+        )
+
+        # Simulate a checkpoint where kv_b_proj carried a per-tensor bits
+        # override: re-pack the already-derived embed_q/unembed_out at a
+        # different bit width than the model's global default, without
+        # adding their paths to config["quantization"].
+        attn = model.layers[0].self_attn
+        for proj in (attn.embed_q, attn.unembed_out):
+            w = mx.dequantize(
+                proj.weight,
+                proj.scales,
+                proj.biases,
+                group_size=proj.group_size,
+                bits=proj.bits,
+                mode=proj.mode,
+            )
+            proj.weight, proj.scales, proj.biases = mx.quantize(
+                w, group_size=32, bits=8, mode=proj.mode
+            )
+            proj.group_size, proj.bits = 32, 8
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            self.assertFalse(
+                any(
+                    "embed_q" in k or "unembed_out" in k for k in config["quantization"]
+                )
+            )
+
+            loaded, _ = utils.load_model(Path(mlx_path))
+
+            loaded_attn = loaded.layers[0].self_attn
+            self.assertEqual(loaded_attn.embed_q.bits, 8)
+            self.assertEqual(loaded_attn.unembed_out.bits, 8)
 
             logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
             mx.eval(logits)
