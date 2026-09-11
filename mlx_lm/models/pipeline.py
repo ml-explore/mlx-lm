@@ -1,6 +1,17 @@
 # Copyright © 2025 Apple Inc.
 
 
+def _rank_sizes(dim, N, block=1):
+    # Split dim into N ranks as evenly as possible: the first `extra`
+    # ranks get one extra unit (or block, for group_size-aware quantized
+    # splits), the rest get the base amount. Reduces to an exactly even
+    # split whenever dim % (N * block) == 0.
+    n_blocks = dim // block
+    base = n_blocks // N
+    extra = n_blocks - base * N
+    return [(base + (1 if i < extra else 0)) * block for i in range(N)]
+
+
 class PipelineMixin:
     def __init__(self):
         super().__init__()

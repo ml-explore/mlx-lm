@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .mla import MultiLinear
-from .pipeline import PipelineMixin
+from .pipeline import PipelineMixin, _rank_sizes
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -483,30 +483,51 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
+
         for layer in self.model.layers:
+            attn = layer.self_attn
+            # MLA has no separate KV-head count — every head reconstructs
+            # its own K/V via the batched embed_q/unembed_out projections,
+            # so (unlike GQA) heads can be distributed individually rather
+            # than in fixed-size groups.
+            head_sizes = _rank_sizes(attn.num_heads, N)
+            if any(s == 0 for s in head_sizes):
+                zero_ranks = [i for i, s in enumerate(head_sizes) if s == 0]
+                raise ValueError(
+                    f"Cannot shard {self.args.model_type}'s {attn.num_heads} attention "
+                    f"head(s) across {N} ranks: rank(s) {zero_ranks} would get zero "
+                    "heads."
+                )
+            q_sizes = [s * attn.q_head_dim for s in head_sizes]
+
             # Shard the self attention
-            if layer.self_attn.q_lora_rank is None:
-                layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", group=group
+            if attn.q_lora_rank is None:
+                attn.q_proj = shard_linear(
+                    attn.q_proj, "all-to-sharded", group=group, sizes=q_sizes
                 )
             else:
-                layer.self_attn.q_b_proj = shard_linear(
-                    layer.self_attn.q_b_proj, "all-to-sharded", group=group
+                attn.q_b_proj = shard_linear(
+                    attn.q_b_proj, "all-to-sharded", group=group, sizes=q_sizes
                 )
-            layer.self_attn.num_heads //= N
-            num_heads = layer.self_attn.num_heads
-            sh = rank * num_heads
-            eh = sh + num_heads
+
+            # embed_q/unembed_out are batched per-head (MultiLinear), sliced
+            # directly along their head axis rather than through
+            # shard_linear — boundaries follow the same cumulative,
+            # possibly-uneven head_sizes as q_proj/o_proj above.
+            sh = sum(head_sizes[:rank])
+            eh = sh + head_sizes[rank]
 
             def shard_heads(w):
                 return w[sh:eh]
 
-            layer.self_attn.embed_q.apply(shard_heads)
-            layer.self_attn.unembed_out.apply(shard_heads)
+            attn.embed_q.apply(shard_heads)
+            attn.unembed_out.apply(shard_heads)
 
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
+            o_sizes = [s * attn.v_head_dim for s in head_sizes]
+            attn.o_proj = shard_linear(
+                attn.o_proj, "sharded-to-all", group=group, sizes=o_sizes
             )
+            attn.num_heads = head_sizes[rank]
 
             # Shard the MLP
             if isinstance(layer.mlp, DeepseekV3MLP):
