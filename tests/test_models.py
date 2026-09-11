@@ -2001,6 +2001,54 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_nemotron_h_layer_count_from_block_types(self):
+        from mlx_lm.models import nemotron_h
+
+        # transformers derives the layer count from layers_block_type and omits
+        # num_hidden_layers, so recent checkpoints do not carry the key.
+        config = {
+            "model_type": "nemotron_h",
+            "vocab_size": 1000,
+            "hidden_size": 128,
+            "intermediate_size": 128,
+            "max_position_embeddings": 1000,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "attention_bias": False,
+            "mamba_num_heads": 8,
+            "mamba_head_dim": 64,
+            "mamba_proj_bias": False,
+            "ssm_state_size": 128,
+            "conv_kernel": 3,
+            "n_groups": 4,
+            "mlp_bias": False,
+            "layer_norm_epsilon": 1e-4,
+            "use_bias": True,
+            "use_conv_bias": True,
+            "layers_block_type": ["full_attention", "linear_attention", "mlp", "moe"],
+        }
+        expected = ["*", "M", "-", "E"]
+
+        args = nemotron_h.ModelArgs.from_dict(config)
+        self.assertEqual(args.num_hidden_layers, 4)
+        self.assertEqual(args.hybrid_override_pattern, expected)
+
+        # The legacy spellings describe the same stack.
+        legacy = dict(config, layers_block_type=["attention", "conv", "mlp", "moe"])
+        self.assertEqual(
+            nemotron_h.ModelArgs.from_dict(legacy).hybrid_override_pattern, expected
+        )
+        legacy["layers_block_type"] = ["attention", "mamba", "mlp", "moe"]
+        self.assertEqual(
+            nemotron_h.ModelArgs.from_dict(legacy).hybrid_override_pattern, expected
+        )
+
+        # An unmappable block type is reported instead of raising a KeyError.
+        unknown = dict(config, layers_block_type=["sliding_attention"] * 4)
+        with self.assertRaises(ValueError) as raised:
+            nemotron_h.ModelArgs.from_dict(unknown)
+        self.assertIn("sliding_attention", str(raised.exception))
+
     def test_phi3small(self):
         from mlx_lm.models import phi3small
 

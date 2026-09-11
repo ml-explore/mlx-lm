@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import math
 import os
 import resource
 import shutil
@@ -303,9 +304,42 @@ def hf_repo_to_path(hf_repo):
     )
 
 
+# transformers tags non-finite floats so config.json stays valid JSON, e.g.
+# {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
+_FLOAT_TAG_KEY = "__float__"
+_FLOAT_TAGS = {
+    "Infinity": float("inf"),
+    "-Infinity": float("-inf"),
+    "NaN": float("nan"),
+}
+
+
+def _decode_tagged_floats(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        if set(obj) == {_FLOAT_TAG_KEY} and obj[_FLOAT_TAG_KEY] in _FLOAT_TAGS:
+            return _FLOAT_TAGS[obj[_FLOAT_TAG_KEY]]
+        return {k: _decode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_tagged_floats(v) for v in obj]
+    return obj
+
+
+def _encode_tagged_floats(obj: Any) -> Any:
+    """Tag non-finite floats again, so a saved config stays valid JSON."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        if math.isnan(obj):
+            return {_FLOAT_TAG_KEY: "NaN"}
+        return {_FLOAT_TAG_KEY: "Infinity" if obj > 0 else "-Infinity"}
+    if isinstance(obj, dict):
+        return {k: _encode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_encode_tagged_floats(v) for v in obj]
+    return obj
+
+
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
-        config = json.load(f)
+        config = _decode_tagged_floats(json.load(f))
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
@@ -994,7 +1028,7 @@ def save_config(
 
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
-        json.dump(config, fid, indent=4)
+        json.dump(_encode_tagged_floats(config), fid, indent=4)
 
 
 def save(
