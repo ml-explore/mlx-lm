@@ -156,10 +156,21 @@ class FoldingTrunk(nn.Module):
         return pair
 
     def __call__(self, pair: mx.array, mask: Optional[mx.array] = None) -> mx.array:
+        # Blocks run in bf16; casting back on return keeps the caller's
+        # residual in fp32. The mask must be cast too, or TriMul's
+        # `routed * mask[..., None]` promotes the product back to fp32.
+        orig_dtype = pair.dtype
+        if orig_dtype != mx.bfloat16:
+            pair = pair.astype(mx.bfloat16)
+            if mask is not None:
+                mask = mask.astype(mx.bfloat16)
         # mx.compile needs array arguments, so an absent mask takes the raw path.
-        if mask is None:
-            return self._apply_blocks(pair, None)
-        return self._compiled(pair, mask)
+        out = (
+            self._apply_blocks(pair, None)
+            if mask is None
+            else self._compiled(pair, mask)
+        )
+        return out if out.dtype == orig_dtype else out.astype(orig_dtype)
 
 
 # ---------------------------------------------------------------------------
