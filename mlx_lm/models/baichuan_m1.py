@@ -221,7 +221,7 @@ class Model(nn.Module):
 
     def make_cache(self) -> List[Any]:
         caches = []
-        for i, layer in enumerate(self.model.layers):
+        for i in range(len(self.model.layers)):
             is_swa = i in self.config.sliding_window_layers
             conv_cache = ArraysCache(size=2)
             if is_swa:

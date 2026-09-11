@@ -2,23 +2,18 @@
 
 import concurrent.futures
 import random
-import threading
 import unittest
 from typing import List
 
 import mlx.core as mx
 
 from mlx_lm.generate import (
-    DEFAULT_PREFILL_STEP_SIZE,
     BatchGenerator,
     GenerationResponse,
-    StopSequenceMatcher,
-    _build_trie,
+    StopSequences,
     batch_generate,
     generate,
     generate_step,
-    generation_stream,
-    setup_arg_parser,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -36,9 +31,7 @@ class TestGenerate(unittest.TestCase):
 
     def test_generate(self):
         # Simple test that generation runs
-        text = generate(
-            self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
-        )
+        generate(self.model, self.tokenizer, "hello", max_tokens=5, verbose=False)
 
     def test_generate_step_processor_sees_prefilled_prompt(self):
         # prefill_step_size=2 over a 4-token prompt leaves one token for _step,
@@ -398,7 +391,7 @@ class TestGenerate(unittest.TestCase):
             logits_processors=processors,
         )
         prompt = self.tokenizer.encode("hello")
-        uids = batch_gen.insert([prompt])
+        batch_gen.insert([prompt])
         response = batch_gen.next_generated()[0]
         logprobs = response.logprobs
         self.assertEqual(logprobs[0].item(), 0.0)
@@ -502,7 +495,7 @@ class TestGenerate(unittest.TestCase):
             sampler=lambda _: mx.array([1]),
         )
         prompt = self.tokenizer.encode("hello")
-        uids = batch_gen.insert([prompt])
+        batch_gen.insert([prompt])
         response = batch_gen.next_generated()[0]
         self.assertEqual(response.token, 1)
 
@@ -526,17 +519,17 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
-    def test_batch_generate_with_stop_matchers(self):
-        """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
+    def test_batch_generate_with_stop_sequences(self):
+        """Per-sequence stop_sequences stop on different tokens."""
         batch_gen = BatchGenerator(
             self.model,
             max_tokens=10,
         )
         prompt = self.tokenizer.encode("hello")
 
-        sm_0 = StopSequenceMatcher([[0]])
-        sm_1 = StopSequenceMatcher([[1]])
-        sm_2 = StopSequenceMatcher([[2]])
+        ss_0 = StopSequences([[0]])
+        ss_1 = StopSequences([[1]])
+        ss_2 = StopSequences([[2]])
 
         processor_0 = make_logits_processors({0: 2000.0})
         processor_1 = make_logits_processors({1: 2000.0})
@@ -545,7 +538,7 @@ class TestGenerate(unittest.TestCase):
         uid0, uid1, uid2 = batch_gen.insert(
             [prompt, prompt, prompt],
             logits_processors=[processor_0, processor_1, processor_2],
-            stop_matchers=[sm_0, sm_1, sm_2],
+            stop_sequences=[ss_0, ss_1, ss_2],
         )
 
         responses = batch_gen.next_generated()
@@ -978,13 +971,30 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(gen.insert([prompt]), [0])
 
     def test_build_trie_ignores_empty_sequences(self):
-        trie = _build_trie([[], [7]])
+        matcher = StopSequences([[], [7]]).matcher()
 
-        state = trie
-        state, matched = StopSequenceMatcher.match(state, trie, 3)
-        self.assertFalse(matched)
-        state, matched = StopSequenceMatcher.match(state, trie, 7)
-        self.assertTrue(matched)
+        self.assertFalse(matcher.advance(3))
+        self.assertTrue(matcher.advance(7))
+
+    def test_stop_sequences_matchers_are_independent(self):
+        stop_sequences = StopSequences([[1, 2]])
+
+        a = stop_sequences.matcher()
+        b = stop_sequences.matcher()
+
+        self.assertFalse(a.advance(1))
+        # b is untouched, so a lone 2 is not a match for it.
+        self.assertFalse(b.advance(2))
+        self.assertTrue(a.advance(2))
+
+    def test_stop_sequences_matcher_fails_back(self):
+        matcher = StopSequences([[1, 1, 2]]).matcher()
+
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertTrue(matcher.advance(2))
 
     def test_batch_mixes_sequences_with_and_without_processors(self):
         gen = BatchGenerator(self.model, max_tokens=3)
