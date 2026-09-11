@@ -40,9 +40,9 @@ class ModelArgs(BaseModelArgs):
     use_conv_bias: bool
     hybrid_override_pattern: Optional[List[str]] = None
     layers_block_type: Optional[List[str]] = None
+    # Alias transformers exposes the list under.
     layer_types: Optional[List[str]] = None
-    # Derived from the block list when the config leaves it out, which is what
-    # transformers does: there the layer count is a property of layers_block_type.
+    # Omitted by transformers, which derives it from the block list.
     num_hidden_layers: Optional[int] = None
     head_dim: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
@@ -59,17 +59,15 @@ class ModelArgs(BaseModelArgs):
     time_step_min: Optional[float] = None
     time_step_max: Optional[float] = None
 
-    # Map from layers_block_type names to single-char pattern codes. Both the
-    # current spelling and the legacy one are accepted, since a checkpoint may
-    # have been saved by either version of transformers.
     _block_type_to_char = {
-        "linear_attention": "M",
-        "mamba": "M",
-        "conv": "M",
         "full_attention": "*",
-        "attention": "*",
+        "linear_attention": "M",
         "moe": "E",
         "mlp": "-",
+        # legacy spellings, remapped since transformers 5.13
+        "attention": "*",
+        "mamba": "M",
+        "conv": "M",
     }
 
     def __post_init__(self):
@@ -89,8 +87,6 @@ class ModelArgs(BaseModelArgs):
                 self._block_type_to_char[t] for t in block_types
             ]
         if self.hybrid_override_pattern is not None:
-            # The block list is authoritative for the layer count; transformers
-            # treats num_hidden_layers as deprecated for this architecture.
             self.num_hidden_layers = len(self.hybrid_override_pattern)
         else:
             raise ValueError(

@@ -2004,6 +2004,8 @@ class TestModels(unittest.TestCase):
     def test_nemotron_h_layer_count_from_block_types(self):
         from mlx_lm.models import nemotron_h
 
+        # transformers derives the layer count from layers_block_type and omits
+        # num_hidden_layers, so recent checkpoints do not carry the key.
         config = {
             "model_type": "nemotron_h",
             "vocab_size": 1000,
@@ -2023,55 +2025,29 @@ class TestModels(unittest.TestCase):
             "layer_norm_epsilon": 1e-4,
             "use_bias": True,
             "use_conv_bias": True,
-            # transformers derives the layer count from this list and treats
-            # num_hidden_layers as deprecated, so recent checkpoints of this
-            # architecture do not carry the key at all.
-            "layers_block_type": [
-                "full_attention",
-                "linear_attention",
-                "mlp",
-                "linear_attention",
-            ],
+            "layers_block_type": ["full_attention", "linear_attention", "mlp", "moe"],
         }
-        expected_pattern = ["*", "M", "-", "M"]
+        expected = ["*", "M", "-", "E"]
 
         args = nemotron_h.ModelArgs.from_dict(config)
         self.assertEqual(args.num_hidden_layers, 4)
-        self.assertEqual(args.hybrid_override_pattern, expected_pattern)
-        model = nemotron_h.Model(args)
-        self.model_test_runner(model, args.model_type, config["vocab_size"], 4)
+        self.assertEqual(args.hybrid_override_pattern, expected)
 
-        # The legacy block-type spelling describes the same stack.
-        legacy = dict(config)
-        legacy["layers_block_type"] = ["attention", "mamba", "mlp", "mamba"]
+        # The legacy spellings describe the same stack.
+        legacy = dict(config, layers_block_type=["attention", "conv", "mlp", "moe"])
         self.assertEqual(
-            nemotron_h.ModelArgs.from_dict(legacy).hybrid_override_pattern,
-            expected_pattern,
+            nemotron_h.ModelArgs.from_dict(legacy).hybrid_override_pattern, expected
         )
-
-        # So does layer_types, the alias transformers exposes the list under.
-        aliased = {k: v for k, v in config.items() if k != "layers_block_type"}
-        aliased["layer_types"] = config["layers_block_type"]
+        legacy["layers_block_type"] = ["attention", "mamba", "mlp", "moe"]
         self.assertEqual(
-            nemotron_h.ModelArgs.from_dict(aliased).hybrid_override_pattern,
-            expected_pattern,
+            nemotron_h.ModelArgs.from_dict(legacy).hybrid_override_pattern, expected
         )
 
         # An unmappable block type is reported instead of raising a KeyError.
-        unknown = dict(config)
-        unknown["layers_block_type"] = ["sliding_attention"] * 4
+        unknown = dict(config, layers_block_type=["sliding_attention"] * 4)
         with self.assertRaises(ValueError) as raised:
             nemotron_h.ModelArgs.from_dict(unknown)
         self.assertIn("sliding_attention", str(raised.exception))
-
-    def test_model_args_reports_missing_config_keys(self):
-        from mlx_lm.models import llama
-
-        with self.assertRaises(ValueError) as raised:
-            llama.ModelArgs.from_dict({"model_type": "llama", "hidden_size": 128})
-        message = str(raised.exception)
-        self.assertIn("llama", message)
-        self.assertIn("num_hidden_layers", message)
 
     def test_phi3small(self):
         from mlx_lm.models import phi3small

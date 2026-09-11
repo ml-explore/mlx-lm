@@ -304,9 +304,8 @@ def hf_repo_to_path(hf_repo):
     )
 
 
-# Recent versions of transformers keep config.json readable by every JSON
-# parser by tagging non-finite floats, e.g. {"__float__": "Infinity"} for inf.
-# Undo the tagging here or the value reaches the model as a dict.
+# transformers tags non-finite floats so config.json stays valid JSON, e.g.
+# {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
 _FLOAT_TAG_KEY = "__float__"
 _FLOAT_TAGS = {
     "Infinity": float("inf"),

@@ -12,19 +12,13 @@ from mlx.utils import tree_map
 class BaseModelArgs:
     @classmethod
     def from_dict(cls, params):
-        accepted = inspect.signature(cls).parameters
-        kwargs = {k: v for k, v in params.items() if k in accepted}
-        missing = [
-            name
-            for name, param in accepted.items()
-            if param.default is inspect.Parameter.empty and name not in kwargs
-        ]
-        if missing:
-            raise ValueError(
-                f"Config for model type '{params.get('model_type', 'unknown')}' is "
-                f"missing required key(s): {', '.join(missing)}."
-            )
-        return cls(**kwargs)
+        return cls(
+            **{
+                k: v
+                for k, v in params.items()
+                if k in inspect.signature(cls).parameters
+            }
+        )
 
 
 def create_causal_mask(
