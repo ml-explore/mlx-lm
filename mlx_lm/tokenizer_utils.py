@@ -118,15 +118,14 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self.trim_space = trim_space
         self._sep = "\u2581".encode()
 
-        # Extract the tokens in a list from id to text
-        vocab = tokenizer.get_vocab()
-        self.tokenmap = [""] * (max(vocab.values()) + 1)
-        for value, tokenid in vocab.items():
-            if value.startswith("<0x"):
-                # Replace bytes with their value
-                self.tokenmap[tokenid] = bytes([int(value[3:5], 16)])
-            else:
-                self.tokenmap[tokenid] = value.encode()
+        # Extract the tokens in a list from id to bytes
+        ids = list(range(len(tokenizer)))
+        tokens = tokenizer.convert_ids_to_tokens(ids)
+        self.tokenmap = [
+            # Replace bytes with their value
+            bytes([int(t[3:5], 16)]) if t.startswith("<0x") else t.encode()
+            for t in tokens
+        ]
 
         self.reset()
 
@@ -167,10 +166,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def __init__(self, tokenizer):
         # Extract the tokens in a list from id to text
-        vocab = tokenizer.get_vocab()
-        self.tokenmap = [None] * len(vocab)
-        for value, tokenid in vocab.items():
-            self.tokenmap[tokenid] = value
+        ids = list(range(len(tokenizer)))
+        self.tokenmap = tokenizer.convert_ids_to_tokens(ids)
 
         self.reset()
 
@@ -512,6 +509,10 @@ class TokenizerWrapper:
     @eos_token_ids.setter
     def eos_token_ids(self, value):
         self._eos_token_ids = set(value) if value is not None else set()
+
+    def __len__(self):
+        # Special methods bypass __getattr__, so proxy this one explicitly.
+        return len(self._tokenizer)
 
     def __getattr__(self, attr):
         # Only reached when normal lookup fails. Names this class defines are
