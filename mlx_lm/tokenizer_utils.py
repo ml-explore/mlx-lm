@@ -43,6 +43,11 @@ class StreamingDetokenizer(abc.ABC):
         # Now detokenizer.text should match tokenizer.decode(detokenizer.tokens)
     """
 
+    # Set by reset(); text is a property on some subclasses.
+    text: str
+    tokens: List[int]
+    offset: int
+
     @abc.abstractmethod
     def reset(self):
         """Drop all streaming state, keeping data derived from the tokenizer."""
@@ -73,6 +78,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     """
 
     def __init__(self, tokenizer):
+        super().__init__()
         self._tokenizer = tokenizer
         self._tokenizer.decode([0])
         probe = tokenizer.encode("a ,b", add_special_tokens=False)
@@ -120,6 +126,7 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
     """
 
     def __init__(self, tokenizer, trim_space=True):
+        super().__init__()
         self.trim_space = trim_space
         self._sep = "\u2581".encode()
 
