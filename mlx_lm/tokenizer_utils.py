@@ -119,8 +119,9 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self._sep = "\u2581".encode()
 
         # Extract the tokens in a list from id to text
-        self.tokenmap = [""] * (max(tokenizer.vocab.values()) + 1)
-        for value, tokenid in tokenizer.vocab.items():
+        vocab = tokenizer.get_vocab()
+        self.tokenmap = [""] * (max(vocab.values()) + 1)
+        for value, tokenid in vocab.items():
             if value.startswith("<0x"):
                 # Replace bytes with their value
                 self.tokenmap[tokenid] = bytes([int(value[3:5], 16)])
@@ -166,8 +167,9 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def __init__(self, tokenizer):
         # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        for value, tokenid in tokenizer.vocab.items():
+        vocab = tokenizer.get_vocab()
+        self.tokenmap = [None] * len(vocab)
+        for value, tokenid in vocab.items():
             self.tokenmap[tokenid] = value
 
         self.reset()
