@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import abc
 import copy
 import importlib
 import inspect
@@ -12,7 +13,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
-class StreamingDetokenizer:
+class StreamingDetokenizer(abc.ABC):
     """The streaming detokenizer interface so that we can detokenize one token at a time.
 
     Example usage is as follows:
@@ -42,14 +43,17 @@ class StreamingDetokenizer:
         # Now detokenizer.text should match tokenizer.decode(detokenizer.tokens)
     """
 
+    @abc.abstractmethod
     def reset(self):
-        raise NotImplementedError()
+        """Drop all streaming state, keeping data derived from the tokenizer."""
 
+    @abc.abstractmethod
     def add_token(self, token):
-        raise NotImplementedError()
+        """Consume one token id."""
 
+    @abc.abstractmethod
     def finalize(self):
-        raise NotImplementedError()
+        """Flush any text held back waiting for more tokens."""
 
     @property
     def last_segment(self):
