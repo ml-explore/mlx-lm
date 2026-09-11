@@ -126,10 +126,11 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
     underscore which results in linear complexity.
     """
 
+    _sep = "\u2581".encode("utf-8")
+
     def __init__(self, tokenizer, trim_space=True):
         super().__init__()
         self.trim_space = trim_space
-        self._sep = "\u2581".encode()
 
         ids = list(range(len(tokenizer)))
         tokens = tokenizer.convert_ids_to_tokens(ids)
