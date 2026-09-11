@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import copy
 import importlib
 import inspect
 import json
@@ -118,11 +119,10 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self.trim_space = trim_space
         self._sep = "\u2581".encode()
 
-        # Extract the tokens in a list from id to bytes
         ids = list(range(len(tokenizer)))
         tokens = tokenizer.convert_ids_to_tokens(ids)
         self.tokenmap = [
-            # Replace bytes with their value
+            # Byte tokens carry their value in hex.
             bytes([int(t[3:5], 16)]) if t.startswith("<0x") else t.encode()
             for t in tokens
         ]
@@ -165,7 +165,6 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _byte_decoder = None
 
     def __init__(self, tokenizer):
-        # Extract the tokens in a list from id to text
         ids = list(range(len(tokenizer)))
         self.tokenmap = tokenizer.convert_ids_to_tokens(ids)
 
@@ -341,7 +340,8 @@ class TokenizerWrapper:
         tool_parser=None,
     ):
         self._tokenizer = tokenizer
-        self._detokenizer_class = detokenizer_class
+        # Built once, since building the token map is expensive.
+        self._detokenizer = detokenizer_class(tokenizer)
         self._eos_token_ids = set(eos_token_ids or [])
         if tokenizer.eos_token_id is not None:
             self._eos_token_ids.add(tokenizer.eos_token_id)
@@ -500,7 +500,10 @@ class TokenizerWrapper:
         """
         Get a stateful streaming detokenizer.
         """
-        return self._detokenizer_class(self)
+        # A copy per caller, since requests are detokenized concurrently.
+        detokenizer = copy.copy(self._detokenizer)
+        detokenizer.reset()
+        return detokenizer
 
     @property
     def eos_token_ids(self):
@@ -515,9 +518,8 @@ class TokenizerWrapper:
         return len(self._tokenizer)
 
     def __getattr__(self, attr):
-        # Only reached when normal lookup fails. Names this class defines are
-        # not delegated, so a property that raises reports its own error
-        # instead of a misleading one about the wrapped tokenizer.
+        # Names this class defines are not delegated, so a property that
+        # raises reports its own error.
         if attr.startswith("_") or hasattr(type(self), attr):
             raise AttributeError(
                 f"{type(self).__name__!r} object has no attribute {attr!r}"
