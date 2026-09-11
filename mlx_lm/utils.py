@@ -303,6 +303,27 @@ def hf_repo_to_path(hf_repo):
     )
 
 
+def compressed_tensors_quantization(quantization_config: dict) -> dict:
+    """Map a compressed-tensors config to an MLX quantization dict.
+
+    ``compressed-tensors`` is a container format. Only packed integer formats that
+    MLX already implements are accepted. Unknown formats such as ``float-quantized``
+    (FP8) used to fall through to 4-bit affine and silently misinterpret F8_E4M3
+    weights.
+    """
+    fmt = quantization_config.get("format")
+    if fmt == "nvfp4-pack-quantized":
+        return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    if fmt == "mxfp4-pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    if fmt == "pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "affine"}
+    raise ValueError(
+        f"unsupported compressed-tensors format {fmt!r}; "
+        "dequantize to bf16 before converting"
+    )
+
+
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
         config = json.load(f)
@@ -434,12 +455,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            if quantization_config.get("format") == "nvfp4-pack-quantized":
-                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-            elif quantization_config.get("format") == "mxfp4-pack-quantized":
-                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            else:
-                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            quantization = compressed_tensors_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
