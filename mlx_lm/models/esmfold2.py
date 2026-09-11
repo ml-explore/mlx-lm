@@ -86,30 +86,35 @@ class TriangleMultiplicativeUpdate(nn.Module):
         self.proj_gate = nn.Linear(dim, dim, bias=False)
 
     def _contract(self, left: mx.array, right: mx.array) -> mx.array:
-        # left/right: (B, L, L, D). Reference einsum:
+        # left/right: (D, B, L, L). Reference einsum:
         #   outgoing: out[b,i,j,d] = sum_k left[b,i,k,d] * right[b,j,k,d]
         #   incoming: out[b,i,j,d] = sum_k left[b,k,i,d] * right[b,k,j,d]
-        # Move channel D to the batch axis and reduce over k with a matmul.
-        if self.outgoing:
-            l = left.transpose(0, 3, 1, 2)  # (B, D, i, k)
-            r = right.transpose(0, 3, 1, 2)  # (B, D, j, k)
-        else:
-            l = left.transpose(0, 3, 2, 1)  # (B, D, i, k)
-            r = right.transpose(0, 3, 2, 1)  # (B, D, j, k)
+        # Only the batch axes move, so nothing is copied.
+        perm = (1, 0, 2, 3) if self.outgoing else (1, 0, 3, 2)
+        l = left.transpose(*perm)  # (B, D, i, k)
+        r = right.transpose(*perm)  # (B, D, j, k)
         out = l @ r.transpose(0, 1, 3, 2)  # (B, D, i, j)
         return out.transpose(0, 2, 3, 1)  # (B, i, j, D)
 
     def __call__(self, z: mx.array, mask: Optional[mx.array] = None) -> mx.array:
         normalized = self.norm_start(z)
-        bundled = self.proj_bundle(normalized)
-        signal, gate_logits = mx.split(bundled, 2, axis=-1)
+        # Channel-first, so the contraction needs no copy. `x @ W.T` gives
+        # (B,i,j,C), and permuting that to (B,C,i,k) leaves neither inner axis
+        # contiguous, so MLX materialises it: 5.7ms per call at L=500. `W @ x.T`
+        # gives (C,M) straight out of the GEMM, after which every step is a
+        # reshape, an outermost-axis slice or a batch permute.
+        b, n = normalized.shape[0], normalized.shape[1]
+        bundled = (
+            self.proj_bundle.weight @ normalized.reshape(-1, self.dim).T
+        ).reshape(4 * self.dim, b, n, n)
+        signal, gate_logits = mx.split(bundled, 2, axis=0)
         routed = signal * mx.sigmoid(gate_logits)
         if mask is not None:
-            routed = routed * mask[..., None]
+            routed = routed * mask[None]
         # bf16 inputs are safe here because MLX accumulates the matmul in
         # fp32, so the reduction over k keeps full precision. Matches the
         # reference's fused CUDA path, not its eager fp32 one.
-        left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)
+        left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=0)
         contracted = self._contract(left, right).astype(z.dtype)
         mixed = self.proj_emit(self.norm_mix(contracted))
         out_gate = mx.sigmoid(self.proj_gate(normalized))
