@@ -106,7 +106,10 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if self._current_text.endswith("\ufffd") or (
+            if self._current_text.endswith("\ufffd"):
+                # An incomplete character can decode to several replacements.
+                self._current_text = self._current_text.rstrip("\ufffd")
+            elif (
                 self._clean_spaces
                 and len(self._current_text) > 0
                 and self._current_text[-1] == " "
@@ -235,6 +238,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
+        # Undocumented fallback from #418, likely for a padded model vocab.
+        # TODO(michalk8): check whether this is still needed.
         v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)

@@ -98,6 +98,19 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(text_a, tokenizer.decode(a))
         self.assertEqual(text_b, tokenizer.decode(b))
 
+    def test_naive_detokenizer_holds_back_partial_characters(self):
+        tokenizer = load_tokenizer("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        tokenizer = TokenizerWrapper(
+            tokenizer._tokenizer, detokenizer_class=NaiveStreamingDetokenizer
+        )
+        # Half of a multi-byte character.
+        partial = 3219
+        self.assertEqual(tokenizer.decode([partial]).count("�"), 2)
+
+        detokenizer = tokenizer.detokenizer
+        detokenizer.add_token(partial)
+        self.assertEqual(detokenizer.last_segment, "")
+
     def test_special_tokens(self):
         tokenizer_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
         tokenizer = load_tokenizer(tokenizer_repo)
