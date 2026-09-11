@@ -106,8 +106,10 @@ class TriangleMultiplicativeUpdate(nn.Module):
         routed = signal * mx.sigmoid(gate_logits)
         if mask is not None:
             routed = routed * mask[..., None]
-        # Contraction in fp32 (matches the reference).
-        left, right = mx.split(routed.astype(mx.float32), 2, axis=-1)
+        # bf16 inputs are safe here because MLX accumulates the matmul in
+        # fp32, so the reduction over k keeps full precision. Matches the
+        # reference's fused CUDA path, not its eager fp32 one.
+        left, right = mx.split(routed.astype(mx.bfloat16), 2, axis=-1)
         contracted = self._contract(left, right).astype(z.dtype)
         mixed = self.proj_emit(self.norm_mix(contracted))
         out_gate = mx.sigmoid(self.proj_gate(normalized))
