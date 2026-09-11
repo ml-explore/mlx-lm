@@ -378,6 +378,14 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
+    if "quantization_config" not in config:
+        # NVIDIA ModelOpt exports keep their quantization metadata in a separate
+        # file rather than in config.json.
+        hf_quant_config = model_path / "hf_quant_config.json"
+        if hf_quant_config.exists():
+            with open(hf_quant_config, "r") as fid:
+                config["quantization_config"] = json.load(fid)
+
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
@@ -392,7 +400,20 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            # An nvfp4 tensor scale is a parameter of the layer, so the layer has
+            # to be built to hold one. Whether it needs one is a property of the
+            # checkpoint, so read it from the weights rather than the config:
+            # externally produced nvfp4 does not carry per-layer entries.
+            if f"{p}.global_scale" in weights and _takes_global_scale(m):
+                return {
+                    "group_size": quantization["group_size"],
+                    "bits": quantization["bits"],
+                    "mode": quantization.get("mode", "affine"),
+                    "global_scale": True,
+                }
+            return True
 
         nn.quantize(
             model,
@@ -424,6 +445,19 @@ def load_model(
                 quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             else:
                 quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method == "modelopt":
+            # NVIDIA ModelOpt.
+            algo = quantization_config["quantization"]["quant_algo"]
+            if algo != "NVFP4":
+                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+            quantization = {
+                "group_size": quantization_config["quantization"].get("group_size", 16),
+                "bits": 4,
+                "mode": "nvfp4",
+            }
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -886,7 +920,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
