@@ -136,7 +136,7 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         tokens = tokenizer.convert_ids_to_tokens(ids)
         self.tokenmap = [
             # Byte tokens carry their value in hex.
-            bytes([int(t[3:5], 16)]) if t.startswith("<0x") else t.encode()
+            bytes([int(t[3:5], 16)]) if t.startswith("<0x") else t.encode("utf-8")
             for t in tokens
         ]
 
