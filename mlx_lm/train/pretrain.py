@@ -211,6 +211,12 @@ def build_parser():
         help="Number of tokens per sequence. Overrides the experiment config",
     )
     parser.add_argument(
+        "--grad-accum-steps",
+        type=int,
+        default=None,
+        help="Number of gradient accumulation steps. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--fsdp-dim",
         type=int,
         default=None,
