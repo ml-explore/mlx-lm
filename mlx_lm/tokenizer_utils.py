@@ -41,8 +41,6 @@ class StreamingDetokenizer:
         # Now detokenizer.text should match tokenizer.decode(detokenizer.tokens)
     """
 
-    __slots__ = ("text", "tokens", "offset")
-
     def reset(self):
         raise NotImplementedError()
 
@@ -505,23 +503,27 @@ class TokenizerWrapper:
         """
         return self._detokenizer_class(self)
 
+    @property
+    def eos_token_ids(self):
+        return self._eos_token_ids
+
+    @eos_token_ids.setter
+    def eos_token_ids(self, value):
+        self._eos_token_ids = set(value) if value is not None else set()
+
     def __getattr__(self, attr):
-        if attr == "detokenizer":
-            return self._detokenizer
-        elif attr == "eos_token_ids":
-            return self._eos_token_ids
-        elif attr.startswith("_"):
-            return self.__getattribute__(attr)
-        else:
-            return getattr(self._tokenizer, attr)
+        # Only reached when normal lookup fails. Names this class defines are
+        # not delegated, so a property that raises reports its own error
+        # instead of a misleading one about the wrapped tokenizer.
+        if attr.startswith("_") or hasattr(type(self), attr):
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {attr!r}"
+            )
+        return getattr(self._tokenizer, attr)
 
     def __setattr__(self, attr, value):
-        if attr in {"detokenizer", "eos_token_ids"}:
-            if attr == "detokenizer":
-                raise AttributeError("Cannot set the detokenizer.")
-            elif attr == "eos_token_ids":
-                self._eos_token_ids = set(value) if value is not None else set()
-        elif attr.startswith("_"):
+        # Defer to the class so properties keep their setters.
+        if attr.startswith("_") or hasattr(type(self), attr):
             super().__setattr__(attr, value)
         else:
             setattr(self._tokenizer, attr, value)
