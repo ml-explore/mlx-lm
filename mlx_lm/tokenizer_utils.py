@@ -176,6 +176,7 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     _byte_decoder = None
 
     def __init__(self, tokenizer):
+        super().__init__()
         ids = list(range(len(tokenizer)))
         self.tokenmap = tokenizer.convert_ids_to_tokens(ids)
 
