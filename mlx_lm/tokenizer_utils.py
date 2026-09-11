@@ -2,6 +2,7 @@
 
 import abc
 import copy
+import functools
 import importlib
 import inspect
 import json
@@ -166,14 +167,37 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self._unflushed = b""
 
 
+@functools.lru_cache(maxsize=1)
+def _byte_decoder():
+    """See https://github.com/openai/gpt-2/blob/master/src/encoder.py for the rationale."""
+    char_to_bytes = {}
+    limits = [
+        0,
+        ord("!"),
+        ord("~") + 1,
+        ord("¡"),
+        ord("¬") + 1,
+        ord("®"),
+        ord("ÿ") + 1,
+    ]
+    n = 0
+    for i, (start, stop) in enumerate(zip(limits, limits[1:])):
+        if i % 2 == 0:
+            for b in range(start, stop):
+                char_to_bytes[chr(2**8 + n)] = b
+                n += 1
+        else:
+            for b in range(start, stop):
+                char_to_bytes[chr(b)] = b
+    return char_to_bytes
+
+
 class BPEStreamingDetokenizer(StreamingDetokenizer):
     """A streaming detokenizer for OpenAI style BPE models.
 
     It adds tokens to the text if the next token starts with a space similar to
     the SPM detokenizer.
     """
-
-    _byte_decoder = None
 
     def __init__(self, tokenizer):
         super().__init__()
@@ -182,10 +206,6 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
         self.reset()
 
-        # Make the BPE byte decoder from
-        # https://github.com/openai/gpt-2/blob/master/src/encoder.py
-        self.make_byte_decoder()
-
     def reset(self):
         self.offset = 0
         self._unflushed = ""
@@ -193,9 +213,10 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self.tokens = []
 
     def _decode_bytes(self, seq):
+        byte_decoder = _byte_decoder()
         barr = bytearray()
         for c in seq:
-            res = self._byte_decoder.get(c, False)
+            res = byte_decoder.get(c, False)
             if res:
                 barr.append(res)
             else:
@@ -220,45 +241,19 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         # For multi-byte utf-8 wait until they are complete
         # For single spaces wait until the next token to clean it if needed
         if not text.endswith("\ufffd") and not (
-            len(v) == 1 and self._byte_decoder.get(v[0]) == 32
+            len(v) == 1 and _byte_decoder().get(v[0]) == 32
         ):
             self.text += self._maybe_trim_space(text)
             self._unflushed = ""
 
     def finalize(self):
-        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
+        byte_decoder = _byte_decoder()
+        current_text = bytearray(byte_decoder[c] for c in self._unflushed).decode(
             "utf-8",
             "replace",
         )
         self.text += self._maybe_trim_space(current_text)
         self._unflushed = ""
-
-    @classmethod
-    def make_byte_decoder(cls):
-        """See https://github.com/openai/gpt-2/blob/master/src/encoder.py for the rationale."""
-        if cls._byte_decoder is not None:
-            return
-
-        char_to_bytes = {}
-        limits = [
-            0,
-            ord("!"),
-            ord("~") + 1,
-            ord("¡"),
-            ord("¬") + 1,
-            ord("®"),
-            ord("ÿ") + 1,
-        ]
-        n = 0
-        for i, (start, stop) in enumerate(zip(limits, limits[1:])):
-            if i % 2 == 0:
-                for b in range(start, stop):
-                    char_to_bytes[chr(2**8 + n)] = b
-                    n += 1
-            else:
-                for b in range(start, stop):
-                    char_to_bytes[chr(b)] = b
-        cls._byte_decoder = char_to_bytes
 
 
 def _infer_thinking(tokenizer):
