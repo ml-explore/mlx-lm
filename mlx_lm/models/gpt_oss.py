@@ -106,7 +106,6 @@ class AttentionBlock(nn.Module):
     def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
         B, L, _ = x.shape
         D = self.head_dim
-        Hk = self.num_key_value_heads
 
         q = self.q_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
         k = self.k_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)

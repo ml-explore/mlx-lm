@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -118,6 +120,7 @@ def _group_expert_select(
     )
     routing_scores = mx.flatten(routing_scores, -2, -1)
     indices = mx.argpartition(-routing_scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    indices = mx.stop_gradient(indices)
     selected = mx.take_along_axis(scores, indices, axis=-1)
     selected = selected / (selected.sum(axis=-1, keepdims=True) + 1e-20)
     return indices, selected * routed_scaling_factor

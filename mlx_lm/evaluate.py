@@ -201,7 +201,6 @@ class MLXLM(LM):
             # compute truncation length
             max_tokens = self._max_tokens or DEFAULT_MAX_TOKENS
             truncation = max(0, max_completed_l - max_tokens - 1)
-            orig_prefix_l = len(prefix)
             prefix_l = max(len(prefix) - truncation, 0)
             prefix = prefix[len(prefix) - prefix_l :]
 
@@ -303,7 +302,7 @@ class MLXLM(LM):
         for i in tqdm(range(0, len(inputs), self._batch_size)):
             batch = inputs[i : i + self._batch_size]
             scores, lengths, _ = self._score_fn(batch)
-            mask = mx.arange(scores.shape[-1]) < lengths[:, None]
+            mask = mx.arange(scores.shape[-1]) < lengths[:, None] - 1
             all_scores.extend((mask * scores).sum(axis=-1).tolist())
 
         return all_scores

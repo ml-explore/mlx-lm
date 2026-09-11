@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import argparse
 import gc
@@ -22,9 +22,7 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -34,6 +32,7 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     TextStateMachine,
     make_stop_sequences,
@@ -42,7 +41,12 @@ from .generate import (
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import _parse_size, load, sharded_load
+from .utils import (
+    _parse_size,
+    load,
+    maybe_set_recommended_wired_limit,
+    sharded_load,
+)
 
 
 def get_system_fingerprint():
@@ -627,7 +631,11 @@ class ResponseGenerator:
         return stop_sequences, text_sm
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and self.cli_args.kv_bits is None
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -639,7 +647,6 @@ class ResponseGenerator:
         self.model_provider.load_default()
 
         current_model = None
-        current_sampling = None
         current_tokenizer = None
         current_model_key = None
         batch_generator = None
@@ -688,7 +695,7 @@ class ResponseGenerator:
 
                     stop_sequences, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
-                        tokenizer,
+                        current_tokenizer,
                         args.stop_words,
                     )
 
@@ -707,9 +714,9 @@ class ResponseGenerator:
                             break
 
                     ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        has_thinking=tokenizer.has_thinking,
-                        tool_parser=tokenizer.tool_parser,
+                        has_tool_calling=current_tokenizer.has_tool_calling,
+                        has_thinking=current_tokenizer.has_thinking,
+                        tool_parser=current_tokenizer.tool_parser,
                         text_sm=text_sm,
                         initial_state=initial_state,
                         prompt=prompt,
@@ -722,14 +729,14 @@ class ResponseGenerator:
                         max_tokens=[args.max_tokens],
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
-                        samplers=[_make_sampler(args, tokenizer)],
+                        samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
                         stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
-                        "detokenizer": tokenizer.detokenizer,
+                        "detokenizer": current_tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                     }
@@ -784,7 +791,6 @@ class ResponseGenerator:
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
-                        current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()
@@ -947,6 +953,9 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
 
@@ -1215,8 +1224,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
-            except ValueError:
-                raise ValueError("logit_bias must be a dict of int to float")
+            except ValueError as e:
+                raise ValueError("logit_bias must be a dict of int to float") from e
 
     def generate_response(
         self,
@@ -1866,14 +1875,33 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization (e.g., 4 or 8). "
+        "Reduces memory usage for long contexts. Disables batching, so "
+        "requests are served one at a time. Default: None (full precision)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Token position to start KV cache quantization "
+        f"(default: {DEFAULT_QUANTIZED_KV_START})",
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_wired_limit(wired_limit)
+    _ = maybe_set_recommended_wired_limit()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),

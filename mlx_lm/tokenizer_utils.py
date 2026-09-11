@@ -1,7 +1,8 @@
+# Copyright © 2024 Apple Inc.
+
 import importlib
 import inspect
 import json
-import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional
@@ -344,11 +345,9 @@ class TokenizerWrapper:
     ):
         self._tokenizer = tokenizer
         self._detokenizer_class = detokenizer_class
-        self._eos_token_ids = (
-            set(eos_token_ids)
-            if eos_token_ids is not None
-            else {tokenizer.eos_token_id}
-        )
+        self._eos_token_ids = set(eos_token_ids or [])
+        if tokenizer.eos_token_id is not None:
+            self._eos_token_ids.add(tokenizer.eos_token_id)
         (
             self._think_start,
             self._think_end,
@@ -650,7 +649,9 @@ def load(
             try:
                 tokenizer_content = json.load(fid)
             except JSONDecodeError as e:
-                raise JSONDecodeError("Failed to parse tokenizer.json", e.doc, e.pos)
+                raise JSONDecodeError(
+                    "Failed to parse tokenizer.json", e.doc, e.pos
+                ) from e
 
         if "decoder" in tokenizer_content:
             if _is_spm_decoder(tokenizer_content["decoder"]):
@@ -663,7 +664,6 @@ def load(
     if isinstance(eos_token_ids, int):
         eos_token_ids = [eos_token_ids]
 
-    tokenizer_config_file = model_path / "tokenizer_config.json"
     chat_template = None
 
     tokenizer = AutoTokenizer.from_pretrained(

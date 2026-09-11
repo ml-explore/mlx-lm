@@ -1,4 +1,5 @@
 # Copyright © 2026 Apple Inc.
+
 """
 Parser for the Kimi K3 XTML tool-call format.
 

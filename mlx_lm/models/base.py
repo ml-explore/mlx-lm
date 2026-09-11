@@ -1,8 +1,8 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import inspect
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 from mlx.utils import tree_map

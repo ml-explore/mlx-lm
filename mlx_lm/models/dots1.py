@@ -1,7 +1,6 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -121,11 +120,13 @@ def group_expert_select(
         scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
         group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
         group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        group_idx = mx.stop_gradient(group_idx)
         scores = mx.put_along_axis(scores, group_idx, mx.array(0.0), axis=-2)
         scores = mx.flatten(scores, -2, -1)
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
@@ -161,7 +162,10 @@ class Dots1TopkRouter(nn.Module):
 
 class Dots1MLP(nn.Module):
     def __init__(
-        self, args: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        args: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
 
@@ -296,7 +300,7 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             if l >= self.args.first_k_dense_replace:
-                for n, m in [
+                for _, m in [
                     ("w1", "gate_proj"),
                     ("w2", "down_proj"),
                     ("w3", "up_proj"),
