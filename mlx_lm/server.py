@@ -15,7 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
 from queue import Queue
-from threading import Lock, Thread
+from threading import Thread
 from typing import (
     Any,
     Callable,
@@ -440,27 +440,18 @@ class ResponseGenerator:
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_failed = False
-        self._generation_lock = Lock()
         self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
 
     def _run_generate(self):
         try:
             self._generate()
-        except Exception:
-            logging.exception("mlx_lm.server generation thread died")
-            with self._generation_lock:
-                self._generation_failed = True
-                try:
-                    while True:
-                        rqueue, _, _ = self.requests.get_nowait()
-                        rqueue.put(RuntimeError("generation thread died"))
-                except QueueEmpty:
-                    pass
+        except Exception as e:
+            logging.exception(f"mlx_lm.server generation thread died: {e}")
+            self._generation_failed = True
 
     def generation_available(self):
-        with self._generation_lock:
-            return self._generation_thread.is_alive() and not self._generation_failed
+        return self._generation_thread.is_alive() and not self._generation_failed
 
     def stop_and_join(self):
         self._stop = True
@@ -1018,6 +1009,16 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
+    def _await_response(self, response_queue):
+        # Wherever the request was when the thread died, nothing more will be
+        # put on its queue, so give up rather than block forever.
+        while True:
+            try:
+                return response_queue.get(timeout=1.0)
+            except QueueEmpty:
+                if not self.generation_available():
+                    raise RuntimeError("generation thread died") from None
+
     def generate(
         self,
         request: CompletionRequest,
@@ -1025,14 +1026,13 @@ class ResponseGenerator:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         response_queue = Queue()
-        with self._generation_lock:
-            if not (self._generation_thread.is_alive() and not self._generation_failed):
-                raise RuntimeError("generation thread died")
-            self.requests.put((response_queue, request, generation_args))
+        if not self.generation_available():
+            raise RuntimeError("generation thread died")
+        self.requests.put((response_queue, request, generation_args))
 
         def _inner():
             while True:
-                response = response_queue.get()
+                response = self._await_response(response_queue)
                 if response is None:
                     break
                 if isinstance(response, Exception):
@@ -1043,7 +1043,7 @@ class ResponseGenerator:
                     continue
                 yield response
 
-        ctx = response_queue.get()
+        ctx = self._await_response(response_queue)
         if isinstance(ctx, Exception):
             raise ctx
 
@@ -1666,14 +1666,6 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /v1/models endpoint.
         """
-        if not self.response_generator.generation_available():
-            self._set_completion_headers(503)
-            self.end_headers()
-            self.wfile.write(
-                '{"error": {"message": "generation thread died", "type": "server_error"}}'.encode()
-            )
-            self.wfile.flush()
-            return
         self._set_completion_headers(200)
         self.end_headers()
 

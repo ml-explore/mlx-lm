@@ -4,7 +4,10 @@ import http
 import io
 import json
 import threading
+import time
 import unittest
+from queue import Queue
+from unittest import mock
 
 import mlx.core as mx
 import requests
@@ -850,9 +853,12 @@ class TestMakeSampler(unittest.TestCase):
 
 
 class TestModelSwapClearsCache(unittest.TestCase):
-    def test_load_clears_mlx_buffer_pool(self):
+    @mock.patch("mlx_lm.server.mx.clear_cache")
+    @mock.patch("mlx_lm.server.make_prompt_cache", return_value=[])
+    @mock.patch("mlx_lm.server.load")
+    @mock.patch("mlx_lm.server.mx.distributed.init")
+    def test_load_clears_mlx_buffer_pool(self, init, load, make_cache, clear_cache):
         import argparse
-        from unittest import mock
 
         from mlx_lm.server import ModelProvider
 
@@ -865,40 +871,43 @@ class TestModelSwapClearsCache(unittest.TestCase):
             trust_remote_code=False,
             use_default_chat_template=False,
         )
-        fake_model = mock.Mock()
-        fake_tokenizer = mock.Mock()
-        fake_tokenizer.chat_template = None
-        fake_tokenizer.default_chat_template = None
-        group = mock.Mock()
-        group.size.return_value = 1
+        tokenizer = mock.Mock()
+        tokenizer.chat_template = None
+        tokenizer.default_chat_template = None
+        load.return_value = (mock.Mock(), tokenizer)
+        init.return_value.size.return_value = 1
 
-        with (
-            mock.patch("mlx_lm.server.mx.distributed.init", return_value=group),
-            mock.patch("mlx_lm.server.load", return_value=(fake_model, fake_tokenizer)),
-            mock.patch("mlx_lm.server.make_prompt_cache", return_value=[]),
-            mock.patch("mlx_lm.server.mx.clear_cache") as clear_cache,
-        ):
-            provider = ModelProvider(args)
-            provider._load("model-a")
-            provider._load("model-b")
-            self.assertGreaterEqual(clear_cache.call_count, 2)
+        provider = ModelProvider(args)
+        provider._load("model-a")
+        provider._load("model-b")
+        self.assertGreaterEqual(clear_cache.call_count, 2)
+
+
+class FailingModelProvider:
+    def load_default(self):
+        raise RuntimeError("simulated generate crash")
 
 
 class TestGenerationThreadDeath(unittest.TestCase):
-    def test_generation_unavailable_after_thread_crash(self):
-        import time
-
-        class BoomProvider:
-            def load_default(self):
-                raise RuntimeError("simulated generate crash")
-
-        rg = ResponseGenerator(BoomProvider(), LRUPromptCache())
+    def _crashed_generator(self):
+        rg = ResponseGenerator(FailingModelProvider(), LRUPromptCache())
         rg.join()
         time.sleep(0.05)
+        return rg
+
+    def test_generation_unavailable_after_thread_crash(self):
+        rg = self._crashed_generator()
         self.assertTrue(rg._generation_failed)
         self.assertFalse(rg.generation_available())
         with self.assertRaisesRegex(RuntimeError, "generation thread died"):
             rg.generate(None, None)
+
+    def test_inflight_request_does_not_hang_after_thread_crash(self):
+        rg = self._crashed_generator()
+        # A request dequeued before the crash never gets a response queued, so
+        # waiting on it must give up instead of blocking forever.
+        with self.assertRaisesRegex(RuntimeError, "generation thread died"):
+            rg._await_response(Queue())
 
 
 if __name__ == "__main__":
