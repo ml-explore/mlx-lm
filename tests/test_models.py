@@ -406,6 +406,48 @@ class TestModels(unittest.TestCase):
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
 
+    @unittest.skipIf(
+        not mx.metal.is_available(), "Global scale is only supported on Metal backend"
+    )
+    def test_switch_linear_global_scale(self):
+        from mlx_lm.models.switch_layers import SwitchLinear
+
+        mx.random.seed(0)
+        E, N, K = 8, 128, 256
+        layer = SwitchLinear(K, N, E, bias=False)
+        # Scale the experts apart so a mixed up scale shows in the output.
+        layer.weight = layer.weight * mx.array(
+            [[1, 2, 4, 8][e % 4] for e in range(E)], mx.float32
+        ).reshape((E, 1, 1))
+
+        ql = layer.to_quantized(group_size=16, bits=4, mode="nvfp4", global_scale=True)
+        self.assertEqual(ql.global_scale.shape, (E,))
+        self.assertEqual(ql.global_scale.dtype, mx.float32)
+
+        x = mx.random.normal((16, 1, K))
+        indices = mx.random.randint(0, E, (16,))
+        w_hat = mx.stack(
+            [
+                mx.dequantize(
+                    ql.weight[e],
+                    ql.scales[e],
+                    mode="nvfp4",
+                    global_scale=ql.global_scale[e],
+                    dtype=x.dtype,
+                )
+                for e in range(E)
+            ]
+        )
+        expected = x @ w_hat[indices].swapaxes(-1, -2)
+        self.assertTrue(mx.allclose(ql(x, indices), expected, atol=1e-4))
+
+        # Without it the layer keeps the plain nvfp4 parameters
+        self.assertNotIn(
+            "global_scale", layer.to_quantized(group_size=16, bits=4, mode="nvfp4")
+        )
+        with self.assertRaises(ValueError):
+            layer.to_quantized(group_size=32, bits=4, mode="mxfp4", global_scale=True)
+
     def test_bailing_moe_v3(self):
         from dataclasses import replace
 
