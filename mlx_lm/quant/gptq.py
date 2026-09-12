@@ -123,8 +123,10 @@ def gptq_quantize(
 
                 e = gptq_error(w, d, scales, biases)
 
-                W[..., k : k + j] -= e @ Hinv[k : k + 1, k : k + j]
-                err[..., k : k + 1] = e
+                # Update the remaining columns of this group now; the
+                # columns after the group are updated once per group below.
+                W[..., k:j] -= e @ Hinv[k : k + 1, k:j]
+                err[..., k - i : k - i + 1] = e
                 mx.eval(err, W)
 
             W[..., j:] -= err @ Hinv[i:j, j:]
