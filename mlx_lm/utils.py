@@ -303,7 +303,7 @@ def hf_repo_to_path(hf_repo):
     )
 
 
-def compressed_tensors_quantization(quantization_config: dict) -> dict:
+def _compressed_tensors_quantization(quantization_config: dict) -> dict:
     """Map a compressed-tensors config to an MLX quantization dict.
 
     ``compressed-tensors`` is a container format. Only packed integer formats that
@@ -455,7 +455,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = compressed_tensors_quantization(quantization_config)
+            quantization = _compressed_tensors_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
