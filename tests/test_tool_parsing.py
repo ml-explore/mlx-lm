@@ -9,6 +9,7 @@ from mlx_lm.tool_parsers import (
     json_tools,
     kimi_k2,
     kimi_k3,
+    llm_jp_harmony,
     longcat,
     minimax_m2,
     mistral,
@@ -352,6 +353,39 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["name"], "skill_manage")
         self.assertEqual(tool_call["arguments"]["action"], "create")
         self.assertIn("{", tool_call["arguments"]["content"])
+
+    def test_llm_jp_harmony(self):
+        # Recipient in the role header, as the LLM-jp-4.1 template renders it;
+        # the tokenizer decodes a space after every special token.
+        call = llm_jp_harmony.parse_tool_call(
+            'get_weather<|channel|> commentary <|constrain|>  json<|message|> {"city": "Tokyo"}'
+        )
+        self.assertEqual(call, {"name": "get_weather", "arguments": {"city": "Tokyo"}})
+
+        # Recipient in the channel header
+        call = llm_jp_harmony.parse_tool_call(
+            'get_weather <|constrain|>  json<|message|> {"city": "Osaka"}'
+        )
+        self.assertEqual(call, {"name": "get_weather", "arguments": {"city": "Osaka"}})
+
+        # Nested arguments and a name with dots
+        call = llm_jp_harmony.parse_tool_call(
+            "spotify.play<|channel|> commentary <|constrain|>  json<|message|> "
+            '{"artist": "Taylor Swift", "options": {"shuffle": true, "n": 2}}'
+        )
+        self.assertEqual(call["name"], "spotify.play")
+        self.assertEqual(
+            call["arguments"],
+            {"artist": "Taylor Swift", "options": {"shuffle": True, "n": 2}},
+        )
+
+        # Empty body
+        call = llm_jp_harmony.parse_tool_call("ping<|channel|> commentary<|message|> ")
+        self.assertEqual(call, {"name": "ping", "arguments": {}})
+
+        # Truncated JSON
+        with self.assertRaises(ValueError):
+            llm_jp_harmony.parse_tool_call('get_weather<|message|> {"city": "To')
 
     def test_mistral(self):
         # Single call with trailing natural-language text.

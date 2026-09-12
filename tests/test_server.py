@@ -12,7 +12,7 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine
+from mlx_lm.generate import TextStateMachine, make_text_state_machine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
@@ -136,6 +136,99 @@ class TestTextStateMachine(unittest.TestCase):
         state, rest, _ = sm.flush(state)
         full = t1 + t2 + rest
         self.assertEqual(full, "call1call2")
+
+    def test_llm_jp_harmony_dialect(self):
+        """Reasoning, final and <|end|>-separated parallel tool calls of the
+        LLM-jp Harmony dialect are split by the markers inferred for it."""
+        from types import SimpleNamespace
+
+        from mlx_lm.tokenizer_utils import _infer_structural_markers, _infer_thinking
+        from mlx_lm.tool_parsers import llm_jp_harmony as harmony
+
+        class FakeTokenizer:
+            chat_template = "{#- chat_format=llm-jp-harmony-v1 -#}"
+
+            def get_vocab(self):
+                return {"<|end|>": 11}
+
+            def encode(self, text, add_special_tokens=False):
+                return [0, 0, 0]  # token form is not used by this test
+
+        think_start, think_end, _, _ = _infer_thinking(FakeTokenizer())
+        tokenizer = SimpleNamespace(
+            has_thinking=True,
+            think_start=think_start,
+            think_end=think_end,
+            has_tool_calling=True,
+            tool_call_start=harmony.tool_call_start,
+            tool_call_end=harmony.tool_call_end,
+            structural_markers=_infer_structural_markers(FakeTokenizer()),
+        )
+        sm = make_text_state_machine(tokenizer)
+
+        def run(text):
+            # feed one character at a time and collect text per state, like the server
+            out = {"reasoning": "", "normal": "", "tool": []}
+            state = sm.make_state("normal")
+            tool_text, prev = "", "normal"
+            for ch in text:
+                state, clean, current = sm.step(state, ch)
+                if current == "reasoning":
+                    out["reasoning"] += clean
+                elif current == "tool":
+                    tool_text += clean
+                else:
+                    if prev == "tool":
+                        out["tool"].append(tool_text)
+                        tool_text = ""
+                    out["normal"] += clean
+                prev = current
+            state, rest, current = sm.flush(state)
+            if current == "tool":
+                out["tool"].append(tool_text + rest)
+            else:
+                out["normal"] += rest
+            return out
+
+        # reasoning, then two parallel calls; the last call ends with <|call|>, an
+        # end-of-sequence token that never reaches the text
+        out = run(
+            "<|channel|> analysis<|message|> I need both cities.<|end|>"
+            "<|start|> assistant to=functions.get_weather<|channel|> commentary <|constrain|>  json"
+            '<|message|> {"city": "Tokyo"}<|end|>'
+            "<|start|> assistant to=functions.get_weather<|channel|> commentary <|constrain|>  json"
+            '<|message|> {"city": "Osaka"}'
+        )
+        self.assertEqual(out["reasoning"], "I need both cities.")
+        self.assertEqual(out["normal"], "")
+        self.assertEqual(
+            [harmony.parse_tool_call(t) for t in out["tool"]],
+            [
+                {"name": "get_weather", "arguments": {"city": "Tokyo"}},
+                {"name": "get_weather", "arguments": {"city": "Osaka"}},
+            ],
+        )
+
+        # final answer: the tokenizer's one space is dropped, an intentional one survives
+        out = run(
+            "<|channel|> analysis<|message|> thinking<|end|>"
+            "<|start|> assistant<|channel|> final<|message|>  padded answer"
+        )
+        self.assertEqual(out["reasoning"], "thinking")
+        self.assertEqual(out["normal"], " padded answer")
+        self.assertEqual(out["tool"], [])
+
+        # commentary preamble is content; recipient in the channel header is a call
+        out = run(
+            "<|start|> assistant<|channel|> commentary<|message|> Let me check.<|end|>"
+            "<|start|> assistant<|channel|> commentary to=functions.get_weather"
+            ' <|constrain|>  json<|message|> {"city": "Kyoto"}'
+        )
+        self.assertEqual(out["normal"], "Let me check.")
+        self.assertEqual(
+            [harmony.parse_tool_call(t) for t in out["tool"]],
+            [{"name": "get_weather", "arguments": {"city": "Kyoto"}}],
+        )
 
     def test_partial_match_buffered_then_flushed(self):
         sm = TextStateMachine(
