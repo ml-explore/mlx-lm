@@ -260,10 +260,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        # Presence-based, not a fixed layer-0 probe: whether layer 0 is
-        # an MoE layer is config-driven (decoder_sparse_step,
-        # mlp_only_layers), so a layer-0-only gate would wrongly skip
-        # stacking for every layer on any config where it isn't.
+        # Layer 0 is only an MoE layer when decoder_sparse_step is 1.
         moe_layers = sorted(
             int(k.split(".")[2])
             for k in weights

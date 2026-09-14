@@ -740,6 +740,45 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_qwen3_moe_sanitize_sparse_step(self):
+        from mlx_lm.models import qwen3_moe
+
+        args = qwen3_moe.ModelArgs(
+            model_type="qwen3_moe",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=8,
+            vocab_size=128,
+            decoder_sparse_step=2,
+            mlp_only_layers=[],
+            num_experts_per_tok=2,
+            num_experts=4,
+            moe_intermediate_size=64,
+            rope_theta=1000,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+        )
+        # A sparse step of 2 makes only the odd layers MoE.
+        model = qwen3_moe.Model(args)
+        moe = [
+            i for i, l in enumerate(model.model.layers) if hasattr(l.mlp, "switch_mlp")
+        ]
+        self.assertNotIn(0, moe)
+        weights = {
+            f"model.layers.{i}.mlp.experts.{e}.up_proj.weight": mx.zeros((1, 1))
+            for i in moe
+            for e in range(args.num_experts)
+        }
+        self.assertEqual(
+            sorted(model.sanitize(weights)),
+            [f"model.layers.{i}.mlp.switch_mlp.up_proj.weight" for i in moe],
+        )
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
