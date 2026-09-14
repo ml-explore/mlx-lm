@@ -60,14 +60,19 @@ class TestUtils(unittest.TestCase):
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
 
-    def test_make_shards_does_not_prepend_empty_shard_for_oversized_weight(self):
-        oversized_weight = SimpleNamespace(nbytes=(1 << 30) + 1)
-        weights = {"model.embed_tokens.weight": oversized_weight}
-
-        shards = utils.make_shards(weights, max_file_size_gb=1)
-
-        self.assertEqual(shards, [weights])
-        self.assertTrue(all(shards))
+    def test_make_shards_oversized_weight(self):
+        # make_shards only reads .nbytes, so fake the sizes.
+        small = SimpleNamespace(nbytes=1 << 20)
+        big = SimpleNamespace(nbytes=(1 << 30) + 1)
+        for weights, expected in (
+            ({}, []),
+            ({"a": big}, [{"a": big}]),
+            (
+                {"a": small, "b": big, "c": small},
+                [{"a": small}, {"b": big}, {"c": small}],
+            ),
+        ):
+            self.assertEqual(utils.make_shards(weights, 1), expected)
 
     def test_parse_size(self):
         self.assertEqual(utils._parse_size("1024"), 1024)
