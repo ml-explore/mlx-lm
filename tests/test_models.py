@@ -3794,6 +3794,51 @@ class TestModels(unittest.TestCase):
         self.assertEqual(ids.tolist(), [[0, 5, 23, 2], [0, 5, 2, esmc.PAD_ID]])
         self.assertEqual(mask.tolist(), [[1, 1, 1, 1], [1, 1, 1, 0]])
 
+        # Published "port" layout, with q/k/v and gate/up fused along dim 0.
+        named = model.sanitize(
+            {
+                "esmc.embed_tokens.weight": mx.zeros((1, 2)),
+                "esmc.norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.input_layernorm.bias": mx.zeros((2,)),
+                "esmc.layers.0.post_attention_layernorm.bias": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.q_norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.k_norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.o_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.q_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.k_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.v_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.mlp.gate_proj.weight": mx.zeros((3, 2)),
+                "esmc.layers.0.mlp.up_proj.weight": mx.zeros((3, 2)),
+                "esmc.layers.0.mlp.down_proj.weight": mx.zeros((2, 3)),
+                "lm_head.dense.bias": mx.zeros((2,)),
+                "lm_head.layer_norm.bias": mx.zeros((2,)),
+                "lm_head.decoder.bias": mx.zeros((1,)),
+            }
+        )
+        b = "esmc.transformer.blocks.0."
+        self.assertEqual(
+            sorted(named),
+            sorted(
+                ["esmc.embed.weight", "esmc.transformer.norm.weight"]
+                + [f"lm_head.{i}.bias" for i in (0, 2, 3)]
+                + [
+                    b + k
+                    for k in (
+                        "attn.ln_qkv.bias",
+                        "ffn.ln.bias",
+                        "attn.q_ln.weight",
+                        "attn.k_ln.weight",
+                        "attn.out_proj.weight",
+                        "attn.qkv.weight",
+                        "ffn.fc1.weight",
+                        "ffn.fc2.weight",
+                    )
+                ]
+            ),
+        )
+        self.assertEqual(named[b + "attn.qkv.weight"].shape, (6, 2))
+        self.assertEqual(named[b + "ffn.fc1.weight"].shape, (6, 2))
+
     def test_esmc_sae(self):
         from mlx_lm.models import esmc, esmc_sae
 
@@ -3918,6 +3963,53 @@ class TestModels(unittest.TestCase):
         model.set_chunk_size(2)
         chunked = model.trunk(feats, z0=z0, num_loops=1)[0]
         self.assertTrue(mx.allclose(full, chunked, atol=1e-4))
+
+    def test_esmfold2_port_layout_sanitize(self):
+        from mlx_lm.models.esmfold2 import sanitize_esmfold2
+
+        tt = "structure_head.token_transformer.layers.0."
+        cond = "structure_head.conditioning.single_transition_0.mlp."
+        out = sanitize_esmfold2(
+            {
+                "input_embedder.pair_init_1.weight": mx.zeros((2, 2)),
+                "parcae.log_state_decay": mx.zeros((2,)),
+                "language_model.layer_weights": mx.zeros((2,)),
+                "folding_trunk.layers.0.tri_mul_in.proj_gate.weight": mx.zeros((2, 2)),
+                cond + "gate_up_proj.weight": mx.zeros((4, 2)),
+                tt + "self_attn.q_proj.weight": mx.zeros((2, 2)),
+                tt + "self_attn.k_proj.weight": mx.zeros((2, 2)),
+                tt + "self_attn.v_proj.weight": mx.zeros((2, 2)),
+                tt + "mlp.gate_up_proj.weight": mx.zeros((4, 2)),
+            }
+        )
+        dm = "structure_head.diffusion_module."
+        self.assertEqual(
+            sorted(out),
+            sorted(
+                [
+                    "z_init_1.weight",
+                    "parcae_log_a",
+                    "language_model.base_z_combine",
+                    "folding_trunk.blocks.0.tri_mul_in.proj_gate.weight",
+                    dm + "conditioning.s_transitions.0.a_proj.weight",
+                    dm + "conditioning.s_transitions.0.b_proj.weight",
+                    dm + "token_transformer.attn_blocks.0.q_proj.weight",
+                    dm + "token_transformer.attn_blocks.0.kv_proj.weight",
+                    dm + "token_transformer.transition_blocks.0.lin_swish.weight",
+                ]
+            ),
+        )
+        kv = dm + "token_transformer.attn_blocks.0.kv_proj.weight"
+        self.assertEqual(out[kv].shape, (4, 2))
+        a_proj = dm + "conditioning.s_transitions.0.a_proj.weight"
+        self.assertEqual(out[a_proj].shape, (2, 2))
+        # A native-layout checkpoint only loses the `._engine.` trimul level.
+        engine = "folding_trunk.blocks.0.tri_mul_in._engine.proj_gate.weight"
+        native = {engine: mx.zeros((2, 2))}
+        self.assertEqual(
+            list(sanitize_esmfold2(native)),
+            ["folding_trunk.blocks.0.tri_mul_in.proj_gate.weight"],
+        )
 
     def test_esmfold2_config_field_names(self):
         from mlx_lm.models import esmfold2
