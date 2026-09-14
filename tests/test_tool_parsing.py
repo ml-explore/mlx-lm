@@ -607,6 +607,17 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["name"], "read_file")
         self.assertEqual(tool_call["arguments"]["path"], "/etc/hosts")
 
+        # A ">" later in the value must not be mistaken for the name's
+        test_case = (
+            "<function=read_file>\n"
+            "<parameter=path\n"
+            "a>b\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"], {"path": "a>b"})
+
 
 if __name__ == "__main__":
     unittest.main()
