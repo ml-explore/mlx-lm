@@ -99,7 +99,7 @@ def main(config, save_dir):
             grads = average_gradients(
                 tree_map(lambda x: x / grad_accum_steps, grads),
                 mesh.ddp.group,
-                all_reduce_size=config.get("all_reduce_size", None),
+                all_reduce_size=config.get("all_reduce_size", 32 * 1024 * 1024),
             )
             grad_norm = None
             if max_grad_norm is not None:
