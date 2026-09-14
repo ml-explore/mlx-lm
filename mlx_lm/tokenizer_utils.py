@@ -1,5 +1,8 @@
 # Copyright © 2024 Apple Inc.
 
+import abc
+import copy
+import functools
 import importlib
 import inspect
 import json
@@ -11,7 +14,7 @@ from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 
-class StreamingDetokenizer:
+class StreamingDetokenizer(abc.ABC):
     """The streaming detokenizer interface so that we can detokenize one token at a time.
 
     Example usage is as follows:
@@ -41,16 +44,22 @@ class StreamingDetokenizer:
         # Now detokenizer.text should match tokenizer.decode(detokenizer.tokens)
     """
 
-    __slots__ = ("text", "tokens", "offset")
+    # Set by reset(); text is a property on some subclasses.
+    text: str
+    tokens: List[int]
+    offset: int
 
+    @abc.abstractmethod
     def reset(self):
-        raise NotImplementedError()
+        """Drop all streaming state, keeping data derived from the tokenizer."""
 
+    @abc.abstractmethod
     def add_token(self, token):
-        raise NotImplementedError()
+        """Consume one token id."""
 
+    @abc.abstractmethod
     def finalize(self):
-        raise NotImplementedError()
+        """Flush any text held back waiting for more tokens."""
 
     @property
     def last_segment(self):
@@ -70,6 +79,7 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     """
 
     def __init__(self, tokenizer):
+        super().__init__()
         self._tokenizer = tokenizer
         self._tokenizer.decode([0])
         probe = tokenizer.encode("a ,b", add_special_tokens=False)
@@ -96,7 +106,10 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
     def text(self):
         if self._current_tokens:
             self._current_text = self._tokenizer.decode(self._current_tokens)
-            if self._current_text.endswith("\ufffd") or (
+            if self._current_text.endswith("\ufffd"):
+                # An incomplete character can decode to several replacements.
+                self._current_text = self._current_text.rstrip("\ufffd")
+            elif (
                 self._clean_spaces
                 and len(self._current_text) > 0
                 and self._current_text[-1] == " "
@@ -116,18 +129,19 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
     underscore which results in linear complexity.
     """
 
-    def __init__(self, tokenizer, trim_space=True):
-        self.trim_space = trim_space
-        self._sep = "\u2581".encode()
+    _sep = "\u2581".encode("utf-8")
 
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [""] * (max(tokenizer.vocab.values()) + 1)
-        for value, tokenid in tokenizer.vocab.items():
-            if value.startswith("<0x"):
-                # Replace bytes with their value
-                self.tokenmap[tokenid] = bytes([int(value[3:5], 16)])
-            else:
-                self.tokenmap[tokenid] = value.encode()
+    def __init__(self, tokenizer, trim_space=True):
+        super().__init__()
+        self.trim_space = trim_space
+
+        ids = list(range(len(tokenizer)))
+        tokens = tokenizer.convert_ids_to_tokens(ids)
+        self.tokenmap = [
+            # Byte tokens carry their value in hex.
+            bytes([int(t[3:5], 16)]) if t.startswith("<0x") else t.encode("utf-8")
+            for t in tokens
+        ]
 
         self.reset()
 
@@ -157,6 +171,31 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
         self._unflushed = b""
 
 
+@functools.lru_cache(maxsize=1)
+def _byte_decoder():
+    """See https://github.com/openai/gpt-2/blob/master/src/encoder.py for the rationale."""
+    char_to_bytes = {}
+    limits = [
+        0,
+        ord("!"),
+        ord("~") + 1,
+        ord("¡"),
+        ord("¬") + 1,
+        ord("®"),
+        ord("ÿ") + 1,
+    ]
+    n = 0
+    for i, (start, stop) in enumerate(zip(limits, limits[1:])):
+        if i % 2 == 0:
+            for b in range(start, stop):
+                char_to_bytes[chr(2**8 + n)] = b
+                n += 1
+        else:
+            for b in range(start, stop):
+                char_to_bytes[chr(b)] = b
+    return char_to_bytes
+
+
 class BPEStreamingDetokenizer(StreamingDetokenizer):
     """A streaming detokenizer for OpenAI style BPE models.
 
@@ -164,19 +203,12 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
     the SPM detokenizer.
     """
 
-    _byte_decoder = None
-
     def __init__(self, tokenizer):
-        # Extract the tokens in a list from id to text
-        self.tokenmap = [None] * len(tokenizer.vocab)
-        for value, tokenid in tokenizer.vocab.items():
-            self.tokenmap[tokenid] = value
+        super().__init__()
+        ids = list(range(len(tokenizer)))
+        self.tokenmap = tokenizer.convert_ids_to_tokens(ids)
 
         self.reset()
-
-        # Make the BPE byte decoder from
-        # https://github.com/openai/gpt-2/blob/master/src/encoder.py
-        self.make_byte_decoder()
 
     def reset(self):
         self.offset = 0
@@ -185,9 +217,10 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         self.tokens = []
 
     def _decode_bytes(self, seq):
+        byte_decoder = _byte_decoder()
         barr = bytearray()
         for c in seq:
-            res = self._byte_decoder.get(c, False)
+            res = byte_decoder.get(c, False)
             if res:
                 barr.append(res)
             else:
@@ -205,6 +238,8 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
     def add_token(self, token):
         self.tokens.append(token)
+        # Undocumented fallback from #418, likely for a padded model vocab.
+        # TODO(michalk8): check whether this is still needed.
         v = self.tokenmap[token] if token < len(self.tokenmap) else "!"
         self._unflushed += v
         text = self._decode_bytes(self._unflushed)
@@ -212,45 +247,19 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
         # For multi-byte utf-8 wait until they are complete
         # For single spaces wait until the next token to clean it if needed
         if not text.endswith("\ufffd") and not (
-            len(v) == 1 and self._byte_decoder.get(v[0]) == 32
+            len(v) == 1 and _byte_decoder().get(v[0]) == 32
         ):
             self.text += self._maybe_trim_space(text)
             self._unflushed = ""
 
     def finalize(self):
-        current_text = bytearray(self._byte_decoder[c] for c in self._unflushed).decode(
+        byte_decoder = _byte_decoder()
+        current_text = bytearray(byte_decoder[c] for c in self._unflushed).decode(
             "utf-8",
             "replace",
         )
         self.text += self._maybe_trim_space(current_text)
         self._unflushed = ""
-
-    @classmethod
-    def make_byte_decoder(cls):
-        """See https://github.com/openai/gpt-2/blob/master/src/encoder.py for the rationale."""
-        if cls._byte_decoder is not None:
-            return
-
-        char_to_bytes = {}
-        limits = [
-            0,
-            ord("!"),
-            ord("~") + 1,
-            ord("¡"),
-            ord("¬") + 1,
-            ord("®"),
-            ord("ÿ") + 1,
-        ]
-        n = 0
-        for i, (start, stop) in enumerate(zip(limits, limits[1:])):
-            if i % 2 == 0:
-                for b in range(start, stop):
-                    char_to_bytes[chr(2**8 + n)] = b
-                    n += 1
-            else:
-                for b in range(start, stop):
-                    char_to_bytes[chr(b)] = b
-        cls._byte_decoder = char_to_bytes
 
 
 def _infer_thinking(tokenizer):
@@ -344,7 +353,8 @@ class TokenizerWrapper:
         tool_parser=None,
     ):
         self._tokenizer = tokenizer
-        self._detokenizer_class = detokenizer_class
+        # Built once, since building the token map is expensive.
+        self._detokenizer = detokenizer_class(tokenizer)
         self._eos_token_ids = set(eos_token_ids or [])
         if tokenizer.eos_token_id is not None:
             self._eos_token_ids.add(tokenizer.eos_token_id)
@@ -503,25 +513,35 @@ class TokenizerWrapper:
         """
         Get a stateful streaming detokenizer.
         """
-        return self._detokenizer_class(self)
+        # A copy per caller, since requests are detokenized concurrently.
+        detokenizer = copy.copy(self._detokenizer)
+        detokenizer.reset()
+        return detokenizer
+
+    @property
+    def eos_token_ids(self):
+        return self._eos_token_ids
+
+    @eos_token_ids.setter
+    def eos_token_ids(self, value):
+        self._eos_token_ids = set(value) if value is not None else set()
+
+    def __len__(self):
+        # Special methods bypass __getattr__, so proxy this one explicitly.
+        return len(self._tokenizer)
 
     def __getattr__(self, attr):
-        if attr == "detokenizer":
-            return self._detokenizer
-        elif attr == "eos_token_ids":
-            return self._eos_token_ids
-        elif attr.startswith("_"):
-            return self.__getattribute__(attr)
-        else:
-            return getattr(self._tokenizer, attr)
+        # Names this class defines are not delegated, so a property that
+        # raises reports its own error.
+        if attr.startswith("_") or hasattr(type(self), attr):
+            raise AttributeError(
+                f"{type(self).__name__!r} object has no attribute {attr!r}"
+            )
+        return getattr(self._tokenizer, attr)
 
     def __setattr__(self, attr, value):
-        if attr in {"detokenizer", "eos_token_ids"}:
-            if attr == "detokenizer":
-                raise AttributeError("Cannot set the detokenizer.")
-            elif attr == "eos_token_ids":
-                self._eos_token_ids = set(value) if value is not None else set()
-        elif attr.startswith("_"):
+        # Defer to the class so properties keep their setters.
+        if attr.startswith("_") or hasattr(type(self), attr):
             super().__setattr__(attr, value)
         else:
             setattr(self._tokenizer, attr, value)

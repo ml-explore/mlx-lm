@@ -494,13 +494,6 @@ class Model(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        # Presence-based, not a fixed layer-0 probe: whether layer 0 is
-        # an MoE layer is config-driven (decoder_sparse_step,
-        # mlp_only_layers), so a layer-0-only gate would wrongly skip
-        # stacking for every layer on any config where it isn't. Also
-        # only stack the layers actually present in weights — iterating
-        # every layer in the config would KeyError popping a layer whose
-        # key isn't in weights at all.
         moe_layers = sorted(
             int(k.split(".")[2])
             for k in weights

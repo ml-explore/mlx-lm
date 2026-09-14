@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,6 +59,20 @@ class TestUtils(unittest.TestCase):
         gb = sum(p.nbytes for _, p in weights) // 2**30
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
+
+    def test_make_shards_oversized_weight(self):
+        # make_shards only reads .nbytes, so fake the sizes.
+        small = SimpleNamespace(nbytes=1 << 20)
+        big = SimpleNamespace(nbytes=(1 << 30) + 1)
+        for weights, expected in (
+            ({}, []),
+            ({"a": big}, [{"a": big}]),
+            (
+                {"a": small, "b": big, "c": small},
+                [{"a": small}, {"b": big}, {"c": small}],
+            ),
+        ):
+            self.assertEqual(utils.make_shards(weights, 1), expected)
 
     def test_parse_size(self):
         self.assertEqual(utils._parse_size("1024"), 1024)
@@ -287,6 +302,24 @@ class TestTrustRemoteCode(unittest.TestCase):
         model, loaded_config = utils.load_model(self.model_path, strict=False)
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(loaded_config["model_type"], "llama")
+
+    def test_compressed_tensors_known_formats(self):
+        self.assertEqual(
+            utils._compressed_tensors_quantization({"format": "nvfp4-pack-quantized"}),
+            {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        self.assertEqual(
+            utils._compressed_tensors_quantization({"format": "mxfp4-pack-quantized"}),
+            {"group_size": 32, "bits": 4, "mode": "mxfp4"},
+        )
+        self.assertEqual(
+            utils._compressed_tensors_quantization({"format": "pack-quantized"}),
+            {"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+
+    def test_compressed_tensors_float_quantized_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "float-quantized"):
+            utils._compressed_tensors_quantization({"format": "float-quantized"})
 
 
 if __name__ == "__main__":
