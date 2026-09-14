@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,6 +59,20 @@ class TestUtils(unittest.TestCase):
         gb = sum(p.nbytes for _, p in weights) // 2**30
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
+
+    def test_make_shards_oversized_weight(self):
+        # make_shards only reads .nbytes, so fake the sizes.
+        small = SimpleNamespace(nbytes=1 << 20)
+        big = SimpleNamespace(nbytes=(1 << 30) + 1)
+        for weights, expected in (
+            ({}, []),
+            ({"a": big}, [{"a": big}]),
+            (
+                {"a": small, "b": big, "c": small},
+                [{"a": small}, {"b": big}, {"c": small}],
+            ),
+        ):
+            self.assertEqual(utils.make_shards(weights, 1), expected)
 
     def test_parse_size(self):
         self.assertEqual(utils._parse_size("1024"), 1024)
