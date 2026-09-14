@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import ast
-from typing import Any, Dict, List
+from typing import Any
 
 import regex as re
 
@@ -14,7 +14,9 @@ Parses assistant responses containing tool calls in formats like:
 
 
 _tool_call_regex = re.compile(r"\[(\w+)\((.*?)\)\]", re.DOTALL)
-_tool_args_regex = re.compile(r'(\w+)=(?:"([^"]*)"|([^,]+))(?:,\s*|$)', re.DOTALL)
+_tool_args_regex = re.compile(
+    r"""(\w+)=(?:"([^"]*)"|'([^']*)'|([^,]+))(?:,\s*|$)""", re.DOTALL
+)
 
 
 def parse_tool_call(text: str, tools: Any | None = None):
@@ -30,8 +32,8 @@ def parse_tool_call(text: str, tools: Any | None = None):
         matches = _tool_args_regex.findall(args_str)
         for pair in matches:
             key = pair[0].strip()
-            # pair[1] is quoted value, pair[2] is unquoted value
-            value = pair[1] if pair[1] else pair[2].strip()
+            # pair[1] is double-quoted, pair[2] is single-quoted, pair[3] is unquoted
+            value = pair[1] if pair[1] else (pair[2] if pair[2] else pair[3].strip())
 
             # Try to parse the value using ast.literal_eval
             try:
@@ -42,7 +44,7 @@ def parse_tool_call(text: str, tools: Any | None = None):
 
             arguments[key] = value
 
-    return dict(name=func_name, arguments=arguments)
+    return {"name": func_name, "arguments": arguments}
 
 
 tool_call_start = "<|tool_call_start|>"

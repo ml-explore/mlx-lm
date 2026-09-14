@@ -1,4 +1,5 @@
 # Copyright © 2025 Apple Inc.
+
 from dataclasses import dataclass
 from typing import Any, List, Optional
 
@@ -220,6 +221,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
             inds = mx.argpartition(scores_for_routing, kth=-k, axis=-1)[..., -k:]
         else:
             inds = mx.argpartition(routing_weights, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
 
         scores = mx.take_along_axis(routing_weights, inds, axis=-1)
         if self.norm_topk_prob:

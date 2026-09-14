@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -336,6 +336,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
@@ -450,14 +451,20 @@ class Model(nn.Module):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+        moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.up_proj.weight")
+        )
+        if not moe_layers:
             return weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        for l in range(self.args.num_hidden_layers):
+        for l in moe_layers:
             prefix = f"model.layers.{l}.mlp"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 to_join = [
