@@ -67,8 +67,49 @@ class TestTokenizers(unittest.TestCase):
 
         # Try one with a naive detokenizer
         tokenizer = load_tokenizer("mlx-community/Llama-3.2-1B-Instruct-4bit")
-        tokenizer._detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        tokenizer = TokenizerWrapper(
+            tokenizer._tokenizer, detokenizer_class=NaiveStreamingDetokenizer
+        )
+        self.assertIsInstance(tokenizer.detokenizer, NaiveStreamingDetokenizer)
         self.check_tokenizer(tokenizer)
+
+    def test_detokenizers_are_independent(self):
+        # The batched server keeps one detokenizer per in-flight request.
+        tokenizer = load_tokenizer("mlx-community/Llama-3.2-1B-Instruct-4bit")
+        a = tokenizer.encode("over 40 years", add_special_tokens=False)
+        b = tokenizer.encode("disengage, allowing now", add_special_tokens=False)
+        n = min(len(a), len(b))
+        a, b = a[:n], b[:n]
+
+        da, db = tokenizer.detokenizer, tokenizer.detokenizer
+        self.assertIsNot(da, db)
+
+        text_a = text_b = ""
+        for ta, tb in zip(a, b):
+            da.add_token(ta)
+            text_a += da.last_segment
+            db.add_token(tb)
+            text_b += db.last_segment
+        da.finalize()
+        text_a += da.last_segment
+        db.finalize()
+        text_b += db.last_segment
+
+        self.assertEqual(text_a, tokenizer.decode(a))
+        self.assertEqual(text_b, tokenizer.decode(b))
+
+    def test_naive_detokenizer_holds_back_partial_characters(self):
+        tokenizer = load_tokenizer("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        tokenizer = TokenizerWrapper(
+            tokenizer._tokenizer, detokenizer_class=NaiveStreamingDetokenizer
+        )
+        # Half of a multi-byte character.
+        partial = 3219
+        self.assertEqual(tokenizer.decode([partial]).count("�"), 2)
+
+        detokenizer = tokenizer.detokenizer
+        detokenizer.add_token(partial)
+        self.assertEqual(detokenizer.last_segment, "")
 
     def test_special_tokens(self):
         tokenizer_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
