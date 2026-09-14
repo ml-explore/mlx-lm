@@ -155,7 +155,7 @@ class Qwen2Model(PipelineMixin, nn.Module):
         # linear-attention layer types), so a single mask covers all of
         # this rank's layers. cache can be empty if a rank ends up with
         # zero local layers (e.g. more ranks than layers).
-        mask = create_attention_mask(h, cache[0] if cache else None)
+        mask = create_attention_mask(h, cache[0])
 
         # Receive from the previous process in the pipeline
         if pipeline_rank < pipeline_size - 1:
@@ -167,7 +167,7 @@ class Qwen2Model(PipelineMixin, nn.Module):
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
-            if cache and cache[-1] is not None:
+            if cache[-1] is not None:
                 cache[-1].keys = mx.depends(cache[-1].keys, h)
 
         # Broadcast h while keeping it in the graph

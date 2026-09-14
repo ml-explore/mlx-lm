@@ -405,15 +405,10 @@ class Qwen3NextModel(PipelineMixin, nn.Module):
 
     def pipeline(self, group, split=None):
         super().pipeline(group, split=split)
-        self.ssm_idx = None
-        self.fa_idx = None
-        for e, l in enumerate(self.pipeline_layers):
-            if self.ssm_idx is None and l.is_linear:
-                self.ssm_idx = e
-            elif self.fa_idx is None and not l.is_linear:
-                self.fa_idx = e
-            if self.ssm_idx is not None and self.fa_idx is not None:
-                break
+        # A rank always holds at least one layer, so at most one index is None.
+        layers = self.pipeline_layers
+        self.ssm_idx = next((e for e, l in enumerate(layers) if l.is_linear), None)
+        self.fa_idx = next((e for e, l in enumerate(layers) if not l.is_linear), None)
 
     def __call__(
         self,
@@ -448,7 +443,7 @@ class Qwen3NextModel(PipelineMixin, nn.Module):
             hidden_states = mx.distributed.send(
                 hidden_states, (pipeline_rank - 1) % pipeline_size
             )
-            if cache and cache[-1] is not None:
+            if cache[-1] is not None:
                 # Linear layers cache arrays instead of keys and values.
                 if isinstance(cache[-1], ArraysCache):
                     cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
