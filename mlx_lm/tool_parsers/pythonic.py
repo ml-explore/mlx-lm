@@ -15,9 +15,12 @@ Parses assistant responses containing tool calls in formats like:
 
 ToolCall = dict[str, Any]
 
-_tool_call_regex = re.compile(r"\[([\w.]+)\((.*?)\)\]", re.DOTALL)
+_tool_call_regex = re.compile(r"\[(?P<name>[\w.]+)\((?P<args>.*?)\)\]", re.DOTALL)
 _tool_args_regex = re.compile(
-    r"""(\w+)=(?:"([^"]*)"|'([^']*)'|([^,]+))(?:,\s*|$)""", re.DOTALL
+    r"""(?P<key>\w+)="""
+    r"""(?:"(?P<quoted>[^"]*)"|'(?P<quoted>[^']*)'|(?P<bare>[^,]+))"""
+    r"""(?:,\s*|$)""",
+    re.DOTALL,
 )
 
 
@@ -62,7 +65,7 @@ def _parse_call(node: ast.expr) -> ToolCall | None:
 def _parse_pythonic_tool_call(text: str) -> ToolCall | list[ToolCall] | None:
     start = text.find("[")
     end = text.rfind("]")
-    if start == -1 or end == -1 or end <= start:
+    if start == -1 or end <= start:
         return None
 
     parsed = ast.parse(text[start : end + 1], mode="eval").body
@@ -89,14 +92,13 @@ def parse_tool_call(text: str, tools: Any | None = None) -> ToolCall | list[Tool
     if not match:
         raise ValueError("No function provided.")
 
-    func_name = match.group(1)
-    args_str = match.group(2)
+    func_name = match.group("name")
+    args_str = match.group("args")
 
     arguments = {}
-    for pair in _tool_args_regex.findall(args_str):
-        key = pair[0].strip()
-        # pair[1] is double-quoted, pair[2] is single-quoted, pair[3] is unquoted
-        value = pair[1] if pair[1] else (pair[2] if pair[2] else pair[3].strip())
+    for match in _tool_args_regex.finditer(args_str):
+        bare = match.group("bare")
+        value = bare.strip() if bare is not None else match.group("quoted")
 
         # Try to parse the value using ast.literal_eval
         try:
@@ -105,7 +107,7 @@ def parse_tool_call(text: str, tools: Any | None = None) -> ToolCall | list[Tool
             # If parsing fails, keep as string
             pass
 
-        arguments[key] = value
+        arguments[match.group("key").strip()] = value
 
     return {"name": func_name, "arguments": arguments}
 
