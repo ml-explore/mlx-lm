@@ -1118,6 +1118,53 @@ class TestModels(unittest.TestCase):
         )
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_granite_sensitive_projections_quantize_to_8bit(self):
+        from mlx_lm.models import granite
+        from mlx_lm.utils import quantize_model
+
+        args = granite.ModelArgs(
+            model_type="granite",
+            hidden_size=64,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            logits_scaling=1.0,
+            attention_multiplier=0.015625,
+            embedding_multiplier=1.0,
+            residual_multiplier=1.0,
+            max_position_embeddings=2048,
+            num_key_value_heads=2,
+            attention_bias=False,
+            mlp_bias=False,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+        )
+        model = granite.Model(args)
+        model, config = quantize_model(
+            model,
+            {"model_type": "granite"},
+            group_size=16,
+            bits=4,
+            mode="nvfp4",
+        )
+
+        layer = model.model.layers[0]
+        for sensitive in (layer.self_attn.o_proj, layer.mlp.down_proj, model.lm_head):
+            self.assertIsInstance(sensitive, nn.QuantizedLinear)
+            self.assertEqual(sensitive.bits, 8)
+        self.assertIsInstance(layer.self_attn.q_proj, nn.QuantizedLinear)
+        self.assertEqual(layer.self_attn.q_proj.bits, 4)
+        self.assertEqual(
+            config["quantization"]["model.layers.0.self_attn.o_proj"]["bits"], 8
+        )
+        self.assertEqual(
+            config["quantization"]["model.layers.0.mlp.down_proj"]["bits"], 8
+        )
+        self.assertEqual(config["quantization"]["lm_head"]["bits"], 8)
+        self.assertEqual(config["quantization"]["bits"], 4)
+
     def test_qwen2_moe(self):
         from mlx_lm.models import qwen2_moe
 
@@ -3974,6 +4021,93 @@ class TestModels(unittest.TestCase):
                 y = y[:, s:e]
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
+
+
+class TestVLSanitize(unittest.TestCase):
+    # Newer layout
+    HF_WEIGHTS = {
+        "model.visual.blocks.0.attn.qkv.weight": None,
+        "model.visual.merger.norm.weight": None,
+        "model.language_model.embed_tokens.weight": None,
+        "model.language_model.layers.0.self_attn.q_proj.weight": None,
+        "model.language_model.norm.weight": None,
+        "lm_head.weight": None,
+    }
+
+    # Older layout
+    LEGACY_WEIGHTS = {
+        "visual.blocks.0.attn.qkv.weight": None,
+        "model.embed_tokens.weight": None,
+        "model.layers.0.self_attn.q_proj.weight": None,
+        "model.norm.weight": None,
+        "lm_head.weight": None,
+    }
+
+    def _assert_sanitized(self, result):
+        self.assertEqual([k for k in result if "visual" in k], [])
+        self.assertEqual([k for k in result if "vision_tower" in k], [])
+        self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", result)
+        self.assertIn("language_model.model.embed_tokens.weight", result)
+        self.assertIn("language_model.lm_head.weight", result)
+
+    def _text_config(self, model_type, **extra):
+        config = {
+            "model_type": model_type,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 100,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": False,
+            "rope_theta": 100000.0,
+            "max_position_embeddings": 4096,
+        }
+        config.update(extra)
+        return config
+
+    def test_qwen2_vl(self):
+        from mlx_lm.models.qwen2_vl import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(model_type="qwen2_vl", text_config=self._text_config("qwen2"))
+        )
+        for name, weights in (
+            ("hf", self.HF_WEIGHTS),
+            ("legacy", self.LEGACY_WEIGHTS),
+        ):
+            with self.subTest(layout=name):
+                self._assert_sanitized(model.sanitize(dict(weights)))
+
+    def test_qwen3_vl(self):
+        from mlx_lm.models.qwen3_vl import Model, ModelArgs
+
+        model = Model(
+            ModelArgs(model_type="qwen3_vl", text_config=self._text_config("qwen3"))
+        )
+        for name, weights in (
+            ("hf", self.HF_WEIGHTS),
+            ("legacy", self.LEGACY_WEIGHTS),
+        ):
+            with self.subTest(layout=name):
+                self._assert_sanitized(model.sanitize(dict(weights)))
+
+    def test_qwen3_vl_moe(self):
+        from mlx_lm.models.qwen3_vl_moe import Model, ModelArgs
+
+        text_config = self._text_config(
+            "qwen3_moe",
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            moe_intermediate_size=16,
+            norm_topk_prob=True,
+        )
+        model = Model(ModelArgs(model_type="qwen3_vl_moe", text_config=text_config))
+        self._assert_sanitized(model.sanitize(dict(self.HF_WEIGHTS)))
 
 
 if __name__ == "__main__":
