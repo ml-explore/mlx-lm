@@ -377,6 +377,15 @@ class TestModelParallel(unittest.TestCase):
         self.assertEqual(model.model.fa_idx, 0)
         self.assertEqual(model.model.ssm_idx, 1)
 
+        args = qwen3_next.ModelArgs.from_dict(
+            {**qwen3_next_config, "full_attention_interval": 1}
+        )
+        for rank in range(size):
+            model = qwen3_next.Model(args)
+            model.model.pipeline(Group(rank, size))
+            self.assertIsNone(model.model.ssm_idx)
+            self.assertEqual(model.model.fa_idx, 0)
+
 
 if __name__ == "__main__":
     unittest.main()
