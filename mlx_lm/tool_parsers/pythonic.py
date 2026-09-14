@@ -63,8 +63,7 @@ def _parse_call(node: ast.expr) -> ToolCall | None:
 
 
 def _parse_pythonic_tool_call(text: str) -> ToolCall | list[ToolCall] | None:
-    start = text.find("[")
-    end = text.rfind("]")
+    start, end = text.find("["), text.rfind("]")
     if start == -1 or end <= start:
         return None
 
