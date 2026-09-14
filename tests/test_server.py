@@ -213,30 +213,23 @@ class TestTextStateMachine(unittest.TestCase):
 
 
 class TestToolCallFormatter(unittest.TestCase):
-    def test_formats_nested_array_tool_call(self):
+    def test_formats_parallel_tool_calls(self):
         formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
         raw_tool_call = (
-            "[grocery.orderIngredients("
-            'ingredientList=[{"name": "noodles", "amount": 500, "unit": "g"}, '
-            '{"name": "ground beef", "amount": 300, "unit": "g"}], '
-            'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
+            '[get_time(location="Paris"), '
+            'grocery.order(items=[{"name": "noodles", "organic": true}])]'
         )
 
         tool_calls = formatter([raw_tool_call])
 
-        self.assertEqual(len(tool_calls), 1)
-        self.assertEqual(tool_calls[0]["type"], "function")
-        self.assertEqual(tool_calls[0]["function"]["name"], "grocery.orderIngredients")
-        arguments = json.loads(tool_calls[0]["function"]["arguments"])
         self.assertEqual(
-            arguments,
-            {
-                "ingredientList": [
-                    {"name": "noodles", "amount": 500, "unit": "g"},
-                    {"name": "ground beef", "amount": 300, "unit": "g"},
-                ],
-                "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
-            },
+            [tc["function"]["name"] for tc in tool_calls],
+            ["get_time", "grocery.order"],
+        )
+        self.assertTrue(all(tc["type"] == "function" for tc in tool_calls))
+        self.assertEqual(
+            json.loads(tool_calls[1]["function"]["arguments"]),
+            {"items": [{"name": "noodles", "organic": True}]},
         )
 
 

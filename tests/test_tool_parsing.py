@@ -212,11 +212,11 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
-    def test_pythonic_nested_array_tool_call(self):
+    def test_pythonic_nested_args(self):
+        # Containers are rendered with tojson, so they hold true/false/null.
         test_case = (
             "[grocery.orderIngredients("
-            'ingredientList=[{"name": "noodles", "amount": 500, "unit": "g"}, '
-            '{"name": "ground beef", "amount": 300, "unit": "g"}], '
+            'ingredientList=[{"name": "noodles", "organic": true, "unit": null}], '
             'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
         )
         self.assertEqual(
@@ -225,15 +225,14 @@ class TestToolParsing(unittest.TestCase):
                 "name": "grocery.orderIngredients",
                 "arguments": {
                     "ingredientList": [
-                        {"name": "noodles", "amount": 500, "unit": "g"},
-                        {"name": "ground beef", "amount": 300, "unit": "g"},
+                        {"name": "noodles", "organic": True, "unit": None}
                     ],
                     "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
                 },
             },
         )
 
-    def test_pythonic_parallel_tool_calls(self):
+    def test_pythonic_parallel_calls(self):
         test_case = '[get_time(location="Paris"), get_temperature(location="Tokyo")]'
         self.assertEqual(
             pythonic.parse_tool_call(test_case, None),
@@ -243,13 +242,10 @@ class TestToolParsing(unittest.TestCase):
             ],
         )
 
-    def test_pythonic_json_literals_in_nested_args(self):
-        # Containers are rendered with tojson, so they hold true/false/null.
-        test_case = '[configure(opts={"enabled": true, "retries": null})]'
-        self.assertEqual(
-            pythonic.parse_tool_call(test_case, None)["arguments"],
-            {"opts": {"enabled": True, "retries": None}},
-        )
+    def test_pythonic_invalid_calls(self):
+        for test_case in ['[manim-video(mode="plan")]', 'get_time(location="Paris")']:
+            with self.assertRaises(ValueError):
+                pythonic.parse_tool_call(test_case, None)
 
     def test_gemma4(self):
         # Nested object
