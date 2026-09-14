@@ -5,8 +5,6 @@ from typing import Any
 
 import regex as re
 
-from . import json_tools
-
 """
 Tool parser for Pythonic function call formats.
 
@@ -15,13 +13,27 @@ Parses assistant responses containing tool calls in formats like:
 """
 
 
+ToolCall = dict[str, Any]
+
 _tool_call_regex = re.compile(r"\[([\w.]+)\((.*?)\)\]", re.DOTALL)
 _tool_args_regex = re.compile(
     r"""(\w+)=(?:"([^"]*)"|'([^']*)'|([^,]+))(?:,\s*|$)""", re.DOTALL
 )
 
 
-def _function_name(func):
+class _JSONLiterals(ast.NodeTransformer):
+    """Chat templates render nested containers as JSON, so those hold
+    true/false/null where Python expects True/False/None."""
+
+    _values = {"true": True, "false": False, "null": None}
+
+    def visit_Name(self, node: ast.Name) -> ast.expr:
+        if node.id not in self._values:
+            return node
+        return ast.copy_location(ast.Constant(self._values[node.id]), node)
+
+
+def _function_name(func: ast.expr) -> str | None:
     if isinstance(func, ast.Name):
         return func.id
     if isinstance(func, ast.Attribute):
@@ -30,25 +42,24 @@ def _function_name(func):
     return None
 
 
-def _parse_json_tool_call(text):
-    text = text.strip()
-    if text.startswith("<tool_call>") and text.endswith("</tool_call>"):
-        text = text[len("<tool_call>") : -len("</tool_call>")].strip()
-
-    if not text.startswith("{"):
+def _parse_call(node: ast.expr) -> ToolCall | None:
+    if not isinstance(node, ast.Call) or node.args:
         return None
 
-    parsed = json_tools.parse_tool_call(text)
-    if (
-        not isinstance(parsed, dict)
-        or "name" not in parsed
-        or "arguments" not in parsed
-    ):
+    func_name = _function_name(node.func)
+    if func_name is None:
         return None
-    return parsed
+
+    arguments = {}
+    for keyword in node.keywords:
+        if keyword.arg is None:
+            return None
+        arguments[keyword.arg] = ast.literal_eval(_JSONLiterals().visit(keyword.value))
+
+    return {"name": func_name, "arguments": arguments}
 
 
-def _parse_pythonic_tool_call(text):
+def _parse_pythonic_tool_call(text: str) -> ToolCall | list[ToolCall] | None:
     start = text.find("[")
     end = text.rfind("]")
     if start == -1 or end == -1 or end <= start:
@@ -58,32 +69,22 @@ def _parse_pythonic_tool_call(text):
     if not isinstance(parsed, ast.List) or not parsed.elts:
         return None
 
-    call = parsed.elts[0]
-    if not isinstance(call, ast.Call):
+    # The payload can hold several calls, e.g. [a(x=1), b(y=2)].
+    calls = [_parse_call(elt) for elt in parsed.elts]
+    if any(call is None for call in calls):
         return None
-
-    func_name = _function_name(call.func)
-    if func_name is None:
-        return None
-
-    arguments = {}
-    for keyword in call.keywords:
-        if keyword.arg is None:
-            continue
-        arguments[keyword.arg] = ast.literal_eval(keyword.value)
-
-    return dict(name=func_name, arguments=arguments)
+    return calls[0] if len(calls) == 1 else calls
 
 
-def parse_tool_call(text: str, tools: Any | None = None):
-    for parser in (_parse_json_tool_call, _parse_pythonic_tool_call):
-        try:
-            parsed = parser(text)
-        except (SyntaxError, ValueError):
-            parsed = None
-        if parsed is not None:
-            return parsed
+def parse_tool_call(text: str, tools: Any | None = None) -> ToolCall | list[ToolCall]:
+    try:
+        parsed = _parse_pythonic_tool_call(text)
+    except (SyntaxError, ValueError):
+        parsed = None
+    if parsed is not None:
+        return parsed
 
+    # Fall back to the regex parser for anything that is not valid Python.
     match = _tool_call_regex.search(text)
     if not match:
         raise ValueError("No function provided.")
@@ -92,21 +93,19 @@ def parse_tool_call(text: str, tools: Any | None = None):
     args_str = match.group(2)
 
     arguments = {}
-    if args_str:
-        matches = _tool_args_regex.findall(args_str)
-        for pair in matches:
-            key = pair[0].strip()
-            # pair[1] is double-quoted, pair[2] is single-quoted, pair[3] is unquoted
-            value = pair[1] if pair[1] else (pair[2] if pair[2] else pair[3].strip())
+    for pair in _tool_args_regex.findall(args_str):
+        key = pair[0].strip()
+        # pair[1] is double-quoted, pair[2] is single-quoted, pair[3] is unquoted
+        value = pair[1] if pair[1] else (pair[2] if pair[2] else pair[3].strip())
 
-            # Try to parse the value using ast.literal_eval
-            try:
-                value = ast.literal_eval(value)
-            except (ValueError, SyntaxError):
-                # If parsing fails, keep as string
-                pass
+        # Try to parse the value using ast.literal_eval
+        try:
+            value = ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            # If parsing fails, keep as string
+            pass
 
-            arguments[key] = value
+        arguments[key] = value
 
     return {"name": func_name, "arguments": arguments}
 

@@ -213,38 +213,43 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
     def test_pythonic_nested_array_tool_call(self):
-        expected = {
-            "name": "grocery.orderIngredients",
-            "arguments": {
-                "ingredientList": [
-                    {"name": "noodles", "amount": 500, "unit": "g"},
-                    {"name": "ground beef", "amount": 300, "unit": "g"},
-                ],
-                "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+        test_case = (
+            "[grocery.orderIngredients("
+            'ingredientList=[{"name": "noodles", "amount": 500, "unit": "g"}, '
+            '{"name": "ground beef", "amount": 300, "unit": "g"}], '
+            'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
+        )
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            {
+                "name": "grocery.orderIngredients",
+                "arguments": {
+                    "ingredientList": [
+                        {"name": "noodles", "amount": 500, "unit": "g"},
+                        {"name": "ground beef", "amount": 300, "unit": "g"},
+                    ],
+                    "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+                },
             },
-        }
+        )
 
-        test_cases = [
-            (
-                "[grocery.orderIngredients("
-                'ingredientList=[{"name": "noodles", "amount": 500, "unit": "g"}, '
-                '{"name": "ground beef", "amount": 300, "unit": "g"}], '
-                'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
-            ),
-            (
-                "<tool_call>"
-                '{"name": "grocery.orderIngredients", "arguments": {'
-                '"ingredientList": ['
-                '{"name": "noodles", "amount": 500, "unit": "g"}, '
-                '{"name": "ground beef", "amount": 300, "unit": "g"}], '
-                '"deliveryAddress": "845 Willow Lane, Springfield, IL 62704"}}'
-                "</tool_call>"
-            ),
-        ]
+    def test_pythonic_parallel_tool_calls(self):
+        test_case = '[get_time(location="Paris"), get_temperature(location="Tokyo")]'
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"location": "Paris"}},
+                {"name": "get_temperature", "arguments": {"location": "Tokyo"}},
+            ],
+        )
 
-        for test_case in test_cases:
-            with self.subTest(test_case=test_case):
-                self.assertEqual(pythonic.parse_tool_call(test_case, None), expected)
+    def test_pythonic_json_literals_in_nested_args(self):
+        # Containers are rendered with tojson, so they hold true/false/null.
+        test_case = '[configure(opts={"enabled": true, "retries": null})]'
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None)["arguments"],
+            {"opts": {"enabled": True, "retries": None}},
+        )
 
     def test_gemma4(self):
         # Nested object
