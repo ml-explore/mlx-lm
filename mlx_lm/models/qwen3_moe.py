@@ -260,7 +260,6 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        # Layer 0 is only an MoE layer when decoder_sparse_step is 1.
         moe_layers = sorted(
             int(k.split(".")[2])
             for k in weights
@@ -270,12 +269,11 @@ class Model(nn.Module):
         for l in moe_layers:
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                to_join = [
+                    weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
