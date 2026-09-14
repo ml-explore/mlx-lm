@@ -290,15 +290,11 @@ class TestTrustRemoteCode(unittest.TestCase):
 
     def test_compressed_tensors_known_formats(self):
         self.assertEqual(
-            utils._compressed_tensors_quantization(
-                {"format": "nvfp4-pack-quantized"}
-            ),
+            utils._compressed_tensors_quantization({"format": "nvfp4-pack-quantized"}),
             {"group_size": 16, "bits": 4, "mode": "nvfp4"},
         )
         self.assertEqual(
-            utils._compressed_tensors_quantization(
-                {"format": "mxfp4-pack-quantized"}
-            ),
+            utils._compressed_tensors_quantization({"format": "mxfp4-pack-quantized"}),
             {"group_size": 32, "bits": 4, "mode": "mxfp4"},
         )
         self.assertEqual(
