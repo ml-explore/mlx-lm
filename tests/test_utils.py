@@ -207,6 +207,190 @@ class TestUtils(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    def test_load_model_qwen3_5_with_unsanitized_per_tensor_quantization(self):
+        from mlx_lm.models import qwen3_5
+
+        args = qwen3_5.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 4,
+                    "vocab_size": 1000,
+                    "linear_num_value_heads": 4,
+                    "linear_num_key_heads": 4,
+                    "linear_key_head_dim": 32,
+                    "linear_value_head_dim": 32,
+                    "linear_conv_kernel_dim": 3,
+                    "rms_norm_eps": 1e-5,
+                    "head_dim": 64,
+                    "rope_theta": 1000.0,
+                    "partial_rotary_factor": 0.5,
+                    "max_position_embeddings": 1000,
+                },
+            }
+        )
+        model = qwen3_5.Model(args)
+        model, config = utils.quantize_model(
+            model,
+            {
+                "model_type": "qwen3_5",
+                "text_config": args.text_config,
+            },
+            group_size=32,
+            bits=4,
+        )
+
+        # Inject an UN-SANITIZED per-tensor override key (as a real AutoRound
+        # checkpoint would write it to config.json — before sanitize rewrites).
+        config["quantization"][
+            "model.language_model.layers.0.linear_attn.in_proj_qkv"
+        ] = {
+            "group_size": 32,
+            "bits": 4,
+        }
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+
+            loaded, loaded_config = utils.load_model(Path(mlx_path))
+
+            # Hook fired through the load path — un-sanitized key was rewritten
+            self.assertIn(
+                "language_model.model.layers.0.linear_attn.in_proj_qkv",
+                loaded_config["quantization"],
+            )
+            self.assertNotIn(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv",
+                loaded_config["quantization"],
+            )
+
+            # Smoke test: forward pass succeeds after load. The assertIn /
+            # assertNotIn above proves the remap hook fired; this proves
+            # load_weights did not raise on the rewritten quantization config.
+            logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
+            mx.eval(logits)
+            self.assertEqual(logits.shape, (1, 3, args.text_config["vocab_size"]))
+
+
+class TestQwen3_5SanitizeQuantization(unittest.TestCase):
+    def _make_model(self):
+        from mlx_lm.models import qwen3_5
+
+        args = qwen3_5.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5",
+                    "hidden_size": 128,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 4,
+                    "vocab_size": 1000,
+                    "linear_num_value_heads": 4,
+                    "linear_num_key_heads": 4,
+                    "linear_key_head_dim": 32,
+                    "linear_value_head_dim": 32,
+                    "linear_conv_kernel_dim": 3,
+                    "rms_norm_eps": 1e-5,
+                    "head_dim": 64,
+                    "rope_theta": 1000.0,
+                    "partial_rotary_factor": 0.5,
+                    "max_position_embeddings": 1000,
+                },
+            }
+        )
+        return qwen3_5.Model(args)
+
+    def test_remap_combines_all_key_shapes(self):
+        model = self._make_model()
+        quant_config = {
+            # Global keys (property 1)
+            "bits": 4,
+            "group_size": 128,
+            "mode": "affine",
+            # vision_tower drop (property 2)
+            "vision_tower.encoder.layer.0.attn.weight": False,
+            "model.visual.blocks.0.attn.qkv": False,
+            # model.language_model rewrite (property 3)
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                "bits": 6,
+                "group_size": 32,
+            },
+            # language_model passthrough (property 4)
+            "language_model.model.layers.1.mlp.gate_proj": {
+                "bits": 8,
+                "group_size": 32,
+            },
+            # bare key prefix (property 5)
+            "model.layers.0.embed_tokens": {"bits": 6, "group_size": 32},
+        }
+
+        result = model.sanitize_quantization(quant_config)
+
+        # Property 1: globals pass through unchanged
+        self.assertEqual(result["bits"], 4)
+        self.assertEqual(result["group_size"], 128)
+        self.assertEqual(result["mode"], "affine")
+
+        # Property 2: vision_tower / model.visual entries dropped
+        self.assertNotIn("vision_tower.encoder.layer.0.attn.weight", result)
+        self.assertNotIn("model.visual.blocks.0.attn.qkv", result)
+
+        # Property 3: model.language_model → language_model.model
+        self.assertIn("language_model.model.layers.0.linear_attn.in_proj_qkv", result)
+        self.assertEqual(
+            result["language_model.model.layers.0.linear_attn.in_proj_qkv"],
+            {"bits": 6, "group_size": 32},
+        )
+        self.assertNotIn(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv", result
+        )
+
+        # Property 4: language_model.* passthrough
+        self.assertIn("language_model.model.layers.1.mlp.gate_proj", result)
+        self.assertEqual(
+            result["language_model.model.layers.1.mlp.gate_proj"],
+            {"bits": 8, "group_size": 32},
+        )
+        self.assertNotIn(
+            "language_model.language_model.model.layers.1.mlp.gate_proj", result
+        )
+
+        # Property 5: bare key gets language_model. prefix
+        self.assertIn("language_model.model.layers.0.embed_tokens", result)
+        self.assertEqual(
+            result["language_model.model.layers.0.embed_tokens"],
+            {"bits": 6, "group_size": 32},
+        )
+        self.assertNotIn("model.layers.0.embed_tokens", result)
+
+    def test_input_not_mutated(self):
+        model = self._make_model()
+        quant_config = {
+            "bits": 4,
+            "group_size": 128,
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+                "bits": 6,
+                "group_size": 32,
+            },
+            "vision_tower.x.y": False,
+        }
+        original_copy = dict(quant_config)
+
+        result = model.sanitize_quantization(quant_config)
+
+        # Output is a new dict
+        self.assertIsNot(result, quant_config)
+        # Input dict unchanged
+        self.assertEqual(quant_config, original_copy)
+
 
 CUSTOM_MODEL_FILE = """\
 from pathlib import Path
