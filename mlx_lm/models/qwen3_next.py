@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -19,6 +19,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -336,6 +337,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
@@ -389,7 +391,7 @@ class Qwen3NextDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3NextModel(nn.Module):
+class Qwen3NextModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -401,6 +403,13 @@ class Qwen3NextModel(nn.Module):
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
+        # A rank always holds at least one layer, so at most one index is None.
+        layers = self.pipeline_layers
+        self.ssm_idx = next((e for e, l in enumerate(layers) if l.is_linear), None)
+        self.fa_idx = next((e for e, l in enumerate(layers) if not l.is_linear), None)
+
     def __call__(
         self,
         inputs: mx.array,
@@ -408,15 +417,44 @@ class Qwen3NextModel(nn.Module):
     ) -> mx.array:
         hidden_states = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache[-1] is not None:
+                # Linear layers cache arrays instead of keys and values.
+                if isinstance(cache[-1], ArraysCache):
+                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+                else:
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         return self.norm(hidden_states)
 
@@ -444,20 +482,26 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
+        moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.up_proj.weight")
+        )
+        if not moe_layers:
             return weights
         weights = {key: value for key, value in weights.items() if "mtp." not in key}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        for l in range(self.args.num_hidden_layers):
+        for l in moe_layers:
             prefix = f"model.layers.{l}.mlp"
             for n in ["up_proj", "down_proj", "gate_proj"]:
                 to_join = [

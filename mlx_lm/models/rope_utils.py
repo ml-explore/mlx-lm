@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import math
 from typing import List, Optional, Union
@@ -16,8 +16,8 @@ class SuScaledRoPE(nn.Module):
         original_max_position_embeddings: int = 4096,
         short_factor: Union[List[float], float] = 1.0,
         long_factor: Union[List[float], float] = 1.0,
-        short_mscale: float = None,
-        long_mscale: float = None,
+        short_mscale: Optional[float] = None,
+        long_mscale: Optional[float] = None,
     ):
         """
         Su Scaled Rotary Embedding layer.
@@ -58,10 +58,8 @@ class SuScaledRoPE(nn.Module):
         self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
-        x = x[...]
-        x[..., : self.dim] = self._scale * x[..., : self.dim]
         return mx.fast.rope(
-            x,
+            x.at[..., : self.dim].multiply(self._scale),
             self.dim,
             traditional=False,
             base=None,
@@ -78,7 +76,7 @@ class Llama3RoPE(nn.Module):
         max_position_embeddings: int = 2048,
         traditional: bool = False,
         base: float = 10000,
-        scaling_config: dict = None,
+        scaling_config: Optional[dict] = None,
     ):
         super().__init__()
         self.dims = dims
@@ -183,8 +181,7 @@ class YarnRoPE(nn.Module):
 
     def __call__(self, x, offset=0):
         if self.mscale != 1.0:
-            x = x[...]
-            x[..., : self.dims] = self.mscale * x[..., : self.dims]
+            x = x.at[..., : self.dims].multiply(self.mscale)
         return mx.fast.rope(
             x,
             self.dims,
@@ -232,6 +229,46 @@ class ProportionalRoPE(nn.Module):
         )
 
 
+class DynamicNTKScalingRoPE(nn.Module):
+
+    def __init__(
+        self,
+        dims: int,
+        max_position_embeddings: int,
+        traditional: bool,
+        base: float,
+        factor: float,
+    ):
+        super().__init__()
+        self.dims = dims
+        self.max_position_embeddings = max_position_embeddings
+        self.traditional = traditional
+        self.base = base
+        self.factor = factor
+
+    def extra_repr(self) -> str:
+        return (
+            f"{self.dims}, traditional={self.traditional}, "
+            f"max_position_embeddings={self.max_position_embeddings}, "
+            f"factor={self.factor}"
+        )
+
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        # x.shape: [batch, num_heads, seq_len, head_dim]
+        seq_len = max(x.shape[-2] + offset, self.max_position_embeddings)
+        base = self.base * (
+            (self.factor * seq_len / self.max_position_embeddings) - (self.factor - 1)
+        ) ** (self.dims / (self.dims - 2))
+        return mx.fast.rope(
+            x,
+            self.dims,
+            traditional=self.traditional,
+            base=base,
+            scale=1.0,
+            offset=offset,
+        )
+
+
 def initialize_rope(
     dims,
     base,
@@ -249,6 +286,15 @@ def initialize_rope(
     if rope_type in ["default", "linear"]:
         scale = 1 / scaling_config["factor"] if rope_type == "linear" else 1.0
         return nn.RoPE(dims, traditional=traditional, base=base, scale=scale)
+
+    elif rope_type == "dynamic":
+        return DynamicNTKScalingRoPE(
+            dims=dims,
+            max_position_embeddings=max_position_embeddings,
+            traditional=traditional,
+            base=base,
+            factor=scaling_config["factor"],
+        )
 
     elif rope_type == "llama3":
         return Llama3RoPE(
