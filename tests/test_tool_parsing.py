@@ -337,9 +337,42 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["cmd"], "echo {x} [ARGS] }")
         self.assertEqual(tool_call["arguments"]["opts"], {"deep": [1, 2, {"k": "v"}]})
 
-        # Text with no tool call still raises.
-        with self.assertRaises(ValueError):
-            mistral.parse_tool_call("just some prose, no call here", None)
+        for test_case in (
+            "just some prose, no call here",
+            'a[ARGS]{"x": 1}b[ARGS]{"y":',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(test_case, None)
+
+    def test_mistral_json_list(self):
+        cases = [
+            (
+                '[{"name": "get_weather", "arguments": {"city": "Paris"}}]',
+                {"name": "get_weather", "arguments": {"city": "Paris"}},
+            ),
+            (
+                '[{"name": "c", "arguments": "{\\"e\\": \\"2+3\\"}", "id": "abcdefghi"}]',
+                {"name": "c", "arguments": {"e": "2+3"}, "id": "abcdefghi"},
+            ),
+            (
+                '[{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]',
+                [{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}],
+            ),
+            (
+                '[{"name": "shell", "arguments": {"cmd": "run[ARGS]{}"}}]',
+                {"name": "shell", "arguments": {"cmd": "run[ARGS]{}"}},
+            ),
+        ]
+        for text, expected in cases:
+            self.assertEqual(mistral.parse_tool_call(text, None), expected)
+
+        # A malformed entry raises instead of falling back to the header parser.
+        for text in (
+            '[{"name": 1}]',
+            '[{"name": 1, "arguments": {"cmd": "run[ARGS]{}"}}]',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(text, None)
 
     def test_kimi_k2(self):
         # Single tool call
