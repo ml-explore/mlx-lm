@@ -337,9 +337,12 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["cmd"], "echo {x} [ARGS] }")
         self.assertEqual(tool_call["arguments"]["opts"], {"deep": [1, 2, {"k": "v"}]})
 
-        # Text with no tool call still raises.
-        with self.assertRaises(ValueError):
-            mistral.parse_tool_call("just some prose, no call here", None)
+        for test_case in (
+            "just some prose, no call here",
+            'a[ARGS]{"x": 1}b[ARGS]{"y":',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(test_case, None)
 
     def test_mistral_json_list(self):
         cases = [
