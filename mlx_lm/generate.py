@@ -918,6 +918,12 @@ class StopSequences:
             self._node = node
             return node.get("__match__") is not None
 
+        @property
+        def matched(self) -> Optional[Tuple[int, ...]]:
+            """The stop sequence completed at the current position, if any."""
+            match = self._node.get("__match__")
+            return match[0] if match is not None else None
+
     def __init__(self, stop_sequences: Optional[Sequence[Sequence[int]]] = None):
         self._root = _build_trie(stop_sequences) if stop_sequences else {}
 
@@ -1281,6 +1287,8 @@ class GenerationBatch:
         finish_reason: Optional[str]
         prompt_cache: Optional[List[Any]]
         all_tokens: Optional[List[int]]
+        # The stop sequence that matched, when finish_reason == "stop".
+        match_sequence: Optional[Tuple[int, ...]] = None
 
     def __init__(
         self,
@@ -1457,8 +1465,10 @@ class GenerationBatch:
             if self._num_tokens[i] >= self.max_tokens[i]:
                 finish_reason = "length"
 
+            match_sequence = None
             if self._matchers[i].advance(tokens[i]):
                 finish_reason = "stop"
+                match_sequence = self._matchers[i].matched
 
             if finish_reason is not None:
                 responses.append(
@@ -1469,6 +1479,7 @@ class GenerationBatch:
                         finish_reason=finish_reason,
                         prompt_cache=self.extract_cache(i),
                         all_tokens=self.tokens[i],
+                        match_sequence=match_sequence,
                     )
                 )
             else:
