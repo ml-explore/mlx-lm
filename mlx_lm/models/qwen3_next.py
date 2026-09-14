@@ -449,12 +449,11 @@ class Qwen3NextModel(PipelineMixin, nn.Module):
                 hidden_states, (pipeline_rank - 1) % pipeline_size
             )
             if cache and cache[-1] is not None:
-                # KVCache (full-attention) exposes .keys directly;
-                # ArraysCache (linear/GatedDeltaNet) is indexed instead.
-                if hasattr(cache[-1], "keys"):
-                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
-                else:
+                # Linear layers cache arrays instead of keys and values.
+                if isinstance(cache[-1], ArraysCache):
                     cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+                else:
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
 
         # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
