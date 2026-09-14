@@ -112,11 +112,11 @@ def load_prompt_cache(file_name, return_metadata=False):
     return cache
 
 
-def can_trim_prompt_cache(cache: List[Any]) -> bool:
+def can_trim_prompt_cache(cache: List[Any], num_tokens: int = -1) -> bool:
     """
     Check if model's cache can be trimmed.
     """
-    return all(c.is_trimmable() for c in cache)
+    return all(c.is_trimmable(num_tokens) for c in cache)
 
 
 def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
@@ -133,7 +133,7 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     Returns:
         (int): The number of tokens that were trimmed.
     """
-    if not can_trim_prompt_cache(cache) or len(cache) == 0:
+    if not can_trim_prompt_cache(cache, num_tokens) or len(cache) == 0:
         return 0
     return [c.trim(num_tokens) for c in cache][0]
 
@@ -161,7 +161,7 @@ class _BaseCache:
         if v is not None and v:
             raise ValueError("This cache has no state but a state was set.")
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return False
 
     def size(self):
@@ -227,7 +227,7 @@ class ConcatenateKVCache(_BaseCache):
         self.keys, self.values = v
         self.offset = self.keys.shape[-2]
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return True
 
     def trim(self, n):
@@ -317,7 +317,7 @@ class QuantizedKVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values, self.offset, self.group_size, self.bits = v
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return True
 
     def trim(self, n):
@@ -385,7 +385,7 @@ class KVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values, self.offset = v
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return True
 
     def trim(self, n):
@@ -541,7 +541,7 @@ class RotatingKVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values, self.offset, self.keep, self.max_size, self._idx = v
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return self.offset < self.max_size
 
     def trim(self, n):
@@ -593,6 +593,7 @@ class RotatingKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
+# ArraysCache has been deprecated by RecurrentCache, no new code should use this.
 class ArraysCache(_BaseCache):
     def __init__(self, size, left_padding: Optional[List[int]] = None):
         self.cache = [None] * size
@@ -724,6 +725,312 @@ class ArraysCache(_BaseCache):
         return sum(c.nbytes for c in self.cache if c is not None)
 
 
+def dynamic_roll(x, shifts, axis):
+    n = x.shape[axis]
+    expand_shifts = (...,) + (None,) * (x.ndim - axis)
+    expand_indices = expand_shifts[:-1]
+    idx = (mx.arange(n)[expand_indices] - shifts[expand_shifts]) % n
+    rolled = mx.take_along_axis(x, idx, axis=axis)
+    return rolled
+
+
+class RecurrentCache(_BaseCache):
+    def __init__(self, *, conv_state_size=0, conv_kernel_size=4, max_size=1):
+        self.conv_states = [None] * conv_state_size
+        self.ssm_states = None
+        self.conv_kernel_size = conv_kernel_size
+        self.max_size = max_size
+        self.conv_offset = 0
+        self.ssm_offset = 0
+        self._right_padding = None
+
+    def __getitem__(self, idx: int):
+        if 0 <= idx < len(self.conv_states):
+            return self.conv_states[idx]
+        elif idx == -1 or idx == len(self.conv_states):
+            if self.ssm_states is not None:
+                return self.ssm_states[self.ssm_offset - 1]
+            else:
+                return None
+        else:
+            raise IndexError("Cache index out of bounds")
+
+    def update_conv_input(self, qkv: mx.array, idx=0):
+        B, S, D = qkv.shape
+        n_keep = self.conv_kernel_size - 1
+
+        conv_state = prev_conv_state = self.conv_states[idx]
+        if conv_state is None:
+            conv_state = mx.zeros(
+                (B, max(S, self.max_size) + n_keep, D),
+                dtype=qkv.dtype,
+            )
+            self.conv_offset = n_keep
+
+        # Enlarge to keep all of S for conv input
+        if S + n_keep > conv_state.shape[1]:
+            conv_state = mx.zeros((B, S + n_keep, D), dtype=qkv.dtype)
+            # Carry over
+            conv_state[:, : self.conv_offset, :] = prev_conv_state
+
+        # Rotate
+        overflow = self.conv_offset + S - conv_state.shape[1]
+        if overflow > 0:
+            overflow = min(self.conv_offset, overflow)
+            self.conv_offset -= overflow
+            conv_state = mx.roll(conv_state, -overflow, axis=1)
+
+        # Update
+        end = min(self.conv_offset + S, conv_state.shape[1])
+        conv_state[:, end - S : end, :] = qkv
+
+        # Slice to (S + n_keep) for conv input
+        conv_input = conv_state[:, end - S - n_keep : end, :]
+
+        # Slice to max_size for cache
+        if conv_state.shape[1] > self.max_size + n_keep:
+            conv_state = mx.contiguous(conv_state[:, -(self.max_size + n_keep) :, :])
+        self.conv_states[idx] = conv_state
+        self.conv_offset = min(end, self.max_size + n_keep)
+
+        return conv_input
+
+    def update_ssm_states(self, states: mx.array):
+        S, B, *rest = states.shape
+        if S > self.max_size:
+            states = states[-self.max_size :, ...]
+            S = self.max_size
+
+        if self.ssm_states is None:
+            self.ssm_states = mx.zeros((self.max_size, B, *rest), dtype=states.dtype)
+
+        # Rotate
+        overflow = self.ssm_offset + S - self.max_size
+        if overflow > 0:
+            self.ssm_offset -= overflow
+            self.ssm_states = mx.roll(self.ssm_states, -overflow, axis=0)
+
+        # Update
+        self.ssm_states[self.ssm_offset : self.ssm_offset + S, ...] = states
+
+        # Advance
+        self.ssm_offset += S
+
+    def prepare(self, right_padding: List[int] | None = None, **kwargs):
+        self._right_padding = mx.array(right_padding)
+
+    def finalize(self):
+        if self._right_padding is not None:
+            for i in range(len(self.conv_states)):
+                self.conv_states[i] = dynamic_roll(
+                    self.conv_states[i], self._right_padding, axis=1
+                )
+        self._right_padding = None
+
+    @property
+    def state(self):
+        return (
+            self.conv_states,
+            self.ssm_states,
+            self.conv_kernel_size,
+            self.max_size,
+            self.conv_offset,
+            self.ssm_offset,
+        )
+
+    @state.setter
+    def state(self, v):
+        (
+            self.conv_states,
+            self.ssm_states,
+            self.conv_kernel_size,
+            self.max_size,
+            self.conv_offset,
+            self.ssm_offset,
+        ) = v
+
+    def is_trimmable(self, n: int = -1):
+        if len(self.conv_states) > 0:
+            if self.conv_offset - n < self.conv_kernel_size - 1:
+                return False
+        if self.ssm_states is not None:
+            if n > self.ssm_offset:
+                return False
+        return True
+
+    def trim(self, n: int):
+        if len(self.conv_states) > 0:
+            if self.conv_offset - n < self.conv_kernel_size - 1:
+                raise ValueError("Trimming more conv states than available")
+            self.conv_offset -= n
+        if self.ssm_states is not None:
+            if n > self.ssm_offset:
+                raise ValueError("Trimming more ssm states than available")
+            self.ssm_offset -= n
+        return n
+
+    def make_mask(self, N: int):
+        return None
+
+    def filter(self, batch_indices):
+        """
+        In-place filter to keep just the given indices in the cache.
+        """
+        self.conv_states = [
+            c[batch_indices] if c is not None else None for c in self.conv_states
+        ]
+        self.ssm_states = self.ssm_states[:, batch_indices, ...]
+
+    def extend(self, other: "RecurrentCache"):
+        """
+        In-place extend this cache with the other cache.
+        """
+
+        def batch_size(cache):
+            for c in cache.conv_states:
+                if c is not None:
+                    return c.shape[0]
+            if cache.ssm_states is not None:
+                return cache.ssm_states.shape[1]
+            return 1
+
+        a_batch = batch_size(self)
+        b_batch = batch_size(other)
+
+        max_conv_offset = max(self.conv_offset, other.conv_offset)
+        max_ssm_offset = max(self.ssm_offset, other.ssm_offset)
+
+        # Pad the hidden states so they are right-aligned
+        def pad(x, left, right, axis):
+            if right < 0:
+                x = x[..., :right, :]
+                right = 0
+            if left != 0 or right != 0:
+                pad = [(0, 0)] * len(x.shape)
+                pad[axis] = (left, right)
+                x = mx.pad(x, pad)
+            return x
+
+        def pad_conv_states(a, b):
+            max_size = max(a.shape[1], b.shape[1])
+            left_a = max_conv_offset - self.conv_offset
+            left_b = max_conv_offset - other.conv_offset
+            right_a = max_size - a.shape[1] - left_a
+            right_b = max_size - b.shape[1] - left_b
+            a = pad(a, left_a, right_a, 1)
+            b = pad(b, left_b, right_b, 1)
+            return a, b
+
+        def pad_ssm_states(a, b):
+            max_size = max(a.shape[0], b.shape[0])
+            left_a = max_ssm_offset - self.ssm_offset
+            left_b = max_ssm_offset - other.ssm_offset
+            right_a = max_size - a.shape[0] - left_a
+            right_b = max_size - b.shape[0] - left_b
+            a = pad(a, left_a, right_a, 0)
+            b = pad(b, left_b, right_b, 0)
+            return a, b
+
+        # Concatenate on batch dim
+        def cat(a, b, pad_fun=None, axis=0):
+            shape = dtype = None
+            if a is not None:
+                shape = a.shape
+                dtype = a.dtype
+            if b is not None:
+                shape = b.shape
+                dtype = b.dtype
+
+            if shape is None:
+                return None
+
+            if a is None:
+                a = mx.zeros(shape[:axis] + (a_batch,) + shape[axis + 1 :], dtype=dtype)
+            if b is None:
+                b = mx.zeros(shape[:axis] + (b_batch,) + shape[axis + 1 :], dtype=dtype)
+            if pad_fun:
+                a, b = pad_fun(a, b)
+
+            return mx.concatenate([a, b], axis)
+
+        self.conv_states = [
+            cat(c, o, pad_conv_states)
+            for c, o in zip(self.conv_states, other.conv_states)
+        ]
+        self.ssm_states = cat(self.ssm_states, other.ssm_states, pad_ssm_states, axis=1)
+        self.max_size = max(self.max_size, other.max_size)
+        self.conv_offset = max_conv_offset
+        self.ssm_offset = max_ssm_offset
+
+    def extract(self, idx: int):
+        cache = RecurrentCache(
+            conv_state_size=len(self.conv_states),
+            conv_kernel_size=self.conv_kernel_size,
+            max_size=self.max_size,
+        )
+        cache.conv_states = [c[idx : idx + 1] for c in self.conv_states]
+        cache.ssm_states = mx.contiguous(self.ssm_states[:, idx : idx + 1, ...])
+        cache.conv_offset = self.conv_offset
+        cache.ssm_offset = self.ssm_offset
+        return cache
+
+    @classmethod
+    def merge(cls, caches: List["RecurrentCache"]):
+        max_size = max(c.max_size for c in caches)
+        cache = cls(
+            conv_state_size=len(caches[0].conv_states),
+            conv_kernel_size=caches[0].conv_kernel_size,
+            max_size=max_size,
+        )
+        cache.conv_offset = max(c.conv_offset for c in caches)
+        cache.ssm_offset = max(c.ssm_offset for c in caches)
+
+        # Merge conv states
+        for i in range(len(cache.conv_states)):
+            valid_states = [(c[i], c.conv_offset) for c in caches if c[i] is not None]
+            if len(valid_states) == 0:
+                continue
+            B = sum(s.shape[0] for s, _ in valid_states)
+            S = max_size + cache.conv_kernel_size - 1
+            D = valid_states[0][0].shape[2]
+            cache.conv_states[i] = mx.zeros((B, S, D), dtype=valid_states[0][0].dtype)
+            j = 0
+            for s, offset in valid_states:
+                B_s = s.shape[0]
+                target = slice(cache.conv_offset - offset, cache.conv_offset)
+                cache.conv_states[i][j : j + B_s, target, :] = s[:, :offset, :]
+                j += B_s
+
+        # Merge ssm states
+        valid_states = [
+            (c.ssm_states, c.ssm_offset) for c in caches if c.ssm_states is not None
+        ]
+        if len(valid_states) > 0:
+            B = sum(s.shape[1] for s, _ in valid_states)
+            rest = valid_states[0][0].shape[2:]
+            cache.ssm_states = mx.zeros(
+                (max_size, B, *rest), dtype=valid_states[0][0].dtype
+            )
+            j = 0
+            for s, offset in valid_states:
+                B_s = s.shape[1]
+                target = slice(cache.ssm_offset - offset, cache.ssm_offset)
+                cache.ssm_states[target, j : j + B_s, :] = s[:offset, :, :]
+                j += B_s
+
+        return cache
+
+    def empty(self):
+        empty_conv = all(c is None for c in self.conv_states)
+        return empty_conv and self.ssm_states is None
+
+    @property
+    def nbytes(self):
+        conv_nbytes = sum(c.nbytes for c in self.conv_states if c is not None)
+        ssm_nbytes = self.ssm_states.nbytes if self.ssm_states is not None else 0
+        return conv_nbytes + ssm_nbytes
+
+
 class ChunkedKVCache(_BaseCache):
     step = 256
 
@@ -782,7 +1089,7 @@ class ChunkedKVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values, self.offset, self.chunk_size, self.start_position = v
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return True
 
     def trim(self, n):
@@ -807,8 +1114,8 @@ class CacheList(_BaseCache):
     def __getitem__(self, idx):
         return self.caches[idx]
 
-    def is_trimmable(self):
-        return all(c.is_trimmable() for c in self.caches)
+    def is_trimmable(self, n: int = -1):
+        return all(c.is_trimmable(n) for c in self.caches)
 
     def trim(self, n):
         for c in self.caches:
@@ -866,15 +1173,6 @@ class CacheList(_BaseCache):
     @property
     def nbytes(self):
         return sum(c.nbytes for c in self.caches)
-
-
-def dynamic_roll(x, shifts, axis):
-    n = x.shape[axis]
-    expand_shifts = (...,) + (None,) * (x.ndim - axis)
-    expand_indices = expand_shifts[:-1]
-    idx = (mx.arange(n)[expand_indices] - shifts[expand_shifts]) % n
-    rolled = mx.take_along_axis(x, idx, axis=axis)
-    return rolled
 
 
 class BatchKVCache(_BaseCache):
@@ -965,7 +1263,7 @@ class BatchKVCache(_BaseCache):
     def state(self, v):
         self.keys, self.values, self.offset, self.left_padding, self._idx = v
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return True
 
     def trim(self, n):
@@ -1288,7 +1586,7 @@ class BatchRotatingKVCache(_BaseCache):
             self.rotated,
         ) = v
 
-    def is_trimmable(self):
+    def is_trimmable(self, n: int = -1):
         return self._offset < self.max_size
 
     def trim(self, n):
@@ -1658,10 +1956,10 @@ class LRUPromptCache:
         short_length = len(result.shorter) if result.shorter is not None else 0
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
-            if can_trim_prompt_cache(cache_entry.prompt_cache):
+            prefix = min(len(tokens) - 1, result.common_prefix)
+            num_to_trim = len(result.longer) - prefix
+            if can_trim_prompt_cache(cache_entry.prompt_cache, num_to_trim):
                 cache = copy.deepcopy(cache_entry.prompt_cache)
-                prefix = min(len(tokens) - 1, result.common_prefix)
-                num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 

@@ -546,8 +546,9 @@ def gated_delta_ops(
     v: mx.array,
     g: mx.array,
     beta: mx.array,
-    state: Optional[mx.array] = None,
-    mask: Optional[mx.array] = None,
+    state: mx.array | None = None,
+    mask: mx.array | None = None,
+    return_num_states: int | None = None,
 ) -> Tuple[mx.array, mx.array]:
     """
     Ops-based reference implementation for prompt prefill (sequential loop).
@@ -561,7 +562,7 @@ def gated_delta_ops(
       - state: [B, Hv, Dv, Dk]
     Returns:
       - y: [B, T, Hv, Dv]
-      - state: [B, Hv, Dv, Dk]
+      - state: [B, Hv, Dv, Dk] or [T, B, Hv, Dv, Dk]
     """
     B, T, Hk, Dk = q.shape
     Hv, Dv = v.shape[-2:]
@@ -573,6 +574,7 @@ def gated_delta_ops(
         k = mx.repeat(k, repeat_factor, -2)
 
     ys = []
+    states = []
     for t in range(T):
         y, state = _gated_delta_step_ops(
             q[:, t],
@@ -584,8 +586,15 @@ def gated_delta_ops(
             None if mask is None else mask[:, t],
         )
         ys.append(y)
+        if return_num_states is not None:
+            states.append(state)
+            if len(states) > return_num_states:
+                states = states[-return_num_states:]
     y = mx.stack(ys, axis=1)
-    return y, state
+    if return_num_states is not None:
+        return y, mx.stack(states)
+    else:
+        return y, state
 
 
 def gated_delta_update(
@@ -600,6 +609,7 @@ def gated_delta_update(
     mask: Optional[mx.array] = None,
     use_kernel: bool = True,
     lower_bound: float | None = None,
+    return_num_states: int | None = None,
 ) -> Tuple[mx.array, mx.array]:
     """Gated delta rule recurrence.
 
@@ -619,10 +629,11 @@ def gated_delta_update(
 
     if (
         not use_kernel
+        or return_num_states is not None
         or mx.default_device() != mx.gpu
         or not mx.metal.is_available()
         or k.shape[-1] < 32
         or k.shape[-1] % 32 != 0
     ):
-        return gated_delta_ops(q, k, v, g, beta, state, mask)
+        return gated_delta_ops(q, k, v, g, beta, state, mask, return_num_states)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)
