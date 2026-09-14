@@ -41,6 +41,38 @@ class TestUtils(unittest.TestCase):
         p2 = model_lazy.layers[0].mlp.up_proj.weight
         self.assertTrue(mx.allclose(p1, p2))
 
+    def test_load_config_decodes_tagged_floats(self):
+        # transformers tags non-finite floats so that config.json stays valid
+        # JSON for every parser; the tag has to be undone on the way back in.
+        model_path = Path(self.test_dir) / "tagged-floats"
+        model_path.mkdir(exist_ok=True)
+        with open(model_path / "config.json", "w") as f:
+            json.dump(
+                {
+                    "model_type": "nemotron_h",
+                    "time_step_limit": [0.0, {"__float__": "Infinity"}],
+                    "nested": {"lower": {"__float__": "-Infinity"}},
+                    "not_a_tag": {"__float__": 3, "other": 4},
+                },
+                f,
+            )
+
+        config = utils.load_config(model_path)
+        self.assertEqual(config["time_step_limit"], [0.0, float("inf")])
+        self.assertEqual(config["nested"]["lower"], float("-inf"))
+        self.assertEqual(config["not_a_tag"], {"__float__": 3, "other": 4})
+
+        # Saving tags them again, so a converted model keeps a config.json that
+        # any JSON parser can read, and reading it back gives the same floats.
+        utils.save_config(config, model_path / "config.json")
+        with open(model_path / "config.json") as f:
+            self.assertEqual(
+                json.load(f)["time_step_limit"], [0.0, {"__float__": "Infinity"}]
+            )
+        self.assertEqual(
+            utils.load_config(model_path)["time_step_limit"], config["time_step_limit"]
+        )
+
     def test_make_shards(self):
         from mlx_lm.models import llama
 
