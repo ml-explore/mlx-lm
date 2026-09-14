@@ -740,6 +740,107 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def check_moe_sanitize(self, model, num_experts, moe_attr):
+        """Expert stacking must not be gated on layer 0 being an MoE layer."""
+        moe = [i for i, l in enumerate(model.model.layers) if hasattr(l.mlp, moe_attr)]
+        self.assertNotIn(0, moe)
+        names = ("gate_proj", "up_proj", "down_proj")
+        weights = {
+            f"model.layers.{i}.mlp.experts.{e}.{n}.weight": mx.zeros((1, 1))
+            for i in moe
+            for e in range(num_experts)
+            for n in names
+        }
+        self.assertEqual(
+            sorted(model.sanitize(weights)),
+            sorted(
+                f"model.layers.{i}.mlp.{moe_attr}.{n}.weight"
+                for i in moe
+                for n in names
+            ),
+        )
+
+    def test_qwen3_moe_sanitize_sparse_step(self):
+        from mlx_lm.models import qwen3_moe
+
+        args = qwen3_moe.ModelArgs(
+            model_type="qwen3_moe",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            head_dim=8,
+            vocab_size=128,
+            decoder_sparse_step=2,
+            mlp_only_layers=[],
+            num_experts_per_tok=2,
+            num_experts=4,
+            moe_intermediate_size=64,
+            rope_theta=1000,
+            max_position_embeddings=512,
+            tie_word_embeddings=False,
+            norm_topk_prob=True,
+        )
+        # A sparse step of 2 makes only the odd layers MoE.
+        self.check_moe_sanitize(qwen3_moe.Model(args), args.num_experts, "switch_mlp")
+
+    def test_qwen3_next_sanitize_sparse_step(self):
+        from mlx_lm.models import qwen3_next
+
+        args = qwen3_next.ModelArgs(
+            model_type="qwen3_next",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=4,
+            linear_num_value_heads=4,
+            linear_num_key_heads=2,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=2,
+            shared_expert_intermediate_size=64,
+            mlp_only_layers=[],
+            moe_intermediate_size=64,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            rope_theta=1000.0,
+            partial_rotary_factor=0.25,
+            max_position_embeddings=512,
+            head_dim=8,
+        )
+        self.check_moe_sanitize(qwen3_next.Model(args), args.num_experts, "switch_mlp")
+
+    def test_klear_sanitize_sparse_step(self):
+        from mlx_lm.models import Klear
+
+        args = Klear.ModelArgs(
+            model_type="Klear",
+            hidden_size=32,
+            num_hidden_layers=4,
+            intermediate_size=64,
+            num_attention_heads=4,
+            attention_bias=False,
+            mlp_only_layers=[],
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=2,
+            n_shared_experts=1,
+            moe_intermediate_size=64,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            num_key_value_heads=2,
+            rope_theta=1000.0,
+            max_position_embeddings=512,
+            norm_topk_prob=True,
+        )
+        self.check_moe_sanitize(Klear.Model(args), args.num_experts, "experts")
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
