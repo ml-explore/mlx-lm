@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import concurrent.futures
 import random
 import unittest
 from typing import List
@@ -9,7 +10,7 @@ import mlx.core as mx
 from mlx_lm.generate import (
     BatchGenerator,
     GenerationResponse,
-    StopSequenceMatcher,
+    StopSequences,
     batch_generate,
     generate,
     generate_step,
@@ -30,9 +31,29 @@ class TestGenerate(unittest.TestCase):
 
     def test_generate(self):
         # Simple test that generation runs
-        text = generate(
-            self.model, self.tokenizer, "hello", max_tokens=5, verbose=False
+        generate(self.model, self.tokenizer, "hello", max_tokens=5, verbose=False)
+
+    def test_generate_step_processor_sees_prefilled_prompt(self):
+        # prefill_step_size=2 over a 4-token prompt leaves one token for _step,
+        # so the processor only sees the whole prompt if prefill contributes.
+        prompt = mx.array([2, 5, 7, 9])
+        histories = []
+
+        def record_history(tokens, logits):
+            histories.append(tokens.tolist())
+            return logits
+
+        list(
+            generate_step(
+                prompt,
+                self.model,
+                max_tokens=1,
+                prefill_step_size=2,
+                logits_processors=[record_history],
+            )
         )
+
+        self.assertEqual(histories[0], [2, 5, 7, 9])
 
     def test_generate_with_logit_bias(self):
         logit_bias = {0: 2000.0, 1: -20.0}
@@ -370,7 +391,7 @@ class TestGenerate(unittest.TestCase):
             logits_processors=processors,
         )
         prompt = self.tokenizer.encode("hello")
-        uids = batch_gen.insert([prompt])
+        batch_gen.insert([prompt])
         response = batch_gen.next_generated()[0]
         logprobs = response.logprobs
         self.assertEqual(logprobs[0].item(), 0.0)
@@ -421,6 +442,34 @@ class TestGenerate(unittest.TestCase):
         self.assertTrue(hasattr(seen[0], "shape"))
         self.assertEqual(seen[0].tolist(), prompt)
 
+    def test_batch_processor_survive_a_request_without_it(self):
+        prompt = self.tokenizer.encode("hello")
+
+        def run(batch_gen, uid):
+            n = 0
+            while True:
+                for r in batch_gen.next_generated():
+                    if r.uid == uid:
+                        n += 1
+                        if r.finish_reason is not None:
+                            return n
+
+        batch_gen = BatchGenerator(self.model, max_tokens=3)
+        (uid,) = batch_gen.insert([prompt])
+        run(batch_gen, uid)
+
+        calls = []
+
+        def processor(tokens, logits):
+            calls.append(len(tokens))
+            return logits
+
+        (uid,) = batch_gen.insert([prompt], logits_processors=[[processor]])
+        n_tokens = run(batch_gen, uid)
+        # One call per generated token, plus the step that sampled the token
+        # after the last one returned
+        self.assertEqual(len(calls), n_tokens + 1)
+
     def test_batch_generate_function_with_logits_processors(self):
         """Test that batch_generate function with logits_processors produces correct results."""
         logit_bias = {0: 2000.0, 1: -2000.0}
@@ -446,7 +495,7 @@ class TestGenerate(unittest.TestCase):
             sampler=lambda _: mx.array([1]),
         )
         prompt = self.tokenizer.encode("hello")
-        uids = batch_gen.insert([prompt])
+        batch_gen.insert([prompt])
         response = batch_gen.next_generated()[0]
         self.assertEqual(response.token, 1)
 
@@ -470,17 +519,17 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].token, 2)
         self.assertEqual(responses[uid2].token, 3)
 
-    def test_batch_generate_with_stop_matchers(self):
-        """Test that batch_generate with per-sequence stop_matchers stops on different tokens."""
+    def test_batch_generate_with_stop_sequences(self):
+        """Per-sequence stop_sequences stop on different tokens."""
         batch_gen = BatchGenerator(
             self.model,
             max_tokens=10,
         )
         prompt = self.tokenizer.encode("hello")
 
-        sm_0 = StopSequenceMatcher([[0]])
-        sm_1 = StopSequenceMatcher([[1]])
-        sm_2 = StopSequenceMatcher([[2]])
+        ss_0 = StopSequences([[0]])
+        ss_1 = StopSequences([[1]])
+        ss_2 = StopSequences([[2]])
 
         processor_0 = make_logits_processors({0: 2000.0})
         processor_1 = make_logits_processors({1: 2000.0})
@@ -489,7 +538,7 @@ class TestGenerate(unittest.TestCase):
         uid0, uid1, uid2 = batch_gen.insert(
             [prompt, prompt, prompt],
             logits_processors=[processor_0, processor_1, processor_2],
-            stop_matchers=[sm_0, sm_1, sm_2],
+            stop_sequences=[ss_0, ss_1, ss_2],
         )
 
         responses = batch_gen.next_generated()
@@ -843,6 +892,172 @@ class TestGenerate(unittest.TestCase):
         )
         self.assertIsNone(response.logprobs)
         self.assertIsNone(response.token_ids)
+
+    def test_generate_step_worker_thread(self):
+        """generate_step must not crash on a non-main thread.
+
+        Servers like vllm-mlx run generation on worker threads.  The decode
+        loop in generate_step calls mx.async_eval which needs a valid stream.
+        Without the generation_stream context wrapping the decode loop, this
+        crashes with ``RuntimeError: There is no Stream(gpu, N) in current
+        thread`` because the thread-local default stream doesn't exist on the
+        worker.
+        """
+        import mlx_lm.generate as gen_mod
+
+        prompt = self.tokenizer.encode("hi")
+        prompt = mx.array(prompt)
+
+        def run_on_worker():
+            new_stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(new_stream)
+            gen_mod.generation_stream = new_stream
+
+            tokens = []
+            for token, _ in generate_step(prompt, self.model, max_tokens=3):
+                tokens.append(token)
+            return tokens
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_on_worker)
+            tokens = future.result(timeout=30)
+        self.assertGreater(len(tokens), 0)
+
+    def test_stream_generate_worker_thread(self):
+        """stream_generate must not crash on a non-main thread."""
+        import mlx_lm.generate as gen_mod
+
+        def run_on_worker():
+            new_stream = mx.new_stream(mx.default_device())
+            mx.set_default_stream(new_stream)
+            gen_mod.generation_stream = new_stream
+
+            tokens = []
+            for response in stream_generate(
+                self.model, self.tokenizer, "hello", max_tokens=3
+            ):
+                tokens.append(response.token)
+            return tokens
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(run_on_worker)
+            tokens = future.result(timeout=30)
+        self.assertGreater(len(tokens), 0)
+
+    def test_stream_generate_rejects_zero_max_tokens(self):
+        with self.assertRaises(ValueError):
+            next(stream_generate(self.model, self.tokenizer, "hello", max_tokens=0))
+
+        gen = stream_generate(self.model, self.tokenizer, "hello", max_tokens=-1)
+        self.assertIsNotNone(next(gen).token)
+        gen.close()
+
+    def test_insert_validates_atomically(self):
+        gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello")
+
+        # A short option list must raise, not drop the third prompt.
+        with self.assertRaises(ValueError) as ctx:
+            gen.insert([prompt, prompt, prompt], max_tokens=[2, 2])
+        self.assertIn("max_tokens", str(ctx.exception))
+
+        with self.assertRaises(ValueError):
+            gen.insert([prompt, prompt], max_tokens=[2, 0])
+        with self.assertRaises(ValueError):
+            gen.insert([[]])
+
+        # Nothing was enqueued and the uid counter did not advance.
+        self.assertEqual(len(gen._unprocessed_sequences), 0)
+        self.assertEqual(gen.insert([prompt]), [0])
+
+    def test_build_trie_ignores_empty_sequences(self):
+        matcher = StopSequences([[], [7]]).matcher()
+
+        self.assertFalse(matcher.advance(3))
+        self.assertTrue(matcher.advance(7))
+
+    def test_stop_sequences_matchers_are_independent(self):
+        stop_sequences = StopSequences([[1, 2]])
+
+        a = stop_sequences.matcher()
+        b = stop_sequences.matcher()
+
+        self.assertFalse(a.advance(1))
+        # b is untouched, so a lone 2 is not a match for it.
+        self.assertFalse(b.advance(2))
+        self.assertTrue(a.advance(2))
+
+    def test_stop_sequences_matcher_fails_back(self):
+        matcher = StopSequences([[1, 1, 2]]).matcher()
+
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertFalse(matcher.advance(1))
+        self.assertTrue(matcher.advance(2))
+
+    def test_batch_mixes_sequences_with_and_without_processors(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+        prompt = self.tokenizer.encode("hello")
+
+        uid_plain, uid_biased = gen.insert(
+            [prompt, prompt],
+            logits_processors=[None, make_logits_processors({0: 2000.0})],
+        )
+
+        tokens = {uid_plain: [], uid_biased: []}
+        while responses := gen.next_generated():
+            for r in responses:
+                tokens[r.uid].append(r.token)
+
+        self.assertEqual(len(tokens[uid_plain]), 3)
+        self.assertEqual(tokens[uid_biased], [0, 0, 0])
+
+    def test_batch_stats_empty_window(self):
+        gen = BatchGenerator(self.model)
+        with gen.stats() as stats:
+            pass
+
+        self.assertEqual(stats.prompt_tps, 0.0)
+        self.assertEqual(stats.generation_tps, 0.0)
+        self.assertEqual(stats.decode_tps, 0.0)
+
+    def test_batch_stats_windows_nest(self):
+        gen = BatchGenerator(self.model, max_tokens=2)
+        prompt = self.tokenizer.encode("hello world")
+
+        with gen.stats() as outer:
+            gen.insert([prompt])
+            while gen.next_generated():
+                pass
+
+            with gen.stats() as inner:
+                gen.insert([prompt])
+                while gen.next_generated():
+                    pass
+
+        self.assertGreater(inner.generation_tokens, 0)
+        self.assertEqual(outer.generation_tokens, 2 * inner.generation_tokens)
+        self.assertGreater(inner.prompt_tokens, 0)
+        self.assertEqual(outer.prompt_tokens, 2 * inner.prompt_tokens)
+        self.assertGreaterEqual(outer.wall_time, inner.wall_time)
+
+    def test_batch_stats_time_partitions(self):
+        gen = BatchGenerator(self.model, max_tokens=3)
+
+        with gen.stats() as stats:
+            gen.insert([self.tokenizer.encode("hello world")])
+            while gen.next_generated():
+                pass
+
+        self.assertGreater(stats.prompt_time, 0.0)
+        self.assertGreater(stats.decode_time, 0.0)
+        self.assertGreaterEqual(stats.overhead_time, 0.0)
+        self.assertAlmostEqual(
+            stats.prompt_time + stats.decode_time + stats.overhead_time,
+            stats.wall_time,
+            places=6,
+        )
 
 
 if __name__ == "__main__":

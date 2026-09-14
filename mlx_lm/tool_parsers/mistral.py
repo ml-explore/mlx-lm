@@ -5,16 +5,27 @@ from typing import Any
 
 import regex as re
 
-_tool_call_regex = re.compile(r"\s*(\w+)\[ARGS\]\s*(\{.*\})", re.DOTALL)
+# Matches a "name[ARGS]" header, ending where the JSON arguments start.
+_tool_call_header_regex = re.compile(r"([\w-]+)\s*\[ARGS\]\s*")
 
 tool_call_start = "[TOOL_CALLS]"
 tool_call_end = ""
 
 
 def parse_tool_call(text: str, tools: Any | None = None):
-    match = _tool_call_regex.search(text)
-    if match is None:
+    # Mistral has no tool-call end token, so the text can hold several calls.
+    # raw_decode reads exactly one JSON value and reports where it ended.
+    decoder = json.JSONDecoder()
+    calls = []
+    pos = 0
+    while (match := _tool_call_header_regex.search(text, pos)) is not None:
+        pos = match.end()
+        try:
+            arguments, pos = decoder.raw_decode(text, pos)
+        except json.JSONDecodeError:
+            continue
+        calls.append(dict(name=match.group(1), arguments=arguments))
+
+    if not calls:
         raise ValueError(f"Could not parse tool call from: {text}")
-    func_name = match.group(1)
-    func_args = json.loads(match.group(2))
-    return dict(name=func_name, arguments=func_args)
+    return calls[0] if len(calls) == 1 else calls

@@ -1,6 +1,7 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import argparse
+import gc
 import json
 import logging
 import pickle
@@ -21,9 +22,7 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
-    Sequence,
     Tuple,
     Union,
 )
@@ -33,16 +32,21 @@ from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
+    DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
-    StopSequenceMatcher,
     TextStateMachine,
-    make_stop_matcher,
+    make_stop_sequences,
     make_text_state_machine,
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
 from .sample_utils import make_logits_processors, make_sampler
-from .utils import _parse_size, load, sharded_load
+from .utils import (
+    _parse_size,
+    load,
+    maybe_set_recommended_wired_limit,
+    sharded_load,
+)
 
 
 def get_system_fingerprint():
@@ -303,6 +307,13 @@ class ModelProvider:
         if cli_args.chat_template:
             self._tokenizer_config["chat_template"] = cli_args.chat_template
 
+    def reset(self) -> None:
+        self.model_key = None
+        self.model = None
+        self.tokenizer = None
+        self.draft_model = None
+        self.is_batchable = False
+
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
             adapter_path is not None or draft_model_path is not None
@@ -311,11 +322,12 @@ class ModelProvider:
                 "Loading with adapters or draft models not supported in distributed mode"
             )
 
-        # Remove the old model if it exists.
-        self.model_key = None
-        self.model = None
-        self.tokenizer = None
-        self.draft_model = None
+        # Remove the old model if it exists. Dropping the refs returns the
+        # weights to MLX's buffer pool, not the OS; clear that pool so a
+        # later load of a different model does not keep every previous one.
+        self.reset()
+        gc.collect()
+        mx.clear_cache()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -367,8 +379,8 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        model_path = self._model_map.get(model_path, model_path)
         adapter_path = self._adapter_map.get(model_path, adapter_path)
+        model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
         model_key = (model_path, adapter_path, draft_model_path)
@@ -427,8 +439,19 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_failed = False
+        self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
+
+    def _run_generate(self):
+        try:
+            self._generate()
+        except Exception as e:
+            logging.exception(f"mlx_lm.server generation thread died: {e}")
+            self._generation_failed = True
+
+    def generation_available(self):
+        return self._generation_thread.is_alive() and not self._generation_failed
 
     def stop_and_join(self):
         self._stop = True
@@ -436,6 +459,10 @@ class ResponseGenerator:
 
     def join(self):
         self._generation_thread.join()
+
+    @property
+    def is_healthy(self):
+        return self.generation_available()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -603,23 +630,27 @@ class ResponseGenerator:
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) a StopSequenceMatcher and TextStateMachine."""
+        """Make (and cache) a StopSequences and TextStateMachine."""
         cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        stop_matcher = make_stop_matcher(tokenizer, stop_words)
+        stop_sequences = make_stop_sequences(tokenizer, stop_words)
         text_sm = make_text_state_machine(tokenizer, stop_words)
 
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_matcher, text_sm)
+        self._state_machine_cache[cache_key] = (stop_sequences, text_sm)
 
-        return stop_matcher, text_sm
+        return stop_sequences, text_sm
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and self.cli_args.kv_bits is None
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -631,7 +662,6 @@ class ResponseGenerator:
         self.model_provider.load_default()
 
         current_model = None
-        current_sampling = None
         current_tokenizer = None
         current_model_key = None
         batch_generator = None
@@ -678,9 +708,9 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_matcher, text_sm = self._make_state_machine(
+                    stop_sequences, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
-                        tokenizer,
+                        current_tokenizer,
                         args.stop_words,
                     )
 
@@ -699,9 +729,9 @@ class ResponseGenerator:
                             break
 
                     ctx = GenerationContext(
-                        has_tool_calling=tokenizer.has_tool_calling,
-                        has_thinking=tokenizer.has_thinking,
-                        tool_parser=tokenizer.tool_parser,
+                        has_tool_calling=current_tokenizer.has_tool_calling,
+                        has_thinking=current_tokenizer.has_thinking,
+                        tool_parser=current_tokenizer.tool_parser,
                         text_sm=text_sm,
                         initial_state=initial_state,
                         prompt=prompt,
@@ -714,14 +744,14 @@ class ResponseGenerator:
                         max_tokens=[args.max_tokens],
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
-                        samplers=[_make_sampler(args, tokenizer)],
+                        samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        stop_matchers=[stop_matcher],
+                        stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
-                        "detokenizer": tokenizer.detokenizer,
+                        "detokenizer": current_tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                     }
@@ -747,7 +777,7 @@ class ResponseGenerator:
                         continue
 
                     if not self._is_batchable(args):
-                        self._serve_single((rqueue, request, args))
+                        self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
                     current_model = args.model
@@ -776,7 +806,6 @@ class ResponseGenerator:
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
-                        current_sampling = None
                         current_tokenizer = None
                         current_model_key = None
                         batch_generator.close()
@@ -865,7 +894,13 @@ class ResponseGenerator:
                         # generation
                         batch_results.pop(uid, None)
 
-    def _serve_single(self, request):
+        # Make sure the model and prompt cache are destroyed in the generation
+        # thread under same stream.
+        self.model_provider.reset()
+        del self.prompt_cache
+        gc.collect()
+
+    def _serve_single(self, request, stream):
         rqueue, request, args = request
 
         # Define the progress callback
@@ -880,7 +915,7 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_matcher, text_sm = self._make_state_machine(
+            stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
@@ -918,9 +953,11 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
-            stop_state = stop_matcher.make_state()
+            # Own matcher: the automaton is cached across requests.
+            stop_matcher = stop_sequences.matcher()
             for gen in stream_generate(
                 model=model,
+                stream=stream,
                 tokenizer=tokenizer,
                 prompt=rest,
                 max_tokens=args.max_tokens,
@@ -931,14 +968,14 @@ class ResponseGenerator:
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
+                kv_bits=self.cli_args.kv_bits,
+                kv_group_size=self.cli_args.kv_group_size,
+                quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
                 finish_reason = gen.finish_reason
 
                 # Token-level stop word detection
-                stop_state, matched = StopSequenceMatcher.match(
-                    stop_state, stop_matcher._trie, gen.token
-                )
-                if matched:
+                if stop_matcher.advance(gen.token):
                     finish_reason = "stop"
 
                 rqueue.put(
@@ -972,6 +1009,16 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
+    def _await_response(self, response_queue):
+        # Wherever the request was when the thread died, nothing more will be
+        # put on its queue, so give up rather than block forever.
+        while True:
+            try:
+                return response_queue.get(timeout=1.0)
+            except QueueEmpty:
+                if not self.generation_available():
+                    raise RuntimeError("generation thread died") from None
+
     def generate(
         self,
         request: CompletionRequest,
@@ -979,11 +1026,13 @@ class ResponseGenerator:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         response_queue = Queue()
+        if not self.generation_available():
+            raise RuntimeError("generation thread died")
         self.requests.put((response_queue, request, generation_args))
 
         def _inner():
             while True:
-                response = response_queue.get()
+                response = self._await_response(response_queue)
                 if response is None:
                     break
                 if isinstance(response, Exception):
@@ -994,7 +1043,7 @@ class ResponseGenerator:
                     continue
                 yield response
 
-        ctx = response_queue.get()
+        ctx = self._await_response(response_queue)
         if isinstance(ctx, Exception):
             raise ctx
 
@@ -1202,8 +1251,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
-            except ValueError:
-                raise ValueError("logit_bias must be a dict of int to float")
+            except ValueError as e:
+                raise ValueError("logit_bias must be a dict of int to float") from e
 
     def generate_response(
         self,
@@ -1301,7 +1350,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
             choice[key_name] = {"role": "assistant"}
-            if text:
+            if not self.stream:
+                # The schema requires "content" field to be present
+                choice[key_name]["content"] = text if text else None
+            elif text:
                 choice[key_name]["content"] = text
             if reasoning_text:
                 choice[key_name]["reasoning"] = reasoning_text
@@ -1600,10 +1652,14 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /health endpoint.
         """
-        self._set_completion_headers(200)
+        is_healthy = self.response_generator.is_healthy
+        status_code = 200 if is_healthy else 503
+        status = "ok" if is_healthy else "unavailable"
+
+        self._set_completion_headers(status_code)
         self.end_headers()
 
-        self.wfile.write('{"status": "ok"}'.encode())
+        self.wfile.write(json.dumps({"status": status}).encode())
         self.wfile.flush()
 
     def handle_models_request(self):
@@ -1846,14 +1902,33 @@ def main():
         help="Maximum size in bytes of the KV caches",
     )
     parser.add_argument(
+        "--kv-bits",
+        type=int,
+        default=None,
+        help="Number of bits for KV cache quantization (e.g., 4 or 8). "
+        "Reduces memory usage for long contexts. Disables batching, so "
+        "requests are served one at a time. Default: None (full precision)",
+    )
+    parser.add_argument(
+        "--kv-group-size",
+        type=int,
+        default=64,
+        help="Group size for KV cache quantization (default: 64)",
+    )
+    parser.add_argument(
+        "--quantized-kv-start",
+        type=int,
+        default=DEFAULT_QUANTIZED_KV_START,
+        help="Token position to start KV cache quantization "
+        f"(default: {DEFAULT_QUANTIZED_KV_START})",
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
-    if mx.metal.is_available():
-        wired_limit = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_wired_limit(wired_limit)
+    _ = maybe_set_recommended_wired_limit()
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), None),
