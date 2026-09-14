@@ -97,7 +97,9 @@ def main(config, save_dir):
         # update
         if do_update:
             grads = average_gradients(
-                tree_map(lambda x: x / grad_accum_steps, grads), mesh.ddp.group
+                tree_map(lambda x: x / grad_accum_steps, grads),
+                mesh.ddp.group,
+                all_reduce_size=config.get("all_reduce_size", None),
             )
             grad_norm = None
             if max_grad_norm is not None:
@@ -249,6 +251,12 @@ def build_parser():
         "schedule back by. Checked against the checkpoint",
     )
     parser.add_argument(
+        "--all-reduce-size",
+        type=int,
+        default=None,
+        help="Size of the all-reduce operation. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--experiment-name", default=None, help="Run name for wandb; omit to disable"
     )
     return parser
@@ -269,7 +277,10 @@ def cli():
         config.context_size = args.context_size
     if args.fsdp_dim is not None:
         config.fsdp_dim = args.fsdp_dim
-
+    if args.grad_accum_steps is not None:
+        config.grad_accum_steps = args.grad_accum_steps
+    if args.all_reduce_size is not None:
+        config.all_reduce_size = args.all_reduce_size
     if args.init_from is not None:
         with config.ignore_type():
             config.init_from = args.init_from
