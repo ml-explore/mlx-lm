@@ -151,10 +151,6 @@ class Qwen2Model(PipelineMixin, nn.Module):
 
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
-        # Every layer is identical plain attention (no sliding-window or
-        # linear-attention layer types), so a single mask covers all of
-        # this rank's layers. cache can be empty if a rank ends up with
-        # zero local layers (e.g. more ranks than layers).
         mask = create_attention_mask(h, cache[0])
 
         # Receive from the previous process in the pipeline
