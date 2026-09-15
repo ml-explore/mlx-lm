@@ -69,7 +69,9 @@ class ModelArgs(BaseModelArgs):
             raise ValueError("num_attention_heads * head_dim must be positive")
 
         for layer_type in set(self.layer_types):
-            factor = float(self.rope_parameters[layer_type].get("partial_rotary_factor", 1.0))
+            factor = float(
+                self.rope_parameters[layer_type].get("partial_rotary_factor", 1.0)
+            )
             dims = int(self.head_dim * factor)
             if dims <= 0 or dims > self.head_dim or dims % 2:
                 raise ValueError(

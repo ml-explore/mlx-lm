@@ -8,7 +8,7 @@ from mlx_lm.tokenizer_utils import (
     SPMStreamingDetokenizer,
     TokenizerWrapper,
 )
-from mlx_lm.tool_parsers import pythonic
+from mlx_lm.tool_parsers import glm47, pythonic
 from mlx_lm.utils import load_tokenizer
 
 
@@ -140,6 +140,14 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(tokenizer.tool_call_start, "<|tool_call_start|>")
         self.assertEqual(tokenizer.tool_call_end, "<|tool_call_end|>")
         self.assertEqual(tokenizer.tool_parser, pythonic.parse_tool_call)
+
+        # Spark2.5 renders GLM-style <arg_key>/<arg_value> tool calls.
+        tokenizer_repo = "XHToken/Spark-X2.5-1.7B"
+        tokenizer = load_tokenizer(tokenizer_repo, {"trust_remote_code": True})
+        self.assertTrue(tokenizer.has_tool_calling)
+        self.assertEqual(tokenizer.tool_call_start, "<tool_call>")
+        self.assertEqual(tokenizer.tool_call_end, "</tool_call>")
+        self.assertEqual(tokenizer.tool_parser, glm47.parse_tool_call)
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"
