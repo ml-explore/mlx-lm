@@ -4093,6 +4093,24 @@ class TestModels(unittest.TestCase):
         from_oneshot = model(last, cache=oneshot_cache)
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
 
+    def _text_config(self, model_type, **extra):
+        config = {
+            "model_type": model_type,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 100,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": False,
+            "rope_theta": 100000.0,
+            "max_position_embeddings": 4096,
+        }
+        config.update(extra)
+        return config
+
     def test_qwen2_vl(self):
         from mlx_lm.models.qwen2_vl import Model, ModelArgs
 
