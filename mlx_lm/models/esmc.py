@@ -94,6 +94,37 @@ class ModelArgs(BaseModelArgs):
         return math.sqrt(self.num_hidden_layers / self.residue_scaling_base)
 
 
+# Published "port" keys first, then the older packed TransformerEngine spellings.
+_KEY_RENAMES = (
+    ("esmc.embed_tokens.", "esmc.embed."),
+    ("esmc.norm.", "esmc.transformer.norm."),
+    ("esmc.layers.", "esmc.transformer.blocks."),
+    (".input_layernorm.", ".attn.ln_qkv."),
+    (".post_attention_layernorm.", ".ffn.ln."),
+    (".self_attn.q_norm.", ".attn.q_ln."),
+    (".self_attn.k_norm.", ".attn.k_ln."),
+    (".self_attn.o_proj.", ".attn.out_proj."),
+    (".mlp.down_proj.", ".ffn.fc2."),
+    ("lm_head.dense.", "lm_head.0."),
+    ("lm_head.layer_norm.", "lm_head.2."),
+    ("lm_head.decoder.", "lm_head.3."),
+    (".attn.layernorm_qkv.layer_norm_", ".attn.ln_qkv."),
+    (".attn.layernorm_qkv.weight", ".attn.qkv.weight"),
+    (".ffn.layer_norm_", ".ffn.ln."),
+    (".ffn.fc1_weight", ".ffn.fc1.weight"),
+    (".ffn.fc2_weight", ".ffn.fc2.weight"),
+)
+
+# Slot is the concat order along dim 0; q,k,v and gate,up is bit-exact.
+_KEY_FUSIONS = (
+    (".self_attn.q_proj.", ".attn.qkv.", 0),
+    (".self_attn.k_proj.", ".attn.qkv.", 1),
+    (".self_attn.v_proj.", ".attn.qkv.", 2),
+    (".mlp.gate_proj.", ".ffn.fc1.", 0),
+    (".mlp.up_proj.", ".ffn.fc1.", 1),
+)
+
+
 class Attention(nn.Module):
     """Multi-head self-attention with QK-LayerNorm (over full hidden_size) and RoPE."""
 
@@ -304,20 +335,20 @@ class Model(nn.Module):
         return self._lm_head(self.encode(input_ids, attention_mask).last_hidden_state)
 
     def sanitize(self, weights):
-        out = {}
+        out, fused = {}, {}
         for k, v in weights.items():
             if k.endswith("._extra_state"):
                 continue
-            k = k.replace(
-                ".attn.layernorm_qkv.layer_norm_weight", ".attn.ln_qkv.weight"
-            )
-            k = k.replace(".attn.layernorm_qkv.layer_norm_bias", ".attn.ln_qkv.bias")
-            k = k.replace(".attn.layernorm_qkv.weight", ".attn.qkv.weight")
-            k = k.replace(".ffn.layer_norm_weight", ".ffn.ln.weight")
-            k = k.replace(".ffn.layer_norm_bias", ".ffn.ln.bias")
-            k = k.replace(".ffn.fc1_weight", ".ffn.fc1.weight")
-            k = k.replace(".ffn.fc2_weight", ".ffn.fc2.weight")
-            out[k] = v
+            for src, dst in _KEY_RENAMES:
+                k = k.replace(src, dst)
+            for src, dst, slot in _KEY_FUSIONS:
+                if src in k:
+                    fused.setdefault(k.replace(src, dst), {})[slot] = v
+                    break
+            else:
+                out[k] = v
+        for k, parts in fused.items():
+            out[k] = mx.concatenate([parts[i] for i in sorted(parts)], axis=0)
         return out
 
     @property
@@ -333,14 +364,28 @@ def from_pretrained(repo: str = "biohub/ESMC-6B", dtype=mx.bfloat16) -> Model:
     from huggingface_hub import snapshot_download
 
     local = snapshot_download(repo, allow_patterns=["config.json", "*.safetensors"])
-    model = Model(ModelArgs.from_dict(json.load(open(f"{local}/config.json"))))
     weights = {}
     # Shard by shard: loading the fp32 whole and casting after peaks ~55 GB.
     for shard in sorted(glob.glob(f"{local}/*.safetensors")):
         part = {k: _cast(v, dtype) for k, v in mx.load(shard).items()}
         mx.eval(list(part.values()))
         weights.update(part)
-    model.load_weights(list(model.sanitize(weights).items()), strict=True)
+    cfg = json.load(open(f"{local}/config.json"))
+    return from_weights(cfg, weights, dtype)
+
+
+def from_weights(config: dict, weights: dict, dtype=mx.bfloat16, strict=True) -> Model:
+    """Build an ESMC from an in-memory config and weights already loaded."""
+    from mlx.utils import tree_flatten
+
+    model = Model(ModelArgs.from_dict(config))
+    named = {k: _cast(v, dtype) for k, v in model.sanitize(weights).items()}
+    # strict=False skips MLX's own key/shape checks, so do them on what we got.
+    params = dict(tree_flatten(model.parameters()))
+    bad = [k for k, v in named.items() if k not in params or v.shape != params[k].shape]
+    if bad:
+        raise ValueError(f"ESMC parameters unknown or misshapen: {sorted(bad)[:8]}")
+    model.load_weights(list(named.items()), strict=strict)
     model.set_dtype(dtype)
     model.eval()
     mx.eval(model.parameters())

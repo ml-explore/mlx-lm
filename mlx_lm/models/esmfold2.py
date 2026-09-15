@@ -10,6 +10,7 @@ libraries are absent).
 """
 
 import math
+import re
 import warnings
 from typing import Optional
 
@@ -1416,14 +1417,11 @@ class ConfidenceHead(nn.Module):
         super().__init__()
         self.boundaries = mx.linspace(min_dist, max_dist, distogram_bins - 1)
         self.dist_bin_pairwise_embed = nn.Embedding(distogram_bins, d_pair)
-        self.s_norm = nn.LayerNorm(d_single)  # (unused in forward)
-        self.s_inputs_to_single = nn.Linear(d_inputs, d_single, bias=False)  # (unused)
         self.s_to_z = nn.Linear(d_inputs, d_pair, bias=False)
         self.s_to_z_transpose = nn.Linear(d_inputs, d_pair, bias=False)
         self.s_to_z_prod_in1 = nn.Linear(d_inputs, d_pair, bias=False)
         self.s_to_z_prod_in2 = nn.Linear(d_inputs, d_pair, bias=False)
         self.s_to_z_prod_out = nn.Linear(d_pair, d_pair, bias=False)
-        self.s_input_to_s = nn.Linear(d_inputs, d_single, bias=False)  # (unused)
         self.s_inputs_norm = nn.LayerNorm(d_inputs)
         self.z_norm = nn.LayerNorm(d_pair)
         self.row_attention_pooling = RowAttentionPooling(d_pair, d_single)
@@ -1899,7 +1897,7 @@ class ESMFold2Model(nn.Module):
         sh = config["structure_head"]
         ae = dict(
             d_atom=g("inputs.atom_encoder.d_atom", "atom_encoder.hidden_size"),
-            d_token=g("inputs.atom_encoder.d_token", "atom_encoder.output_dim"),
+            d_token=g("inputs.atom_encoder.d_token", "atom_encoder.token_hidden_size"),
             n_blocks=g(
                 "inputs.atom_encoder.n_blocks", "atom_encoder.num_hidden_layers"
             ),
@@ -2463,16 +2461,25 @@ class ESMFold2Model(nn.Module):
         ``device`` is accepted and ignored -- MLX has one unified device -- so
         the same call site works on both backends.
         """
+        import glob
         import json
 
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import snapshot_download
 
         from .esmc import _cast
         from .esmc import from_pretrained as load_esmc_model
+        from .esmc import from_weights
 
-        cfg = json.load(open(hf_hub_download(repo, "config.json")))
+        # snapshot_download covers both the single file and the sharded export.
+        local = snapshot_download(repo, allow_patterns=["config.json", "*.safetensors"])
+        cfg = json.load(open(f"{local}/config.json"))
         model = cls(cfg)
-        weights = sanitize_esmfold2(mx.load(hf_hub_download(repo, "model.safetensors")))
+        weights = {}
+        for shard in sorted(glob.glob(f"{local}/*.safetensors")):
+            weights.update(mx.load(shard))
+        weights = sanitize_esmfold2(weights)
+        # Republished repos bundle the backbone under esmc.*, with no esmc_id.
+        bundled = {k: weights.pop(k) for k in list(weights) if k.startswith("esmc.")}
         model.load_weights(
             [(k, _cast(v, dtype)) for k, v in weights.items()], strict=True
         )
@@ -2482,12 +2489,194 @@ class ESMFold2Model(nn.Module):
         del weights
 
         if load_esmc:
-            model._esmc = load_esmc_model(cfg.get("esmc_id", "biohub/ESMC-6B"), dtype)
+            model._esmc = (
+                from_weights(cfg["esmc_config"], bundled, dtype, strict=False)
+                if bundled
+                else load_esmc_model(cfg.get("esmc_id", "biohub/ESMC-6B"), dtype)
+            )
         return model
 
 
+# Port key -> MLX key, in order; mirrors esm's hf_checkpoint._KEY_RULES.
+_PORT_RULES = (
+    (r"^input_embedder\.atom_encoder\.", "inputs_embedder.atom_attention_encoder."),
+    (r"^input_embedder\.pair_init_", "z_init_"),
+    (r"^input_embedder\.", ""),
+    (
+        r"^structure_head\.coords_linear\.",
+        "structure_head.diffusion_module.atom_encoder.coords_linear.",
+    ),
+    (r"^structure_head\.(?!diffusion_module\.)", "structure_head.diffusion_module."),
+    (
+        r"^structure_head\.diffusion_module\.single_",
+        "structure_head.diffusion_module.s_",
+    ),
+    (r"\.conditioning\.pair_transition_(\d+)\.", r".conditioning.z_transitions.\1."),
+    (r"\.conditioning\.single_transition_(\d+)\.", r".conditioning.s_transitions.\1."),
+    (r"\.conditioning\.pair_", ".conditioning.z_"),
+    (r"\.conditioning\.single_", ".conditioning.s_"),
+    (r"(_transitions\.\d+)\.mlp\.gate_up_proj", r"\1.a_proj"),
+    (r"(_transitions\.\d+)\.mlp\.down_proj", r"\1.out_proj"),
+    (r"\.fourier\.frequencies$", ".fourier.w"),
+    (r"\.fourier\.phases$", ".fourier.b"),
+    (
+        r"(atom_(?:attention_)?(?:encoder|decoder))\.layers\.(\d+)\.",
+        r"\1.atom_transformer.blocks.\2.",
+    ),
+    (r"(\.atom_transformer\.blocks\.\d+)\.self_attn\.", r"\1.attn."),
+    (r"(\.atom_transformer\.blocks\.\d+)\.mlp\.gate_up_proj", r"\1.ffn.w_up"),
+    (r"(\.atom_transformer\.blocks\.\d+)\.mlp\.down_proj", r"\1.ffn.w_down"),
+    (r"(\.atom_transformer\.blocks\.\d+)\.adaln_linear", r"\1.adaln_modulation.1"),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.input_layernorm\.",
+        r".token_transformer.attn_blocks.\1.adaln.s_",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.post_attention_layernorm\.",
+        r".token_transformer.transition_blocks.\1.adaln.s_",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.attn_gate\.",
+        r".token_transformer.attn_blocks.\1.out_gate.",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.mlp_gate\.",
+        r".token_transformer.transition_blocks.\1.output_gate.",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.mlp\.gate_up_proj",
+        r".token_transformer.transition_blocks.\1.lin_swish",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.mlp\.down_proj",
+        r".token_transformer.transition_blocks.\1.lin_out",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.(pair_norm|pair_bias_proj)\.",
+        r".token_transformer.attn_blocks.\1.\2.",
+    ),
+    (
+        r"\.token_transformer\.layers\.(\d+)\.self_attn\.",
+        r".token_transformer.attn_blocks.\1.",
+    ),
+    (r"\.adaln\.s_cond_norm\.weight$", ".adaln.s_scale"),
+    (r"(\.adaln\.s_(?:gate|shift))_proj", r"\1"),
+    (r"(\.attn_blocks\.\d+\.)gate_proj", r"\1g_proj"),
+    (r"^parcae\.output_stack\.layers\.", "parcae_coda.blocks."),
+    (r"^parcae\.out_proj", "parcae_readout"),
+    (r"^parcae\.input_matrix_continuous", "parcae_b_cont"),
+    (r"^parcae\.log_state_decay", "parcae_log_a"),
+    (r"^parcae\.", "parcae_"),
+    (r"\.layers\.(\d+)\.", r".blocks.\1."),
+    (r"\.mlp\.gate_up_proj", ".ffn.w12"),
+    (r"\.mlp\.down_proj", ".ffn.w3"),
+    (
+        r"\.msa_pair_weighted_averaging\.bias_norm\.",
+        ".msa_pair_weighted_averaging.compute_bias.0.",
+    ),
+    (
+        r"\.msa_pair_weighted_averaging\.bias_proj\.",
+        ".msa_pair_weighted_averaging.compute_bias.1.",
+    ),
+    (
+        r"\.msa_pair_weighted_averaging\.(gate|v)_proj\.",
+        r".msa_pair_weighted_averaging.W\1.",
+    ),
+    (r"\.msa_pair_weighted_averaging\.o_proj\.", ".msa_pair_weighted_averaging.Wout."),
+    (r"\.outer_product_mean\.input_proj\.", ".outer_product_mean.W."),
+    (r"\.outer_product_mean\.output_proj\.", ".outer_product_mean.Wout."),
+    (
+        r"^confidence_head\.input_embedder\.single_inputs_norm",
+        "confidence_head.s_inputs_norm",
+    ),
+    (r"^confidence_head\.input_embedder\.single_to_pair", "confidence_head.s_to_z"),
+    (r"^confidence_head\.input_embedder\.pair_norm", "confidence_head.z_norm"),
+    (r"^confidence_head\.(\w+)_layernorm\.", r"confidence_head.\1_ln."),
+    (r"^language_model\.pair_input_norm", "language_model.base_z_linear.0"),
+    (r"^language_model\.pair_proj", "language_model.base_z_linear.1"),
+    (r"^language_model\.pair_output_norm", "language_model.base_z_mlp.1"),
+    (
+        r"^language_model\.single_to_pair\.output_fc1",
+        "language_model.base_z_mlp.0.output_mlp.0",
+    ),
+    (
+        r"^language_model\.single_to_pair\.output_fc2",
+        "language_model.base_z_mlp.0.output_mlp.2",
+    ),
+    (r"^language_model\.single_to_pair\.", "language_model.base_z_mlp.0."),
+    (r"^language_model\.layer_weights$", "language_model.base_z_combine"),
+    (r"\.attn\.[qkv]_proj\.weight$", ".attn.Wqkv.weight"),
+    (r"\.attn_blocks\.(\d+)\.[kv]_proj\.weight$", r".attn_blocks.\1.kv_proj.weight"),
+    (r"\.o_proj\.weight$", ".out_proj.weight"),
+)
+
+# Fused MLX weight -> the port parts it concatenates, in row order.
+_PORT_PACKED = {"attn.Wqkv.weight": ("q", "k", "v"), "kv_proj.weight": ("k", "v")}
+
+# Markers only one layout has; the tensor names cannot lie about how they pack.
+_PORT_MARKERS = (".layers.", ".self_attn.", ".mlp.gate_up_proj.")
+_NATIVE_MARKERS = (".blocks.", ".attn.", ".ffn.")
+
+# Carried by the older export, unused in the forward pass; esm ignores them too.
+_UNUSED_CONFIDENCE_KEYS = (
+    "confidence_head.s_norm.weight",
+    "confidence_head.s_norm.bias",
+    "confidence_head.s_inputs_to_single.weight",
+    "confidence_head.s_input_to_s.weight",
+)
+
+
+def _to_mlx_key(key: str) -> str:
+    for pattern, replacement in _PORT_RULES:
+        key = re.sub(pattern, replacement, key)
+    return key
+
+
 def sanitize_esmfold2(weights: dict) -> dict:
-    """Strip the reference's `._engine.` trimul wrapper segment. `confidence_head.*`
-    keys are kept (they map 1:1 onto the opt-in ConfidenceHead built when the config
-    enables it); msa_encoder.* keys are likewise kept when that module is built."""
-    return {k.replace("._engine.", "."): v for k, v in weights.items()}
+    """Rewrite a checkpoint onto this port's layout, from either published layout.
+
+    `esmc.*` passes through untouched for the caller's ESMC loader. Fails rather
+    than dropping: two tensors on one name is a quietly half-loaded model.
+    """
+    trunk = [k for k in weights if not k.startswith("esmc.")]
+    port = sum(any(m in k for m in _PORT_MARKERS) for k in trunk)
+    native = sum(any(m in k for m in _NATIVE_MARKERS) for k in trunk)
+    if not port and not native:
+        raise ValueError(f"unrecognised ESMFold2 tensor layout: {sorted(trunk)[:5]}")
+
+    out, packed = {}, {}
+
+    def emit(key, value):
+        if key in out:
+            raise ValueError(f"two checkpoint tensors both map onto {key!r}")
+        out[key] = value
+
+    for key, value in weights.items():
+        if key.startswith("esmc.") or native >= port:
+            emit(key.replace("._engine.", "."), value)
+            continue
+        mlx_key = _to_mlx_key(key)
+        order = next((o for s, o in _PORT_PACKED.items() if mlx_key.endswith(s)), None)
+        if order is not None:
+            # The part is named by the projection the rules replaced.
+            parts = packed.setdefault(mlx_key, (order, {}))[1]
+            part = key.rsplit(".", 2)[-2][0]
+            if part in parts:
+                raise ValueError(f"two checkpoint tensors both map onto {mlx_key!r}")
+            parts[part] = value
+        elif mlx_key.endswith(".a_proj.weight"):
+            # Alone among the transitions, these two never fused gate and up.
+            gate, up = mx.split(value, 2, axis=0)
+            emit(mlx_key, gate)
+            emit(mlx_key.replace(".a_proj.", ".b_proj."), up)
+        else:
+            emit(mlx_key, value)
+
+    for mlx_key, (order, parts) in packed.items():
+        if set(parts) != set(order):
+            missing = sorted(set(order) - set(parts))
+            raise ValueError(f"{mlx_key!r} is missing parts: {missing}")
+        emit(mlx_key, mx.concatenate([parts[p] for p in order], axis=0))
+    for key in _UNUSED_CONFIDENCE_KEYS:
+        out.pop(key, None)
+    return out
