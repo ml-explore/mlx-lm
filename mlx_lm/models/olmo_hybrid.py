@@ -390,7 +390,8 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = OlmoHybridModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(
         self,
@@ -398,7 +399,11 @@ class Model(nn.Module):
         cache: Optional[Any] = None,
     ) -> mx.array:
         out = self.model(inputs, cache)
-        return self.lm_head(out)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
 
     @property
     def layers(self):
@@ -414,6 +419,8 @@ class Model(nn.Module):
         return caches
 
     def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
         sanitized = {}
         for k, v in weights.items():
             if "conv1d.weight" in k and v.ndim == 3 and v.shape[-1] != 1:
