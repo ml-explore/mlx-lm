@@ -4023,6 +4023,405 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
 
+    def test_spark2_5(self):
+        from mlx_lm.models import spark2_5
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=32,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        model = spark2_5.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_spark2_5_config(self):
+        from mlx_lm.models import spark2_5
+
+        # Real 1.7B checkpoint geometry (layer_types + rope_parameters present).
+        args = spark2_5.ModelArgs.from_dict(
+            {
+                "model_type": "spark2_5",
+                "hidden_size": 2048,
+                "intermediate_size": 8192,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 131072,
+                "sliding_window": 512,
+                "max_position_embeddings": 1048576,
+                "rms_norm_eps": 1e-6,
+                "hidden_act": "gelu",
+                "layer_types": [
+                    "sliding_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ]
+                * 6,
+                "rope_parameters": {
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 1.0,
+                    },
+                    "full_attention": {
+                        "rope_theta": 5e6,
+                        "partial_rotary_factor": 0.25,
+                    },
+                },
+                "headwise_attn_output_gate": True,
+                "gate_attn_act_mode": "sigmoid",
+                "tie_word_embeddings": True,
+            }
+        )
+        self.assertEqual(args.num_hidden_layers, 24)
+        self.assertEqual(args.layer_types[:4], ["sliding_attention"] * 3 + ["full_attention"])
+        self.assertEqual(len(args.layer_types), 24)
+
+        # Derive the layer sequence when the checkpoint omits layer_types:
+        # three sliding layers, one full layer, repeating.
+        derived = spark2_5.ModelArgs.from_dict(
+            {
+                "model_type": "spark2_5",
+                "hidden_size": 128,
+                "intermediate_size": 256,
+                "num_hidden_layers": 8,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "vocab_size": 1000,
+                "sliding_window": 512,
+                "rope_parameters": {
+                    "sliding_attention": {
+                        "rope_theta": 10000.0,
+                        "partial_rotary_factor": 1.0,
+                    },
+                    "full_attention": {
+                        "rope_theta": 5e6,
+                        "partial_rotary_factor": 0.25,
+                    },
+                },
+            }
+        )
+        self.assertEqual(
+            derived.layer_types,
+            [
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+
+    def test_spark2_5_config_validation(self):
+        from mlx_lm.models import spark2_5
+
+        base = {
+            "model_type": "spark2_5",
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 64,
+            "vocab_size": 1000,
+            "sliding_window": 512,
+            "rope_parameters": {
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        }
+
+        cases = [
+            # Wrong number of layer types.
+            {"layer_types": ["full_attention"] * 3},
+            # Unknown layer type.
+            {"layer_types": ["sliding_attention", "global_attention", "sliding_attention", "sliding_attention"]},
+            # Missing RoPE params for a used layer type.
+            {"layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+             "rope_parameters": {"sliding_attention": base["rope_parameters"]["sliding_attention"]}},
+            # Gate must be head-wise sigmoid.
+            {"headwise_attn_output_gate": False},
+            {"gate_attn_act_mode": "tanh"},
+            # Partial rotary factor must give an even, positive dimension:
+            # 0.3 * 64 = 19.2 -> 19 dims (odd).
+            {"rope_parameters": {
+                "sliding_attention": {"rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+                "full_attention": {"rope_theta": 5e6, "partial_rotary_factor": 0.3},
+            }},
+        ]
+        for overrides in cases:
+            cfg = dict(base)
+            cfg.update(overrides)
+            with self.assertRaises(ValueError):
+                spark2_5.ModelArgs.from_dict(cfg)
+
+    def test_spark2_5_cache_types_and_rope(self):
+        from mlx_lm.models import spark2_5
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=32,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        model = spark2_5.Model(args)
+        cache = model.make_cache()
+        self.assertEqual(len(cache), 4)
+        self.assertIsInstance(cache[0], RotatingKVCache)
+        self.assertIsInstance(cache[1], RotatingKVCache)
+        self.assertIsInstance(cache[2], RotatingKVCache)
+        self.assertIsInstance(cache[3], KVCache)
+        self.assertEqual(cache[0].max_size, 32)
+
+        # Per-layer-type RoPE: partial rotary factor 1.0 on sliding layers
+        # (64 dims), 0.25 on full layers (16 dims).
+        self.assertEqual(model.layers[0].self_attn.rope.dims, 64)
+        self.assertEqual(model.layers[3].self_attn.rope.dims, 16)
+
+    def test_spark2_5_masks_at_sliding_boundary(self):
+        from mlx_lm.models import spark2_5
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=512,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        model = spark2_5.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        for length in (511, 512, 513):
+            ids = mx.array([list(range(length))])
+            # Cached (sliding mask drives eviction) vs uncached (full window).
+            cache = make_prompt_cache(model)
+            cached = model(ids, cache=cache)
+            uncached = model(ids)
+            self.assertEqual(cached.shape, (1, length, 1000))
+            self.assertTrue(
+                mx.allclose(cached, uncached, rtol=1e-4, atol=1e-4),
+                f"cached/uncached mismatch at length {length}: "
+                f"max {mx.max(mx.abs(cached - uncached))}",
+            )
+            # A single decode step after each prefill must stay sane.
+            last = mx.argmax(cached[0, -1:, :], keepdims=True)
+            out = model(last, cache=cache)
+            self.assertEqual(out.shape, (1, 1, 1000))
+
+    def test_spark2_5_chunked_vs_oneshot_prefill(self):
+        from mlx_lm.models import spark2_5
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=16,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        model = spark2_5.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        ids = mx.array([list(range(40))])
+        # Oneshot prefill.
+        oneshot_cache = make_prompt_cache(model)
+        oneshot = model(ids, cache=oneshot_cache)
+
+        # Same prompt in two chunks of 20.
+        chunked_cache = make_prompt_cache(model)
+        c1 = model(ids[:, :20], cache=chunked_cache)
+        c2 = model(ids[:, 20:], cache=chunked_cache)
+        chunked = mx.concatenate([c1, c2], axis=1)
+
+        self.assertTrue(
+            mx.allclose(chunked, oneshot, rtol=1e-4, atol=1e-4),
+            f"chunked/oneshot mismatch: max {mx.max(mx.abs(chunked - oneshot))}",
+        )
+
+        # The decode step that follows must agree regardless of how the
+        # prompt got into the cache.
+        last = mx.argmax(oneshot[0, -1:, :], keepdims=True)
+        from_chunked = model(last, cache=chunked_cache)
+        from_oneshot = model(last, cache=oneshot_cache)
+        self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
+
+    def test_spark2_5_wrap_rope_offset(self):
+        from mlx_lm.models import spark2_5
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=64,
+            vocab_size=1000,
+            sliding_window=8,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        model = spark2_5.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        ids = mx.array([list(range(24))])
+        cache = make_prompt_cache(model)
+        out = model(ids, cache=cache)
+        # The prefill lands in the cache untrimmed (the rotating cache trims
+        # on the next write); the sliding mask caps attention during prefill.
+        self.assertEqual(cache[0].offset, 24)
+
+        # The first decode write trims the buffer to the last 8 tokens, and
+        # RoPE keeps counting from the absolute position (24, 25, 26).
+        last = mx.argmax(out[0, -1:, :], keepdims=True)
+        for _ in range(3):
+            out = model(last, cache=cache)
+            last = mx.argmax(out[0, -1:, :], keepdims=True)
+        self.assertEqual(cache[0].keys.shape[2], 8)
+        self.assertEqual(cache[0].offset, 27)
+        self.assertEqual(cache[3].offset, 27)
+
+    def test_spark2_5_quantize_and_sanitize(self):
+        from mlx_lm.models import spark2_5
+        from mlx_lm.utils import quantize_model
+
+        args = spark2_5.ModelArgs(
+            model_type="spark2_5",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=32,
+            vocab_size=64,
+            sliding_window=16,
+            rope_parameters={
+                "sliding_attention": {
+                    "rope_theta": 10000.0,
+                    "partial_rotary_factor": 1.0,
+                },
+                "full_attention": {
+                    "rope_theta": 5e6,
+                    "partial_rotary_factor": 0.25,
+                },
+            },
+        )
+        model = spark2_5.Model(args)
+        model, config = quantize_model(
+            model,
+            {"model_type": "spark2_5", **vars(args)},
+            group_size=64,
+            bits=4,
+        )
+
+        # The head-gate projection is protected at source precision; fused
+        # QKV stays 4-bit.
+        self.assertIsInstance(model.layers[0].self_attn.g_proj, nn.Linear)
+        self.assertIsInstance(model.layers[0].self_attn.q_k_v_proj, nn.QuantizedLinear)
+        self.assertIsInstance(model.layers[0].mlp.gate_proj, nn.QuantizedLinear)
+        self.assertNotIn(
+            "model.layers.0.self_attn.g_proj",
+            config.get("quantization", {}),
+        )
+        self.assertEqual(config["quantization"]["bits"], 4)
+
+        # The quantized model still runs.
+        x = mx.array([[0, 1]])
+        out = model(x)
+        self.assertEqual(out.shape, (1, 2, 64))
+
+        # Sanitize: HF-style mapping, tied lm_head, and stray RoPE buffers.
+        weights = dict(tree_flatten(model.parameters()))
+        emb = weights.pop("model.embedding.weight")
+        weights["model.embed_tokens.weight"] = emb
+        weights["lm_head.weight"] = emb
+        weights["model.layers.0.self_attn.rotary_emb.inv_freq"] = mx.ones(16)
+        sanitized = model.sanitize(weights)
+        self.assertIn("model.embedding.weight", sanitized)
+        self.assertNotIn("model.embed_tokens.weight", sanitized)
+        self.assertNotIn("lm_head.weight", sanitized)
+        self.assertFalse(any("inv_freq" in k for k in sanitized))
+
+
 class TestVLSanitize(unittest.TestCase):
     # Newer layout
     HF_WEIGHTS = {
