@@ -181,7 +181,7 @@ class Attention(nn.Module):
             scale=self.scale,
             mask=mask,
         )
-        output = output.transpose(0, 2, 1, 3)
+        output = mx.contiguous(output.transpose(0, 2, 1, 3))
 
         gate = mx.sigmoid(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
         output = output * gate[..., None]
