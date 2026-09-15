@@ -97,6 +97,7 @@ def parse_tool_call(text: str, tools: Any | None = None) -> ToolCall | list[Tool
     arguments = {}
     for match in _tool_args_regex.finditer(args_str):
         bare = match.group("bare")
+        key = match.group("key").strip()
         value = bare.strip() if bare is not None else match.group("quoted")
 
         # Try to parse the value using ast.literal_eval
@@ -106,7 +107,7 @@ def parse_tool_call(text: str, tools: Any | None = None) -> ToolCall | list[Tool
             # If parsing fails, keep as string
             pass
 
-        arguments[match.group("key").strip()] = value
+        arguments[key] = value
 
     return {"name": func_name, "arguments": arguments}
 
