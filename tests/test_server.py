@@ -19,8 +19,10 @@ from mlx_lm.server import (
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
+    ToolCallFormatter,
     _make_sampler,
 )
+from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
 
 
@@ -208,6 +210,27 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(text, "f[ARGS]{}")
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
+
+
+class TestToolCallFormatter(unittest.TestCase):
+    def test_formats_parallel_tool_calls(self):
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
+        raw_tool_call = (
+            '[get_time(location="Paris"), '
+            'grocery.order(items=[{"name": "noodles", "organic": true}])]'
+        )
+
+        tool_calls = formatter([raw_tool_call])
+
+        self.assertEqual(
+            [tc["function"]["name"] for tc in tool_calls],
+            ["get_time", "grocery.order"],
+        )
+        self.assertTrue(all(tc["type"] == "function" for tc in tool_calls))
+        self.assertEqual(
+            json.loads(tool_calls[1]["function"]["arguments"]),
+            {"items": [{"name": "noodles", "organic": True}]},
+        )
 
 
 class TestServer(unittest.TestCase):

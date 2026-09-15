@@ -212,6 +212,41 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_pythonic_nested_args(self):
+        # Containers are rendered with tojson, so they hold true/false/null.
+        test_case = (
+            "[grocery.orderIngredients("
+            'ingredientList=[{"name": "noodles", "organic": true, "unit": null}], '
+            'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
+        )
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            {
+                "name": "grocery.orderIngredients",
+                "arguments": {
+                    "ingredientList": [
+                        {"name": "noodles", "organic": True, "unit": None}
+                    ],
+                    "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+                },
+            },
+        )
+
+    def test_pythonic_parallel_calls(self):
+        test_case = '[get_time(location="Paris"), get_temperature(location="Tokyo")]'
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"location": "Paris"}},
+                {"name": "get_temperature", "arguments": {"location": "Tokyo"}},
+            ],
+        )
+
+    def test_pythonic_invalid_calls(self):
+        for test_case in ['[manim-video(mode="plan")]', 'get_time(location="Paris")']:
+            with self.assertRaises(ValueError):
+                pythonic.parse_tool_call(test_case, None)
+
     def test_gemma4(self):
         # Nested object
         test_case = 'call:configure{settings:{enabled:true,name:<|"|>test<|"|>}}'
