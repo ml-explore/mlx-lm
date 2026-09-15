@@ -9,7 +9,6 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.nn.utils import average_gradients, clip_grad_norm_sharded
 from mlx.utils import tree_map
 
 from mlx_lm.train import data, fsdp, optim, utils
@@ -96,16 +95,13 @@ def main(config, save_dir):
             grads = tree_map(lambda x, y: x + y, grads, grad_accum)
         # update
         if do_update:
-            grads = average_gradients(
+            grads = mesh.ddp.average_gradients(
                 tree_map(lambda x: x / grad_accum_steps, grads),
-                mesh.ddp.group,
                 all_reduce_size=config.get("all_reduce_size", 32 * 1024 * 1024),
             )
             grad_norm = None
             if max_grad_norm is not None:
-                grads, grad_norm = clip_grad_norm_sharded(
-                    grads, max_norm=max_grad_norm, group=mesh.fsdp.group
-                )
+                grads, grad_norm = mesh.fsdp.clip_grad_norm(grads, max_grad_norm)
             params = optimizer.apply_gradients(grads, params)
 
         return (
