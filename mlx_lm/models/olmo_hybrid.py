@@ -166,8 +166,10 @@ class GatedDeltaNet(nn.Module):
         v = v.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
         inv_scale = self.head_k_dim**-0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        # The reference L2-normalises q/k, so eps applies to sum, not mean.
+        qk_eps = 1e-6 / self.head_k_dim
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, qk_eps)
+        k = inv_scale * mx.fast.rms_norm(k, None, qk_eps)
 
         beta = mx.sigmoid(self.b_proj(x))
         if self.allow_neg_eigval:
