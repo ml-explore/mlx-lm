@@ -14,7 +14,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import compute_g, gated_delta_kernel, gated_delta_ops
+from .gated_delta import gated_delta_update
 from .rope_utils import initialize_rope
 
 
@@ -171,29 +171,20 @@ class GatedDeltaNet(nn.Module):
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, qk_eps)
         k = inv_scale * mx.fast.rms_norm(k, None, qk_eps)
 
-        beta = mx.sigmoid(self.b_proj(x))
-        if self.allow_neg_eigval:
-            beta = beta * 2.0
-
-        a = self.a_proj(x)
-        g = compute_g(self.A_log, a, self.dt_bias)
-
         state = cache[3] if (cache is not None and cache[3] is not None) else None
-        if state is None:
-            state = mx.zeros(
-                (B, self.num_v_heads, self.head_v_dim, self.head_k_dim),
-                dtype=mx.float32,
-            )
-
-        use_kernel = (
-            not self.training
-            and mx.default_device() == mx.gpu
-            and mx.metal.is_available()
+        out, state = gated_delta_update(
+            q,
+            k,
+            v,
+            self.a_proj(x),
+            self.b_proj(x),
+            self.A_log,
+            self.dt_bias,
+            state,
+            mask,
+            use_kernel=not self.training,
+            allow_neg_eigval=self.allow_neg_eigval,
         )
-        if use_kernel:
-            out, state = gated_delta_kernel(q, k, v, g, beta, state, mask)
-        else:
-            out, state = gated_delta_ops(q, k, v, g, beta, state, mask)
 
         if cache is not None:
             cache[3] = state
