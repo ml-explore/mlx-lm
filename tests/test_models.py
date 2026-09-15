@@ -4093,6 +4093,34 @@ class TestModels(unittest.TestCase):
         from_oneshot = model(last, cache=oneshot_cache)
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
 
+
+class TestVLSanitize(unittest.TestCase):
+    # Newer layout
+    HF_WEIGHTS = {
+        "model.visual.blocks.0.attn.qkv.weight": None,
+        "model.visual.merger.norm.weight": None,
+        "model.language_model.embed_tokens.weight": None,
+        "model.language_model.layers.0.self_attn.q_proj.weight": None,
+        "model.language_model.norm.weight": None,
+        "lm_head.weight": None,
+    }
+
+    # Older layout
+    LEGACY_WEIGHTS = {
+        "visual.blocks.0.attn.qkv.weight": None,
+        "model.embed_tokens.weight": None,
+        "model.layers.0.self_attn.q_proj.weight": None,
+        "model.norm.weight": None,
+        "lm_head.weight": None,
+    }
+
+    def _assert_sanitized(self, result):
+        self.assertEqual([k for k in result if "visual" in k], [])
+        self.assertEqual([k for k in result if "vision_tower" in k], [])
+        self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", result)
+        self.assertIn("language_model.model.embed_tokens.weight", result)
+        self.assertIn("language_model.lm_head.weight", result)
+
     def _text_config(self, model_type, **extra):
         config = {
             "model_type": model_type,
