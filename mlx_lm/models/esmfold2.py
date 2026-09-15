@@ -1353,11 +1353,10 @@ class DiffusionSampler(nn.Module):
 # Confidence head (pLDDT / PAE / pTM / ipTM)
 # ---------------------------------------------------------------------------
 
-# Matches esm/models/esmfold2/model.py, which hardcodes 4. The featurizer only
-# ever emits mol_type in {0,1,2,3} (constants.MOL_TYPE_NONPOLYMER == 3), so the
-# ligand branch below is unreachable in the reference too. Kept in step with the
-# reference rather than with the constant, so both produce the same number.
-_NONPOLYMER_ID = 4
+# The featurizer emits mol_type in {0,1,2,3}; constants.MOL_TYPE_NONPOLYMER == 3.
+# esm/models/esmfold2/model.py still hardcodes 4, so its ligand branch never fires
+# and its complex_iplddt runs high on ligand-heavy complexes. We follow the constant.
+_MOL_TYPE_NONPOLYMER = 3
 
 
 def _categorical_mean(logits, start, end):
@@ -1510,7 +1509,7 @@ class ConfidenceHead(nn.Module):
 
         # Interface-weighted pLDDT: ligands count double, polymer tokens count
         # only where they sit within 8 A of another chain.
-        is_ligand = (mol_type == _NONPOLYMER_ID).astype(mx.float32)
+        is_ligand = (mol_type == _MOL_TYPE_NONPOLYMER).astype(mx.float32)
         inter_chain = (asym_id[:, :, None] != asym_id[:, None, :]).astype(mx.float32)
         interface = mx.max(
             (rep_d < 8).astype(mx.float32) * inter_chain * (1.0 - is_ligand)[..., None],
