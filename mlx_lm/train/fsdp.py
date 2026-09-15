@@ -84,6 +84,10 @@ class FullyShardedModule(Module):
     def __call__(self, *args, **kwargs):
         return self._gathered_call(self.module, *args, **kwargs)
 
+    def is_linear(self):
+        # To distinguash gated delta net layers attention with sdpa
+        return self.module.is_linear
+    
     def as_linear(self, *args, **kwargs):
         return self._gathered_call(self.module.as_linear, *args, **kwargs)
 
