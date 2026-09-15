@@ -322,6 +322,23 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            # Routing is discrete, so keep the router more precise than the rest.
+            if path.endswith("mlp.gate.proj"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
+
     def make_cache(self):
         return [
             (
