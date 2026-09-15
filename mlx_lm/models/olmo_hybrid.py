@@ -137,7 +137,7 @@ class GatedDeltaNet(nn.Module):
             )
 
         if cache_slot is not None:
-            cache_slot[slot_idx] = padded[:, -n_keep:, :]
+            cache_slot[slot_idx] = mx.contiguous(padded[:, -n_keep:, :])
 
         return nn.silu(conv(padded))
 
