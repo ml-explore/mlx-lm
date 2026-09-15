@@ -651,6 +651,26 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_phimoe_rope_scaling_none(self):
+        from mlx_lm.models import phimoe
+
+        args = phimoe.ModelArgs(
+            model_type="phimoe",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=256,
+            num_local_experts=2,
+            num_experts_per_tok=2,
+            rope_scaling=None,
+        )
+        model = phimoe.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_gemma(self):
         from mlx_lm.models import gemma
 
