@@ -368,8 +368,12 @@ class OlmoHybridModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[self._fa_idx])
-        ssm_mask = create_ssm_mask(h, cache[self._lin_idx])
+        fa_mask = None
+        if self._fa_idx is not None:
+            fa_mask = create_attention_mask(h, cache[self._fa_idx])
+        ssm_mask = None
+        if self._lin_idx is not None:
+            ssm_mask = create_ssm_mask(h, cache[self._lin_idx])
 
         for layer, c in zip(self.layers, cache):
             if isinstance(layer, FullAttentionDecoderLayer):
