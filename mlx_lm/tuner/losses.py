@@ -3,9 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-
-def can_run_metal():
-    return mx.default_device() == mx.gpu and mx.metal.is_available()
+from ..utils import can_run_metal
 
 
 def _make_kl_forward_kernel():

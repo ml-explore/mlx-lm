@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +42,7 @@ class ModelArgs(BaseModelArgs):
     shared_expert_intermediate_size: int = 512
     moe_routed_scaling_factor: float = 1.0
     moe_router_logit_softcapping: float = 0.0
+    moe_router_score_func: str = "sigmoid"
 
     def __post_init__(self):
         if self.layer_types is None:
@@ -168,23 +171,29 @@ class MoEGate(nn.Module):
         self.top_k = args.num_experts_per_tok
         self.num_experts = args.num_experts
         self.softcap = args.moe_router_logit_softcapping
-        # A Linear rather than a bare matrix so quantized checkpoints (which
-        # ship the router as a quantized layer, e.g. the public 8-bit repacks)
-        # can load it directly; sanitize() maps the bare `gate.weight` layout
-        # onto `gate.proj.weight`.
+        self.score_func = args.moe_router_score_func
+        # A Linear, not a bare matrix, so a quantized router can load.
         self.proj = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
+
+    def _routing_scores(self, logits: mx.array) -> mx.array:
+        if self.score_func == "sigmoid":
+            return mx.sigmoid(logits)
+        if self.score_func == "sqrtsoftplus":
+            return mx.sqrt(nn.softplus(logits))
+        raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
     def __call__(self, x):
         logits = self.proj(x).astype(mx.float32)
         if self.softcap > 0.0:
             logits = mx.tanh(logits / self.softcap) * self.softcap
 
-        scores = mx.sigmoid(logits)
+        scores = self._routing_scores(logits)
         scores_for_selection = scores + self.e_score_correction_bias
         inds = mx.argpartition(-scores_for_selection, kth=self.top_k - 1, axis=-1)[
             ..., : self.top_k
         ]
+        inds = mx.stop_gradient(inds)
         weights = mx.take_along_axis(scores, inds, axis=-1)
         weights = weights / weights.sum(axis=-1, keepdims=True)
         return inds, weights
@@ -324,9 +333,7 @@ class Model(nn.Module):
         ]
 
     def sanitize(self, weights):
-        # Public repacks (e.g. AtomicChat/Laguna-XS-2.1-MLX-8bit and
-        # mlx-community/Laguna-XS-2.1-bf16) wrap every tensor in a VLM-style
-        # `language_model.` prefix.
+        # Repacked checkpoints wrap every tensor in a `language_model.` prefix.
         if any(k.startswith("language_model.") for k in weights):
             prefix = "language_model."
             weights = {
@@ -340,9 +347,7 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}.mlp"
 
-            # The original poolside layout (e.g. poolside/Laguna-S-2.1-bf16)
-            # stores the router as a bare matrix and the correction bias
-            # under `experts.`.
+            # The original layout has a bare router and the bias under `experts.`.
             gate_weight = weights.pop(f"{prefix}.gate.weight", None)
             if gate_weight is not None:
                 weights[f"{prefix}.gate.proj.weight"] = gate_weight
@@ -350,8 +355,7 @@ class Model(nn.Module):
             if bias is not None:
                 weights[f"{prefix}.gate.e_score_correction_bias"] = bias
 
-            # The original layout also stores experts individually; stack
-            # them into the SwitchGLU layout.
+            # It also stores experts individually; stack them for SwitchGLU.
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 for suffix in ("weight", "scales", "biases"):
                     if f"{prefix}.experts.0.{proj}.{suffix}" not in weights:
