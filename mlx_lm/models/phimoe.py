@@ -45,15 +45,18 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=True)
 
+        # Phi-mini-MoE-instruct ships `"rope_scaling": null`. SuScaledRoPE
+        # already defaults short/long factors to 1.0 when those keys are absent.
+        scaling = args.rope_scaling or {}
         self.rope = SuScaledRoPE(
             head_dim,
             base=args.rope_theta,
             max_position_embeddings=args.max_position_embeddings,
             original_max_position_embeddings=args.original_max_position_embeddings,
-            short_factor=args.rope_scaling["short_factor"],
-            long_factor=args.rope_scaling["long_factor"],
-            short_mscale=args.rope_scaling["short_mscale"],
-            long_mscale=args.rope_scaling["long_mscale"],
+            short_factor=scaling.get("short_factor", 1.0),
+            long_factor=scaling.get("long_factor", 1.0),
+            short_mscale=scaling.get("short_mscale"),
+            long_mscale=scaling.get("long_mscale"),
         )
 
     def __call__(
