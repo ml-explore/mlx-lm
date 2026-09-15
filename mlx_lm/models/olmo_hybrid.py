@@ -350,10 +350,12 @@ class OlmoHybridModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         self._fa_idx = next(
-            i for i, lt in enumerate(args.layer_types) if lt == "full_attention"
+            (i for i, lt in enumerate(args.layer_types) if lt == "full_attention"),
+            None,
         )
         self._lin_idx = next(
-            i for i, lt in enumerate(args.layer_types) if lt == "linear_attention"
+            (i for i, lt in enumerate(args.layer_types) if lt == "linear_attention"),
+            None,
         )
 
     def __call__(
