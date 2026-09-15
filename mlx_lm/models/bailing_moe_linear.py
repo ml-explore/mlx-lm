@@ -76,8 +76,6 @@ def recurrent_gla(
     Returns y with shape [B, H, T, Dv].
     """
     B, Hq, L, K = q.shape
-    Hv = k.shape[1]
-    V = v.shape[-1]
 
     outputs = []
     exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
@@ -105,7 +103,6 @@ class GroupRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        shape = x.shape
         x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
         x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
         return self.weight * mx.flatten(x, -2)
@@ -356,6 +353,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
