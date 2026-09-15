@@ -200,11 +200,18 @@ Face Space.
 
 - A rotating fixed-size key-value cache.
 - Prompt caching
+- A configurable prefill step size
 
 To use the rotating key-value cache pass the argument `--max-kv-size n` where
 `n` can be any integer. Smaller values like `512` will use very little RAM but
 result in worse quality. Larger values like `4096` or higher will use more RAM
 but have better quality.
+
+Long prompts are read in steps, and the step size sets how many prompt tokens
+are processed at once. Smaller steps use less peak memory while the prompt is
+read, at some cost to prompt processing speed. To change it pass
+`--prefill-step-size n`. The default is `2048`, and `mlx_lm.generate`,
+`mlx_lm.chat`, `mlx_lm.server` and `mlx_lm.benchmark` all accept it.
 
 Caching prompts can substantially speedup reusing the same long context with
 different queries. To cache a prompt use `mlx_lm.cache_prompt`. For example:

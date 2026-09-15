@@ -165,7 +165,7 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(B, S, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
-        inv_scale = self.head_k_dim ** -0.5
+        inv_scale = self.head_k_dim**-0.5
         q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
         k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
 
@@ -218,8 +218,12 @@ class Attention(nn.Module):
         total_kv_dim = args.num_key_value_heads * self.head_dim
 
         self.q_proj = nn.Linear(args.hidden_size, total_q_dim, bias=args.attention_bias)
-        self.k_proj = nn.Linear(args.hidden_size, total_kv_dim, bias=args.attention_bias)
-        self.v_proj = nn.Linear(args.hidden_size, total_kv_dim, bias=args.attention_bias)
+        self.k_proj = nn.Linear(
+            args.hidden_size, total_kv_dim, bias=args.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            args.hidden_size, total_kv_dim, bias=args.attention_bias
+        )
         self.o_proj = nn.Linear(total_q_dim, args.hidden_size, bias=args.attention_bias)
 
         self.q_norm = nn.RMSNorm(total_q_dim, eps=args.rms_norm_eps)
@@ -248,9 +252,15 @@ class Attention(nn.Module):
         k = self.k_norm(self.k_proj(x))
         v = self.v_proj(x)
 
-        q = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        k = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
+        v = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
+            0, 2, 1, 3
+        )
 
         if cache is not None:
             if self.rope is not None:
@@ -328,9 +338,11 @@ class OlmoHybridModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            LinearAttentionDecoderLayer(args)
-            if lt == "linear_attention"
-            else FullAttentionDecoderLayer(args)
+            (
+                LinearAttentionDecoderLayer(args)
+                if lt == "linear_attention"
+                else FullAttentionDecoderLayer(args)
+            )
             for lt in args.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
