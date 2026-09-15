@@ -6,7 +6,7 @@ from typing import Any
 
 import regex as re
 
-_func_name_regex = re.compile(r"^(.*?)<longcat_arg_key>", re.DOTALL)
+_func_name_regex = re.compile(r"^(.*?)(?:<longcat_arg_key>|$)", re.DOTALL)
 _func_arg_regex = re.compile(
     r"<longcat_arg_key>(.*?)</longcat_arg_key>(?:\\n|\s)*<longcat_arg_value>(.*?)</longcat_arg_value>",
     re.DOTALL,
