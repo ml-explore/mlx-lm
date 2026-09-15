@@ -156,6 +156,34 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_glm47_string_typed_args(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "postal_code": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+        # Laguna puts each pair on its own line. A string-typed argument stays a
+        # string even when it parses as a number.
+        test_case = (
+            "get_weather\n"
+            "<arg_key>postal_code</arg_key>\n<arg_value>123</arg_value>\n"
+            "<arg_key>days</arg_key>\n<arg_value>3</arg_value>"
+        )
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
+        )
+
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
         test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
