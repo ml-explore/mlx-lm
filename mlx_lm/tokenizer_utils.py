@@ -619,38 +619,40 @@ def _is_bpe_decoder(decoder):
 def _infer_tool_parser(tokenizer):
     """Attempt to auto-infer a tool parser from the chat template or vocab."""
     chat_template = tokenizer.chat_template
-    if not isinstance(chat_template, str):
-        if _is_xtml_vocab(tokenizer.get_vocab()):
-            return "kimi_k3"
-        return None
+    if isinstance(chat_template, str):
+        if "<minimax:tool_call>" in chat_template:
+            return "minimax_m2"
+        elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
+            return "gemma4"
+        elif "<start_function_call>" in chat_template:
+            return "function_gemma"
+        elif "<longcat_tool_call>" in chat_template:
+            return "longcat"
+        elif "<arg_key>" in chat_template:
+            return "glm47"
+        elif (
+            "<|tool_list_start|>" in chat_template
+            or "<|tool_call_start|>" in chat_template
+        ):
+            return "pythonic"
+        elif (
+            "<tool_call>\\n<function=" in chat_template
+            or "<tool_call>\n<function=" in chat_template
+        ):
+            return "qwen3_coder"
+        elif "<|tool_calls_section_begin|>" in chat_template:
+            return "kimi_k2"
+        elif "[TOOL_CALLS]" in chat_template:
+            return "mistral"
+        elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
+            return "json_tools"
 
-    if "<minimax:tool_call>" in chat_template:
-        return "minimax_m2"
-    elif "<|tool_call>" in chat_template and "<tool_call|>" in chat_template:
-        return "gemma4"
-    elif "<start_function_call>" in chat_template:
-        return "function_gemma"
-    elif "<longcat_tool_call>" in chat_template:
-        return "longcat"
-    elif "<arg_key>" in chat_template:
-        return "glm47"
-    elif "<|tool_list_start|>" in chat_template:
-        return "pythonic"
-    elif (
-        "<tool_call>\\n<function=" in chat_template
-        or "<tool_call>\n<function=" in chat_template
-    ):
-        return "qwen3_coder"
-    elif "<|tool_calls_section_begin|>" in chat_template:
-        return "kimi_k2"
-    elif "[TOOL_CALLS]" in chat_template:
-        return "mistral"
-    elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
-        return "json_tools"
-
-    # LFM2.5 has the tool-call tokens in its vocab but not its chat template.
+    # No template match, so fall back to the vocab. LFM2.5 conversions for
+    # example have the tool-call tokens but do not name them in the template.
     vocab = tokenizer.get_vocab()
-    if "<|tool_call_start|>" in vocab and "<|tool_call_end|>" in vocab:
+    if _is_xtml_vocab(vocab):
+        return "kimi_k3"
+    elif "<|tool_call_start|>" in vocab and "<|tool_call_end|>" in vocab:
         return "pythonic"
 
     return None
