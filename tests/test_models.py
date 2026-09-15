@@ -4022,6 +4022,278 @@ class TestModels(unittest.TestCase):
                 self.assertTrue(mx.allclose(y, y_gt, rtol=1e-4, atol=1e-4))
                 self.assertTrue(mx.allclose(st, st_gt, rtol=1e-4, atol=1e-3))
 
+    def encoder_model_test_runner(self, model, model_type, vocab_size, num_layers):
+        self.assertEqual(len(model.layers), num_layers)
+        self.assertEqual(model.model_type, model_type)
+
+        for t in [mx.float32, mx.float16]:
+            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
+
+            inputs = mx.array([[0, 5, 6, 2]])
+            outputs = model(inputs)
+            self.assertEqual(outputs.shape, (1, 4, vocab_size))
+            self.assertEqual(outputs.dtype, t)
+
+            out = model.encode(inputs, output_hidden_states=True)
+            self.assertEqual(out.hidden_states.shape[0], num_layers + 1)
+            self.assertEqual(out.last_hidden_state.dtype, t)
+
+        outputs = model(mx.array([[0, 5, 6, 2], [0, 7, 8, 2]]))
+        self.assertEqual(outputs.shape, (2, 4, vocab_size))
+
+        copy.deepcopy(model)
+
+    def test_esmc(self):
+        from mlx_lm.models import esmc
+
+        args = esmc.ModelArgs(
+            model_type="esmc",
+            vocab_size=64,
+            hidden_size=64,
+            num_attention_heads=4,
+            num_hidden_layers=4,
+        )
+        model = esmc.Model(args)
+        self.encoder_model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Pre-alignment field names, still carried by published checkpoints.
+        legacy = esmc.ModelArgs.from_dict({"d_model": 64, "n_heads": 4, "n_layers": 4})
+        self.assertEqual(legacy.hidden_size, args.hidden_size)
+        self.assertEqual(legacy.ffn_hidden, args.ffn_hidden)
+        self.assertEqual(esmc.ModelArgs(intermediate_size=128).ffn_hidden, 128)
+
+        ids, mask = esmc.batch_encode(["AC", "A"])
+        self.assertEqual(ids.tolist(), [[0, 5, 23, 2], [0, 5, 2, esmc.PAD_ID]])
+        self.assertEqual(mask.tolist(), [[1, 1, 1, 1], [1, 1, 1, 0]])
+
+        # Published "port" layout, with q/k/v and gate/up fused along dim 0.
+        named = model.sanitize(
+            {
+                "esmc.embed_tokens.weight": mx.zeros((1, 2)),
+                "esmc.norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.input_layernorm.bias": mx.zeros((2,)),
+                "esmc.layers.0.post_attention_layernorm.bias": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.q_norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.k_norm.weight": mx.zeros((2,)),
+                "esmc.layers.0.self_attn.o_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.q_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.k_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.self_attn.v_proj.weight": mx.zeros((2, 2)),
+                "esmc.layers.0.mlp.gate_proj.weight": mx.zeros((3, 2)),
+                "esmc.layers.0.mlp.up_proj.weight": mx.zeros((3, 2)),
+                "esmc.layers.0.mlp.down_proj.weight": mx.zeros((2, 3)),
+                "lm_head.dense.bias": mx.zeros((2,)),
+                "lm_head.layer_norm.bias": mx.zeros((2,)),
+                "lm_head.decoder.bias": mx.zeros((1,)),
+            }
+        )
+        b = "esmc.transformer.blocks.0."
+        self.assertEqual(
+            sorted(named),
+            sorted(
+                ["esmc.embed.weight", "esmc.transformer.norm.weight"]
+                + [f"lm_head.{i}.bias" for i in (0, 2, 3)]
+                + [
+                    b + k
+                    for k in (
+                        "attn.ln_qkv.bias",
+                        "ffn.ln.bias",
+                        "attn.q_ln.weight",
+                        "attn.k_ln.weight",
+                        "attn.out_proj.weight",
+                        "attn.qkv.weight",
+                        "ffn.fc1.weight",
+                        "ffn.fc2.weight",
+                    )
+                ]
+            ),
+        )
+        self.assertEqual(named[b + "attn.qkv.weight"].shape, (6, 2))
+        self.assertEqual(named[b + "ffn.fc1.weight"].shape, (6, 2))
+
+    def test_esmc_sae(self):
+        from mlx_lm.models import esmc, esmc_sae
+
+        sae = esmc_sae.SaeLayer(d_model=64, codebook_dim=128, k=4, layer=2)
+        sae.W_enc = mx.random.normal((64, 128))
+        sae.W_dec = mx.random.normal((128, 64))
+
+        features = sae(mx.random.normal((2, 5, 64)))
+        self.assertEqual(features.shape, (2, 5, 128))
+        self.assertTrue(mx.all(mx.sum(features > 0, axis=-1) <= sae.k))
+        self.assertEqual(sae.reconstruct(features).shape, (2, 5, 64))
+
+        model = esmc.Model(
+            esmc.ModelArgs(hidden_size=64, num_attention_heads=4, num_hidden_layers=4)
+        )
+        model.add_sae_layers([sae])
+        out = model.encode(mx.array([[0, 5, 6, 2]]))
+        self.assertEqual(out.sae_outputs[2].shape, (1, 4, 128))
+        # Only the SAE's own layer is collected when hidden states are not asked for.
+        self.assertIsNone(out.hidden_states)
+
+    def test_esmfold2(self):
+        from mlx_lm.models import esmc, esmfold2
+
+        n_tokens, n_atoms, d_inputs = 6, 12, 71
+        config = {
+            "d_pair": 8,
+            "d_single": 8,
+            "lm_d_model": 8,
+            "lm_num_layers": 2,
+            "inputs": {
+                "d_inputs": d_inputs,
+                "atom_encoder": {
+                    "d_atom": 16,
+                    "d_token": 8,
+                    "n_blocks": 1,
+                    "n_heads": 2,
+                    "swa_window_size": 8,
+                    "expansion_ratio": 2,
+                    "spatial_rope_base_frequency": 20.0,
+                    "n_spatial_rope_pairs_per_axis": 1,
+                    "n_uid_rope_pairs": 1,
+                    "uid_rope_base_frequency": 10000.0,
+                },
+            },
+            "folding_trunk": {"n_layers": 1},
+            "lm_encoder": {"n_layers": 1, "enabled": True},
+            "parcae": {"coda_n_layers": 1},
+            "structure_head": {
+                "distogram_bins": 4,
+                "diffusion_module": {
+                    "c_atom": 16,
+                    "c_token": 8,
+                    "c_z": 8,
+                    "c_s_inputs": d_inputs,
+                    "sigma_data": 16.0,
+                    "fourier_dim": 8,
+                    "atom_num_blocks": 1,
+                    "atom_num_heads": 2,
+                    "token_num_blocks": 1,
+                    "token_num_heads": 2,
+                    "transition_multiplier": 2,
+                },
+            },
+            "confidence_head": {
+                "enabled": True,
+                "distogram_bins": 4,
+                "num_plddt_bins": 4,
+                "num_pae_bins": 4,
+                "num_pde_bins": 4,
+                "folding_trunk": {"n_layers": 1},
+            },
+        }
+        model = esmfold2.ESMFold2Model(config)
+        model._esmc = esmc.Model(
+            esmc.ModelArgs(hidden_size=8, num_attention_heads=2, num_hidden_layers=2)
+        )
+        model.eval()
+
+        atoms_per_token = n_atoms // n_tokens
+        a2t = mx.repeat(mx.arange(n_tokens), atoms_per_token)[None]
+        chains = mx.array([[0] * 3 + [1] * 3])
+        feats = {
+            "token_index": mx.arange(n_tokens)[None],
+            "residue_index": mx.arange(n_tokens)[None],
+            "asym_id": chains,
+            "entity_id": chains,
+            "sym_id": mx.zeros((1, n_tokens), mx.int32),
+            "mol_type": mx.zeros((1, n_tokens), mx.int32),
+            "res_type": mx.arange(n_tokens)[None] + 4,
+            "input_ids": mx.arange(n_tokens)[None] + 4,
+            "token_bonds": mx.zeros((1, n_tokens, n_tokens, 1)),
+            "token_attention_mask": mx.ones((1, n_tokens), mx.bool_),
+            "ref_pos": mx.random.normal((1, n_atoms, 3)),
+            "ref_element": mx.full((1, n_atoms), 6, mx.int32),
+            "ref_charge": mx.zeros((1, n_atoms)),
+            "ref_atom_name_chars": mx.ones((1, n_atoms, 4), mx.int32),
+            "ref_space_uid": a2t,
+            "atom_attention_mask": mx.ones((1, n_atoms), mx.bool_),
+            "atom_to_token": a2t,
+            "distogram_atom_idx": (mx.arange(n_tokens) * atoms_per_token)[None],
+        }
+
+        for samples in (1, 3):
+            out = model.fold(
+                feats,
+                num_loops=1,
+                num_sampling_steps=2,
+                num_diffusion_samples=samples,
+                return_confidence=True,
+            )
+            mx.eval(out)
+            self.assertEqual(out["sample_atom_coords"].shape, (samples, n_atoms, 3))
+            self.assertEqual(out["plddt"].shape, (samples, n_tokens))
+            self.assertEqual(out["ptm"].shape, (samples,))
+            self.assertEqual(out["pair_chains_iptm"].shape, (samples, 2, 2))
+        self.assertEqual(out["distogram_logits"].shape, (1, n_tokens, n_tokens, 4))
+
+        # Chunking the pair transitions must not change the trunk output.
+        z0 = mx.zeros((1, n_tokens, n_tokens, config["d_pair"]))
+        full = model.trunk(feats, z0=z0, num_loops=1)[0]
+        model.set_chunk_size(2)
+        chunked = model.trunk(feats, z0=z0, num_loops=1)[0]
+        self.assertTrue(mx.allclose(full, chunked, atol=1e-4))
+
+    def test_esmfold2_port_layout_sanitize(self):
+        from mlx_lm.models.esmfold2 import sanitize_esmfold2
+
+        tt = "structure_head.token_transformer.layers.0."
+        cond = "structure_head.conditioning.single_transition_0.mlp."
+        out = sanitize_esmfold2(
+            {
+                "input_embedder.pair_init_1.weight": mx.zeros((2, 2)),
+                "parcae.log_state_decay": mx.zeros((2,)),
+                "language_model.layer_weights": mx.zeros((2,)),
+                "folding_trunk.layers.0.tri_mul_in.proj_gate.weight": mx.zeros((2, 2)),
+                cond + "gate_up_proj.weight": mx.zeros((4, 2)),
+                tt + "self_attn.q_proj.weight": mx.zeros((2, 2)),
+                tt + "self_attn.k_proj.weight": mx.zeros((2, 2)),
+                tt + "self_attn.v_proj.weight": mx.zeros((2, 2)),
+                tt + "mlp.gate_up_proj.weight": mx.zeros((4, 2)),
+            }
+        )
+        dm = "structure_head.diffusion_module."
+        self.assertEqual(
+            sorted(out),
+            sorted(
+                [
+                    "z_init_1.weight",
+                    "parcae_log_a",
+                    "language_model.base_z_combine",
+                    "folding_trunk.blocks.0.tri_mul_in.proj_gate.weight",
+                    dm + "conditioning.s_transitions.0.a_proj.weight",
+                    dm + "conditioning.s_transitions.0.b_proj.weight",
+                    dm + "token_transformer.attn_blocks.0.q_proj.weight",
+                    dm + "token_transformer.attn_blocks.0.kv_proj.weight",
+                    dm + "token_transformer.transition_blocks.0.lin_swish.weight",
+                ]
+            ),
+        )
+        kv = dm + "token_transformer.attn_blocks.0.kv_proj.weight"
+        self.assertEqual(out[kv].shape, (4, 2))
+        a_proj = dm + "conditioning.s_transitions.0.a_proj.weight"
+        self.assertEqual(out[a_proj].shape, (2, 2))
+        # A native-layout checkpoint only loses the `._engine.` trimul level.
+        engine = "folding_trunk.blocks.0.tri_mul_in._engine.proj_gate.weight"
+        native = {engine: mx.zeros((2, 2))}
+        self.assertEqual(
+            list(sanitize_esmfold2(native)),
+            ["folding_trunk.blocks.0.tri_mul_in.proj_gate.weight"],
+        )
+
+    def test_esmfold2_config_field_names(self):
+        from mlx_lm.models import esmfold2
+
+        self.assertEqual(esmfold2._get({"d_pair": 8}, "d_pair", "x"), 8)
+        self.assertEqual(esmfold2._get({"x": 8}, "d_pair", "x"), 8)
+        self.assertEqual(esmfold2._get({}, "d_pair", "x", 256), 256)
+        with self.assertRaises(KeyError):
+            esmfold2._get({}, "d_pair", "pairwise_hidden_size")
+
 
 class TestVLSanitize(unittest.TestCase):
     # Newer layout
