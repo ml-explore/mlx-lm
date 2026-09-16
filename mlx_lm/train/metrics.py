@@ -3,6 +3,7 @@
 import dataclasses
 import logging
 import time
+from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
@@ -92,41 +93,55 @@ class Metrics:
         return metrics
 
 
+_wandb = None  # the module, once init_wandb has opened a run
+
+
 def log_metrics(metrics):
     list_metrics = metrics if isinstance(metrics, list) else metrics.to_list()
 
     to_str = lambda v: f"{v:.4f}" if isinstance(v, float) else repr(v)
     logging.info(", ".join(f"{n}: {to_str(v)}" for n, v in list_metrics))
 
-    try:
-        import wandb
-    except ImportError:
+    if _wandb is None:
         return
 
     metrics_dict = dict(list_metrics)
     step = metrics_dict.pop("step")
-    if wandb.run is not None:
-        wandb.log(metrics_dict, step=step)
+    _wandb.log(metrics_dict, step=step)
+
+
+def experiment_name(config, args):
+    model = "-".join(Path(args.config).with_suffix("").parts[-2:])
+    return (
+        f"{model}_bs{config.batch_size}_ctx{config.context_size}"
+        f"_ga{config.get('grad_accum_steps', 1)}"
+    )
 
 
 def init_wandb(config, args, is_master):
-    if not is_master:
+    if not (args.wandb and is_master):
         return
     try:
         import wandb
     except ImportError:
+        logging.warning("--wandb was passed but wandb is not installed")
         return
     task = config.get("task", "pretrain")
-    kwargs = dict(
-        project=config.get("project", "mlx-lm"),
-        name=args.experiment_name,
-        tags=[
-            task,
-            f"batch_size_{config.batch_size}",
-            f"context_size_{config.context_size}",
-            f"grad_accum_{config.get('grad_accum_steps', 1)}",
-        ],
+    tags = [
+        task,
+        f"batch_size_{config.batch_size}",
+        f"context_size_{config.context_size}",
+        f"grad_accum_{config.get('grad_accum_steps', 1)}",
+        f"fsdp_dim_{config.get('fsdp_dim', 1)}",
+    ]
+    if config.get("random_data", False):
+        # a debug run on random tokens must not be mistaken for a real one
+        tags.append("random_data")
+    wandb.init(
+        project=config.get("project", "yet-another-smollm"),
+        name=experiment_name(config, args),
+        tags=tags,
+        config=config.to_dict(),
     )
-    if args.experiment_name is None:
-        kwargs["mode"] = "disabled"
-    wandb.init(**kwargs)
+    global _wandb
+    _wandb = wandb

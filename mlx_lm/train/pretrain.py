@@ -288,7 +288,10 @@ def build_parser():
         help="How often to log the training metrics. Overrides the experiment config",
     )
     parser.add_argument(
-        "--experiment-name", default=None, help="Run name for wandb; omit to disable"
+        "--wandb",
+        action="store_true",
+        help="Log the run to wandb. The run is named after the config, the "
+        "batch size, the context size and the accumulation steps",
     )
     return parser
 
