@@ -1,43 +1,19 @@
 # Copyright © 2026 Apple Inc.
 
-"""DeepSeek-V4.1-Flash text model.
-
-This module implements the text backbone used by DeepSeek-V4.1-Flash:
-
-* MLA with a shared K=V latent and a grouped output projection;
-* sliding attention plus CSA2 compressed attention and cross-layer KV sharing;
-* the two-level sparse indexer;
-* single-pass mHC residual streams; and
-* sqrt-softplus top-k MoE routing with a shared expert.
-
-The release also contains a vision tower, DSpark draft heads, and very large
-Engram tables. The MLX language-model loader intentionally keeps this module
-text-only and drops those optional checkpoint tensors in ``sanitize``. This
-keeps small and text-only checkpoints usable on local hardware.
-"""
-
-from __future__ import annotations
-
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
+from .activations import swiglu
 from .base import BaseModelArgs
+from .switch_layers import SwitchGLU
 
 
 NEG_INF = -1e30
-
-
-def _get(config: dict, *names: str, default=None):
-    for name in names:
-        if name in config and config[name] is not None:
-            return config[name]
-    return default
-
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -83,7 +59,6 @@ class ModelArgs(BaseModelArgs):
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
-    # Kept for config compatibility. Engram and multimodal tensors are dropped.
     engram_layer_ids: tuple = ()
     engram_num_embeddings: tuple = ()
     engram_max_ngram_size: int = 4
@@ -96,112 +71,6 @@ class ModelArgs(BaseModelArgs):
     dspark_target_layer_ids: tuple = ()
     vision_n_layers: int = 0
 
-    @property
-    def dim(self) -> int:
-        return self.hidden_size
-
-    @property
-    def n_layers(self) -> int:
-        return self.num_hidden_layers
-
-    @property
-    def rope_head_dim(self) -> int:
-        return self.qk_rope_head_dim
-
-    @property
-    def q_head_dim(self) -> int:
-        return self.head_dim
-
-    @property
-    def moe_inter_dim(self) -> int:
-        return self.moe_intermediate_size
-
-    @property
-    def n_activated_experts(self) -> int:
-        return self.num_experts_per_tok
-
-    @property
-    def route_scale(self) -> float:
-        return self.routed_scaling_factor
-
-    @property
-    def norm_eps(self) -> float:
-        return self.rms_norm_eps
-
-    @classmethod
-    def from_dict(cls, config: dict) -> "ModelArgs":
-        # The Hub config is composite: its model fields live under text_config.
-        text_config = config.get("text_config")
-        if isinstance(text_config, dict):
-            merged = dict(config)
-            merged.update(text_config)
-            config = merged
-
-        rope = _get(config, "rope_scaling", default={}) or {}
-        return cls(
-            vocab_size=_get(config, "vocab_size", default=129280),
-            hidden_size=_get(config, "hidden_size", "dim", default=5120),
-            num_hidden_layers=_get(config, "num_hidden_layers", "n_layers", default=40),
-            num_attention_heads=_get(config, "num_attention_heads", "n_heads", default=64),
-            num_key_value_heads=_get(config, "num_key_value_heads", default=1),
-            head_dim=_get(config, "head_dim", default=512),
-            q_lora_rank=_get(config, "q_lora_rank", default=1280),
-            qk_rope_head_dim=_get(config, "qk_rope_head_dim", "rope_head_dim", default=64),
-            o_groups=_get(config, "o_groups", default=8),
-            o_lora_rank=_get(config, "o_lora_rank", default=1024),
-            moe_intermediate_size=_get(config, "moe_intermediate_size", "moe_inter_dim", default=2304),
-            n_routed_experts=_get(config, "n_routed_experts", default=384),
-            n_shared_experts=_get(config, "n_shared_experts", default=1),
-            num_experts_per_tok=_get(config, "num_experts_per_tok", "n_activated_experts", default=6),
-            scoring_func=_get(config, "scoring_func", "score_func", default="sqrtsoftplus"),
-            gate_temp=_get(config, "gate_temp", default=1.0),
-            norm_topk_prob=_get(config, "norm_topk_prob", default=True),
-            routed_scaling_factor=_get(config, "routed_scaling_factor", "route_scale", default=1.5),
-            swiglu_limit=_get(config, "swiglu_limit", default=10.0),
-            hidden_act=_get(config, "hidden_act", default="silu"),
-            rms_norm_eps=_get(config, "rms_norm_eps", "norm_eps", default=1e-20),
-            sliding_window=_get(config, "sliding_window", "window_size", default=128),
-            compress_ratios=tuple(_get(config, "compress_ratios", default=()) or ()),
-            kv_source_layer_ids=tuple(_get(config, "kv_source_layer_ids", default=()) or ()),
-            index_source_layer_ids=tuple(_get(config, "index_source_layer_ids", default=()) or ()),
-            compress_rope_theta=_get(config, "compress_rope_theta", default=160000.0),
-            candidate_source_layer_id=_get(config, "candidate_source_layer_id", default=-1),
-            candidate_topk_blocks=_get(config, "candidate_topk_blocks", default=2048),
-            candidate_block_size=_get(config, "candidate_block_size", default=8),
-            index_n_heads=_get(config, "index_n_heads", default=32),
-            index_head_dim=_get(config, "index_head_dim", default=128),
-            index_topk=_get(config, "index_topk", default=512),
-            rope_theta=_get(config, "rope_theta", default=10000.0),
-            rope_scaling=rope,
-            max_position_embeddings=_get(config, "max_position_embeddings", "max_seq_len", default=1048576),
-            hc_mult=_get(config, "hc_mult", default=4),
-            hc_sinkhorn_iters=_get(config, "hc_sinkhorn_iters", default=20),
-            hc_eps=_get(config, "hc_eps", default=1e-6),
-            engram_layer_ids=tuple(_get(config, "engram_layer_ids", default=()) or ()),
-            engram_num_embeddings=tuple(_get(config, "engram_num_embeddings", default=()) or ()),
-            engram_max_ngram_size=_get(config, "engram_max_ngram_size", default=4),
-            engram_vocab_size=_get(config, "engram_vocab_size", default=16000000),
-            engram_n_heads=_get(config, "engram_n_heads", default=8),
-            engram_head_dim=_get(config, "engram_head_dim", default=256),
-            engram_pad_id=_get(config, "engram_pad_id", "engram_pad_token_id", default=2),
-            engram_compressed_vocab_size=_get(config, "engram_compressed_vocab_size", default=99092),
-            num_nextn_predict_layers=_get(config, "num_nextn_predict_layers", default=3),
-            dspark_target_layer_ids=tuple(_get(config, "dspark_target_layer_ids", default=()) or ()),
-        )
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.weight = mx.ones((dim,), dtype=mx.float32)
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
-        xf = x.astype(mx.float32)
-        xf = xf * mx.rsqrt(mx.mean(mx.square(xf), axis=-1, keepdims=True) + self.eps)
-        return (xf * self.weight).astype(dtype)
-
 
 class UnweightedRMSNorm(nn.Module):
     def __init__(self, eps: float):
@@ -209,10 +78,7 @@ class UnweightedRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        dtype = x.dtype
-        xf = x.astype(mx.float32)
-        xf = xf * mx.rsqrt(mx.mean(mx.square(xf), axis=-1, keepdims=True) + self.eps)
-        return xf.astype(dtype)
+        return mx.fast.rms_norm(x, None, self.eps)
 
 
 def _yarn_inv_freq(dim: int, base: float, factor: float, original: int,
@@ -444,7 +310,7 @@ class Compressor(nn.Module):
         self.gate_proj = (
             nn.Linear(args.hidden_size, args.head_dim, bias=False) if self.ratio > 1 else None
         )
-        self.kv_norm = RMSNorm(args.head_dim, args.rms_norm_eps)
+        self.kv_norm = nn.RMSNorm(args.head_dim, args.rms_norm_eps)
 
     def __call__(self, x: mx.array, start_pos: int, cache: LayerCache):
         if self.ratio == 1:
@@ -472,7 +338,6 @@ class Compressor(nn.Module):
         gate = gate[:, : groups * self.ratio].reshape(gate.shape[0], groups, self.ratio, -1)
         latent = mx.sum(kv * mx.softmax(gate, axis=2), axis=2)
         latent = self.kv_norm(latent.astype(x.dtype))
-        first = start_pos - (self.pending_len if False else 0)
         # pending_len has already been updated, so derive the first group from
         # the current absolute position and the number of newly emitted groups.
         group_start = start_pos - ((total - x.shape[1]) % self.ratio)
@@ -501,14 +366,14 @@ def _sparse_attention(q: mx.array, kv: mx.array, sinks: mx.array, indices: mx.ar
     # q [B,S,H,D], kv [B,K,D], indices [B,S,Ksel].
     selected = _gather_rows(kv, indices).astype(mx.float32)
     qf = q.astype(mx.float32)
-    logits = mx.einsum("bshd,bskd->bshk", qf, selected) * scale
+    logits = mx.matmul(qf, selected.swapaxes(-1, -2)) * scale
     valid = indices[:, :, None, :] >= 0
     logits = mx.where(valid, logits, NEG_INF)
     max_logit = mx.maximum(mx.max(logits, axis=-1, keepdims=True), sinks.reshape(1, 1, -1, 1))
     weights = mx.exp(logits - max_logit)
     weights = mx.where(valid, weights, 0.0)
     denom = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(sinks.reshape(1, 1, -1, 1) - max_logit)
-    out = mx.einsum("bshk,bskd->bshd", weights, selected) / denom
+    out = mx.matmul(weights, selected) / denom
     return out.astype(q.dtype)
 
 
@@ -529,9 +394,8 @@ class Indexer(nn.Module):
         self.q_b_proj = nn.Linear(args.q_lora_rank, self.num_heads * self.head_dim, bias=False)
         self.weights_proj = nn.Linear(args.hidden_size, self.num_heads, bias=False)
         if self.owns_k:
-            # The index key dimension is index_head_dim in the HF checkpoint.
             self.k_proj = nn.Linear(args.head_dim, args.index_head_dim, bias=False)
-            self.k_norm = RMSNorm(args.index_head_dim, args.rms_norm_eps)
+            self.k_norm = nn.RMSNorm(args.index_head_dim, args.rms_norm_eps)
 
     def __call__(self, x: mx.array, q_residual: mx.array, positions: mx.array,
                  index_k: mx.array, cos: mx.array, sin: mx.array, shared: dict):
@@ -547,7 +411,9 @@ class Indexer(nn.Module):
         q = _fake_quant_fp4(q, 32)
         keys = index_k.astype(mx.float32)
         weights = self.weights_proj(x).astype(mx.float32) * (self.num_heads ** -0.5)
-        scores = mx.einsum("bshd,btd->bsht", q.astype(mx.float32), keys)
+        scores = mx.matmul(
+            q.astype(mx.float32), keys[:, None, :, :].swapaxes(-1, -2)
+        )
         scores = mx.maximum(scores, 0.0) * (self.head_dim ** -0.5)
         scores = mx.sum(scores * weights[..., None], axis=2)
         lens = ((positions + 1) // self.ratio).astype(mx.int32)[:, None]
@@ -582,10 +448,10 @@ class Attention(nn.Module):
         self.is_kv_source = layer_id in args.kv_source_layer_ids
         self.is_index_source = layer_id in args.index_source_layer_ids
         self.q_a_proj = nn.Linear(args.hidden_size, args.q_lora_rank, bias=False)
-        self.q_a_norm = RMSNorm(args.q_lora_rank, args.rms_norm_eps)
+        self.q_a_norm = nn.RMSNorm(args.q_lora_rank, args.rms_norm_eps)
         self.q_b_proj = nn.Linear(args.q_lora_rank, args.num_attention_heads * args.head_dim, bias=False)
         self.kv_proj = nn.Linear(args.hidden_size, args.head_dim, bias=False)
-        self.kv_norm = RMSNorm(args.head_dim, args.rms_norm_eps)
+        self.kv_norm = nn.RMSNorm(args.head_dim, args.rms_norm_eps)
         self.o_a_proj = nn.Linear(
             args.num_attention_heads * args.head_dim // args.o_groups,
             args.o_groups * args.o_lora_rank,
@@ -682,7 +548,7 @@ class Attention(nn.Module):
             topk = shared.get("topk_idx")
             if compressed_kv is not None and topk is not None and topk.shape[-1] > 0:
                 # Compressed entries follow the window entries in the index space.
-                topk = topk + window.shape[1]
+                topk = mx.where(topk >= 0, topk + window.shape[1], mx.array(-1, mx.int32))
                 selected_indices = mx.concatenate([window_indices, topk], axis=-1)
                 window = mx.concatenate([window, compressed_kv], axis=1)
 
@@ -694,21 +560,35 @@ class Attention(nn.Module):
         return self.o_b_proj(output.reshape(batch, length, -1).astype(x.dtype))
 
 
+class DeepseekV41SwiGLU(nn.Module):
+    """DeepSeek-V4.1's clamped SwiGLU activation."""
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, up: mx.array, gate: mx.array) -> mx.array:
+        dtype = up.dtype
+        gate = gate.astype(mx.float32)
+        up = up.astype(mx.float32)
+        if self.limit > 0:
+            gate = mx.minimum(gate, self.limit)
+            up = mx.clip(up, -self.limit, self.limit)
+        return swiglu(gate, up).astype(dtype)
+
+
 class SharedMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.gate_proj = nn.Linear(args.hidden_size, args.moe_intermediate_size, bias=False)
         self.up_proj = nn.Linear(args.hidden_size, args.moe_intermediate_size, bias=False)
         self.down_proj = nn.Linear(args.moe_intermediate_size, args.hidden_size, bias=False)
-        self.limit = args.swiglu_limit
+        self.activation = DeepseekV41SwiGLU(args.swiglu_limit)
 
     def __call__(self, x: mx.array):
-        gate = self.gate_proj(x).astype(mx.float32)
-        up = self.up_proj(x).astype(mx.float32)
-        if self.limit > 0:
-            gate = mx.minimum(gate, self.limit)
-            up = mx.clip(up, -self.limit, self.limit)
-        return self.down_proj((mx.sigmoid(gate) * gate * up).astype(x.dtype))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        return self.down_proj(self.activation(up, gate).astype(x.dtype))
 
 
 class Router(nn.Module):
@@ -742,34 +622,22 @@ class Router(nn.Module):
 
 
 class Experts(nn.Module):
+    """Sparse V4.1 experts backed by the shared SwitchGLU implementation."""
+
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_up_proj = mx.zeros(
-            (args.n_routed_experts, 2 * args.moe_intermediate_size, args.hidden_size),
-            dtype=mx.float32,
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.n_routed_experts,
+            activation=DeepseekV41SwiGLU(args.swiglu_limit),
         )
-        self.down_proj = mx.zeros(
-            (args.n_routed_experts, args.hidden_size, args.moe_intermediate_size),
-            dtype=mx.float32,
-        )
-        self.num_experts = args.n_routed_experts
-        self.intermediate = args.moe_intermediate_size
-        self.limit = args.swiglu_limit
 
     def __call__(self, x: mx.array, indices: mx.array, weights: mx.array):
-        # Gathering only selected experts avoids materializing all expert outputs.
-        selected = self.gate_up_proj[indices]
-        gate_w = selected[..., : self.intermediate, :]
-        up_w = selected[..., self.intermediate :, :]
-        gate = mx.einsum("td,tkid->tki", x.astype(mx.float32), gate_w.astype(mx.float32))
-        up = mx.einsum("td,tkid->tki", x.astype(mx.float32), up_w.astype(mx.float32))
-        if self.limit > 0:
-            gate = mx.minimum(gate, self.limit)
-            up = mx.clip(up, -self.limit, self.limit)
-        hidden = mx.sigmoid(gate) * gate * up
-        down_w = self.down_proj[indices]
-        routed = mx.einsum("tki,tkdi->tkd", hidden.astype(x.dtype), down_w.astype(x.dtype))
-        return mx.sum(routed.astype(mx.float32) * weights[..., None].astype(mx.float32), axis=1)
+        routed = self.switch_mlp(x, indices)
+        return mx.sum(
+            routed.astype(mx.float32) * weights[..., None].astype(mx.float32), axis=1
+        )
 
 
 class MoE(nn.Module):
@@ -795,8 +663,8 @@ class DecoderLayer(nn.Module):
         self.layer_idx = layer_id
         self.self_attn = Attention(args, layer_id)
         self.mlp = MoE(args)
-        self.input_layernorm = RMSNorm(args.hidden_size, args.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
         self.attn_hc = HyperConnection(args)
         self.ffn_hc = HyperConnection(args)
 
@@ -821,7 +689,7 @@ class TextModel(nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
-        self.norm = RMSNorm(args.hidden_size, args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
         self.args = args
 
     def make_cache(self):
@@ -855,7 +723,6 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        # Keep the conventional public API without registering a second module path.
         return self.model.layers
 
     def make_cache(self):
@@ -887,9 +754,6 @@ class Model(nn.Module):
                 )
                 continue
 
-            # Transformers reverses the DeepSeek-V4.1 conversion map when a
-            # checkpoint is saved. Accept those legacy names as well as the
-            # current native module names used by the MLX model.
             if key == "head.weight":
                 key = "lm_head.weight"
             elif key == "embed.weight":
@@ -922,12 +786,26 @@ class Model(nn.Module):
             clean[key] = value
 
         for prefix, parts in experts.items():
-            for name, rows in parts.items():
+            for _name, rows in parts.items():
                 rows.sort(key=lambda item: item[0])
             if all(name in parts and len(parts[name]) == self.args.n_routed_experts for name in ("w1", "w2", "w3")):
                 gate = mx.stack([value for _, value in parts["w1"]])
                 up = mx.stack([value for _, value in parts["w3"]])
                 down = mx.stack([value for _, value in parts["w2"]])
-                clean[f"{prefix}.mlp.experts.gate_up_proj"] = mx.concatenate([gate, up], axis=1)
-                clean[f"{prefix}.mlp.experts.down_proj"] = down
+                clean[f"{prefix}.mlp.experts.switch_mlp.gate_proj.weight"] = gate
+                clean[f"{prefix}.mlp.experts.switch_mlp.up_proj.weight"] = up
+                clean[f"{prefix}.mlp.experts.switch_mlp.down_proj.weight"] = down
+
+        for layer_id in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{layer_id}.mlp.experts"
+            gate_up_key = f"{prefix}.gate_up_proj"
+            if gate_up_key not in clean:
+                continue
+            gate_up = clean.pop(gate_up_key)
+            mid = gate_up.shape[-2] // 2
+            clean[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
+            clean[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
+            clean[f"{prefix}.switch_mlp.down_proj.weight"] = clean.pop(
+                f"{prefix}.down_proj"
+            )
         return clean
