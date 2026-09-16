@@ -1,4 +1,4 @@
-"""Small Transformers-to-MLX parity checks for DeepSeek-V4.1."""
+# Copyright © 2026 Apple Inc.
 
 import importlib.util
 import tempfile
@@ -10,9 +10,12 @@ import numpy as np
 
 from mlx_lm import utils
 from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.deepseek_v41 import _apply_rope
+from mlx_lm.models.rope_utils import YarnRoPE
 
-
-HAS_TRANSFORMERS_V41 = importlib.util.find_spec("transformers.models.deepseek_v41") is not None
+HAS_TRANSFORMERS_V41 = (
+    importlib.util.find_spec("transformers.models.deepseek_v41") is not None
+)
 
 
 def _tiny_config():
@@ -57,7 +60,32 @@ def _tiny_config():
     )
 
 
-@unittest.skipUnless(HAS_TRANSFORMERS_V41, "requires the pending Transformers DeepSeek-V4.1 implementation")
+class DeepseekV41RopeTest(unittest.TestCase):
+    def test_partial_rope_supports_strided_positions_and_inverse(self):
+        rope = YarnRoPE(
+            dims=4,
+            traditional=True,
+            base=160000.0,
+            scaling_factor=2.0,
+            original_max_position_embeddings=16,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=0.0,
+            mscale_all_dim=0.0,
+        )
+
+        for shape in ((1, 5, 8), (1, 5, 2, 8)):
+            x = mx.random.normal(shape)
+            rotated = _apply_rope(x, rope, 4, offset=4, scale=2.0)
+            restored = _apply_rope(rotated, rope, 4, offset=4, scale=2.0, inverse=True)
+            mx.eval(restored)
+            np.testing.assert_allclose(np.asarray(restored), np.asarray(x), atol=1e-5)
+
+
+@unittest.skipUnless(
+    HAS_TRANSFORMERS_V41,
+    "requires the pending Transformers DeepSeek-V4.1 implementation",
+)
 class DeepseekV41Test(unittest.TestCase):
     def test_tiny_transformers_checkpoint_loads_and_matches(self):
         import torch
@@ -79,7 +107,9 @@ class DeepseekV41Test(unittest.TestCase):
             mx.eval(actual)
 
             self.assertLess(sum(p.numel() for p in hf_model.parameters()), 100_000_000)
-            np.testing.assert_allclose(np.asarray(actual), expected, rtol=2e-4, atol=2e-4)
+            np.testing.assert_allclose(
+                np.asarray(actual), expected, rtol=2e-4, atol=2e-4
+            )
 
     def test_cached_decode_matches_full_forward(self):
         import torch

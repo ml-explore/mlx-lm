@@ -1,19 +1,19 @@
 # Copyright © 2026 Apple Inc.
 
-import math
 import re
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs
+from .rope_utils import YarnRoPE
 from .switch_layers import SwitchGLU
 
-
 NEG_INF = -1e30
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -81,46 +81,26 @@ class UnweightedRMSNorm(nn.Module):
         return mx.fast.rms_norm(x, None, self.eps)
 
 
-def _yarn_inv_freq(dim: int, base: float, factor: float, original: int,
-                   beta_fast: int, beta_slow: int) -> mx.array:
-    freqs = 1.0 / (base ** (mx.arange(0, dim, 2, dtype=mx.float32) / dim))
-    if factor <= 1:
-        return freqs
-
-    def correction(rotations: float) -> float:
-        return dim * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(base))
-
-    low = max(correction(beta_fast), 0.0)
-    high = min(correction(beta_slow), dim - 1)
-    ramp = mx.clip(
-        (mx.arange(dim // 2, dtype=mx.float32) - low) / max(high - low, 1e-3),
-        0,
-        1,
-    )
-    # Low-frequency dimensions keep the original frequencies; high-frequency
-    # dimensions use the interpolated frequencies, matching Transformers YaRN.
-    return freqs * ((1.0 - ramp) + ramp / factor)
-
-
-def _rotate_tail(x: mx.array, cos: mx.array, sin: mx.array, rope_dim: int,
-                 inverse: bool = False) -> mx.array:
+def _apply_rope(
+    x: mx.array,
+    rope: YarnRoPE,
+    rope_dim: int,
+    offset: Union[int, mx.array] = 0,
+    scale: float = 1.0,
+    inverse: bool = False,
+) -> mx.array:
+    """Apply interleaved RoPE to the trailing feature slice."""
     if rope_dim == 0:
         return x
-    if inverse:
-        sin = -sin
     head = x[..., :-rope_dim]
     tail = x[..., -rope_dim:].astype(mx.float32)
-    shape = tail.shape
-    tail = tail.reshape(*shape[:-1], rope_dim // 2, 2)
-    even, odd = tail[..., 0], tail[..., 1]
     if x.ndim == 4:
-        c = cos[None, :, None, :]
-        s = sin[None, :, None, :]
+        tail = tail.transpose(0, 2, 1, 3)
+        tail = rope(tail, offset=offset, scale=scale, inverse=inverse)
+        tail = tail.transpose(0, 2, 1, 3)
     else:
-        c = cos[None, :, :]
-        s = sin[None, :, :]
-    out = mx.stack([even * c - odd * s, even * s + odd * c], axis=-1)
-    return mx.concatenate([head, out.reshape(shape).astype(x.dtype)], axis=-1)
+        tail = rope(tail, offset=offset, scale=scale, inverse=inverse)
+    return mx.concatenate([head, tail.astype(x.dtype)], axis=-1)
 
 
 def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
@@ -135,7 +115,11 @@ def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
     exponent = mx.ceil(mx.log2(amax / 448.0))
     scale = mx.power(2.0, exponent)
     quantized = mx.clip(blocks / scale, -448.0, 448.0)
-    return (mx.from_fp8(mx.to_fp8(quantized), mx.float32) * scale).reshape(shape).astype(dtype)
+    return (
+        (mx.from_fp8(mx.to_fp8(quantized), mx.float32) * scale)
+        .reshape(shape)
+        .astype(dtype)
+    )
 
 
 _FP4_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
@@ -157,7 +141,7 @@ def _fake_quant_fp4(x: mx.array, block_size: int, e4m3_scale: bool = False) -> m
     dtype = x.dtype
     shape = x.shape
     blocks = x.astype(mx.float32).reshape(*shape[:-1], -1, block_size)
-    floor = 6.0 * 2.0 ** -9 if e4m3_scale else 6.0 * 2.0 ** -126
+    floor = 6.0 * 2.0**-9 if e4m3_scale else 6.0 * 2.0**-126
     amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), floor)
     if e4m3_scale:
         # e4m3 scale rounding is a small approximation on MLX versions without
@@ -182,10 +166,14 @@ class HyperConnection(nn.Module):
         self.scale = mx.ones((3,), dtype=mx.float32)
 
     def __call__(self, streams: mx.array):
-        flat = self.input_norm(streams.reshape(*streams.shape[:2], -1)).astype(mx.float32)
+        flat = self.input_norm(streams.reshape(*streams.shape[:2], -1)).astype(
+            mx.float32
+        )
         weights = flat @ self.fn.astype(mx.float32).T
         pre_w, post_w, comb_w = mx.split(weights, [self.hc, 2 * self.hc], axis=-1)
-        pre_b, post_b, comb_b = mx.split(self.base.astype(mx.float32), [self.hc, 2 * self.hc], axis=0)
+        pre_b, post_b, comb_b = mx.split(
+            self.base.astype(mx.float32), [self.hc, 2 * self.hc], axis=0
+        )
         pre_scale, post_scale, comb_scale = self.scale.astype(mx.float32)
         pre = mx.sigmoid(pre_w * pre_scale + pre_b) + self.hc_eps
         post = 2.0 * mx.sigmoid(post_w * post_scale + post_b)
@@ -204,7 +192,9 @@ def _collapse(streams: mx.array, mix: mx.array) -> mx.array:
     return out.astype(streams.dtype)
 
 
-def _expand(x: mx.array, residual: mx.array, post: mx.array, comb: mx.array) -> mx.array:
+def _expand(
+    x: mx.array, residual: mx.array, post: mx.array, comb: mx.array
+) -> mx.array:
     mixed = mx.sum(comb[..., None] * residual[..., :, None, :], axis=2)
     out = post[..., None] * x[..., None, :] + mixed
     return out.astype(residual.dtype)
@@ -237,8 +227,12 @@ class LayerCache:
         self.window = mx.zeros((batch_size, 0, self.args.head_dim), dtype=dtype)
         self.comp_kv = mx.zeros((batch_size, 0, self.args.head_dim), dtype=dtype)
         self.index_k = mx.zeros((batch_size, 0, self.args.index_head_dim), dtype=dtype)
-        self.pending_kv = mx.zeros((batch_size, 0, self.args.head_dim), dtype=mx.float32)
-        self.pending_gate = mx.zeros((batch_size, 0, self.args.head_dim), dtype=mx.float32)
+        self.pending_kv = mx.zeros(
+            (batch_size, 0, self.args.head_dim), dtype=mx.float32
+        )
+        self.pending_gate = mx.zeros(
+            (batch_size, 0, self.args.head_dim), dtype=mx.float32
+        )
         self.pending_len = 0
 
     def write_window(self, kv: mx.array):
@@ -265,7 +259,13 @@ class LayerCache:
 
     @property
     def nbytes(self):
-        arrays = (self.window, self.comp_kv, self.index_k, self.pending_kv, self.pending_gate)
+        arrays = (
+            self.window,
+            self.comp_kv,
+            self.index_k,
+            self.pending_kv,
+            self.pending_gate,
+        )
         return sum(a.nbytes for a in arrays if a is not None)
 
     def trim(self, n: int):
@@ -273,7 +273,11 @@ class LayerCache:
         self.offset -= n
         if self.window is not None:
             self.window = self.window[:, : max(self.window.shape[1] - n, 0)]
-        ratio = self.args.compress_ratios[self.layer_id] if self.layer_id < len(self.args.compress_ratios) else 0
+        ratio = (
+            self.args.compress_ratios[self.layer_id]
+            if self.layer_id < len(self.args.compress_ratios)
+            else 0
+        )
         if ratio:
             keep = max((self.offset // ratio), 0)
             self.comp_kv = self.comp_kv[:, :keep]
@@ -308,13 +312,15 @@ class Compressor(nn.Module):
         self.head_dim = args.head_dim
         self.kv_proj = nn.Linear(args.hidden_size, args.head_dim, bias=False)
         self.gate_proj = (
-            nn.Linear(args.hidden_size, args.head_dim, bias=False) if self.ratio > 1 else None
+            nn.Linear(args.hidden_size, args.head_dim, bias=False)
+            if self.ratio > 1
+            else None
         )
         self.kv_norm = nn.RMSNorm(args.head_dim, args.rms_norm_eps)
 
     def __call__(self, x: mx.array, start_pos: int, cache: LayerCache):
         if self.ratio == 1:
-            return self.kv_norm(self.kv_proj(x)), start_pos + mx.arange(x.shape[1])
+            return self.kv_norm(self.kv_proj(x)), start_pos
 
         kv = x.astype(mx.float32) @ self.kv_proj.weight.astype(mx.float32).T
         gate = x.astype(mx.float32) @ self.gate_proj.weight.astype(mx.float32).T
@@ -335,14 +341,15 @@ class Compressor(nn.Module):
         if groups == 0:
             return None, mx.zeros((0,), dtype=mx.int32)
         kv = kv[:, : groups * self.ratio].reshape(kv.shape[0], groups, self.ratio, -1)
-        gate = gate[:, : groups * self.ratio].reshape(gate.shape[0], groups, self.ratio, -1)
+        gate = gate[:, : groups * self.ratio].reshape(
+            gate.shape[0], groups, self.ratio, -1
+        )
         latent = mx.sum(kv * mx.softmax(gate, axis=2), axis=2)
         latent = self.kv_norm(latent.astype(x.dtype))
         # pending_len has already been updated, so derive the first group from
         # the current absolute position and the number of newly emitted groups.
         group_start = start_pos - ((total - x.shape[1]) % self.ratio)
-        positions = group_start + mx.arange(groups) * self.ratio
-        return latent, positions
+        return latent, group_start
 
 
 def _window_indices(previous: int, length: int, window: int) -> mx.array:
@@ -350,7 +357,9 @@ def _window_indices(previous: int, length: int, window: int) -> mx.array:
     end = previous + mx.arange(length)
     start = mx.maximum(end - window + 1, 0)
     indices = start[:, None] + mx.arange(width)[None, :]
-    return mx.where(indices > end[:, None], mx.array(-1, mx.int32), indices.astype(mx.int32))
+    return mx.where(
+        indices > end[:, None], mx.array(-1, mx.int32), indices.astype(mx.int32)
+    )
 
 
 def _gather_rows(values: mx.array, indices: mx.array) -> mx.array:
@@ -361,18 +370,23 @@ def _gather_rows(values: mx.array, indices: mx.array) -> mx.array:
     return flat[(safe + base).reshape(-1)].reshape(*indices.shape, dim)
 
 
-def _sparse_attention(q: mx.array, kv: mx.array, sinks: mx.array, indices: mx.array,
-                      scale: float) -> mx.array:
+def _sparse_attention(
+    q: mx.array, kv: mx.array, sinks: mx.array, indices: mx.array, scale: float
+) -> mx.array:
     # q [B,S,H,D], kv [B,K,D], indices [B,S,Ksel].
     selected = _gather_rows(kv, indices).astype(mx.float32)
     qf = q.astype(mx.float32)
     logits = mx.matmul(qf, selected.swapaxes(-1, -2)) * scale
     valid = indices[:, :, None, :] >= 0
     logits = mx.where(valid, logits, NEG_INF)
-    max_logit = mx.maximum(mx.max(logits, axis=-1, keepdims=True), sinks.reshape(1, 1, -1, 1))
+    max_logit = mx.maximum(
+        mx.max(logits, axis=-1, keepdims=True), sinks.reshape(1, 1, -1, 1)
+    )
     weights = mx.exp(logits - max_logit)
     weights = mx.where(valid, weights, 0.0)
-    denom = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(sinks.reshape(1, 1, -1, 1) - max_logit)
+    denom = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(
+        sinks.reshape(1, 1, -1, 1) - max_logit
+    )
     out = mx.matmul(weights, selected) / denom
     return out.astype(q.dtype)
 
@@ -391,14 +405,24 @@ class Indexer(nn.Module):
         self.head_dim = args.index_head_dim
         self.index_topk = args.index_topk
         self.rope_dim = args.qk_rope_head_dim
-        self.q_b_proj = nn.Linear(args.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.q_b_proj = nn.Linear(
+            args.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
         self.weights_proj = nn.Linear(args.hidden_size, self.num_heads, bias=False)
         if self.owns_k:
             self.k_proj = nn.Linear(args.head_dim, args.index_head_dim, bias=False)
             self.k_norm = nn.RMSNorm(args.index_head_dim, args.rms_norm_eps)
 
-    def __call__(self, x: mx.array, q_residual: mx.array, positions: mx.array,
-                 index_k: mx.array, cos: mx.array, sin: mx.array, shared: dict):
+    def __call__(
+        self,
+        x: mx.array,
+        q_residual: mx.array,
+        positions: mx.array,
+        index_k: mx.array,
+        rope: YarnRoPE,
+        start_pos: int,
+        shared: dict,
+    ):
         batch, length, _ = x.shape
         if index_k.shape[1] == 0:
             shared["topk_idx"] = mx.zeros((batch, length, 0), dtype=mx.int32)
@@ -406,15 +430,15 @@ class Indexer(nn.Module):
                 shared["candidates"] = None
             return
 
-        q = self.q_b_proj(q_residual).reshape(batch, length, self.num_heads, self.head_dim)
-        q = _rotate_tail(q, cos, sin, self.rope_dim)
+        q = self.q_b_proj(q_residual).reshape(
+            batch, length, self.num_heads, self.head_dim
+        )
+        q = _apply_rope(q, rope, self.rope_dim, offset=start_pos)
         q = _fake_quant_fp4(q, 32)
         keys = index_k.astype(mx.float32)
-        weights = self.weights_proj(x).astype(mx.float32) * (self.num_heads ** -0.5)
-        scores = mx.matmul(
-            q.astype(mx.float32), keys[:, None, :, :].swapaxes(-1, -2)
-        )
-        scores = mx.maximum(scores, 0.0) * (self.head_dim ** -0.5)
+        weights = self.weights_proj(x).astype(mx.float32) * (self.num_heads**-0.5)
+        scores = mx.matmul(q.astype(mx.float32), keys[:, None, :, :].swapaxes(-1, -2))
+        scores = mx.maximum(scores, 0.0) * (self.head_dim**-0.5)
         scores = mx.sum(scores * weights[..., None], axis=2)
         lens = ((positions + 1) // self.ratio).astype(mx.int32)[:, None]
         visible = mx.arange(index_k.shape[1])[None, :] < lens
@@ -426,10 +450,14 @@ class Indexer(nn.Module):
             padded = mx.pad(scores, [(0, 0), (0, 0), (0, pad)], constant_values=NEG_INF)
             block_scores = padded.reshape(batch, length, -1, block).max(axis=-1)
             k_blocks = min(self.candidate_topk_blocks, block_scores.shape[-1])
-            chosen = mx.argpartition(-block_scores, k_blocks - 1, axis=-1)[..., :k_blocks]
+            chosen = mx.argpartition(-block_scores, k_blocks - 1, axis=-1)[
+                ..., :k_blocks
+            ]
             candidate = mx.zeros(block_scores.shape, dtype=mx.bool_)
             candidate = mx.put_along_axis(candidate, chosen, True, axis=-1)
-            shared["candidates"] = mx.repeat(candidate, block, axis=-1)[..., : scores.shape[-1]]
+            shared["candidates"] = mx.repeat(candidate, block, axis=-1)[
+                ..., : scores.shape[-1]
+            ]
         elif self.uses_candidates and shared.get("candidates") is not None:
             scores = mx.where(shared["candidates"], scores, NEG_INF)
 
@@ -444,12 +472,18 @@ class Attention(nn.Module):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
-        self.ratio = int(args.compress_ratios[layer_id]) if layer_id < len(args.compress_ratios) else 0
+        self.ratio = (
+            int(args.compress_ratios[layer_id])
+            if layer_id < len(args.compress_ratios)
+            else 0
+        )
         self.is_kv_source = layer_id in args.kv_source_layer_ids
         self.is_index_source = layer_id in args.index_source_layer_ids
         self.q_a_proj = nn.Linear(args.hidden_size, args.q_lora_rank, bias=False)
         self.q_a_norm = nn.RMSNorm(args.q_lora_rank, args.rms_norm_eps)
-        self.q_b_proj = nn.Linear(args.q_lora_rank, args.num_attention_heads * args.head_dim, bias=False)
+        self.q_b_proj = nn.Linear(
+            args.q_lora_rank, args.num_attention_heads * args.head_dim, bias=False
+        )
         self.kv_proj = nn.Linear(args.hidden_size, args.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(args.head_dim, args.rms_norm_eps)
         self.o_a_proj = nn.Linear(
@@ -457,47 +491,68 @@ class Attention(nn.Module):
             args.o_groups * args.o_lora_rank,
             bias=False,
         )
-        self.o_b_proj = nn.Linear(args.o_groups * args.o_lora_rank, args.hidden_size, bias=False)
+        self.o_b_proj = nn.Linear(
+            args.o_groups * args.o_lora_rank, args.hidden_size, bias=False
+        )
         self.sinks = mx.zeros((args.num_attention_heads,), dtype=mx.float32)
         if self.is_kv_source:
             self.compressor = Compressor(args, layer_id)
         if self.is_index_source:
             self.indexer = Indexer(args, layer_id)
-        self._main_inv_freq = _yarn_inv_freq(
-            args.qk_rope_head_dim, args.rope_theta, 1.0, args.max_position_embeddings, 32, 1
+        self.rope = YarnRoPE(
+            dims=args.qk_rope_head_dim,
+            traditional=True,
+            base=args.rope_theta,
+            scaling_factor=1.0,
+            mscale=0.0,
+            mscale_all_dim=0.0,
         )
         rope = args.rope_scaling or {}
-        self._compress_inv_freq = _yarn_inv_freq(
-            args.qk_rope_head_dim,
-            args.compress_rope_theta,
-            float(rope.get("factor", 1.0)),
-            int(rope.get("original_max_position_embeddings", args.max_position_embeddings)),
-            int(rope.get("beta_fast", 32)),
-            int(rope.get("beta_slow", 1)),
+        self.compress_rope = YarnRoPE(
+            dims=args.qk_rope_head_dim,
+            traditional=True,
+            base=args.compress_rope_theta,
+            max_position_embeddings=args.max_position_embeddings,
+            scaling_factor=float(rope.get("factor", 1.0)),
+            original_max_position_embeddings=int(
+                rope.get(
+                    "original_max_position_embeddings", args.max_position_embeddings
+                )
+            ),
+            beta_fast=int(rope.get("beta_fast", 32)),
+            beta_slow=int(rope.get("beta_slow", 1)),
+            # V4.1 uses attention_factor=1 for its YaRN RoPE.
+            mscale=0.0,
+            mscale_all_dim=0.0,
         )
 
-    def _frequencies(self, positions: mx.array, compressed: bool):
-        inv = self._compress_inv_freq if compressed else self._main_inv_freq
-        angles = positions.astype(mx.float32)[:, None] * inv[None, :]
-        return mx.cos(angles), mx.sin(angles)
-
-    def __call__(self, x: mx.array, start_pos: int, cache: Optional[LayerCache], shared: dict):
+    def __call__(
+        self, x: mx.array, start_pos: int, cache: Optional[LayerCache], shared: dict
+    ):
         batch, length, _ = x.shape
         positions = start_pos + mx.arange(length)
         compressed = bool(self.ratio)
-        cos, sin = self._frequencies(positions, compressed)
+        rope = self.compress_rope if compressed else self.rope
 
         q_residual = self.q_a_norm(self.q_a_proj(x))
-        q = self.q_b_proj(q_residual).reshape(batch, length, self.args.num_attention_heads, self.args.head_dim)
-        q = _rotate_tail(q, cos, sin, self.args.qk_rope_head_dim)
+        q = self.q_b_proj(q_residual).reshape(
+            batch, length, self.args.num_attention_heads, self.args.head_dim
+        )
+        q = _apply_rope(q, rope, self.args.qk_rope_head_dim, offset=start_pos)
 
         kv = self.kv_norm(self.kv_proj(x))
-        kv = _rotate_tail(kv, cos, sin, self.args.qk_rope_head_dim)
+        kv = _apply_rope(kv, rope, self.args.qk_rope_head_dim, offset=start_pos)
         kv = _fake_quant_fp8(kv, 32)
         previous = cache.window.shape[1] if cache is not None else 0
-        window = mx.concatenate([cache.window, kv], axis=1) if cache is not None and previous else kv
+        window = (
+            mx.concatenate([cache.window, kv], axis=1)
+            if cache is not None and previous
+            else kv
+        )
         window_indices = _window_indices(previous, length, self.args.sliding_window)
-        window_indices = mx.broadcast_to(window_indices[None], (batch, length, window_indices.shape[-1]))
+        window_indices = mx.broadcast_to(
+            window_indices[None], (batch, length, window_indices.shape[-1])
+        )
         if cache is not None:
             cache.write_window(kv)
 
@@ -515,8 +570,13 @@ class Attention(nn.Module):
                 shared["compress_kv"] = cache.comp_kv if cache is not None else None
 
             if self.is_kv_source and latent is not None:
-                latent_cos, latent_sin = self._frequencies(group_positions, True)
-                rotated = _rotate_tail(latent, latent_cos, latent_sin, self.args.qk_rope_head_dim)
+                rotated = _apply_rope(
+                    latent,
+                    self.compress_rope,
+                    self.args.qk_rope_head_dim,
+                    offset=group_positions,
+                    scale=self.ratio,
+                )
                 rotated = _fake_quant_fp4(rotated, 16, e4m3_scale=True)
                 if cache is not None:
                     cache.comp_kv = mx.concatenate([cache.comp_kv, rotated], axis=1)
@@ -528,8 +588,13 @@ class Attention(nn.Module):
                 index_k = None
                 if self.indexer.owns_k and latent is not None:
                     index_latent = self.indexer.k_norm(self.indexer.k_proj(latent))
-                    index_cos, index_sin = self._frequencies(group_positions, True)
-                    index_k = _rotate_tail(index_latent, index_cos, index_sin, self.args.qk_rope_head_dim)
+                    index_k = _apply_rope(
+                        index_latent,
+                        self.compress_rope,
+                        self.args.qk_rope_head_dim,
+                        offset=group_positions,
+                        scale=self.ratio,
+                    )
                     index_k = _fake_quant_fp4(index_k, 32)
                     if cache is not None:
                         cache.index_k = mx.concatenate([cache.index_k, index_k], axis=1)
@@ -539,8 +604,18 @@ class Attention(nn.Module):
 
                 index_k = shared.get("index_k")
                 if index_k is None:
-                    index_k = mx.zeros((batch, 0, self.args.index_head_dim), dtype=x.dtype)
-                self.indexer(x, q_residual, positions, index_k, cos, sin, shared)
+                    index_k = mx.zeros(
+                        (batch, 0, self.args.index_head_dim), dtype=x.dtype
+                    )
+                self.indexer(
+                    x,
+                    q_residual,
+                    positions,
+                    index_k,
+                    self.compress_rope,
+                    start_pos,
+                    shared,
+                )
             elif "topk_idx" not in shared:
                 shared["topk_idx"] = mx.zeros((batch, length, 0), dtype=mx.int32)
 
@@ -548,15 +623,29 @@ class Attention(nn.Module):
             topk = shared.get("topk_idx")
             if compressed_kv is not None and topk is not None and topk.shape[-1] > 0:
                 # Compressed entries follow the window entries in the index space.
-                topk = mx.where(topk >= 0, topk + window.shape[1], mx.array(-1, mx.int32))
+                topk = mx.where(
+                    topk >= 0, topk + window.shape[1], mx.array(-1, mx.int32)
+                )
                 selected_indices = mx.concatenate([window_indices, topk], axis=-1)
                 window = mx.concatenate([window, compressed_kv], axis=1)
 
-        output = _sparse_attention(q, window, self.sinks, selected_indices, self.args.head_dim ** -0.5)
-        output = _rotate_tail(output, cos, sin, self.args.qk_rope_head_dim, inverse=True)
+        output = _sparse_attention(
+            q, window, self.sinks, selected_indices, self.args.head_dim**-0.5
+        )
+        output = _apply_rope(
+            output,
+            rope,
+            self.args.qk_rope_head_dim,
+            offset=start_pos,
+            inverse=True,
+        )
         output = output.reshape(batch, length, self.args.o_groups, -1)
-        grouped = self.o_a_proj.weight.reshape(self.args.o_groups, self.args.o_lora_rank, -1)
-        output = mx.einsum("bsgd,grd->bsgr", output.astype(mx.float32), grouped.astype(mx.float32))
+        grouped = self.o_a_proj.weight.reshape(
+            self.args.o_groups, self.args.o_lora_rank, -1
+        )
+        output = mx.einsum(
+            "bsgd,grd->bsgr", output.astype(mx.float32), grouped.astype(mx.float32)
+        )
         return self.o_b_proj(output.reshape(batch, length, -1).astype(x.dtype))
 
 
@@ -580,9 +669,15 @@ class DeepseekV41SwiGLU(nn.Module):
 class SharedMLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.moe_intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.moe_intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.moe_intermediate_size, args.hidden_size, bias=False)
+        self.gate_proj = nn.Linear(
+            args.hidden_size, args.moe_intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            args.hidden_size, args.moe_intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            args.moe_intermediate_size, args.hidden_size, bias=False
+        )
         self.activation = DeepseekV41SwiGLU(args.swiglu_limit)
 
     def __call__(self, x: mx.array):
@@ -594,9 +689,15 @@ class SharedMLP(nn.Module):
 class Router(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.weight = mx.zeros((args.n_routed_experts, args.hidden_size), dtype=mx.float32)
-        self.e_score_correction_bias = mx.zeros((args.n_routed_experts,), dtype=mx.float32)
-        self.e_score_correction_bias_vl = mx.zeros((args.n_routed_experts,), dtype=mx.float32)
+        self.weight = mx.zeros(
+            (args.n_routed_experts, args.hidden_size), dtype=mx.float32
+        )
+        self.e_score_correction_bias = mx.zeros(
+            (args.n_routed_experts,), dtype=mx.float32
+        )
+        self.e_score_correction_bias_vl = mx.zeros(
+            (args.n_routed_experts,), dtype=mx.float32
+        )
         self.top_k = args.num_experts_per_tok
         self.score_func = args.scoring_func
         self.gate_temp = args.gate_temp
@@ -668,12 +769,20 @@ class DecoderLayer(nn.Module):
         self.attn_hc = HyperConnection(args)
         self.ffn_hc = HyperConnection(args)
 
-    def __call__(self, streams: mx.array, pre_mix: mx.array, start_pos: int,
-                 cache: Optional[LayerCache], shared: dict):
+    def __call__(
+        self,
+        streams: mx.array,
+        pre_mix: mx.array,
+        start_pos: int,
+        cache: Optional[LayerCache],
+        shared: dict,
+    ):
         residual = streams
         attn_pre, attn_post, attn_comb = self.attn_hc(streams)
         collapsed = _collapse(streams, pre_mix)
-        attn_output = self.self_attn(self.input_layernorm(collapsed), start_pos, cache, shared)
+        attn_output = self.self_attn(
+            self.input_layernorm(collapsed), start_pos, cache, shared
+        )
         streams = _expand(attn_output, residual, attn_post, attn_comb)
 
         residual = streams
@@ -703,7 +812,9 @@ class TextModel(nn.Module):
             for c in cache:
                 c.ensure_batch(batch, h.dtype)
 
-        streams = mx.broadcast_to(h[:, :, None, :], (batch, length, self.args.hc_mult, self.args.hidden_size))
+        streams = mx.broadcast_to(
+            h[:, :, None, :], (batch, length, self.args.hc_mult, self.args.hidden_size)
+        )
         pre_mix = mx.zeros((batch, length, self.args.hc_mult), dtype=mx.float32)
         pre_mix[..., 0] = 1.0
         shared = {}
@@ -747,11 +858,13 @@ class Model(nn.Module):
             ):
                 continue
 
-            expert = re.fullmatch(r"(model\.layers\.\d+)\.ffn\.experts\.(\d+)\.(w[123])\.weight", key)
+            expert = re.fullmatch(
+                r"(model\.layers\.\d+)\.ffn\.experts\.(\d+)\.(w[123])\.weight", key
+            )
             if expert is not None:
-                experts.setdefault(expert.group(1), {}).setdefault(expert.group(3), []).append(
-                    (int(expert.group(2)), value)
-                )
+                experts.setdefault(expert.group(1), {}).setdefault(
+                    expert.group(3), []
+                ).append((int(expert.group(2)), value))
                 continue
 
             if key == "head.weight":
@@ -788,7 +901,10 @@ class Model(nn.Module):
         for prefix, parts in experts.items():
             for _name, rows in parts.items():
                 rows.sort(key=lambda item: item[0])
-            if all(name in parts and len(parts[name]) == self.args.n_routed_experts for name in ("w1", "w2", "w3")):
+            if all(
+                name in parts and len(parts[name]) == self.args.n_routed_experts
+                for name in ("w1", "w2", "w3")
+            ):
                 gate = mx.stack([value for _, value in parts["w1"]])
                 up = mx.stack([value for _, value in parts["w3"]])
                 down = mx.stack([value for _, value in parts["w2"]])
