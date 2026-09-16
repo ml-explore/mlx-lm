@@ -17,6 +17,19 @@ from mlx_lm.train.distributed import init_distributed
 from mlx_lm.train.metrics import Losses, Metrics, init_wandb, log_metrics
 
 
+def random_batches(config, mesh):
+    rng = np.random.default_rng(config.seed + mesh.world.rank)
+    shape = (config.batch_size, config.context_size + 1)
+    while True:
+        yield {
+            "input_ids": rng.integers(
+                0, config.model.vocab_size, shape, dtype=np.int32
+            ),
+            "mask": None,
+            "_data_state": {},
+        }
+
+
 def main(config, save_dir):
 
     np.random.seed(config.seed)
@@ -43,18 +56,27 @@ def main(config, save_dir):
         config.optimizer, config.num_steps, config.get("resume_from_step", 0)
     )
     init_step, data_state = load_training_state(model, optimizer, config, mesh)
-    tokenizer = utils.load_tokenizer(config.get("tokenizer", "allenai/Olmo-3-1025-7B"))
 
-    documents = data.get_documents(
-        config.dataset, tokenizer, mesh, data_state, seed=config.seed
-    )
+    random_data = config.get("random_data", False)
+    if random_data:
+        if mesh.is_master:
+            logging.info("random data: no tokenizer, no dataset, no prefetch")
+        stream = random_batches(config, mesh)
+    else:
+        tokenizer = utils.load_tokenizer(
+            config.get("tokenizer", "allenai/Olmo-3-1025-7B")
+        )
 
-    stream = data.iterate_batches(
-        documents,
-        context_size=config.context_size,
-        batch_size=config.batch_size,
-        resume_state=data_state,
-    )
+        documents = data.get_documents(
+            config.dataset, tokenizer, mesh, data_state, seed=config.seed
+        )
+
+        stream = data.iterate_batches(
+            documents,
+            context_size=config.context_size,
+            batch_size=config.batch_size,
+            resume_state=data_state,
+        )
 
     if config.get("grad_checkpoint", False):
         utils.grad_checkpoint(model.layers[0], dtype=dtype)
@@ -119,7 +141,7 @@ def main(config, save_dir):
         steps_per_report=config.steps_per_report,
     )
     losses_sum = Losses()
-    batches = data.prefetch(stream)
+    batches = stream if random_data else data.prefetch(stream)
     exhausted = False
     step_done = init_step
 
@@ -221,6 +243,13 @@ def build_parser():
         help="Number of ranks to shard the model over. Overrides the experiment config",
     )
     parser.add_argument(
+        "--random-data",
+        action="store_true",
+        help="Train on random tokens, bypassing the tokenizer, the dataset and "
+        "the prefetch process. For taking the data pipeline out of the picture "
+        "when debugging",
+    )
+    parser.add_argument(
         "--save-dir",
         default="checkpoints",
         help="Where to write the model and checkpoints",
@@ -284,8 +313,12 @@ def cli():
         config.restore = args.restore
     if args.resume_from_step is not None:
         config.resume_from_step = args.resume_from_step
+    if args.random_data:
+        config.random_data = True
 
-    if args.stage or args.source or config.get("dataset") is None:
+    if not args.random_data and (
+        args.stage or args.source or config.get("dataset") is None
+    ):
         config.dataset = data.dolma(args.stage or "pre", args.source or "hf")
 
     init_wandb(config, args, os.environ.get("MLX_RANK", "0") == "0")

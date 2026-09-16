@@ -65,7 +65,7 @@ def get_config():
     config.data_type = "bfloat16"
     config.num_valid_batches = 1_000
     # Logging params
-    config.steps_per_report = 10
+    config.steps_per_report = 1
     config.steps_per_checkpoint = 100_000
     config.fsdp_dim = 8
     config.grad_checkpoint = True
