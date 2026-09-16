@@ -14,7 +14,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .rope_utils import initialize_rope
 
 
@@ -165,11 +165,7 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(B, S, self.num_k_heads, self.head_k_dim)
         v = v.reshape(B, S, self.num_v_heads, self.head_v_dim)
 
-        inv_scale = self.head_k_dim**-0.5
-        # The reference L2-normalises q/k, so eps applies to sum, not mean.
-        qk_eps = 1e-6 / self.head_k_dim
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, qk_eps)
-        k = inv_scale * mx.fast.rms_norm(k, None, qk_eps)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         state = cache[3] if (cache is not None and cache[3] is not None) else None
         out, state = gated_delta_update(
