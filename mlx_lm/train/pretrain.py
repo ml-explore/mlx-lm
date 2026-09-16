@@ -282,6 +282,12 @@ def build_parser():
         help="Size of the all-reduce operation. Overrides the experiment config",
     )
     parser.add_argument(
+        "--steps-per-report",
+        type=int,
+        default=None,
+        help="How often to log the training metrics. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--experiment-name", default=None, help="Run name for wandb; omit to disable"
     )
     return parser
@@ -306,6 +312,8 @@ def cli():
         config.grad_accum_steps = args.grad_accum_steps
     if args.all_reduce_size is not None:
         config.all_reduce_size = args.all_reduce_size
+    if args.steps_per_report is not None:
+        config.steps_per_report = args.steps_per_report
     if args.init_from is not None:
         with config.ignore_type():
             config.init_from = args.init_from
