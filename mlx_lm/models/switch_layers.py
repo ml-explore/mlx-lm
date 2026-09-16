@@ -72,6 +72,9 @@ class QuantizedSwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
+        # TODO: check whether gather_qmm has the CUDA sorted-indices defect that
+        # SwitchLinear works around (mlx#4253). The weight is passed untransposed
+        # here, so it may not be affected.
         x = mx.gather_qmm(
             x,
             self["weight"],
@@ -117,9 +120,14 @@ class SwitchLinear(nn.Module):
         return self.weight.shape[0]
 
     def __call__(self, x, indices, sorted_indices=False):
+        # gather_mm gives wrong results on CUDA for a transposed rhs when the
+        # indices are sorted, so make the weight contiguous (mlx#4253).
+        weight = self["weight"].swapaxes(-1, -2)
+        if sorted_indices:
+            weight = mx.contiguous(weight)
         x = mx.gather_mm(
             x,
-            self["weight"].swapaxes(-1, -2),
+            weight,
             rhs_indices=indices,
             sorted_indices=sorted_indices,
         )
