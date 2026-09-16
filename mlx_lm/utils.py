@@ -55,6 +55,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "deepseek_v41_text": "deepseek_v41",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
