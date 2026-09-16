@@ -1,5 +1,5 @@
 # Copyright © 2024 Apple Inc.
-import math
+
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 

@@ -1,3 +1,5 @@
+# Copyright © 2024 Apple Inc.
+
 import argparse
 from typing import List, Union
 
@@ -32,7 +34,7 @@ def ask_for_confirmation(message: str) -> bool:
             return True
         if answer in n:
             return False
-        print(f"Invalid input. Must be one of: yes/no/y/n or empty for no")
+        print("Invalid input. Must be one of: yes/no/y/n or empty for no")
 
 
 def main():

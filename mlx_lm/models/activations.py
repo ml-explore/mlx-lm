@@ -1,4 +1,4 @@
-# Copyright © 2023-2026 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from functools import partial
 
@@ -9,6 +9,13 @@ import mlx.nn as nn
 @partial(mx.compile, shapeless=True)
 def swiglu(gate, x):
     return nn.silu(gate) * x
+
+
+@partial(mx.compile, shapeless=True)
+def precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
 
 
 @partial(mx.compile, shapeless=True)

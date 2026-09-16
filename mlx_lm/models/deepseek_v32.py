@@ -12,6 +12,7 @@ from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
 from .mla import MultiLinear
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -50,6 +51,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: float = 10000.0
     rope_scaling: Dict = None
     attention_bias: bool = False
+    indexer_rope_interleave: bool = False
 
 
 class Indexer(nn.Module):
@@ -71,7 +73,7 @@ class Indexer(nn.Module):
         self.rope = initialize_rope(
             dims=args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=True,
+            traditional=args.indexer_rope_interleave,
             max_position_embeddings=args.max_position_embeddings,
             scaling_config=args.rope_scaling,
         )
@@ -87,21 +89,19 @@ class Indexer(nn.Module):
         b, s, _ = x.shape
         q = self.wq_b(qr)
         q = q.reshape(b, s, self.n_heads, self.head_dim).swapaxes(1, 2)
-        q_pe, q_nope = mx.split(q, [self.rope_head_dim], axis=-1)
-
-        offset = cache.offset if cache is not None else 0
-
-        q_pe = self.rope(q_pe, offset=offset)
-        q = mx.concatenate([q_pe, q_nope], axis=-1)
-
         k = self.wk(x)
         k = self.k_norm(k)
         k = mx.reshape(k, (b, 1, s, self.head_dim))
-        k_pe, k_nope = mx.split(k, [self.rope_head_dim], axis=-1)
-        k_pe = self.rope(k_pe, offset=offset)
-        k = mx.concatenate([k_pe, k_nope], axis=-1)
+
+        offset = cache.offset if cache is not None else 0
+
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+
         if cache is not None:
-            k, _ = cache.update_and_fetch(k, mx.zeros([b, 1, s, 0]))
+            k, _ = cache.update_and_fetch(k, k)
+            # Avoid unevaluated graph growing infinitely
+            cache.values = mx.zeros_like(cache.keys)
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
@@ -109,7 +109,11 @@ class Indexer(nn.Module):
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
         scores = scores * weights
-        scores = scores.sum(axis=1, keepdims=True)
+        # TODO(michalk8): remove once ml-explore/mlx#3784 is merged
+        if s > 1:
+            scores = sum(scores[:, h : h + 1] for h in range(scores.shape[1]))
+        else:
+            scores = scores.sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
@@ -209,6 +213,7 @@ class DeepseekV32Attention(nn.Module):
 
         topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         if topk_indices is not None:
+            topk_indices = mx.stop_gradient(topk_indices)
             if L == 1:
                 idx = topk_indices[:, :, 0, :, None]
                 kv_latent = mx.take_along_axis(
@@ -221,7 +226,8 @@ class DeepseekV32Attention(nn.Module):
                     mx.broadcast_to(idx, idx.shape[:-1] + (k_pe.shape[-1],)),
                     axis=2,
                 )
-                mask = None
+                if mask is not None:
+                    mask = mx.take_along_axis(mask, topk_indices, axis=-1)
             else:
                 shape = list(topk_indices.shape)
                 shape[-1] = kv_latent.shape[2]
@@ -264,7 +270,10 @@ class DeepseekV32Attention(nn.Module):
 
 class DeepseekV32MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -308,6 +317,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
@@ -409,7 +419,7 @@ class DeepseekV32DecoderLayer(nn.Module):
         return h + r
 
 
-class DeepseekV32Model(nn.Module):
+class DeepseekV32Model(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.vocab_size = config.vocab_size
@@ -418,28 +428,7 @@ class DeepseekV32Model(nn.Module):
             DeepseekV32DecoderLayer(config, idx)
             for idx in range(config.num_hidden_layers)
         ]
-        self.start_idx = 0
-        self.end_idx = len(self.layers)
-        self.num_layers = self.end_idx
-
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.pipeline_rank = 0
-        self.pipeline_size = 1
-
-    def pipeline(self, group):
-        # Split layers in reverse so rank=0 gets the last layers and
-        # rank=pipeline_size-1 gets the first
-        self.pipeline_rank = group.rank()
-        self.pipeline_size = group.size()
-        layers_per_rank = len(self.layers) // self.pipeline_size
-        extra = len(self.layers) - layers_per_rank * self.pipeline_size
-        if self.pipeline_rank < extra:
-            layers_per_rank += 1
-        self.start_idx = (self.pipeline_size - self.pipeline_rank - 1) * layers_per_rank
-        self.end_idx = self.start_idx + layers_per_rank
-        self.layers = self.layers[: self.end_idx]
-        self.layers[: self.start_idx] = [None] * self.start_idx
-        self.num_layers = len(self.layers) - self.start_idx
 
     def __call__(
         self,
@@ -452,18 +441,17 @@ class DeepseekV32Model(nn.Module):
         pipeline_size = self.pipeline_size
 
         if cache is None:
-            cache = [None] * self.num_layers
+            cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(
             h, cache[0][0] if cache[0] else None, return_array=True
         )
 
         # Receive from the previous process in the pipeline
-
         if pipeline_rank < pipeline_size - 1:
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
-        for i in range(self.num_layers):
-            h = self.layers[self.start_idx + i](h, mask, cache[i])
+        for layer, c in zip(self.pipeline_layers, cache):
+            h = layer(h, mask, c)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
@@ -537,7 +525,7 @@ class Model(nn.Module):
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
@@ -547,7 +535,6 @@ class Model(nn.Module):
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
             prefix = f"model.layers.{l}.self_attn"
             if f"{prefix}.kv_b_proj.weight" in weights:
-                layer = self.model.layers[l].self_attn.embed_q
                 quantized = f"{prefix}.kv_b_proj.scales" in weights
                 v = weights.pop(f"{prefix}.kv_b_proj.weight")
                 head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
@@ -622,7 +609,7 @@ class Model(nn.Module):
             # Shard the MoE. Shard in place since the MoE should be responsible
             # for aggregating the results.
             else:
-                layer.mlp.sharding_group = group = group
+                layer.mlp.sharding_group = group
                 shard_inplace(
                     layer.mlp.shared_experts.gate_proj, "all-to-sharded", group=group
                 )
@@ -644,7 +631,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers[self.model.start_idx : self.model.end_idx]
+        return self.model.pipeline_layers
 
     @property
     def cast_predicate(self):

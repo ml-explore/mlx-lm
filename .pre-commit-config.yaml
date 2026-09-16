@@ -9,3 +9,7 @@ repos:
     -   id: isort
         args:
             - --profile=black
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.6
+    hooks:
+    -   id: ruff-check
