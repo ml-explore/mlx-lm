@@ -206,7 +206,8 @@ class BailingMLA(nn.Module):
         self.rope = initialize_rope(
             args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=False,
+            # rope_interleave rotates consecutive pairs, which is traditional=True.
+            traditional=True,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
@@ -235,8 +236,9 @@ class BailingMLA(nn.Module):
         )
 
         offset = cache.offset if cache is not None else 0
-        q_rope = self.rope(q_rope, offset=offset)
-        k_rope = self.rope(k_rope, offset=offset)
+        # rope gives wrong results on CUDA for a non-contiguous input
+        q_rope = self.rope(mx.contiguous(q_rope), offset=offset)
+        k_rope = self.rope(mx.contiguous(k_rope), offset=offset)
 
         kv_latent = mx.expand_dims(kv_latent, axis=1)
         if cache is not None:
