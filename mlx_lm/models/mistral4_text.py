@@ -14,7 +14,7 @@ from .deepseek_v3 import (
 )
 from .ministral3 import _get_llama_4_attn_scale
 from .pipeline import PipelineMixin
-from .rope_utils import initialize_rope
+from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -79,7 +79,7 @@ class Mistral4Attention(nn.Module):
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.q_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
 
-        self.scale = self.q_head_dim**-0.5
+        self.scale = apply_yarn_mscale(self.q_head_dim**-0.5, args.rope_parameters)
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(
