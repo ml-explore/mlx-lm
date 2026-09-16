@@ -18,7 +18,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update, normalize_qk
 from .mla import MultiLinear
-from .rope_utils import initialize_rope
+from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -168,6 +168,7 @@ class BailingMLA(nn.Module):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
         self.scale = self.qk_head_dim**-0.5
+        self.scale = apply_yarn_mscale(self.scale, args.rope_scaling)
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(

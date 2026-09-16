@@ -2,6 +2,7 @@
 
 import copy
 import importlib
+import math
 import unittest
 from unittest import mock
 
@@ -473,6 +474,30 @@ class TestModels(unittest.TestCase):
             self.assertIsInstance(getattr(mla, projection), nn.Linear)
         for projection in ("embed_q", "unembed_out"):
             self.assertIsInstance(getattr(mla, projection), bailing_moe_v3.MultiLinear)
+
+        base_scale = (args.qk_nope_head_dim + args.qk_rope_head_dim) ** -0.5
+        self.assertAlmostEqual(model.layers[3].attention.scale, base_scale)
+        yarn_args = replace(
+            args,
+            rope_scaling={"rope_type": "yarn", "factor": 40.0, "mscale_all_dim": 1.0},
+        )
+        s = 0.1 * math.log(40.0) + 1.0
+        self.assertAlmostEqual(
+            bailing_moe_v3.Model(yarn_args).layers[3].attention.scale,
+            base_scale * s * s,
+        )
+        # these must leave the scale alone
+        for rs in (
+            {"rope_type": "yarn", "factor": 40.0, "mscale_all_dim": 0},
+            {"rope_type": "yarn", "factor": 1.0, "mscale_all_dim": 1.0},
+            {"rope_type": "default", "factor": 40.0, "mscale_all_dim": 1.0},
+        ):
+            self.assertAlmostEqual(
+                bailing_moe_v3.Model(replace(args, rope_scaling=rs))
+                .layers[3]
+                .attention.scale,
+                base_scale,
+            )
 
     def test_gear(self):
         from mlx_lm.models import gear

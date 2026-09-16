@@ -269,6 +269,23 @@ class DynamicNTKScalingRoPE(nn.Module):
         )
 
 
+def apply_yarn_mscale(scale: float, scaling_config: Optional[dict]) -> float:
+    """Fold the yarn mscale into an attention scale.
+
+    ``initialize_rope`` puts the ``mscale / mscale_all_dim`` ratio on the rope;
+    this is the other half, ``mscale_all_dim`` squared.
+    """
+    if not scaling_config:
+        return scale
+    rope_type = scaling_config.get("type") or scaling_config.get("rope_type", "default")
+    mscale_all_dim = scaling_config.get("mscale_all_dim", 0)
+    factor = scaling_config.get("factor", 1)
+    if rope_type == "default" or not mscale_all_dim or factor <= 1:
+        return scale
+    s = 0.1 * mscale_all_dim * math.log(factor) + 1.0
+    return scale * s * s
+
+
 def initialize_rope(
     dims,
     base,
