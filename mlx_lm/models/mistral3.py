@@ -49,19 +49,15 @@ class Model(nn.Module):
         )
 
     def sanitize(self, weights):
-        sanitized = {}
+        lm_weights = {}
         for key, value in weights.items():
             if "vision_tower" in key or "multi_modal_projector" in key:
                 continue
-            if key.startswith("model."):
-                key = key[len("model.") :]
-            sanitized[key] = value
-
-        lm_weights = {
-            k[len("language_model.") :]: v
-            for k, v in sanitized.items()
-            if k.startswith("language_model.")
-        }
+            if key.startswith("model.language_model."):
+                key = "model." + key.removeprefix("model.language_model.")
+            else:
+                key = key.removeprefix("language_model.")
+            lm_weights[key] = value
 
         sanitized_lm = self.language_model.sanitize(lm_weights)
         return {"language_model." + k: v for k, v in sanitized_lm.items()}
