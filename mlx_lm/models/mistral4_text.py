@@ -309,7 +309,10 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
             cache = [None] * len(self.pipeline_layers)
 
         offset = cache[0].offset if cache[0] is not None else 0
-        mask = create_attention_mask(h, cache[0], return_array=True)
+        # No return_array: attention passes the mask straight to SDPA, so the
+        # fast "causal" path works. deepseek_v3 needs an array because its
+        # absorbed MLA path does mx.where(mask, pe_scores, ...).
+        mask = create_attention_mask(h, cache[0])
 
         attn_scale = _get_llama_4_attn_scale(
             x.shape[1],
