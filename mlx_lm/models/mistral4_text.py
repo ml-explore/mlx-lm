@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .deepseek_v3 import (
@@ -228,7 +228,12 @@ class Mistral4MoE(nn.Module):
                 args, intermediate_size=intermediate_size
             )
 
+        self.sharding_group = None
+
     def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
         inds, scores = mistral4_expert_select(
             self.gate(x),
             self.num_experts_per_tok,
@@ -241,6 +246,10 @@ class Mistral4MoE(nn.Module):
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.args.n_shared_experts is not None:
             y = y + self.shared_experts(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
         return y
 
 
@@ -474,6 +483,8 @@ class Model(nn.Module):
                 )
 
             else:
+                # Shard in place: the MoE aggregates the partial sums itself.
+                layer.mlp.sharding_group = group
                 if hasattr(layer.mlp, "shared_experts"):
                     shard_inplace(
                         layer.mlp.shared_experts.gate_proj,
