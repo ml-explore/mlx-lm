@@ -61,7 +61,9 @@ def read_manifest(uri, client=None):
     try:
         body = client.get_object(Bucket=bucket, Key=prefix + MANIFEST_NAME)["Body"]
     except ClientError as e:
-        return None
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            return None
+        raise
     return json.loads(body.read())
 
 
