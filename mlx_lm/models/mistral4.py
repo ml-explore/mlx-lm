@@ -13,6 +13,7 @@ from .deepseek_v3 import (
     DeepseekV3Model,
 )
 from .ministral3 import _get_llama_4_attn_scale
+from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
@@ -100,10 +101,12 @@ class Mistral4Attention(nn.Module):
             bias=args.attention_bias,
         )
         self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=1e-6)
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
-            bias=False,
+        # kv_b_proj absorbed, so the cache holds the compressed latent.
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, self.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            self.kv_lora_rank, self.v_head_dim, self.num_heads
         )
 
         self.o_proj = nn.Linear(
@@ -141,35 +144,52 @@ class Mistral4Attention(nn.Module):
 
         compressed_kv = self.kv_a_proj_with_mqa(x)
         k_latent, k_rope = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
-
-        # Project latent to K and V
-        kv = self.kv_b_proj(self.kv_a_layernorm(k_latent))
-        kv = kv.reshape(B, L, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-        kv = kv.transpose(0, 2, 1, 3)
-        k_nope, v = mx.split(kv, [self.qk_nope_head_dim], axis=-1)
-
         k_rope = k_rope.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        kv_latent = mx.expand_dims(self.kv_a_layernorm(k_latent), axis=1)
 
         offset = cache.offset if cache is not None else 0
         q_rope = self.rope(q_rope, offset)
         k_rope = self.rope(k_rope, offset)
 
-        # Expand k_rope to all heads
-        k_rope = mx.broadcast_to(
-            k_rope, [B, self.num_heads, k_rope.shape[2], self.qk_rope_head_dim]
-        )
-
-        query_states = mx.concatenate([q_nope, q_rope], axis=-1)
-        key_states = mx.concatenate([k_nope, k_rope], axis=-1)
-
-        query_states = query_states * attn_scale
+        # The llama-4 scale applies to the whole query, so scale both halves.
+        q_nope = q_nope * attn_scale
+        q_rope = q_rope * attn_scale
 
         if cache is not None:
-            key_states, v = cache.update_and_fetch(key_states, v)
+            kv_latent, k_rope = cache.update_and_fetch(kv_latent, k_rope)
 
-        output = scaled_dot_product_attention(
-            query_states, key_states, v, cache=cache, scale=self.scale, mask=mask
-        )
+        if L == 1:
+            # Decode: attend to the latent directly. pe_scores is [B, H, 1, L].
+            pe_scores = (q_rope * self.scale) @ k_rope.swapaxes(-1, -2)
+            if mask is not None:
+                pe_scores = mx.where(
+                    mask,
+                    pe_scores,
+                    mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+                )
+            output = scaled_dot_product_attention(
+                self.embed_q(q_nope),
+                kv_latent,
+                kv_latent,
+                cache=cache,
+                scale=self.scale,
+                mask=pe_scores,
+            )
+            output = self.unembed_out(output)
+        else:
+            k_nope = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
+            k_rope = mx.broadcast_to(
+                k_rope, [B, self.num_heads, k_rope.shape[2], self.qk_rope_head_dim]
+            )
+            output = scaled_dot_product_attention(
+                mx.concatenate([q_nope, q_rope], axis=-1),
+                mx.concatenate([k_nope, k_rope], axis=-1),
+                v,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+            )
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -309,9 +329,7 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
             cache = [None] * len(self.pipeline_layers)
 
         offset = cache[0].offset if cache[0] is not None else 0
-        # No return_array: attention passes the mask straight to SDPA, so the
-        # fast "causal" path works. deepseek_v3 needs an array because its
-        # absorbed MLA path does mx.where(mask, pe_scores, ...).
+        # "causal" suits prefill; at L == 1 it is None, which decode wants.
         mask = create_attention_mask(h, cache[0])
 
         attn_scale = _get_llama_4_attn_scale(
@@ -448,6 +466,41 @@ class Model(nn.Module):
                         ]
                         weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
+            # Absorb kv_b_proj into embed_q / unembed_out.
+            # TODO: affine only; non-affine modes have no biases key.
+            attn = f"{prefix}.self_attn"
+            if f"{attn}.kv_b_proj.weight" in weights:
+                quantized = f"{attn}.kv_b_proj.scales" in weights
+                w = weights.pop(f"{attn}.kv_b_proj.weight")
+                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
+                if quantized:
+                    dims = self.args.kv_lora_rank
+                    scales = weights.pop(f"{attn}.kv_b_proj.scales")
+                    biases = weights.pop(f"{attn}.kv_b_proj.biases")
+                    bits = (w.shape[-1] * 32) // dims
+                    group_size = dims // scales.shape[-1]
+                    w = mx.dequantize(
+                        w, scales, biases, bits=bits, group_size=group_size
+                    )
+                w = w.reshape(self.args.num_attention_heads, head_dim, -1)
+                wk = mx.contiguous(
+                    w[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
+                )
+                wv = mx.contiguous(w[:, self.args.qk_nope_head_dim :, :])
+                if quantized:
+                    wk, wk_scales, wk_biases = mx.quantize(
+                        wk, bits=bits, group_size=group_size
+                    )
+                    wv, wv_scales, wv_biases = mx.quantize(
+                        wv, bits=bits, group_size=group_size
+                    )
+                    weights[f"{attn}.embed_q.scales"] = wk_scales
+                    weights[f"{attn}.embed_q.biases"] = wk_biases
+                    weights[f"{attn}.unembed_out.scales"] = wv_scales
+                    weights[f"{attn}.unembed_out.biases"] = wv_biases
+                weights[f"{attn}.embed_q.weight"] = wk
+                weights[f"{attn}.unembed_out.weight"] = wv
+
         return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
@@ -464,11 +517,16 @@ class Model(nn.Module):
                     layer.self_attn.q_b_proj, "all-to-sharded", group=group
                 )
 
-            layer.self_attn.kv_b_proj = shard_linear(
-                layer.self_attn.kv_b_proj, "all-to-sharded", group=group
-            )
-
             layer.self_attn.num_heads //= N
+            num_heads = layer.self_attn.num_heads
+            sh = group.rank() * num_heads
+            eh = sh + num_heads
+
+            def shard_heads(w):
+                return w[sh:eh]
+
+            layer.self_attn.embed_q.apply(shard_heads)
+            layer.self_attn.unembed_out.apply(shard_heads)
 
             layer.self_attn.o_proj = shard_linear(
                 layer.self_attn.o_proj, "sharded-to-all", group=group
