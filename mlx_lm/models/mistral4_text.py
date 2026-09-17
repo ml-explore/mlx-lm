@@ -293,6 +293,9 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
     ) -> mx.array:
         h = input_embeddings if input_embeddings is not None else self.embed_tokens(x)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
             cache = [None] * len(self.pipeline_layers)
 
@@ -306,8 +309,22 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
             self.args.rope_parameters["original_max_position_embeddings"],
         ).astype(h.dtype)
 
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
         for l, c in zip(self.pipeline_layers, cache):
             h = l(h, attn_scale, mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -336,7 +353,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def sanitize(self, weights):
         def broadcasts(scale_shape, weight_shape):
