@@ -120,7 +120,7 @@ def main(config, save_dir):
         steps_per_report=config.steps_per_report,
     )
     losses_sum = Losses()
-    batches = stream if random_data else data.prefetch(stream)
+    batches = data.prefetch(stream)
     exhausted = False
     step_done = init_step
 
