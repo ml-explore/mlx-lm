@@ -60,14 +60,14 @@ def get_config():
     config.grad_accum_steps = 1
     config.num_steps = 1_000_000
 
-    config.max_grad_norm = 5
+    config.max_grad_norm = 1
     config.z_loss_weight = 0
     config.data_type = "bfloat16"
     config.num_valid_batches = 1_000
     # Logging params
-    config.steps_per_report = 1
+    config.steps_per_report = 10
     config.steps_per_checkpoint = 100_000
-    config.fsdp_dim = 8
+    config.fsdp_dim = 1
     config.grad_checkpoint = True
     config.tokenizer = "Qwen/Qwen3.5-4B-Base"
     return config

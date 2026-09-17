@@ -132,11 +132,7 @@ def init_wandb(config, args, is_master):
         f"batch_size_{config.batch_size}",
         f"context_size_{config.context_size}",
         f"grad_accum_{config.get('grad_accum_steps', 1)}",
-        f"fsdp_dim_{config.get('fsdp_dim', 1)}",
     ]
-    if config.get("random_data", False):
-        # a debug run on random tokens must not be mistaken for a real one
-        tags.append("random_data")
     wandb.init(
         project=config.get("project", "yet-another-smollm"),
         name=experiment_name(config, args),
