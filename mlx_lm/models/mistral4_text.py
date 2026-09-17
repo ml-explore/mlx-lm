@@ -14,7 +14,7 @@ from .deepseek_v3 import (
 )
 from .ministral3 import _get_llama_4_attn_scale
 from .pipeline import PipelineMixin
-from .rope_utils import initialize_rope
+from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -79,7 +79,7 @@ class Mistral4Attention(nn.Module):
         self.qk_nope_head_dim = args.qk_nope_head_dim
         self.q_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
 
-        self.scale = self.q_head_dim**-0.5
+        self.scale = apply_yarn_mscale(self.q_head_dim**-0.5, args.rope_parameters)
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(
@@ -356,9 +356,18 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
+        def broadcasts(scale_shape, weight_shape):
+            if len(scale_shape) > len(weight_shape):
+                return False
+            pad = (1,) * (len(weight_shape) - len(scale_shape)) + tuple(scale_shape)
+            return all(s in (1, w) for s, w in zip(pad, weight_shape))
+
         def dequant(weight, scale_inv):
             dtype = mx.bfloat16
-            weight = mx.from_fp8(weight, dtype=mx.bfloat16)
+            weight = mx.from_fp8(weight, dtype=dtype)
+            # Per-tensor (rank 0) and per-expert ([E, 1, 1]) scales broadcast.
+            if broadcasts(scale_inv.shape, weight.shape):
+                return (weight * scale_inv).astype(dtype)
             bs = 128
             m, n = weight.shape
             pad_bottom = (-m) % bs
@@ -390,12 +399,14 @@ class Model(nn.Module):
         # Dequantize fp8
         new_weights = {}
         for k, v in weights.items():
-            if "weight_scale_inv" in k:
-                scale_inv = v
+            # Static activation scales have no consumer here.
+            if k.endswith("activation_scale"):
+                continue
+            # Expert scales are named "experts.down_proj_scale_inv", so match
+            # the suffix rather than a "weight_scale_inv" substring.
+            if k.endswith("_scale_inv"):
                 wk = k.replace("_scale_inv", "")
-                weight = weights[wk]
-                weight = dequant(weight, scale_inv)
-                new_weights[wk] = weight
+                new_weights[wk] = dequant(weights[wk], v)
             elif k not in new_weights:
                 new_weights[k] = v
         weights = new_weights
