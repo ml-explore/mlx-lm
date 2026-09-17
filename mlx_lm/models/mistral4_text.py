@@ -210,30 +210,6 @@ def mistral4_expert_select(
     return inds, selected_scores
 
 
-class Mistral4MoEGate(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.top_k = args.num_experts_per_tok
-        self.norm_topk_prob = args.norm_topk_prob
-        self.n_routed_experts = args.n_routed_experts
-        self.routed_scaling_factor = args.routed_scaling_factor
-        self.n_group = args.n_group
-        self.topk_group = args.topk_group
-        self.weight = mx.zeros((self.n_routed_experts, args.hidden_size))
-
-    def __call__(self, x):
-        gates = x @ self.weight.T
-        return mistral4_expert_select(
-            gates,
-            self.top_k,
-            self.n_group,
-            self.topk_group,
-            self.routed_scaling_factor,
-            self.norm_topk_prob,
-        )
-
-
 class Mistral4MoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -245,7 +221,7 @@ class Mistral4MoE(nn.Module):
             args.n_routed_experts,
         )
 
-        self.gate = Mistral4MoEGate(args)
+        self.gate = nn.Linear(args.hidden_size, args.n_routed_experts, bias=False)
         if args.n_shared_experts is not None:
             intermediate_size = args.moe_intermediate_size * args.n_shared_experts
             self.shared_experts = DeepseekV3MLP(
@@ -253,7 +229,14 @@ class Mistral4MoE(nn.Module):
             )
 
     def __call__(self, x):
-        inds, scores = self.gate(x)
+        inds, scores = mistral4_expert_select(
+            self.gate(x),
+            self.num_experts_per_tok,
+            self.args.n_group,
+            self.args.topk_group,
+            self.args.routed_scaling_factor,
+            self.args.norm_topk_prob,
+        )
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
         if self.args.n_shared_experts is not None:
