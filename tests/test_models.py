@@ -1900,6 +1900,85 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_mistral4(self):
+        from mlx_lm.models import mistral4
+
+        args = mistral4.ModelArgs(
+            model_type="mistral4",
+            vocab_size=1024,
+            hidden_size=128,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            n_routed_experts=4,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            n_shared_experts=1,
+            routed_scaling_factor=1.0,
+            kv_lora_rank=4,
+            q_lora_rank=4,
+            qk_rope_head_dim=32,
+            v_head_dim=16,
+            qk_nope_head_dim=32,
+            norm_topk_prob=True,
+            max_position_embeddings=4096,
+            rms_norm_eps=1e-6,
+            first_k_dense_replace=0,
+            rope_parameters={
+                "rope_type": "yarn",
+                "factor": 128.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 1.0,
+                "beta_fast": 32,
+                "beta_slow": 1,
+                "original_max_position_embeddings": 4096,
+                "rope_theta": 100000.0,
+                "llama_4_scaling_beta": 0.1,
+            },
+        )
+        model = mistral4.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        s = 0.1 * math.log(128.0) + 1.0
+        self.assertAlmostEqual(
+            model.layers[0].self_attn.scale,
+            (args.qk_nope_head_dim + args.qk_rope_head_dim) ** -0.5 * s * s,
+        )
+
+        # Real fp8 layout: rank-0 scales, [E, 1, 1] for expert stacks, no "weight_".
+        e, mi, h = args.n_routed_experts, args.moe_intermediate_size, args.hidden_size
+        fp8 = lambda *s: mx.full(s, 0x38, dtype=mx.uint8)  # 0x38 is 1.0 in e4m3
+        scale = lambda v, *s: mx.full(s, v, dtype=mx.bfloat16)
+        p = "model.layers.0.mlp"
+        out = model.sanitize(
+            {
+                f"{p}.shared_experts.down_proj.weight": fp8(h, mi),
+                f"{p}.shared_experts.down_proj.weight_scale_inv": scale(2.0),
+                f"{p}.shared_experts.down_proj.activation_scale": scale(1.0),
+                f"{p}.experts.down_proj": fp8(e, h, mi),
+                f"{p}.experts.down_proj_scale_inv": scale(4.0, e, 1, 1),
+                f"{p}.experts.down_proj_activation_scale": scale(1.0, e, 1, 1),
+                f"{p}.experts.gate_up_proj": fp8(e, 2 * mi, h),
+                f"{p}.experts.gate_up_proj_scale_inv": scale(8.0, e, 1, 1),
+            }
+        )
+        self.assertFalse([k for k in out if "activation_scale" in k])
+        self.assertFalse([k for k, v in out.items() if v.dtype == mx.uint8])
+        for name, shape, value in (
+            ("shared_experts.down_proj", (h, mi), 2.0),
+            ("switch_mlp.down_proj", (e, h, mi), 4.0),
+            ("switch_mlp.gate_proj", (e, mi, h), 8.0),
+            ("switch_mlp.up_proj", (e, mi, h), 8.0),
+        ):
+            w = out[f"{p}.{name}.weight"]
+            self.assertEqual(w.shape, shape)
+            self.assertEqual(w.reshape(-1)[0].item(), value)
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
