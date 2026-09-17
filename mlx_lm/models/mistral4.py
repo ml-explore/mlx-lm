@@ -333,7 +333,7 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
         mask = create_attention_mask(h, cache[0])
 
         attn_scale = _get_llama_4_attn_scale(
-            x.shape[1],
+            h.shape[1],
             offset,
             self.args.rope_parameters["llama_4_scaling_beta"],
             self.args.rope_parameters["original_max_position_embeddings"],
