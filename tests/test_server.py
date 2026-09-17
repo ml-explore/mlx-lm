@@ -4,7 +4,10 @@ import http
 import io
 import json
 import threading
+import time
 import unittest
+from queue import Queue
+from unittest import mock
 
 import mlx.core as mx
 import requests
@@ -16,8 +19,10 @@ from mlx_lm.server import (
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
+    ToolCallFormatter,
     _make_sampler,
 )
+from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
 
 
@@ -205,6 +210,27 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(text, "f[ARGS]{}")
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
+
+
+class TestToolCallFormatter(unittest.TestCase):
+    def test_formats_parallel_tool_calls(self):
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
+        raw_tool_call = (
+            '[get_time(location="Paris"), '
+            'grocery.order(items=[{"name": "noodles", "organic": true}])]'
+        )
+
+        tool_calls = formatter([raw_tool_call])
+
+        self.assertEqual(
+            [tc["function"]["name"] for tc in tool_calls],
+            ["get_time", "grocery.order"],
+        )
+        self.assertTrue(all(tc["type"] == "function" for tc in tool_calls))
+        self.assertEqual(
+            json.loads(tool_calls[1]["function"]["arguments"]),
+            {"items": [{"name": "noodles", "organic": True}]},
+        )
 
 
 class TestServer(unittest.TestCase):
@@ -847,6 +873,64 @@ class TestMakeSampler(unittest.TestCase):
         token = sampler(logits)
         mx.eval(token)
         self.assertEqual(token.shape, (1,))
+
+
+class TestModelSwapClearsCache(unittest.TestCase):
+    @mock.patch("mlx_lm.server.mx.clear_cache")
+    @mock.patch("mlx_lm.server.make_prompt_cache", return_value=[])
+    @mock.patch("mlx_lm.server.load")
+    @mock.patch("mlx_lm.server.mx.distributed.init")
+    def test_load_clears_mlx_buffer_pool(self, init, load, make_cache, clear_cache):
+        import argparse
+
+        from mlx_lm.server import ModelProvider
+
+        args = argparse.Namespace(
+            adapter_path=None,
+            chat_template=None,
+            draft_model=None,
+            model="model-a",
+            pipeline=False,
+            trust_remote_code=False,
+            use_default_chat_template=False,
+        )
+        tokenizer = mock.Mock()
+        tokenizer.chat_template = None
+        tokenizer.default_chat_template = None
+        load.return_value = (mock.Mock(), tokenizer)
+        init.return_value.size.return_value = 1
+
+        provider = ModelProvider(args)
+        provider._load("model-a")
+        provider._load("model-b")
+        self.assertGreaterEqual(clear_cache.call_count, 2)
+
+
+class FailingModelProvider:
+    def load_default(self):
+        raise RuntimeError("simulated generate crash")
+
+
+class TestGenerationThreadDeath(unittest.TestCase):
+    def _crashed_generator(self):
+        rg = ResponseGenerator(FailingModelProvider(), LRUPromptCache())
+        rg.join()
+        time.sleep(0.05)
+        return rg
+
+    def test_generation_unavailable_after_thread_crash(self):
+        rg = self._crashed_generator()
+        self.assertTrue(rg._generation_failed)
+        self.assertFalse(rg.generation_available())
+        with self.assertRaisesRegex(RuntimeError, "generation thread died"):
+            rg.generate(None, None)
+
+    def test_inflight_request_does_not_hang_after_thread_crash(self):
+        rg = self._crashed_generator()
+        # A request dequeued before the crash never gets a response queued, so
+        # waiting on it must give up instead of blocking forever.
+        with self.assertRaisesRegex(RuntimeError, "generation thread died"):
+            rg._await_response(Queue())
 
 
 if __name__ == "__main__":
