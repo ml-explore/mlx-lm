@@ -9,6 +9,8 @@ from pathlib import Path
 
 import ml_collections
 import mlx.core as mx
+from mlx.nn.utils import clip_grad_norm_sharded
+from mlx.optimizers import clip_grad_norm as _clip_grad_norm
 from mlx.utils import tree_map
 
 CONFIG_ROOT = Path(__file__).resolve().parent / "configs"
@@ -88,3 +90,9 @@ def grad_checkpoint(layer, dtype=None):
         return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
 
     type(layer).__call__ = checkpointed_fn
+
+
+def clip_grad_norm(grads, max_norm, fsdp_group=None):
+    if fsdp_group is not None:
+        return clip_grad_norm_sharded(grads, max_norm, group=fsdp_group)
+    return _clip_grad_norm(grads, max_norm)
