@@ -6,7 +6,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import llama, ministral3, mistral4_text
+from . import llama, ministral3, mistral4
 from .base import BaseModelArgs
 
 
@@ -30,8 +30,8 @@ class Model(nn.Module):
                 ministral3.ModelArgs.from_dict(args.text_config)
             )
         elif args.text_config.get("model_type") == "mistral4":
-            self.language_model = mistral4_text.Model(
-                mistral4_text.ModelArgs.from_dict(args.text_config)
+            self.language_model = mistral4.Model(
+                mistral4.ModelArgs.from_dict(args.text_config)
             )
         else:
             self.language_model = llama.Model(

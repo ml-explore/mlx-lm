@@ -1877,9 +1877,9 @@ class TestModels(unittest.TestCase):
         )
 
     def test_mistral4(self):
-        from mlx_lm.models import mistral4_text
+        from mlx_lm.models import mistral4
 
-        args = mistral4_text.ModelArgs(
+        args = mistral4.ModelArgs(
             model_type="mistral4",
             vocab_size=1024,
             hidden_size=128,
@@ -1915,7 +1915,7 @@ class TestModels(unittest.TestCase):
                 "llama_4_scaling_beta": 0.1,
             },
         )
-        model = mistral4_text.Model(args)
+        model = mistral4.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
