@@ -275,8 +275,6 @@ def cli():
         config.batch_size = args.batch_size
     if args.context_size is not None:
         config.context_size = args.context_size
-    if args.fsdp_dim is not None:
-        config.fsdp_dim = args.fsdp_dim
     if args.grad_accum_steps is not None:
         config.grad_accum_steps = args.grad_accum_steps
     if args.all_reduce_size is not None:
@@ -290,12 +288,8 @@ def cli():
         config.restore = args.restore
     if args.resume_from_step is not None:
         config.resume_from_step = args.resume_from_step
-    if args.random_data:
-        config.random_data = True
 
-    if not args.random_data and (
-        args.stage or args.source or config.get("dataset") is None
-    ):
+    if args.stage or args.source or config.get("dataset") is None:
         config.dataset = data.dolma(args.stage or "pre", args.source or "hf")
 
     init_wandb(config, args, os.environ.get("MLX_RANK", "0") == "0")
