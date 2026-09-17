@@ -10,6 +10,7 @@ from mlx_lm.tool_parsers import (
     kimi_k2,
     kimi_k3,
     longcat,
+    minicpm5,
     minimax_m2,
     mistral,
     pythonic,
@@ -38,6 +39,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<invoke name="multiply">\n<parameter name="a">12234585</parameter>\n<parameter name="b">48838483920</parameter>\n</invoke>',
                 minimax_m2,
+            ),
+            (
+                '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>',
+                minicpm5,
             ),
             (
                 "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
@@ -108,6 +113,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<invoke name="get_current_temperature">\n<parameter name="location">London</parameter>\n</invoke>',
                 minimax_m2,
+            ),
+            (
+                '<function name="get_current_temperature"><param name="location">London</param></function>',
+                minicpm5,
             ),
             (
                 "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
@@ -576,6 +585,118 @@ class TestToolParsing(unittest.TestCase):
             kimi_k3.parse_tool_call(
                 '<|open|>call index="1"<|sep|><|close|>call<|sep|>', None
             )
+
+    def test_minicpm5(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                            "metric": {"type": "boolean"},
+                        },
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            },
+        ]
+
+        # What the server passes: both markers stripped by the state machine.
+        tool_call = minicpm5.parse_tool_call(
+            '"get_weather"><param name="city">Paris</param>'
+            '<param name="days">3</param><param name="metric">true</param>',
+            tools,
+        )
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "get_weather",
+                "arguments": {"city": "Paris", "days": 3, "metric": True},
+            },
+        )
+
+        # Single quotes and whitespace around the tags.
+        tool_call = minicpm5.parse_tool_call(
+            "<function name='get_weather'>\n<param name='city'> Paris </param>\n</function>",
+            tools,
+        )
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
+        )
+
+        # CDATA keeps the value verbatim, including newlines and markup.
+        tool_call = minicpm5.parse_tool_call(
+            '<function name="write_file"><param name="path">a.txt</param>'
+            '<param name="content"><![CDATA[line 1\n<b>&</b>\n]]></param></function>',
+            tools,
+        )
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "write_file",
+                "arguments": {"path": "a.txt", "content": "line 1\n<b>&</b>\n"},
+            },
+        )
+
+        # No schema: values stay strings.
+        tool_call = minicpm5.parse_tool_call(
+            '<function name="get_weather"><param name="days">3</param></function>'
+        )
+        self.assertEqual(tool_call, {"name": "get_weather", "arguments": {"days": "3"}})
+
+        # Parallel calls are consecutive blocks.
+        tool_calls = minicpm5.parse_tool_call(
+            '<function name="get_weather"><param name="city">Tokyo</param></function>\n'
+            '<function name="write_file"><param name="path">b.txt</param></function>',
+            tools,
+        )
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "get_weather", "arguments": {"city": "Tokyo"}},
+                {"name": "write_file", "arguments": {"path": "b.txt"}},
+            ],
+        )
+
+        # Truncated by max_tokens: no closing tag, the complete params survive.
+        tool_call = minicpm5.parse_tool_call(
+            '"get_weather"><param name="city">Paris</param><param name="days">3',
+            tools,
+        )
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
+        )
+
+        # No parameters, an empty value, and dotted/hyphenated names.
+        self.assertEqual(
+            minicpm5.parse_tool_call('<function name="get_weather"></function>'),
+            {"name": "get_weather", "arguments": {}},
+        )
+        self.assertEqual(
+            minicpm5.parse_tool_call(
+                '<function name="fs.read-file"><param name="path"></param></function>'
+            ),
+            {"name": "fs.read-file", "arguments": {"path": ""}},
+        )
+
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call("no call here", tools)
 
     def test_minimax_m2(self):
         test_case = (
