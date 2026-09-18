@@ -935,3 +935,40 @@ class TestGenerationThreadDeath(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAllowedModels(unittest.TestCase):
+    """--allowed-models: a request may only load the listed models (plus the --model
+    given at start); anything else is refused before any weights are touched."""
+
+    def _provider(self, model, allowed):
+        import argparse
+        from mlx_lm.server import ModelProvider
+
+        args = argparse.Namespace(
+            model=model,
+            adapter_path=None,
+            draft_model=None,
+            trust_remote_code=False,
+            chat_template=None,
+            pipeline=False,
+            allowed_models=allowed,
+        )
+        provider = ModelProvider(args)
+        provider._load = lambda *a, **k: None  # never load real weights here
+        return provider
+
+    def test_refuses_model_not_in_list(self):
+        p = self._provider("a/model", ["b/model"])
+        with self.assertRaises(ValueError):
+            p.load("c/other")
+
+    def test_allows_listed_and_default(self):
+        p = self._provider("a/model", ["b/model"])
+        p.load("b/model")
+        p.load("a/model")
+        p.load("default_model")
+
+    def test_no_list_means_any(self):
+        p = self._provider("a/model", None)
+        p.load("c/other")
