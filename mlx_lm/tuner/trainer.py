@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -13,6 +14,7 @@ from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
 
 from ..cli_ui import TrainUI, rprint
+from ..utils import maybe_set_recommended_wired_limit
 from .callbacks import TrainingCallback
 from .datasets import CacheDataset
 
@@ -135,7 +137,7 @@ def iterate_batches(
         idx[i + offset : i + offset + batch_size : step]
         for i in range(0, len(idx) - batch_size + 1, batch_size)
     ]
-    if seed:
+    if seed is not None:
         np.random.seed(seed)
     while True:
         indices = np.random.permutation(len(batch_idx))
@@ -182,7 +184,7 @@ def evaluate(
     loss: callable = default_loss,
     iterate_batches: callable = iterate_batches,
     clear_cache_threshold: int = 0,
-    progress_callback: callable = None,
+    progress_callback: Optional[callable] = None,
 ):
     model.eval()
     all_losses = mx.array(0.0)
@@ -226,8 +228,7 @@ def train(
     iterate_batches: callable = iterate_batches,
     training_callback: TrainingCallback = None,
 ):
-    if mx.metal.is_available():
-        mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])
+    _ = maybe_set_recommended_wired_limit()
     world = mx.distributed.init()
     world_size = world.size()
     rank = world.rank()

@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -42,6 +43,38 @@ class TestUtils(unittest.TestCase):
         p2 = model_lazy.layers[0].mlp.up_proj.weight
         self.assertTrue(mx.allclose(p1, p2))
 
+    def test_load_config_decodes_tagged_floats(self):
+        # transformers tags non-finite floats so that config.json stays valid
+        # JSON for every parser; the tag has to be undone on the way back in.
+        model_path = Path(self.test_dir) / "tagged-floats"
+        model_path.mkdir(exist_ok=True)
+        with open(model_path / "config.json", "w") as f:
+            json.dump(
+                {
+                    "model_type": "nemotron_h",
+                    "time_step_limit": [0.0, {"__float__": "Infinity"}],
+                    "nested": {"lower": {"__float__": "-Infinity"}},
+                    "not_a_tag": {"__float__": 3, "other": 4},
+                },
+                f,
+            )
+
+        config = utils.load_config(model_path)
+        self.assertEqual(config["time_step_limit"], [0.0, float("inf")])
+        self.assertEqual(config["nested"]["lower"], float("-inf"))
+        self.assertEqual(config["not_a_tag"], {"__float__": 3, "other": 4})
+
+        # Saving tags them again, so a converted model keeps a config.json that
+        # any JSON parser can read, and reading it back gives the same floats.
+        utils.save_config(config, model_path / "config.json")
+        with open(model_path / "config.json") as f:
+            self.assertEqual(
+                json.load(f)["time_step_limit"], [0.0, {"__float__": "Infinity"}]
+            )
+        self.assertEqual(
+            utils.load_config(model_path)["time_step_limit"], config["time_step_limit"]
+        )
+
     def test_make_shards(self):
         from mlx_lm.models import llama
 
@@ -59,6 +92,31 @@ class TestUtils(unittest.TestCase):
         gb = sum(p.nbytes for _, p in weights) // 2**30
         shards = utils.make_shards(dict(weights), 1)
         self.assertTrue(gb <= len(shards) <= gb + 1)
+
+    def test_make_shards_oversized_weight(self):
+        # make_shards only reads .nbytes, so fake the sizes.
+        small = SimpleNamespace(nbytes=1 << 20)
+        big = SimpleNamespace(nbytes=(1 << 30) + 1)
+        for weights, expected in (
+            ({}, []),
+            ({"a": big}, [{"a": big}]),
+            (
+                {"a": small, "b": big, "c": small},
+                [{"a": small}, {"b": big}, {"c": small}],
+            ),
+        ):
+            self.assertEqual(utils.make_shards(weights, 1), expected)
+
+    def test_parse_size(self):
+        self.assertEqual(utils._parse_size("1024"), 1024)
+        self.assertEqual(utils._parse_size("20G"), 20_000_000_000)
+        self.assertEqual(utils._parse_size("512M"), 512_000_000)
+        self.assertEqual(utils._parse_size("4.1MB"), 4_100_000)
+        self.assertEqual(utils._parse_size("4.1M"), 4_100_000)
+        self.assertEqual(utils._parse_size("4.1GB"), 4_100_000_000)
+        self.assertEqual(utils._parse_size("8.2MB"), 8_200_000)
+        self.assertEqual(utils._parse_size("16.9GB"), 16_900_000_000)
+        self.assertEqual(utils._parse_size("2.7GB"), 2_700_000_000)
 
     def test_quantize(self):
         from mlx_lm.models import llama
@@ -124,6 +182,19 @@ class TestUtils(unittest.TestCase):
         self.assertTrue(hasattr(model, "custom_attribute"))
         self.assertEqual(model.custom_attribute, "This is a custom model")
         self.assertTrue(hasattr(model, "qwenWeights"))
+
+    def test_get_classes_remaps_bailing_v3_architecture(self):
+        from mlx_lm.models import bailing_moe_v3
+
+        model_cls, args_cls = utils._get_classes(
+            {
+                "model_type": "bailing_hybrid",
+                "architectures": ["BailingMoeV3ForCausalLM"],
+            }
+        )
+
+        self.assertIs(model_cls, bailing_moe_v3.Model)
+        self.assertIs(args_cls, bailing_moe_v3.ModelArgs)
 
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
@@ -346,6 +417,24 @@ class TestTrustRemoteCode(unittest.TestCase):
         model, loaded_config = utils.load_model(self.model_path, strict=False)
         self.assertIsInstance(model, nn.Module)
         self.assertEqual(loaded_config["model_type"], "llama")
+
+    def test_compressed_tensors_known_formats(self):
+        self.assertEqual(
+            utils._compressed_tensors_quantization({"format": "nvfp4-pack-quantized"}),
+            {"group_size": 16, "bits": 4, "mode": "nvfp4"},
+        )
+        self.assertEqual(
+            utils._compressed_tensors_quantization({"format": "mxfp4-pack-quantized"}),
+            {"group_size": 32, "bits": 4, "mode": "mxfp4"},
+        )
+        self.assertEqual(
+            utils._compressed_tensors_quantization({"format": "pack-quantized"}),
+            {"group_size": 32, "bits": 4, "mode": "affine"},
+        )
+
+    def test_compressed_tensors_float_quantized_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "float-quantized"):
+            utils._compressed_tensors_quantization({"format": "float-quantized"})
 
 
 if __name__ == "__main__":

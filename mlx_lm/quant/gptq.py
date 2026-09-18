@@ -14,7 +14,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 from tqdm import tqdm
 
-from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     compute_bits_per_weight,
@@ -66,8 +66,8 @@ def gptq_quantize(
     model.update_modules(tree_unflatten(layers))
 
     # Evaluate the Hessians for all quantizable layers
-    for e, s in tqdm(
-        enumerate(range(0, len(data), batch_size)),
+    for s in tqdm(
+        range(0, len(data), batch_size),
         total=len(data) // batch_size,
         desc="Computing Hessians",
     ):
@@ -123,8 +123,10 @@ def gptq_quantize(
 
                 e = gptq_error(w, d, scales, biases)
 
-                W[..., k : k + j] -= e @ Hinv[k : k + 1, k : k + j]
-                err[..., k : k + 1] = e
+                # Update the remaining columns of this group now; the
+                # columns after the group are updated once per group below.
+                W[..., k:j] -= e @ Hinv[k : k + 1, k:j]
+                err[..., k - i : k - i + 1] = e
                 mx.eval(err, W)
 
             W[..., j:] -= err @ Hinv[i:j, j:]
@@ -150,7 +152,7 @@ def gptq_quantize(
     config = {"bits": bits, "group_size": group_size}
     fallback_config = {"bits": fallback_bits, "group_size": fallback_group_size}
     q_layers = []
-    for e, (k, l) in enumerate(layers):
+    for k, l in layers:
         if hasattr(l, "to_quantized"):
             config[k] = fallback_config
             q_layers.append((k, l.to_quantized(**fallback_config)))
