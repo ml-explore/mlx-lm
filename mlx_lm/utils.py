@@ -377,6 +377,33 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """Recover the group_size, bits and mode a saved weight was packed with.
+
+    Use this for paths the per-tensor quantization map does not name, where the
+    top-level default can be wrong. ``module`` must still be unquantized.
+    """
+    scales = weights[f"{path}.scales"]
+    in_dims = module.weight.shape[-1]
+    group_size = in_dims // scales.shape[-1]
+    bits = (weights[f"{path}.weight"].shape[-1] * 32) // in_dims
+    # Only affine keeps the scales in the weight dtype. Each of the other modes
+    # allows exactly one (bits, group_size) pair.
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    if (bits, group_size) == (4, 16):
+        return {"group_size": group_size, "bits": bits, "mode": "nvfp4"}
+    if (bits, group_size) == (4, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp4"}
+    if (bits, group_size) == (8, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp8"}
+
+    raise ValueError(
+        f"Cannot infer the quantization mode of {path}: "
+        f"{bits} bits with group size {group_size}."
+    )
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
@@ -465,23 +492,7 @@ def load_model(
                 return False
             if f"{p}.scales" not in weights:
                 return False
-            # This path has no entry in the per-tensor quantization map but
-            # the checkpoint already carries a quantized weight for it (e.g.
-            # a model's sanitize() can derive and re-quantize tensors, such
-            # as the absorbed MLA projections in deepseek_v3/deepseek_v32/
-            # glm4_moe_lite/kimi_linear/longcat_flash, from a source tensor
-            # that has its own per-tensor bits/group_size override). Infer
-            # the actual packing from the weight/scales shapes instead of
-            # assuming the top-level default, so the module nn.quantize
-            # allocates matches the weight that will be loaded into it.
-            in_dims = m.weight.shape[-1]
-            group_size = in_dims // weights[f"{p}.scales"].shape[-1]
-            bits = (weights[f"{p}.weight"].shape[-1] * 32) // in_dims
-            return {
-                "group_size": group_size,
-                "bits": bits,
-                "mode": quantization.get("mode", "affine"),
-            }
+            return infer_quant_config(p, m, weights)
 
         nn.quantize(
             model,
