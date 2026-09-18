@@ -255,6 +255,42 @@ class TestUtils(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    def test_infer_quant_config(self):
+        from mlx_lm.models.mla import MultiLinear
+
+        for mode, bits, group_size in [
+            ("affine", 3, 64),
+            ("affine", 4, 32),
+            ("affine", 8, 128),
+            ("mxfp4", 4, 32),
+            ("mxfp8", 8, 32),
+            ("nvfp4", 4, 16),
+        ]:
+            for name, layer in [
+                ("linear", nn.Linear(256, 128, bias=False)),
+                ("multi_linear", MultiLinear(256, 128, 4)),
+            ]:
+                with self.subTest(
+                    mode=mode, bits=bits, group_size=group_size, layer=name
+                ):
+                    q = layer.to_quantized(group_size=group_size, bits=bits, mode=mode)
+                    weights = {"l.weight": q.weight, "l.scales": q.scales}
+                    self.assertEqual(
+                        utils.infer_quant_config("l", layer, weights),
+                        {"group_size": group_size, "bits": bits, "mode": mode},
+                    )
+
+    def test_infer_quant_config_unknown_packing(self):
+        # uint8 scales say the weight is not affine, but no mode packs 6 bits
+        # into groups of 64.
+        layer = nn.Linear(256, 128, bias=False)
+        weights = {
+            "l.weight": mx.zeros((128, 48), mx.uint32),
+            "l.scales": mx.zeros((128, 4), mx.uint8),
+        }
+        with self.assertRaises(ValueError):
+            utils.infer_quant_config("l", layer, weights)
+
     def test_load_model_with_mixed_bit_derived_mla_projection(self):
         # Regression test for a mismatch that only shows up with a
         # non-uniform per-tensor quantization map: deepseek_v3's sanitize()
