@@ -888,6 +888,58 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_qwen3_rope_parameters(self):
+        # Regression test: configs saved by transformers >= 5 nest rope_theta
+        # and rope_scaling under rope_parameters and drop the flat fields.
+        from mlx_lm.models import qwen3
+
+        config = {
+            "model_type": "qwen3",
+            "hidden_size": 1024,
+            "num_hidden_layers": 4,
+            "intermediate_size": 2048,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 10_000,
+            "head_dim": 128,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": False,
+            "rope_parameters": {"rope_theta": 1000.0, "rope_type": "default"},
+        }
+        args = qwen3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000.0)
+        model = qwen3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Scaling parameters must reach the rope layer.
+        config["rope_parameters"] = {
+            "rope_theta": 1000.0,
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 1024,
+        }
+        args = qwen3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000.0)
+        self.assertEqual(args.rope_scaling, config["rope_parameters"])
+        model = qwen3.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, rope_utils.YarnRoPE)
+
+        # Flat fields from older configs still take priority.
+        config["rope_theta"] = 2000.0
+        config["rope_scaling"] = {"rope_type": "linear", "factor": 2.0}
+        args = qwen3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 2000.0)
+        self.assertEqual(args.rope_scaling, config["rope_scaling"])
+
+        # No rope_theta anywhere is an error, not a silent default.
+        del config["rope_theta"], config["rope_scaling"]
+        del config["rope_parameters"]["rope_theta"]
+        with self.assertRaises(ValueError):
+            qwen3.ModelArgs.from_dict(config)
+
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
             "hidden_size": 8,
