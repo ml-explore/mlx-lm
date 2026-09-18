@@ -2070,6 +2070,58 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gemma3n_kv_shared_layers_ignore_chunking(self):
+        # KV-shared layers reuse an earlier layer's cache, which that layer has
+        # already advanced by L, so they must not read its offset for RoPE.
+        from mlx_lm.models import gemma3n
+
+        args = gemma3n.ModelArgs(
+            model_type="gemma3n",
+            text_config={
+                "model_type": "gemma3n",
+                "hidden_size": 32,
+                "num_hidden_layers": 4,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 64,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 64,
+                "sliding_window": 8,
+                "max_position_embeddings": 128,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.0, 0.0, 0.0, 0.0],
+                "hidden_size_per_layer_input": 8,
+                "altup_num_inputs": 1,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 4,
+            },
+        )
+        model = gemma3n.Model(args)
+        mx.eval(model.parameters())
+
+        def last_logits(chunks):
+            cache = model.model.language_model.make_cache()
+            for chunk in chunks:
+                out = model(mx.array([chunk]), cache=cache)
+            return out[:, -1]
+
+        whole = last_logits([[1, 2, 3, 4]])
+        chunked = last_logits([[1, 2], [3, 4]])
+        self.assertTrue(mx.allclose(whole, chunked).item())
+
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text
 
