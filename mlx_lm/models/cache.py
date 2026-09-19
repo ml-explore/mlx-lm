@@ -1479,19 +1479,11 @@ class MTPPromptCacheState(_BaseCache):
 
     @property
     def state(self):
-        return [] if self.last_hidden is None else [self.last_hidden]
+        return self.last_hidden, self.num_tokens
 
     @state.setter
     def state(self, value):
-        self.last_hidden = value[0] if value else None
-
-    @property
-    def meta_state(self):
-        return str(self.num_tokens)
-
-    @meta_state.setter
-    def meta_state(self, value):
-        self.num_tokens = int(value or 0)
+        self.last_hidden, self.num_tokens = value
 
     def empty(self):
         return self.last_hidden is None
