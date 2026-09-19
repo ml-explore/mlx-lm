@@ -17,13 +17,14 @@ def make_sampler_chain(
     min_tokens_to_keep: int = 1,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Tuple[List[Callable[[mx.array], mx.array]], Optional[List]]:
     """Return (filter_chain, xtc_cell) for use in mtp_generate_step.
 
     xtc_cell is a mutable [uniform_draw] slot; set it before running the chain
     to share the XTC boolean across draft and verify steps. None when XTC is off.
     """
+    xtc_special_tokens = xtc_special_tokens or []
     _xtc_cell: Optional[List] = [None] if xtc_probability > 0.0 else None
     chain: List[Callable[[mx.array], mx.array]] = []
     if top_p > 0 and top_p < 1.0:

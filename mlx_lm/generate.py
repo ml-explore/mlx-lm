@@ -719,7 +719,7 @@ def mtp_generate_step(
     min_tokens_to_keep: int = 1,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """A generator that uses the model's native MTP head for speculative decoding.
 
@@ -735,6 +735,7 @@ def mtp_generate_step(
         Tuple[mx.array, mx.array, bool]: (token, log-probabilities, from_draft).
             ``from_draft`` is ``True`` when the token came from the MTP head.
     """
+    xtc_special_tokens = xtc_special_tokens or []
     if input_embeddings is not None:
         raise ValueError(
             "Native MTP generation does not yet support input_embeddings. "
@@ -1225,7 +1226,7 @@ def stream_generate(
     min_tokens_to_keep: int = 1,
     xtc_probability: float = 0.0,
     xtc_threshold: float = 0.0,
-    xtc_special_tokens: List[int] = [],
+    xtc_special_tokens: Optional[List[int]] = None,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
