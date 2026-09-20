@@ -232,15 +232,32 @@ large model and a long text was measured.
 
 ## Networking
 
-The tests use the `ring` backend of `mx.distributed`. It sends data over TCP,
-for example through a Thunderbolt bridge. It works for any number of machines.
-Each machine needs two links.
+The examples and tests use the `ring` backend of `mx.distributed`. MLX always
+has this backend. It sends data over TCP sockets, so the machines only need to
+reach each other over a network: Ethernet, Wi-Fi or Thunderbolt. In a ring, each
+machine talks only to its two neighbors.
 
-JACCL (RDMA over Thunderbolt 5) was not tested here. The MLX documentation says
-it needs macOS 26.2 or later, Thunderbolt 5, and a fully connected mesh, so the
-size of the mesh is limited by the number of ports. At the time of writing the
-MLX issue tracker lists open reports of crashes and hangs in JACCL, and a ring
-mode for JACCL is still new.
+- **Number of machines.** The MLX documentation does not give a maximum and
+  shows a ring of 4 machines. In a Thunderbolt ring each machine uses two
+  Thunderbolt ports, one for each neighbor, so the size of the ring does not
+  depend on the number of ports. Over Ethernet, any machines that can reach each
+  other work. We tested only 2 machines: an M3 Max and an M1 MacBook Air over a
+  Thunderbolt bridge. Rings of 4 to 8 machines were not tested. For more than 2
+  machines, MLX provides `mlx.distributed_config` to set up the links.
+- **Latency.** On the 2-machine link we measured about 0.2 ms for one
+  collective and about 3 GB/s in one direction. A ring collective passes data
+  from neighbor to neighbor, so its time grows with the number of machines. We
+  did not measure this growth.
+- **JACCL** (RDMA over Thunderbolt 5). The MLX documentation says its latency is
+  an order of magnitude lower than that of the ring backend. It needs macOS 26.2
+  or later, Thunderbolt 5, and a fully connected mesh with a direct cable between
+  every pair of machines, so N machines need N-1 ports each. We did not test
+  JACCL. At the time of writing the MLX issue tracker lists open reports of
+  crashes and hangs in JACCL, and its ring mode is new.
+
+Context sharding sends small partial results, one collective per sharded layer,
+and never the cache. So the latency of a collective matters more than the
+bandwidth.
 
 An idea that is not implemented: a two-level merge. Small groups of 3 or 4
 machines could use an RDMA mesh inside the group, and the groups could use TCP
