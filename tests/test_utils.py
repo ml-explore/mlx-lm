@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -41,6 +42,38 @@ class TestUtils(unittest.TestCase):
         p1 = model.layers[0].mlp.up_proj.weight
         p2 = model_lazy.layers[0].mlp.up_proj.weight
         self.assertTrue(mx.allclose(p1, p2))
+
+    def test_load_config_decodes_tagged_floats(self):
+        # transformers tags non-finite floats so that config.json stays valid
+        # JSON for every parser; the tag has to be undone on the way back in.
+        model_path = Path(self.test_dir) / "tagged-floats"
+        model_path.mkdir(exist_ok=True)
+        with open(model_path / "config.json", "w") as f:
+            json.dump(
+                {
+                    "model_type": "nemotron_h",
+                    "time_step_limit": [0.0, {"__float__": "Infinity"}],
+                    "nested": {"lower": {"__float__": "-Infinity"}},
+                    "not_a_tag": {"__float__": 3, "other": 4},
+                },
+                f,
+            )
+
+        config = utils.load_config(model_path)
+        self.assertEqual(config["time_step_limit"], [0.0, float("inf")])
+        self.assertEqual(config["nested"]["lower"], float("-inf"))
+        self.assertEqual(config["not_a_tag"], {"__float__": 3, "other": 4})
+
+        # Saving tags them again, so a converted model keeps a config.json that
+        # any JSON parser can read, and reading it back gives the same floats.
+        utils.save_config(config, model_path / "config.json")
+        with open(model_path / "config.json") as f:
+            self.assertEqual(
+                json.load(f)["time_step_limit"], [0.0, {"__float__": "Infinity"}]
+            )
+        self.assertEqual(
+            utils.load_config(model_path)["time_step_limit"], config["time_step_limit"]
+        )
 
     def test_make_shards(self):
         from mlx_lm.models import llama
@@ -221,6 +254,108 @@ class TestUtils(unittest.TestCase):
             logits = loaded(mx.array([[1, 2, 3]], dtype=mx.int32))
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
+
+    def test_infer_quant_config(self):
+        from mlx_lm.models.mla import MultiLinear
+
+        for mode, bits, group_size in [
+            ("affine", 3, 64),
+            ("affine", 4, 32),
+            ("affine", 8, 128),
+            ("mxfp4", 4, 32),
+            ("mxfp8", 8, 32),
+            ("nvfp4", 4, 16),
+        ]:
+            for name, layer in [
+                ("linear", nn.Linear(256, 128, bias=False)),
+                ("multi_linear", MultiLinear(256, 128, 4)),
+            ]:
+                with self.subTest(
+                    mode=mode, bits=bits, group_size=group_size, layer=name
+                ):
+                    q = layer.to_quantized(group_size=group_size, bits=bits, mode=mode)
+                    weights = {"l.weight": q.weight, "l.scales": q.scales}
+                    self.assertEqual(
+                        utils.infer_quant_config("l", layer, weights),
+                        {"group_size": group_size, "bits": bits, "mode": mode},
+                    )
+
+    def test_infer_quant_config_unknown_packing(self):
+        # uint8 scales say the weight is not affine, but no mode packs 6 bits
+        # into groups of 64.
+        layer = nn.Linear(256, 128, bias=False)
+        weights = {
+            "l.weight": mx.zeros((128, 48), mx.uint32),
+            "l.scales": mx.zeros((128, 4), mx.uint8),
+        }
+        with self.assertRaises(ValueError):
+            utils.infer_quant_config("l", layer, weights)
+
+    def test_load_model_with_mixed_bit_derived_mla_projection(self):
+        # deepseek_v3's sanitize() derives embed_q/unembed_out from kv_b_proj at
+        # its bits, but those paths never reach config["quantization"], so
+        # load_model has to infer them instead of using the global default.
+        from mlx_lm.models import deepseek_v3
+
+        args = deepseek_v3.ModelArgs(
+            vocab_size=64,
+            hidden_size=32,
+            intermediate_size=64,
+            moe_intermediate_size=64,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            n_routed_experts=2,
+            kv_lora_rank=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=32,
+            v_head_dim=32,
+            qk_nope_head_dim=32,
+        )
+        model = deepseek_v3.Model(args)
+        # The derived projections use a different mode than the rest of the
+        # model, so load_model has to infer the mode too, not just the bits.
+        group_size, bits, mode = 32, 4, "mxfp4"
+        derived_bits, derived_mode = 8, "mxfp8"
+        model, config = utils.quantize_model(
+            model,
+            dataclasses.asdict(args),
+            group_size=group_size,
+            bits=bits,
+            mode=mode,
+        )
+
+        # Re-pack the derived projections, as a per-tensor override on kv_b_proj
+        # would, leaving config["quantization"] untouched.
+        attn = model.layers[0].self_attn
+        for proj in (attn.embed_q, attn.unembed_out):
+            w = mx.dequantize(
+                proj.weight,
+                proj.scales,
+                group_size=proj.group_size,
+                bits=proj.bits,
+                mode=proj.mode,
+            )
+            proj.weight, proj.scales = mx.quantize(
+                w, group_size=group_size, bits=derived_bits, mode=derived_mode
+            )
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            self.assertEqual(
+                config["quantization"],
+                {"group_size": group_size, "bits": bits, "mode": mode},
+            )
+
+            loaded, _ = utils.load_model(Path(mlx_path))
+
+            loaded_attn = loaded.layers[0].self_attn
+            for proj in (loaded_attn.embed_q, loaded_attn.unembed_out):
+                self.assertEqual(
+                    (proj.bits, proj.group_size, proj.mode),
+                    (derived_bits, group_size, derived_mode),
+                )
 
 
 CUSTOM_MODEL_FILE = """\

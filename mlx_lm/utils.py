@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import math
 import os
 import resource
 import shutil
@@ -324,9 +325,42 @@ def _compressed_tensors_quantization(quantization_config: dict) -> dict:
     )
 
 
+# transformers tags non-finite floats so config.json stays valid JSON, e.g.
+# {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
+_FLOAT_TAG_KEY = "__float__"
+_FLOAT_TAGS = {
+    "Infinity": float("inf"),
+    "-Infinity": float("-inf"),
+    "NaN": float("nan"),
+}
+
+
+def _decode_tagged_floats(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        if set(obj) == {_FLOAT_TAG_KEY} and obj[_FLOAT_TAG_KEY] in _FLOAT_TAGS:
+            return _FLOAT_TAGS[obj[_FLOAT_TAG_KEY]]
+        return {k: _decode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_tagged_floats(v) for v in obj]
+    return obj
+
+
+def _encode_tagged_floats(obj: Any) -> Any:
+    """Tag non-finite floats again, so a saved config stays valid JSON."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        if math.isnan(obj):
+            return {_FLOAT_TAG_KEY: "NaN"}
+        return {_FLOAT_TAG_KEY: "Infinity" if obj > 0 else "-Infinity"}
+    if isinstance(obj, dict):
+        return {k: _encode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_encode_tagged_floats(v) for v in obj]
+    return obj
+
+
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
-        config = json.load(f)
+        config = _decode_tagged_floats(json.load(f))
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
@@ -341,6 +375,33 @@ def load_config(model_path: Path) -> dict:
             config["eos_token_id"] = eos_token_id
 
     return config
+
+
+def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """Recover the group_size, bits and mode a saved weight was packed with.
+
+    Use this for paths the per-tensor quantization map does not name, where the
+    top-level default can be wrong. ``module`` must still be unquantized.
+    """
+    scales = weights[f"{path}.scales"]
+    in_dims = module.weight.shape[-1]
+    group_size = in_dims // scales.shape[-1]
+    bits = (weights[f"{path}.weight"].shape[-1] * 32) // in_dims
+    # Only affine keeps the scales in the weight dtype. Each of the other modes
+    # allows exactly one (bits, group_size) pair.
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    if (bits, group_size) == (4, 16):
+        return {"group_size": group_size, "bits": bits, "mode": "nvfp4"}
+    if (bits, group_size) == (4, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp4"}
+    if (bits, group_size) == (8, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp8"}
+
+    raise ValueError(
+        f"Cannot infer the quantization mode of {path}: "
+        f"{bits} bits with group size {group_size}."
+    )
 
 
 def load_model(
@@ -429,7 +490,9 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            return infer_quant_config(p, m, weights)
 
         nn.quantize(
             model,
@@ -1012,7 +1075,7 @@ def save_config(
 
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
-        json.dump(config, fid, indent=4)
+        json.dump(_encode_tagged_floats(config), fid, indent=4)
 
 
 def save(

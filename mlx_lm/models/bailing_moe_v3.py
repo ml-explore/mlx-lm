@@ -16,9 +16,9 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .mla import MultiLinear
-from .rope_utils import initialize_rope
+from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -73,16 +73,6 @@ def _is_mtp_weight(key: str, num_hidden_layers: int) -> bool:
         return False
     layer_index = key[len(prefix) :].split(".", 1)[0]
     return layer_index.isdigit() and int(layer_index) >= num_hidden_layers
-
-
-def _normalize_kda_qk(
-    q: mx.array, k: mx.array, head_dim: int
-) -> tuple[mx.array, mx.array]:
-    inv_scale = head_dim**-0.5
-    eps = 1e-6 / head_dim
-    q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
-    k = inv_scale * mx.fast.rms_norm(k, None, eps)
-    return q, k
 
 
 class BailingMLP(nn.Module):
@@ -178,6 +168,7 @@ class BailingMLA(nn.Module):
         self.qk_head_dim = args.qk_nope_head_dim + args.qk_rope_head_dim
         self.v_head_dim = args.v_head_dim
         self.scale = self.qk_head_dim**-0.5
+        self.scale = apply_yarn_mscale(self.scale, args.rope_scaling)
 
         if self.q_lora_rank is None:
             self.q_proj = nn.Linear(
@@ -216,7 +207,8 @@ class BailingMLA(nn.Module):
         self.rope = initialize_rope(
             args.qk_rope_head_dim,
             base=args.rope_theta,
-            traditional=False,
+            # rope_interleave rotates consecutive pairs, which is traditional=True.
+            traditional=True,
             scaling_config=args.rope_scaling,
             max_position_embeddings=args.max_position_embeddings,
         )
@@ -372,7 +364,7 @@ class BailingKDA(nn.Module):
         k = k.reshape(batch, length, self.num_heads, self.head_dim)
         v = v.reshape(batch, length, self.num_heads, self.head_dim)
 
-        q, k = _normalize_kda_qk(q, k, self.head_dim)
+        q, k = normalize_qk(q, k, inv_scale=self.head_dim**-0.5, eps=1e-6)
 
         raw_gate = self.f_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
         state = None if cache is None else cache[3]
