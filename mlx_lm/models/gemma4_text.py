@@ -237,6 +237,7 @@ class Attention(nn.Module):
         cache: Optional[Any] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        shared_cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -270,8 +271,15 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
+        # A shared layer holds no cache. If the source cache is sharded, it still
+        # has to merge its attention across the ranks.
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries,
+            keys,
+            values,
+            cache=cache if cache is not None else shared_cache,
+            scale=self.scale,
+            mask=mask,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
@@ -340,12 +348,18 @@ class DecoderLayer(nn.Module):
         per_layer_input: Optional[mx.array] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        shared_cache: Optional[Any] = None,
     ) -> mx.array:
         residual = x
 
         h = self.input_layernorm(x)
         h, shared_kv, offset = self.self_attn(
-            h, mask, cache, shared_kv=shared_kv, offset=offset
+            h,
+            mask,
+            cache,
+            shared_kv=shared_kv,
+            offset=offset,
+            shared_cache=shared_cache,
         )
         h = self.post_attention_layernorm(h)
         h = residual + h
@@ -562,6 +576,12 @@ class Gemma4TextModel(nn.Module):
             )
         ):
             kvs, offset = intermediates[prev_idx]
+            source = cache[prev_idx]
+            shared_cache = (
+                source
+                if c is None and getattr(source, "group", None) is not None
+                else None
+            )
 
             h, kvs, offset = layer(
                 h,
@@ -570,6 +590,7 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 shared_kv=kvs,
                 offset=offset,
+                shared_cache=shared_cache,
             )
 
             intermediates[idx] = (kvs, offset)

@@ -116,6 +116,10 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    if getattr(cache, "group", None) is not None:
+        if sinks is not None:
+            raise ValueError("Sharded attention does not support attention sinks.")
+        return cache.attend(queries, keys, values, scale)
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
