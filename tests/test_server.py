@@ -356,6 +356,35 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
 
+    def test_handle_chat_completions_with_dict_tool_arguments(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        chat_post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "messages": [
+                {"role": "user", "content": "what is 2+3?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "123",
+                            "function": {
+                                "name": "add",
+                                "arguments": {"a": 2, "b": 3},
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "5", "tool_call_id": "123"},
+            ],
+        }
+        response = requests.post(url, json=chat_post_data)
+        response_body = response.text
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+
     def test_generation_thread_exit_releases_model(self):
         response_generator = ResponseGenerator(DummyModelProvider(), LRUPromptCache())
         provider = response_generator.model_provider
