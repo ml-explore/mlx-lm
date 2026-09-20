@@ -14,6 +14,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    BatchKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
@@ -2049,6 +2050,48 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gemma2_grouped_query_batched_mask(self):
+        # Under GQA, gemma2 makes 5-D scores but the mask stays 4-D.
+        # test_gemma2 has repeats == 1, so it does not use this path.
+        from mlx_lm.models import gemma2
+
+        args = gemma2.ModelArgs(
+            model_type="gemma2",
+            hidden_size=128,
+            num_hidden_layers=2,
+            intermediate_size=256,
+            num_attention_heads=8,
+            head_dim=16,
+            rms_norm_eps=1e-4,
+            vocab_size=128,
+            num_key_value_heads=4,   # repeats == 2
+        )
+        model = gemma2.Model(args)
+        mx.eval(model.parameters())
+
+        # A batch of n_kv_heads broadcasts without an error, but masks the
+        # wrong axis. Other batch sizes raise.
+        left_padding = [3, 1, 2, 0]
+        B, L = len(left_padding), 6
+        tokens = mx.broadcast_to(mx.arange(1, L + 1, dtype=mx.int32), (B, L))
+
+        batched = model(tokens, cache=[
+            BatchKVCache(left_padding) for _ in range(args.num_hidden_layers)
+        ])
+        mx.eval(batched)
+        self.assertEqual(batched.shape, (B, L, args.vocab_size))
+
+        # Each row on its own, with its padding dropped, is the reference.
+        for i, pad in enumerate(left_padding):
+            ref = model(tokens[i : i + 1, pad:], cache=[
+                KVCache() for _ in range(args.num_hidden_layers)
+            ])
+            mx.eval(ref)
+            self.assertTrue(
+                mx.allclose(batched[i, pad:], ref[0], atol=1e-4),
+                f"row {i} (left_padding={pad}) differs from the unbatched result",
+            )
 
     def test_gemma3_text(self):
         from mlx_lm.models import gemma3_text
