@@ -113,14 +113,34 @@ Rules for callers:
 
 ## How it works
 
-- **Weights.** Every machine holds the full weights. Only attention over the
-  cache is split.
+Context sharding splits where the KV cache is stored, and the attention over it.
+It does not split the rest of the work of a layer.
+
+| Part | Split between the machines | Same on every machine |
+|---|---|---|
+| Storage of the keys and values | yes, each machine keeps its own part | |
+| Attention over the stored text (a question, a generated token, or a new block during prepare) | yes, each machine reads only its own part | |
+| Weights | | yes, every machine has all of them |
+| The rest of each layer (projections, MLP, norms) | | yes, every machine computes it for every token |
+
+- **Weights.** Every machine holds the full weights.
 - **Prepare.** The text goes through the model in blocks (default 2048 tokens).
-  Every machine computes every block. The keys and values of a block stay on
-  one machine. Blocks go to the machines in turn, or by the shares you give.
-  The memory used during prepare depends on the block size, not on the text
-  length. The score table is computed in tiles of a fixed size
-  (`MLX_LM_SHARD_SCORE_BUDGET`).
+  Every machine runs every block through all layers. Two things are shared:
+    - Storage. When a block is done, one machine keeps its keys and values. The
+      other machines drop their copy. Blocks go to the machines in turn, or by
+      the shares you give.
+    - Attention over the earlier blocks. Each machine computes it only over the
+      blocks it holds. The partial results are merged, as in the next item.
+- **Prepare cost.** The work of computing a block is not shared, so prepare time
+  does not fall when you add machines. The slowest machine sets the pace. You
+  prepare once. Every later question reads the split cache, so each machine
+  reads only its own part. The memory used during prepare depends on the block
+  size, not on the text length. The score table is computed in tiles of a fixed
+  size (`MLX_LM_SHARD_SCORE_BUDGET`).
+- **Ring prefill (not used by the prepare flow).** The cache also supports a
+  ring prefill: each machine takes its own part of the tokens, and the keys and
+  values travel around the ring. This splits the work of the layers too. The
+  example does not use it, and the tests in this branch do not cover it.
 - **Question and generation.** Each machine computes a partial attention result
   over its own shard: the maximum score, the sum of the exponentials, and the
   weighted values. One `all_gather` per sharded layer collects these small
