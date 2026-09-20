@@ -63,6 +63,9 @@ class ShardedKVCache(_BaseCache):
         # True: multi-token inputs are replicated queries against the sharded
         # past (no ring); False: multi-token inputs are a prefill of new shards.
         self.query_mode = False
+        # One id per token of the block being prefilled (-1 = text): tokens of
+        # the same image attend to each other in both directions.
+        self.image_groups = None
         self._query_offset: Optional[int] = None
 
     @property
@@ -177,6 +180,7 @@ class ShardedKVCache(_BaseCache):
                 new_len=L,
                 owns_new=self.owns_new_token,
                 softcap=softcap,
+                image_groups=self.image_groups,
             )
         # Prefill: each rank's chunk of queries, ring-combined over all shards.
         return sharded_prefill_attention(

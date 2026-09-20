@@ -342,6 +342,7 @@ def sharded_query_attention(
     owns_new: bool,
     simulated_rtt_s: float = 0.0,
     softcap: Optional[float] = None,
+    image_groups=None,
 ):
     """``new_len`` replicated query tokens against a sharded, already-stored past.
 
@@ -361,6 +362,15 @@ def sharded_query_attention(
         q_idx = mx.arange(new_len)[:, None]
         k_idx = mx.arange(total)[None, :]
         mask = (k_idx < past) | ((k_idx - past) <= q_idx)
+        if image_groups is not None:
+            # tokens of one image also see each other "forwards" (images are
+            # never split across blocks, so this only concerns the new tokens)
+            same = (image_groups[:, None] == image_groups[None, :]) & (
+                image_groups[:, None] >= 0
+            )
+            mask = mask | mx.concatenate(
+                [mx.zeros((new_len, past), dtype=mx.bool_), same], axis=1
+            )
     local_max, local_sumexp, local_wv = local_partial_attention(
         queries, keys_shard, values_shard, scale, mask=mask, softcap=softcap
     )

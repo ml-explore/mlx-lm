@@ -160,9 +160,30 @@ def block_owners(n_blocks: int, size: int, weights=None) -> List[int]:
     return owners
 
 
-def block_ranges(total: int, block_size: int) -> List[Tuple[int, int]]:
-    """(start, end) of every prefill block."""
-    return [(s, min(total, s + block_size)) for s in range(0, total, block_size)]
+def block_ranges(
+    total: int, block_size: int, image_groups: Optional[List[int]] = None
+) -> List[Tuple[int, int]]:
+    """(start, end) of every prefill block. With ``image_groups`` (one id per
+    token, -1 for text) a block boundary never falls inside an image: the cut
+    moves back to the image's start, or forward past its end if the image
+    would leave the block empty."""
+    ranges, start = [], 0
+    while start < total:
+        end = min(total, start + block_size)
+        if image_groups is not None and 0 < end < total:
+            g = image_groups[end]
+            if g >= 0 and image_groups[end - 1] == g:
+                first = end
+                while first > start and image_groups[first - 1] == g:
+                    first -= 1
+                if first > start:
+                    end = first
+                else:
+                    while end < total and image_groups[end] == g:
+                        end += 1
+        ranges.append((start, end))
+        start = end
+    return ranges
 
 
 def prefill_in_blocks(
@@ -174,6 +195,8 @@ def prefill_in_blocks(
     owners: List[int],
     start_block: int = 0,
     on_block=None,
+    embeddings: Optional[mx.array] = None,
+    image_groups: Optional[List[int]] = None,
 ):
     """Build a sharded KV cache from ``tokens`` block by block.
 
@@ -185,25 +208,38 @@ def prefill_in_blocks(
 
     ``on_block(blocks_done, tokens_done)`` is called after each block (for
     progress and checkpoints).
+
+    Multimodal input: ``embeddings`` (1, len(tokens), hidden) replaces the token
+    embeddings (text embeddings with image features already spliced in) and
+    ``image_groups`` marks each image's tokens (see ``block_ranges``). ``owners``
+    needs one entry per block of ``block_ranges``.
     """
     rank = group.rank()
     sharded = [c for c in caches if isinstance(c, ShardedKVCache)]
     backbone = _backbone(model)
-    ranges = block_ranges(len(tokens), block_size)
+    ranges = block_ranges(len(tokens), block_size, image_groups)
     if len(owners) < len(ranges):
         raise ValueError(f"{len(ranges)} blocks but only {len(owners)} owners")
     for b in range(start_block, len(ranges)):
         start, end = ranges[b]
+        groups = None if image_groups is None else mx.array(image_groups[start:end])
         for c in sharded:
             c.query_mode = True
             c.owns_new_token = owners[b] == rank
             c.offset = start
+            c.image_groups = groups
+        kwargs = {}
+        if embeddings is not None:
+            kwargs["input_embeddings"] = embeddings[:, start:end]
+        if groups is not None:
+            kwargs["image_groups"] = groups
         ids = mx.array(tokens[start:end])[None]
-        mx.eval(backbone(ids, caches))
+        mx.eval(backbone(ids, caches, **kwargs))
         if on_block is not None:
             on_block(b + 1, end)
     for c in sharded:
         c._query_offset = None
+        c.image_groups = None
 
 
 def _snapshot(cache):

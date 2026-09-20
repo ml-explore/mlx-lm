@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    image_bidirectional_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -516,16 +521,22 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
-    def _make_masks(self, h, cache):
+    def _make_masks(self, h, cache, image_groups=None):
         mask = {}
         masks = []
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
                 if l.layer_type == "full_attention":
-                    mask["full_attention"] = create_attention_mask(h, c)
+                    mask["full_attention"] = image_bidirectional_mask(
+                        create_attention_mask(h, c), h, c, None, image_groups
+                    )
                 elif l.layer_type == "sliding_attention":
-                    mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                    mask["sliding_attention"] = image_bidirectional_mask(
+                        create_attention_mask(h, c, window_size=self.window_size),
+                        h,
+                        c,
+                        self.window_size,
+                        image_groups,
                     )
             masks.append(mask[l.layer_type])
         return masks
@@ -536,6 +547,7 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
         # Make the initial hidden state
         if input_embeddings is None:
@@ -564,7 +576,7 @@ class Gemma4TextModel(nn.Module):
 
         # Apply each layer. We save all intermediate kvs and offset and grab
         # the previous one for the shared kv layers.
-        masks = self._make_masks(h, cache)
+        masks = self._make_masks(h, cache, image_groups)
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
             zip(
@@ -615,12 +627,14 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
         out = self.model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            image_groups=image_groups,
         )
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
