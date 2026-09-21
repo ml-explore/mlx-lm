@@ -144,8 +144,7 @@ def main(config, save_dir):
             )
 
             losses_sum = losses_sum.plus(losses)
-            mx.eval(losses_sum)
-            mx.eval(grads, params, optimizer.state)
+            mx.eval(losses_sum, grads, params, optimizer.state)
 
         if exhausted:
             break
