@@ -195,6 +195,7 @@ class MLXLM(LM):
         scores, is_greedy = [], []
         for q, rs in tqdm(zip(questions, responses), total=len(questions)):
             prefix = self._tokenize([q])[0]
+            completion_start = len(prefix)
             full_sequences = self._tokenize([q + r for r in rs])
             max_completed_l = max(len(s) for s in full_sequences)
 
@@ -216,7 +217,7 @@ class MLXLM(LM):
             max_idx = mx.argmax(logprobs).item()
 
             for s in full_sequences:
-                inputs = s[len(prefix) :]
+                inputs = s[completion_start:]
                 # The logprobs from the last token of the prompt are
                 # for the first input token
                 scores.append(logprobs[0, inputs[0]].item())
