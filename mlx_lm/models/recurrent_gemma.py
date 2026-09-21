@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import math
 from dataclasses import dataclass
@@ -173,7 +173,7 @@ class RecurrentBlock(nn.Module):
         self,
         width: int,
         num_heads: int,
-        lru_width: int = None,
+        lru_width: Optional[int] = None,
         conv1d_temporal_width: int = 4,
     ):
         super().__init__()

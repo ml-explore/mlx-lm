@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .cache import KVCache, RotatingKVCache, _BaseCache
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -134,7 +134,9 @@ class Router(nn.Module):
         top_k_indices = mx.argpartition(
             expert_scores, kth=-self.config.top_k_experts, axis=-1
         )
-        top_k_indices = top_k_indices[..., -self.config.top_k_experts :]
+        top_k_indices = mx.stop_gradient(
+            top_k_indices[..., -self.config.top_k_experts :]
+        )
 
         top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
         top_k_weights = mx.softmax(top_k_weights, axis=-1)
@@ -471,7 +473,7 @@ class Gemma4TextModel(nn.Module):
             #
             #   match_counts = (distance < eps).sum(-1)
             #
-            input_ids = mx.argmin(distance, -1)
+            input_ids = mx.stop_gradient(mx.argmin(distance, axis=-1))
 
         result = self.embed_tokens_per_layer(input_ids)
         result = result * self.embed_tokens_per_layer_scale
@@ -609,6 +611,7 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         sanitized = {}
+        first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
         for k, v in weights.items():
             if any(
                 s in k
@@ -621,6 +624,18 @@ class Model(nn.Module):
                 )
             ):
                 continue
+
+            # KV-shared layers reuse K/V from earlier layers — drop their projections
+            if any(
+                s in k
+                for s in (".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.k_norm")
+            ):
+                try:
+                    layer_idx = int(k.split("layers.")[1].split(".")[0])
+                    if layer_idx >= first_kv_shared:
+                        continue
+                except (IndexError, ValueError):
+                    pass
 
             if k.endswith(".experts.gate_up_proj"):
                 base = k.removesuffix(".gate_up_proj")
