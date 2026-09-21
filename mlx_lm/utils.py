@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import math
 import os
 import resource
 import shutil
@@ -303,9 +304,63 @@ def hf_repo_to_path(hf_repo):
     )
 
 
+def _compressed_tensors_quantization(quantization_config: dict) -> dict:
+    """Map a compressed-tensors config to an MLX quantization dict.
+
+    ``compressed-tensors`` is a container format. Only packed integer formats that
+    MLX already implements are accepted. Unknown formats such as ``float-quantized``
+    (FP8) used to fall through to 4-bit affine and silently misinterpret F8_E4M3
+    weights.
+    """
+    fmt = quantization_config.get("format")
+    if fmt == "nvfp4-pack-quantized":
+        return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    if fmt == "mxfp4-pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    if fmt == "pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "affine"}
+    raise ValueError(
+        f"unsupported compressed-tensors format {fmt!r}; "
+        "dequantize to bf16 before converting"
+    )
+
+
+# transformers tags non-finite floats so config.json stays valid JSON, e.g.
+# {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
+_FLOAT_TAG_KEY = "__float__"
+_FLOAT_TAGS = {
+    "Infinity": float("inf"),
+    "-Infinity": float("-inf"),
+    "NaN": float("nan"),
+}
+
+
+def _decode_tagged_floats(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        if set(obj) == {_FLOAT_TAG_KEY} and obj[_FLOAT_TAG_KEY] in _FLOAT_TAGS:
+            return _FLOAT_TAGS[obj[_FLOAT_TAG_KEY]]
+        return {k: _decode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_tagged_floats(v) for v in obj]
+    return obj
+
+
+def _encode_tagged_floats(obj: Any) -> Any:
+    """Tag non-finite floats again, so a saved config stays valid JSON."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        if math.isnan(obj):
+            return {_FLOAT_TAG_KEY: "NaN"}
+        return {_FLOAT_TAG_KEY: "Infinity" if obj > 0 else "-Infinity"}
+    if isinstance(obj, dict):
+        return {k: _encode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_encode_tagged_floats(v) for v in obj]
+    return obj
+
+
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
-        config = json.load(f)
+        config = _decode_tagged_floats(json.load(f))
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
@@ -320,6 +375,33 @@ def load_config(model_path: Path) -> dict:
             config["eos_token_id"] = eos_token_id
 
     return config
+
+
+def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """Recover the group_size, bits and mode a saved weight was packed with.
+
+    Use this for paths the per-tensor quantization map does not name, where the
+    top-level default can be wrong. ``module`` must still be unquantized.
+    """
+    scales = weights[f"{path}.scales"]
+    in_dims = module.weight.shape[-1]
+    group_size = in_dims // scales.shape[-1]
+    bits = (weights[f"{path}.weight"].shape[-1] * 32) // in_dims
+    # Only affine keeps the scales in the weight dtype. Each of the other modes
+    # allows exactly one (bits, group_size) pair.
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    if (bits, group_size) == (4, 16):
+        return {"group_size": group_size, "bits": bits, "mode": "nvfp4"}
+    if (bits, group_size) == (4, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp4"}
+    if (bits, group_size) == (8, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp8"}
+
+    raise ValueError(
+        f"Cannot infer the quantization mode of {path}: "
+        f"{bits} bits with group size {group_size}."
+    )
 
 
 def load_model(
@@ -408,7 +490,9 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            return infer_quant_config(p, m, weights)
 
         nn.quantize(
             model,
@@ -434,12 +518,7 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            if quantization_config.get("format") == "nvfp4-pack-quantized":
-                quantization = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
-            elif quantization_config.get("format") == "mxfp4-pack-quantized":
-                quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
-            else:
-                quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            quantization = _compressed_tensors_quantization(quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -674,6 +753,9 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     """
     Splits the weights into smaller shards.
 
+    A tensor larger than the limit gets a shard of its own, since a single
+    tensor cannot be split.
+
     Args:
         weights (dict): Model weights.
         max_file_size_gb (int): Maximum size of each shard in gigabytes.
@@ -683,14 +765,13 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     """
     max_file_size_bytes = max_file_size_gb << 30
     shards = []
-    shard, shard_size = {}, 0
+    shard_size = 0
     for k, v in weights.items():
-        if shard_size + v.nbytes > max_file_size_bytes:
-            shards.append(shard)
-            shard, shard_size = {}, 0
-        shard[k] = v
+        if not shards or shard_size + v.nbytes > max_file_size_bytes:
+            shards.append({})
+            shard_size = 0
+        shards[-1][k] = v
         shard_size += v.nbytes
-    shards.append(shard)
     return shards
 
 
@@ -994,7 +1075,7 @@ def save_config(
 
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
-        json.dump(config, fid, indent=4)
+        json.dump(_encode_tagged_floats(config), fid, indent=4)
 
 
 def save(

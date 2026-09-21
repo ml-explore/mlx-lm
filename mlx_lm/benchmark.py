@@ -125,7 +125,7 @@ def main():
     prompt = prompts[0]
 
     def single_bench():
-        for _ in stream_generate(
+        for _response in stream_generate(
             model,
             tokenizer,
             prompt,
@@ -133,7 +133,7 @@ def main():
             prefill_step_size=args.prefill_step_size,
         ):
             pass
-        return response
+        return _response
 
     def batch_bench():
         return batch_generate(

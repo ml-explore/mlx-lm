@@ -63,6 +63,10 @@ class Attention(nn.Module):
         self.head_dim = head_dim = args.head_dim or args.hidden_size // n_heads
 
         self.scale = head_dim**-0.5
+        self.scaling_beta = args.rope_parameters["llama_4_scaling_beta"]
+        self.original_max_position_embeddings = args.rope_parameters[
+            "original_max_position_embeddings"
+        ]
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -80,7 +84,7 @@ class Attention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        attn_scale: mx.array,
+        attn_scale: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:
@@ -102,6 +106,13 @@ class Attention(nn.Module):
         else:
             queries = self.rope(queries)
             keys = self.rope(keys)
+        if attn_scale is None:
+            attn_scale = _get_llama_4_attn_scale(
+                L,
+                offset,
+                self.scaling_beta,
+                self.original_max_position_embeddings,
+            ).astype(x.dtype)
         queries = queries * attn_scale
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
@@ -142,7 +153,7 @@ class TransformerBlock(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        attn_scale: mx.array,
+        attn_scale: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
     ) -> mx.array:

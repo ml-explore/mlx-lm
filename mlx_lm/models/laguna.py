@@ -172,7 +172,8 @@ class MoEGate(nn.Module):
         self.num_experts = args.num_experts
         self.softcap = args.moe_router_logit_softcapping
         self.score_func = args.moe_router_score_func
-        self.weight = mx.zeros((args.num_experts, args.hidden_size))
+        # A Linear, not a bare matrix, so a quantized router can load.
+        self.proj = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
 
     def _routing_scores(self, logits: mx.array) -> mx.array:
@@ -183,7 +184,7 @@ class MoEGate(nn.Module):
         raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
     def __call__(self, x):
-        logits = (x @ self.weight.T).astype(mx.float32)
+        logits = self.proj(x).astype(mx.float32)
         if self.softcap > 0.0:
             logits = mx.tanh(logits / self.softcap) * self.softcap
 
@@ -321,6 +322,23 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            # Routing is discrete, so keep the router more precise than the rest.
+            if path.endswith("mlp.gate.proj"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
+
     def make_cache(self):
         return [
             (
@@ -330,3 +348,39 @@ class Model(nn.Module):
             )
             for layer in self.layers
         ]
+
+    def sanitize(self, weights):
+        # Repacked checkpoints wrap every tensor in a `language_model.` prefix.
+        if any(k.startswith("language_model.") for k in weights):
+            prefix = "language_model."
+            weights = {
+                (k[len(prefix) :] if k.startswith(prefix) else k): v
+                for k, v in weights.items()
+            }
+
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
+        for l in range(self.args.num_hidden_layers):
+            prefix = f"model.layers.{l}.mlp"
+
+            # The original layout has a bare router and the bias under `experts.`.
+            gate_weight = weights.pop(f"{prefix}.gate.weight", None)
+            if gate_weight is not None:
+                weights[f"{prefix}.gate.proj.weight"] = gate_weight
+            bias = weights.pop(f"{prefix}.experts.e_score_correction_bias", None)
+            if bias is not None:
+                weights[f"{prefix}.gate.e_score_correction_bias"] = bias
+
+            # It also stores experts individually; stack them for SwitchGLU.
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                for suffix in ("weight", "scales", "biases"):
+                    if f"{prefix}.experts.0.{proj}.{suffix}" not in weights:
+                        continue
+                    weights[f"{prefix}.switch_mlp.{proj}.{suffix}"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.{proj}.{suffix}")
+                            for e in range(self.args.num_experts)
+                        ]
+                    )
+        return weights
