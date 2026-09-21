@@ -475,12 +475,25 @@ class Model(nn.Module):
                 expert0 = f"{prefix}.experts.0.{proj}.weight"
                 if expert0 not in weights:
                     continue
-                weights[f"{prefix}.switch_mlp.{proj}.weight"] = mx.stack(
+                stacked = mx.stack(
                     [
                         weights.pop(f"{prefix}.experts.{e}.{proj}.weight")
                         for e in range(self.args.n_routed_experts)
                     ]
                 )
+                scale0 = f"{prefix}.experts.0.{proj}.weight_scale"
+                if scale0 in weights:
+                    weights[f"{prefix}.switch_mlp.{proj}.weight"] = stacked.view(
+                        mx.uint32
+                    )
+                    weights[f"{prefix}.switch_mlp.{proj}.scales"] = mx.stack(
+                        [
+                            weights.pop(f"{prefix}.experts.{e}.{proj}.weight_scale")
+                            for e in range(self.args.n_routed_experts)
+                        ]
+                    )
+                else:
+                    weights[f"{prefix}.switch_mlp.{proj}.weight"] = stacked
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
