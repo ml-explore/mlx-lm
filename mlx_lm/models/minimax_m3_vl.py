@@ -108,14 +108,12 @@ class TextArgs(BaseModelArgs):
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    text_config: Union[TextArgs, dict] = None
+    text_config: Union[TextArgs, dict]
     model_type: str = "minimax_m3_vl"
 
     def __post_init__(self):
         if isinstance(self.text_config, dict):
             self.text_config = TextArgs.from_dict(self.text_config)
-        if self.text_config is None:
-            self.text_config = TextArgs()
 
 
 class DenseMLP(nn.Module):
