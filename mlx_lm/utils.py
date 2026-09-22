@@ -517,6 +517,11 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "mxfp8":
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
         elif quant_method == "compressed-tensors":
             quantization = _compressed_tensors_quantization(quantization_config)
             config["quantization"] = quantization
