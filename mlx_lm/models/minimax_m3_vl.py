@@ -262,35 +262,36 @@ class Attention(nn.Module):
         if cache is not None:
             k, _ = cache.update_and_fetch(k, mx.zeros((B, 1, L, 0), k.dtype))
 
-        blk = self.index_block_size
+        block_size = self.index_block_size
         topk = self.index_topk_blocks
         S = k.shape[2]
-        n_blk = (S + blk - 1) // blk
-        # Every block fits in the budget, so the selection would keep all of them.
-        if topk >= n_blk:
+        full_blocks, tail_keys = divmod(S, block_size)
+        n_blocks = full_blocks + bool(tail_keys)
+        # Every block fits the budget, so nothing would be dropped.
+        if topk >= n_blocks:
             return mask
 
         q = self.index_q_proj(x).reshape(B, L, H, D)
         q = self.index_q_norm(q).transpose(0, 2, 1, 3)
         q = self.index_rope(q, offset=offset)
 
-        # Blocks are cut over cache slots, so place the queries by slot, not by
-        # the per-row content offset the rope uses.
+        # Blocks are cut over cache slots, so place queries by slot, not content.
         qpos = mx.arange(S - L, S)
         causal = mx.arange(S)[None] <= qpos[:, None]
         scores = q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)
-        # A pad or future key must not win a block, so mask before pooling.
+        # A future key must not win a block, so mask before pooling.
         per_key = mask if isinstance(mask, mx.array) else causal
         scores = mx.where(per_key, scores, -mx.inf)
-        pad = n_blk * blk - S
-        if pad:
-            scores = mx.pad(scores, [(0, 0)] * 3 + [(0, pad)], constant_values=-mx.inf)
-        # Score a block by its best key, then always keep the newest local blocks.
-        block_scores = scores.reshape(B, H, L, n_blk, blk).max(axis=-1)
+        split = full_blocks * block_size
+        block_scores = scores[..., :split].reshape(B, H, L, full_blocks, block_size)
+        block_scores = block_scores.max(axis=-1)
+        if tail_keys:
+            tail_score = scores[..., split:].max(axis=-1, keepdims=True)
+            block_scores = mx.concatenate([block_scores, tail_score], axis=-1)
         if self.index_local_blocks > 0:
-            qblk = (qpos // blk)[:, None]
-            ids = mx.arange(n_blk)
-            is_local = (ids <= qblk) & (ids > qblk - self.index_local_blocks)
+            q_block = (qpos // block_size)[:, None]
+            ids = mx.arange(n_blocks)
+            is_local = (ids <= q_block) & (ids > q_block - self.index_local_blocks)
             block_scores = mx.where(is_local, mx.inf, block_scores)
 
         inds = mx.argpartition(-block_scores, kth=topk - 1, axis=-1)[..., :topk]
@@ -301,7 +302,7 @@ class Attention(nn.Module):
             axis=-1,
         )
         # A kept block still holds future keys, so mask again.
-        keep = mx.repeat(keep, blk, axis=-1)[..., :S] & per_key
+        keep = mx.repeat(keep, block_size, axis=-1)[..., :S] & per_key
         # One selection per KV group, so widen it to every query head in the group.
         return mx.repeat(keep, self.num_attention_heads // H, axis=1)
 
