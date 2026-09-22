@@ -220,20 +220,13 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     Returns:
         token selected based on the top-p criterion.
     """
-    # referenced implementation from https://github.com/huggingface/transformers/blob/main/src/transformers/generation/logits_process.py#L527-L539
-    probs = mx.exp(logprobs)
-    # sort in ascending order
-    sorted_indices = mx.argsort(logprobs, axis=-1)
-    sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-
-    cumulative_probs = mx.cumsum(sorted_probs, axis=-1)
-
-    # Scatter the keep mask back into vocabulary order.
-    sorted_keep = cumulative_probs > 1 - top_p
-    keep = mx.put_along_axis(
-        mx.zeros_like(sorted_keep), sorted_indices, sorted_keep, axis=-1
-    )
-    return mx.where(keep, logprobs, -float("inf"))
+    srt = mx.sort(logprobs, axis=-1)
+    probs = mx.exp(srt.astype(mx.float32))
+    above = mx.cumsum(probs, axis=-1, reverse=True, inclusive=False)
+    total = above[..., :1] + probs[..., :1]
+    cut = (above >= top_p * total).sum(axis=-1, keepdims=True)
+    kth = mx.take_along_axis(srt, cut, axis=-1)
+    return mx.where(logprobs < kth, -float("inf"), logprobs)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
