@@ -11,6 +11,7 @@ from .activations import SwigluOAI
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
 from .pipeline import PipelineMixin
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -48,16 +49,13 @@ class TextArgs(BaseModelArgs):
     partial_rotary_factor: float = 0.5
     vocab_size: int = 200064
     tie_word_embeddings: bool = False
-    scoring_func: str = "sigmoid"
     routed_scaling_factor: float = 2.0
-    use_routing_bias: bool = True
     use_qk_norm: bool = True
     use_gemma_norm: bool = True
     swiglu_alpha: float = 1.702
     swiglu_limit: float = 7.0
     mlp_layer_types: Optional[List[str]] = None
     moe_layer_freq: Optional[List[int]] = None
-    n_shared_experts: int = 1
     layer_types: Optional[List[str]] = None
     sparse_attention_config: Optional[dict] = None
     sparse_attention_freq: Optional[List[int]] = None
@@ -218,7 +216,13 @@ class Attention(nn.Module):
             self.q_norm = NormClass(self.head_dim, eps=args.rms_norm_eps)
             self.k_norm = NormClass(self.head_dim, eps=args.rms_norm_eps)
 
-        self.rope = nn.RoPE(args.rotary_dim, traditional=False, base=args.rope_theta)
+        self.rope = initialize_rope(
+            dims=args.rotary_dim,
+            base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_parameters,
+            max_position_embeddings=args.max_position_embeddings,
+        )
 
         # The indexer picks this layer's key blocks; its weights sit on self_attn.
         self.is_sparse_attn = args.is_sparse_attn(layer_idx)
@@ -237,10 +241,12 @@ class Attention(nn.Module):
             self.index_q_norm = NormClass(self.index_head_dim, eps=args.rms_norm_eps)
             self.index_k_norm = NormClass(self.index_head_dim, eps=args.rms_norm_eps)
             # The reference truncates cos/sin to the index head.
-            self.index_rope = nn.RoPE(
-                min(args.rotary_dim, self.index_head_dim),
-                traditional=False,
+            self.index_rope = initialize_rope(
+                dims=min(args.rotary_dim, self.index_head_dim),
                 base=args.rope_theta,
+                traditional=False,
+                scaling_config=args.rope_parameters,
+                max_position_embeddings=args.max_position_embeddings,
             )
 
     def _block_mask(
