@@ -2987,6 +2987,30 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 10000.0,
                 "max_position_embeddings": 1000,
             },
+            {
+                "model_type": "minimax_m3_vl",
+                "vocab_size": 128,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "model_type": "minimax_m3_vl",
+                    "vocab_size": 128,
+                    "hidden_size": 64,
+                    "intermediate_size": 32,
+                    "dense_intermediate_size": 64,
+                    "shared_intermediate_size": 32,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 16,
+                    "rotary_dim": 8,
+                    "num_local_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "moe_layer_freq": [0, 0, 1, 1],
+                    "rms_norm_eps": 1e-5,
+                    "rope_theta": 1000.0,
+                    "max_position_embeddings": 1000,
+                },
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -3000,6 +3024,83 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_minimax_m3_vl(self):
+        from mlx_lm.generate import _make_cache
+        from mlx_lm.models import minimax_m3_vl
+
+        blk, topk = 4, 2
+        budget = blk * topk
+        base = {
+            "model_type": "minimax_m3_vl",
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "intermediate_size": 32,
+            "dense_intermediate_size": 32,
+            "shared_intermediate_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rotary_dim": 8,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1000.0,
+            "max_position_embeddings": 512,
+            "mlp_layer_types": ["dense", "sparse"],
+            "layer_types": ["full_attention", "minimax_m3_sparse"],
+            "index_n_heads": 2,
+            "index_head_dim": 8,
+            "index_block_size": blk,
+            "index_topk_blocks": topk,
+            "index_local_blocks": 1,
+        }
+
+        def build(**overrides):
+            config = {
+                "model_type": "minimax_m3_vl",
+                "text_config": {**base, **overrides},
+            }
+            return minimax_m3_vl.Model(minimax_m3_vl.ModelArgs.from_dict(config))
+
+        model = build()
+        self.assertEqual([l.is_moe for l in model.layers], [False, True])
+        self.assertEqual(
+            [l.self_attn.is_sparse_attn for l in model.layers], [False, True]
+        )
+
+        # The published config nests the same values.
+        nested = build(
+            layer_types=None,
+            index_block_size=None,
+            sparse_attention_config={
+                "use_sparse_attention": True,
+                "sparse_num_index_heads": 2,
+                "sparse_index_dim": 8,
+                "sparse_block_size": blk,
+                "sparse_topk_blocks": topk,
+                "sparse_local_block": 1,
+                "sparse_attention_freq": [0, 1],
+            },
+        )
+        self.assertEqual(
+            [l.self_attn.is_sparse_attn for l in nested.layers], [False, True]
+        )
+
+        dense = build(index_block_size=None)
+        model.update(dense.parameters())
+        for n in (budget, budget + blk):
+            x = mx.arange(n)[None] % base["vocab_size"]
+            same = bool(mx.allclose(model(x), dense(x), atol=1e-5))
+            self.assertEqual(same, n <= budget, f"length {n}")
+
+        # A batched cache holds a per-row offset array and advances it in place.
+        n = budget * 5
+        ids = mx.arange(n)[None] % base["vocab_size"]
+        want = model(ids)
+        got = model(ids, cache=_make_cache(model, [0], None))
+        self.assertTrue(mx.allclose(got, want, atol=1e-5))
 
     def test_ssm(self):
         for batch_size in [1, 2]:
