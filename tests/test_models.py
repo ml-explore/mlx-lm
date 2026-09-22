@@ -4009,7 +4009,7 @@ class TestModels(unittest.TestCase):
                 )
 
     def test_minimax_m3_vl(self):
-        from mlx_lm.generate import _make_cache
+        from mlx_lm.generate import _merge_caches
         from mlx_lm.models import minimax_m3_vl
 
         blk, topk = 4, 2
@@ -4082,7 +4082,7 @@ class TestModels(unittest.TestCase):
         n = budget * 5
         ids = mx.arange(n)[None] % base["vocab_size"]
         want = model(ids)
-        got = model(ids, cache=_make_cache(model, [0], None))
+        got = model(ids, cache=_merge_caches([model.make_cache()]))
         self.assertTrue(mx.allclose(got, want, atol=1e-5))
 
     def test_llama4_chunked_kv_cache(self):
