@@ -1,44 +1,51 @@
 name: Build and Test
 
 on:
-  push:
-    branches: ["main"]
   pull_request:
+  push:
+    branches:
+      - main
+      # For testing CI without starting a pull request:
+      - test/*
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/head/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   check_lint:
-    if: github.repository == 'ml-explore/mlx-lm'
+    name: Check Lint
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.10"
       - uses: pre-commit/action@v3.0.1
 
   mac_build_and_test:
+    name: macOS
     if: github.repository == 'ml-explore/mlx-lm'
-    runs-on: [self-hosted, macos]
-    needs: check_lint
+    runs-on: 'macos-26-xlarge'
     steps:
-      - uses: actions/checkout@v5
-      - uses: ./.github/actions/setup-macos
-      - name: Install test dependencies
-        shell: bash -l {0}
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.2.0
+        with:
+          enable-cache: false
+          quiet: true
+      - name: Hardware info
+        run: system_profiler SPHardwareDataType
+      - name: Install
         run: |
-          pip install unittest-xml-reporting
-          pip install -e ".[test]"
+          uv venv --python 3.10
+          uv pip install -e ".[test]"
       - name: Run tests
-        shell: bash -l {0}
+        env:
+          METAL_DEVICE_WRAPPER_TYPE: 1
+          METAL_DEBUG_ERROR_MODE: 0
+          HF_HOME: .
         run: |
-          curl -o test_data.zip -L https://github.com/ml-explore/mlx-lm/releases/download/test_data/test_data.zip
-          unzip test_data.zip
-          METAL_DEVICE_WRAPPER_TYPE=1 METAL_DEBUG_ERROR_MODE=0 HF_HOME="." python -m xmlrunner discover -v tests -o test-results/
-          mlx.launch -n 2 tests/model_parallel_tests.py
+          curl -s -o test_data.zip -L https://github.com/ml-explore/mlx-lm/releases/download/test_data/test_data.zip
+          unzip -q test_data.zip
+          uv run python -m unittest discover -v tests
+          uv run mlx.launch -n 2 python tests/model_parallel_tests.py

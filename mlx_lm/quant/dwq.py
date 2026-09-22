@@ -20,6 +20,7 @@ from mlx_lm.tuner.utils import print_trainable_parameters
 from mlx_lm.utils import (
     load,
     load_tokenizer,
+    maybe_set_recommended_wired_limit,
     quantize_model,
     save,
     sharded_load,
@@ -42,13 +43,11 @@ def compute_dwq_targets(
         if rank == 0:
             path = path / split
             path.mkdir(parents=True, exist_ok=True)
-        for i, (batch, _) in (
-            pbar := tqdm(
-                enumerate(iterate_batches(data, batch_size, max_seq_length, seed=seed)),
-                total=len(data) // batch_size,
-                desc=f"Computing targets for {split}",
-                disable=rank != 0,
-            )
+        for i, (batch, _) in tqdm(
+            enumerate(iterate_batches(data, batch_size, max_seq_length, seed=seed)),
+            total=len(data) // batch_size,
+            desc=f"Computing targets for {split}",
+            disable=rank != 0,
         ):
             batch = batch[:, :-1]
             logits = model(batch)
@@ -403,9 +402,7 @@ def main():
     if has_targets and model is not None:
         del model
 
-    if mx.metal.is_available():
-        max_rec_size = mx.device_info()["max_recommended_working_set_size"]
-        mx.set_wired_limit(max_rec_size)
+    _ = maybe_set_recommended_wired_limit()
 
     opt = optimizers.Adam(learning_rate=args.learning_rate, bias_correction=True)
     dwq_quantize(
