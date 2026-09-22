@@ -66,6 +66,7 @@ def main(config, save_dir):
 
     params = model.trainable_parameters()
     mx.eval(params)
+    logging.info("Training %d parameters", sum(p.size for p in params))
     z_loss_weight = config.get("z_loss_weight", 0.0)
 
     def loss_fn(params, sample):
@@ -144,7 +145,8 @@ def main(config, save_dir):
             )
 
             losses_sum = losses_sum.plus(losses)
-            mx.eval(losses_sum, grads, params, optimizer.state)
+            mx.eval(losses_sum)
+            mx.eval(grads, params, optimizer.state)
 
         if exhausted:
             break
