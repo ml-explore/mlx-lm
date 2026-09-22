@@ -474,6 +474,8 @@ class Model(nn.Module):
         # The vision tower and the projectors are not used.
         skip = ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
         out = {k: v for k, v in weights.items() if not k.startswith(skip)}
+        if args.tie_word_embeddings:
+            out.pop("language_model.lm_head.weight", None)
 
         experts = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
         for i in range(args.num_hidden_layers):
@@ -481,9 +483,13 @@ class Model(nn.Module):
             # Some exports keep a dense layer's MLP under block_sparse_moe. Its
             # gate is named gate_proj, the router's is gate, so this is exact.
             for proj in ("gate_proj", "up_proj", "down_proj"):
-                if f"{moe}.{proj}.weight" in out:
-                    mlp = f"language_model.model.layers.{i}.mlp"
-                    out[f"{mlp}.{proj}.weight"] = out.pop(f"{moe}.{proj}.weight")
+                if f"{moe}.{proj}.weight" not in out:
+                    continue
+                mlp = f"language_model.model.layers.{i}.mlp"
+                for part in ("weight", "scales", "biases"):
+                    v = out.pop(f"{moe}.{proj}.{part}", None)
+                    if v is not None:
+                        out[f"{mlp}.{proj}.{part}"] = v
 
             # Some conversions fold the shared expert in as one more expert.
             # The expert axis is not the packed one, so the split is exact
@@ -512,12 +518,15 @@ class Model(nn.Module):
             if f"{moe}.experts.0.w1.weight" not in out:
                 continue
             for src, dst in experts:
-                out[f"{moe}.switch_mlp.{dst}.weight"] = mx.stack(
-                    [
-                        out.pop(f"{moe}.experts.{e}.{src}.weight")
-                        for e in range(args.num_local_experts)
-                    ]
-                )
+                for part in ("weight", "scales", "biases"):
+                    if f"{moe}.experts.0.{src}.{part}" not in out:
+                        continue
+                    out[f"{moe}.switch_mlp.{dst}.{part}"] = mx.stack(
+                        [
+                            out.pop(f"{moe}.experts.{e}.{src}.{part}")
+                            for e in range(args.num_local_experts)
+                        ]
+                    )
 
         return out
 
