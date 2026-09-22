@@ -474,6 +474,13 @@ class Model(nn.Module):
         if args.tie_word_embeddings:
             out.pop("language_model.lm_head.weight", None)
 
+        # MXFP8 stores e4m3 bytes plus one E8M0 exponent per 32 values, which is
+        # MLX's mxfp8 layout once the bytes are read as uint32.
+        for k in [k for k in out if k.endswith(".weight_scale_inv")]:
+            base = k[: -len(".weight_scale_inv")]
+            out[f"{base}.scales"] = out.pop(k)
+            out[f"{base}.weight"] = out[f"{base}.weight"].view(mx.uint32)
+
         experts = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
         for i in range(args.num_hidden_layers):
             moe = f"language_model.model.layers.{i}.block_sparse_moe"
