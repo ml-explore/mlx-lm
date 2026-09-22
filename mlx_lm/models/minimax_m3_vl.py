@@ -68,17 +68,14 @@ class TextArgs(BaseModelArgs):
     def __post_init__(self):
         # The published config nests these; a 5.x re-save spells them flat.
         sac = self.sparse_attention_config or {}
-        if sac.get("use_sparse_attention"):
-            self.index_n_heads = sac["sparse_num_index_heads"]
-            self.index_head_dim = sac["sparse_index_dim"]
-            self.index_block_size = sac["sparse_block_size"]
-            self.index_topk_blocks = sac["sparse_topk_blocks"]
-            self.index_local_blocks = sac.get(
-                "sparse_local_block", self.index_local_blocks
-            )
-            self.sparse_attention_freq = sac.get(
-                "sparse_attention_freq", self.sparse_attention_freq
-            )
+        self.index_n_heads = sac.get("sparse_num_index_heads", self.index_n_heads)
+        self.index_head_dim = sac.get("sparse_index_dim", self.index_head_dim)
+        self.index_block_size = sac.get("sparse_block_size", self.index_block_size)
+        self.index_topk_blocks = sac.get("sparse_topk_blocks", self.index_topk_blocks)
+        self.index_local_blocks = sac.get("sparse_local_block", self.index_local_blocks)
+        self.sparse_attention_freq = sac.get(
+            "sparse_attention_freq", self.sparse_attention_freq
+        )
         rope = self.rope_parameters or {}
         self.rope_theta = rope.get("rope_theta", self.rope_theta)
         self.partial_rotary_factor = rope.get(
