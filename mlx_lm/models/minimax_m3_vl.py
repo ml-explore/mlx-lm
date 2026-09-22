@@ -168,8 +168,9 @@ class SparseMoeBlock(nn.Module):
 
         shared_out = self.shared_experts(x_flat)
 
-        gates = self.gate(x_flat.astype(mx.float32))
-        scores = mx.sigmoid(gates)
+        # The reference routes in the weight dtype and upcasts only the logits.
+        gates = self.gate(x_flat)
+        scores = mx.sigmoid(gates.astype(mx.float32))
         orig_scores = scores
         scores = scores + self.e_score_correction_bias
 
@@ -181,12 +182,12 @@ class SparseMoeBlock(nn.Module):
 
         y = self.switch_mlp(x_flat, inds)
         y = (y * scores[..., None]).sum(axis=-2) * self.routed_scaling_factor
+        y = y + shared_out
 
-        # The shared expert is replicated, so add it after the sum, not before.
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)
 
-        return (y + shared_out).reshape(*ne, -1)
+        return y.reshape(*ne, -1)
 
 
 class Attention(nn.Module):
@@ -335,6 +336,10 @@ class Attention(nn.Module):
             )
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
+            # Keep the indexer cache in the graph: below the block budget nothing
+            # consumes it, and the deferred updates pile up for the whole decode.
+            if self.is_sparse_attn:
+                kv_cache.keys = mx.depends(kv_cache.keys, cache[1].keys)
 
         out = scaled_dot_product_attention(
             q, k, v, cache=kv_cache, scale=self.scale, mask=mask
@@ -515,16 +520,8 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
-        args = self.args.text_config
-        # A count that does not divide leaves some rank with zero heads.
-        for name in ("num_attention_heads", "num_key_value_heads", "index_n_heads"):
-            heads = getattr(args, name)
-            if heads and heads % N != 0:
-                raise ValueError(
-                    f"Cannot shard {name}={heads} across {N} ranks: "
-                    f"{name} must be divisible by the number of ranks."
-                )
-        for layer in self.language_model.model.layers:
+        # pipeline() blanks the layers it does not hold, so take the live ones.
+        for layer in self.layers:
             attn = layer.self_attn
             # Check before the first mutation, or a failure leaves the layer
             # half sharded.
@@ -550,10 +547,21 @@ class Model(nn.Module):
 
             if layer.is_moe:
                 moe = layer.block_sparse_moe
-                shard_inplace(moe.switch_mlp.gate_proj, "all-to-sharded", group=group)
-                shard_inplace(moe.switch_mlp.down_proj, "sharded-to-all", group=group)
-                shard_inplace(moe.switch_mlp.up_proj, "all-to-sharded", group=group)
+                # In place, so the block aggregates both experts with one sum.
+                for mlp in (moe.switch_mlp, moe.shared_experts):
+                    shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
+                    shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
+                    shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
                 moe.sharding_group = group
+            else:
+                mlp = layer.mlp
+                mlp.gate_proj = shard_linear(
+                    mlp.gate_proj, "all-to-sharded", group=group
+                )
+                mlp.up_proj = shard_linear(mlp.up_proj, "all-to-sharded", group=group)
+                mlp.down_proj = shard_linear(
+                    mlp.down_proj, "sharded-to-all", group=group
+                )
 
     @property
     def layers(self) -> List[nn.Module]:
