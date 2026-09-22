@@ -65,7 +65,7 @@ class TextArgs(BaseModelArgs):
     index_head_dim: Optional[int] = None
     index_block_size: Optional[int] = None
     index_topk_blocks: Optional[int] = None
-    index_local_blocks: int = 0
+    index_local_blocks: int = 1
 
     def __post_init__(self):
         # The published config nests these; a 5.x re-save spells them flat.
@@ -75,7 +75,9 @@ class TextArgs(BaseModelArgs):
             self.index_head_dim = sac["sparse_index_dim"]
             self.index_block_size = sac["sparse_block_size"]
             self.index_topk_blocks = sac["sparse_topk_blocks"]
-            self.index_local_blocks = sac.get("sparse_local_block", 0)
+            self.index_local_blocks = sac.get(
+                "sparse_local_block", self.index_local_blocks
+            )
             self.sparse_attention_freq = sac.get(
                 "sparse_attention_freq", self.sparse_attention_freq
             )
@@ -251,8 +253,7 @@ class Attention(nn.Module):
         B, L, _ = x.shape
         H, D = self.index_n_heads, self.index_head_dim
 
-        # Cache the index keys even when no block is dropped below: later steps
-        # score against the whole history, so it has to be complete.
+        # Cache the index keys even when no block is dropped: later steps need them.
         k = self.index_k_proj(x).reshape(B, L, 1, D)
         k = self.index_k_norm(k).transpose(0, 2, 1, 3)
         k = self.index_rope(k, offset=offset)
@@ -271,11 +272,14 @@ class Attention(nn.Module):
         q = self.index_q_norm(q).transpose(0, 2, 1, 3)
         q = self.index_rope(q, offset=offset)
 
-        # Positions ignore per-sequence left padding, as the reference does.
-        qpos = mx.arange(offset, offset + L)
+        # Blocks are cut over cache slots, so place the queries by slot, not by
+        # the per-row content offset the rope uses.
+        qpos = mx.arange(S - L, S)
         causal = mx.arange(S)[None] <= qpos[:, None]
         scores = q.astype(mx.float32) @ k.astype(mx.float32).swapaxes(-1, -2)
-        scores = mx.where(causal, scores, -mx.inf)
+        # A pad or future key must not win a block, so mask before pooling.
+        per_key = mask if isinstance(mask, mx.array) else causal
+        scores = mx.where(per_key, scores, -mx.inf)
         pad = n_blk * blk - S
         if pad:
             scores = mx.pad(scores, [(0, 0)] * 3 + [(0, pad)], constant_values=-mx.inf)
@@ -283,7 +287,7 @@ class Attention(nn.Module):
         block_scores = scores.reshape(B, H, L, n_blk, blk).max(axis=-1)
         if self.index_local_blocks > 0:
             qblk = (qpos // blk)[:, None]
-            ids = mx.arange(n_blk)[None]
+            ids = mx.arange(n_blk)
             is_local = (ids <= qblk) & (ids > qblk - self.index_local_blocks)
             block_scores = mx.where(is_local, mx.inf, block_scores)
 
@@ -294,10 +298,8 @@ class Attention(nn.Module):
             mx.array(True),
             axis=-1,
         )
-        # A dropped block may still hold future keys, so keep the causal mask.
-        keep = mx.repeat(keep, blk, axis=-1)[..., :S] & causal
-        if isinstance(mask, mx.array):
-            keep = keep & mask
+        # A kept block still holds future keys, so mask again.
+        keep = mx.repeat(keep, blk, axis=-1)[..., :S] & per_key
         # One selection per KV group, so widen it to every query head in the group.
         return mx.repeat(keep, self.num_attention_heads // H, axis=1)
 
@@ -312,15 +314,12 @@ class Attention(nn.Module):
         offset = kv_cache.offset if kv_cache is not None else 0
 
         q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        q = q.reshape(B, L, self.num_attention_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        k = k.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
-        v = v.reshape(B, L, self.num_key_value_heads, self.head_dim).transpose(
-            0, 2, 1, 3
-        )
+        q = q.reshape(B, L, self.num_attention_heads, self.head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.reshape(B, L, self.num_key_value_heads, self.head_dim)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.reshape(B, L, self.num_key_value_heads, self.head_dim)
+        v = v.transpose(0, 2, 1, 3)
 
         if self.use_qk_norm:
             q = self.q_norm(q)
@@ -328,13 +327,14 @@ class Attention(nn.Module):
 
         q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
-        if kv_cache is not None:
-            k, v = kv_cache.update_and_fetch(k, v)
 
+        # Select before the cache advances: it moves its offset array in place.
         if self.is_sparse_attn:
             mask = self._block_mask(
                 x, mask, offset, cache[1] if cache is not None else None
             )
+        if kv_cache is not None:
+            k, v = kv_cache.update_and_fetch(k, v)
 
         out = scaled_dot_product_attention(
             q, k, v, cache=kv_cache, scale=self.scale, mask=mask
@@ -413,7 +413,7 @@ class TextModel(PipelineMixin, nn.Module):
         if pipeline_rank != 0:
             h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
             if cache[-1] is not None:
-                cache[-1].keys = mx.depends(cache[-1].keys, h)
+                cache[-1][0].keys = mx.depends(cache[-1][0].keys, h)
 
         # Broadcast h while keeping it in the graph
         if pipeline_size > 1:
