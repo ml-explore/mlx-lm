@@ -10,7 +10,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
-from mlx.utils import tree_map
+from mlx.utils import tree_map, tree_reduce
 
 from mlx_lm.train import data, fsdp, optim, utils
 from mlx_lm.train.checkpoint import load_training_state, save_checkpoint
@@ -65,8 +65,9 @@ def main(config, save_dir):
         fsdp.shard_model(model, mesh.fsdp.group, dtype)
 
     params = model.trainable_parameters()
+    nparams = tree_reduce(lambda acc, p: acc + p.size, params, 0)
     mx.eval(params)
-    logging.info("Training %d parameters", sum(p.size for p in params))
+    logging.info("Training %d parameters", nparams)
     z_loss_weight = config.get("z_loss_weight", 0.0)
 
     def loss_fn(params, sample):
