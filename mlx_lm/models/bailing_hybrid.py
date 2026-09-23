@@ -463,8 +463,12 @@ class Gate(nn.Module):
             group_idx = mx.argpartition(group_scores, kth=n_drop - 1, axis=-2)[
                 ..., :n_drop, :
             ]
+            # -inf, not 0, because expert_bias can make a kept score negative.
             scores = mx.put_along_axis(
-                scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+                scores,
+                mx.stop_gradient(group_idx),
+                mx.array(-mx.inf, scores.dtype),
+                axis=-2,
             )
             scores = mx.flatten(scores, -2, -1)
 
