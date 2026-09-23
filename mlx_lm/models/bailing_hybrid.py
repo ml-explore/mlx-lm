@@ -16,6 +16,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .mla import MultiLinear
+from .pipeline import PipelineMixin
 from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -497,7 +498,7 @@ class DecoderLayer(nn.Module):
         return h + r
 
 
-class LanguageModel(nn.Module):
+class LanguageModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.word_embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -505,12 +506,24 @@ class LanguageModel(nn.Module):
             DecoderLayer(args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.layer_group_size = args.layer_group_size
+        self._set_mask_indices()
 
-        # Find a representative attention layer index for offset/mask sizing.
-        self._attn_idx = next((i for i, l in enumerate(self.layers) if l.is_global), 0)
-        self._gla_idx = next(
-            (i for i, l in enumerate(self.layers) if not l.is_global), 0
-        )
+    def _set_mask_indices(self):
+        # One layer of each kind, to size the two masks and read the offset.
+        layers = self.pipeline_layers
+        self._attn_idx = next((i for i, l in enumerate(layers) if l.is_global), None)
+        self._gla_idx = next((i for i, l in enumerate(layers) if not l.is_global), None)
+
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
+        self._set_mask_indices()
+        if self._attn_idx is None:
+            raise ValueError(
+                "Every pipeline rank needs one MLA layer, which carries the "
+                "position offset the linear layers rope with. Pass a split with "
+                f"at least {self.layer_group_size} layers per rank."
+            )
 
     def __call__(
         self,
@@ -519,17 +532,41 @@ class LanguageModel(nn.Module):
     ) -> mx.array:
         h = self.word_embeddings(inputs)
 
-        if cache is None:
-            cache = [None] * len(self.layers)
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
 
-        attn_cache = cache[self._attn_idx]
+        if cache is None:
+            cache = [None] * len(self.pipeline_layers)
+
+        attn_cache = cache[self._attn_idx] if self._attn_idx is not None else None
         attn_mask = create_attention_mask(h, attn_cache, return_array=True)
-        gla_mask = create_ssm_mask(h, cache[self._gla_idx])
+        gla_mask = (
+            create_ssm_mask(h, cache[self._gla_idx])
+            if self._gla_idx is not None
+            else None
+        )
         offset = attn_cache.offset if attn_cache is not None else 0
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = attn_mask if layer.is_global else gla_mask
             h = layer(h, mask, c, offset=offset)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, h)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -633,7 +670,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         caches = []
