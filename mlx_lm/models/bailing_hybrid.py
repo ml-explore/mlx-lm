@@ -659,10 +659,37 @@ class Model(nn.Module):
 
     def sanitize(self, weights):
         n_layers = self.args.num_hidden_layers
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
 
-        # Drop MTP and any extra non-base layers (Ling 2.6 has 1 MTP layer
-        # appended after num_hidden_layers; deletes weights for those).
-        weights = {
+        for l in range(n_layers):
+            prefix = f"model.layers.{l}"
+            for m in ["gate_proj", "down_proj", "up_proj"]:
+                for k in ["weight", "scales", "biases"]:
+                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+                        to_join = [
+                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
+                            for e in range(self.args.num_experts)
+                        ]
+                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+            if f"{prefix}.mlp.gate.weight" in weights:
+                weights[f"{prefix}.mlp.gate.gate_proj.weight"] = weights.pop(
+                    f"{prefix}.mlp.gate.weight"
+                )
+
+            prefix = f"{prefix}.attention"
+            if f"{prefix}.kv_b_proj.weight" in weights:
+                v = weights.pop(f"{prefix}.kv_b_proj.weight")
+                nope = self.args.qk_nope_head_dim
+                head_dim = nope + self.args.v_head_dim
+                v = v.reshape(self.args.num_attention_heads, head_dim, -1)
+                weights[f"{prefix}.embed_q.weight"] = mx.contiguous(
+                    v[:, :nope, :].swapaxes(-1, -2)
+                )
+                weights[f"{prefix}.unembed_out.weight"] = mx.contiguous(v[:, nope:, :])
+
+        # The checkpoint appends MTP layers after the base ones.
+        return {
             k: v
             for k, v in weights.items()
             if not (
@@ -671,50 +698,6 @@ class Model(nn.Module):
                 and int(k.split(".")[2]) >= n_layers
             )
         }
-
-        if self.args.tie_word_embeddings:
-            weights.pop("lm_head.weight", None)
-
-        for l in range(n_layers):
-            prefix = f"model.layers.{l}"
-
-            # MoE expert stacking + gate remap
-            if l >= self.args.first_k_dense_replace:
-                for m in ["gate_proj", "down_proj", "up_proj"]:
-                    for k in ["weight", "scales", "biases"]:
-                        if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
-                            stacked = [
-                                weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                                for e in range(self.args.num_experts)
-                            ]
-                            weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(
-                                stacked
-                            )
-
-                if f"{prefix}.mlp.gate.weight" in weights:
-                    weights[f"{prefix}.mlp.gate.gate_proj.weight"] = weights.pop(
-                        f"{prefix}.mlp.gate.weight"
-                    )
-                if f"{prefix}.mlp.gate.bias" in weights:
-                    weights[f"{prefix}.mlp.gate.gate_proj.bias"] = weights.pop(
-                        f"{prefix}.mlp.gate.bias"
-                    )
-
-            # MLA kv_b_proj split for global attention layers.
-            kv_b_key = f"{prefix}.attention.kv_b_proj.weight"
-            if kv_b_key in weights:
-                v = weights.pop(kv_b_key)
-                head_dim = self.args.qk_nope_head_dim + self.args.v_head_dim
-                num_heads = self.args.num_attention_heads
-                v = v.reshape(num_heads, head_dim, -1)
-                wk = mx.contiguous(
-                    v[:, : self.args.qk_nope_head_dim, :].swapaxes(-1, -2)
-                )
-                wv = mx.contiguous(v[:, self.args.qk_nope_head_dim :, :])
-                weights[f"{prefix}.attention.embed_q.weight"] = wk
-                weights[f"{prefix}.attention.unembed_out.weight"] = wv
-
-        return weights
 
     @property
     def quant_predicate(self):
