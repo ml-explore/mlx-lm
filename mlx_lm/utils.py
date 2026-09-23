@@ -828,8 +828,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -853,8 +852,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
