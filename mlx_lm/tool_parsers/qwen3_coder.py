@@ -13,6 +13,7 @@ import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
 _parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+_name_regex = re.compile(r"\s*([^\s<>]+)>?")
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -54,7 +55,11 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
         or param_type.startswith("short")
         or param_type.startswith("unsigned")
     ):
-        return int(param_value)
+        float_param_value = float(param_value)
+        int_param_value = int(float_param_value)
+        if float_param_value - int_param_value != 0:
+            raise ValueError(f"Invalid integer literal {param_value!r}")
+        return int_param_value
     elif param_type.startswith("num") or param_type.startswith("float"):
         float_param_value = float(param_value)
         int_param_value = int(float_param_value)
@@ -72,23 +77,30 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             or param_type.startswith("list")
         ):
             try:
-                return json.loads(param_value)
+                return json.loads(param_value, strict=False)
             except json.JSONDecodeError:
-                return ast.literal_eval(param_value)
+                pass
 
-        return ast.literal_eval(param_value)
+        try:
+            return ast.literal_eval(param_value)
+        except (ValueError, SyntaxError):
+            return param_value
 
 
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
-    end_index = function_call_str.index(">")
-    function_name = function_call_str[:end_index]
+    name_match = _name_regex.match(function_call_str)
+    if name_match is None:
+        raise ValueError("No function name provided.")
+    function_name = name_match.group(1)
     param_config = _get_arguments_config(function_name, tools)
-    parameters = function_call_str[end_index + 1 :]
+    parameters = function_call_str[name_match.end() :]
     param_dict = {}
     for match_text in _parameter_regex.findall(parameters):
-        idx = match_text.index(">")
-        param_name = match_text[:idx]
-        param_value = str(match_text[idx + 1 :])
+        param_match = _name_regex.match(match_text)
+        if param_match is None:
+            continue
+        param_name = param_match.group(1)
+        param_value = str(match_text[param_match.end() :])
         if param_value.startswith("\n"):
             param_value = param_value[1:]
         if param_value.endswith("\n"):
