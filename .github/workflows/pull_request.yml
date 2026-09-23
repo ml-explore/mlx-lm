@@ -20,7 +20,7 @@ jobs:
     name: Check Lint
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: pre-commit/action@v3.0.1
 
   mac_build_and_test:
@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: astral-sh/setup-uv@v8.2.0
+      - uses: astral-sh/setup-uv@v10.2.0
         with:
           enable-cache: false
           quiet: true
