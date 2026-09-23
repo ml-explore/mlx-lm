@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-lm"
+description = "LLMs with MLX and the Hugging Face Hub"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "MLX Contributors", email = "mlx@group.apple.com" }]
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+    "mlx>=0.32.2; platform_system == 'Darwin'",
+    "numpy",
+    "transformers>=5.7.0",
+    "sentencepiece",
+    "protobuf",
+    "pyyaml",
+    "jinja2",
+]
+
+[project.urls]
+Homepage = "https://github.com/ml-explore/mlx-lm"
+
+[project.optional-dependencies]
+test = ["datasets", "lm-eval"]
+train = ["datasets", "tqdm"]
+evaluate = ["lm-eval", "tqdm"]
+cuda13 = ["mlx[cuda13]>=0.32.2"]
+cuda12 = ["mlx[cuda12]>=0.32.2"]
+cpu = ["mlx[cpu]>=0.32.2"]
+
+[project.scripts]
+mlx_lm = "mlx_lm.cli:main"
+"mlx_lm.awq" = "mlx_lm.quant.awq:main"
+"mlx_lm.dwq" = "mlx_lm.quant.dwq:main"
+"mlx_lm.dynamic_quant" = "mlx_lm.quant.dynamic_quant:main"
+"mlx_lm.gptq" = "mlx_lm.quant.gptq:main"
+"mlx_lm.benchmark" = "mlx_lm.benchmark:main"
+"mlx_lm.cache_prompt" = "mlx_lm.cache_prompt:main"
+"mlx_lm.chat" = "mlx_lm.chat:main"
+"mlx_lm.convert" = "mlx_lm.convert:main"
+"mlx_lm.evaluate" = "mlx_lm.evaluate:main"
+"mlx_lm.fuse" = "mlx_lm.fuse:main"
+"mlx_lm.generate" = "mlx_lm.generate:main"
+"mlx_lm.lora" = "mlx_lm.lora:main"
+"mlx_lm.perplexity" = "mlx_lm.perplexity:main"
+"mlx_lm.server" = "mlx_lm.server:main"
+"mlx_lm.share" = "mlx_lm.share:main"
+"mlx_lm.manage" = "mlx_lm.manage:main"
+"mlx_lm.upload" = "mlx_lm.upload:main"
+
+[tool.setuptools]
+packages = [
+    "mlx_lm",
+    "mlx_lm.models",
+    "mlx_lm.quant",
+    "mlx_lm.tuner",
+    "mlx_lm.tool_parsers",
+    "mlx_lm.chat_templates",
+]
+
+[tool.setuptools.dynamic]
+version = { attr = "mlx_lm._version.__version__" }
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B006", "B007", "B904", "CPY001", "F", "PLW0127"]  # pyflakes: unused imports and variables, undefined names
+
+[tool.ruff.lint.per-file-ignores]
+# Package initializers re-export names for the public API.
+"**/__init__.py" = ["F401"]

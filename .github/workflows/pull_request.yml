@@ -37,7 +37,7 @@ jobs:
         run: system_profiler SPHardwareDataType
       - name: Install
         run: |
-          uv venv --python 3.10
+          uv venv --python 3.11
           uv pip install -e ".[test]"
       - name: Run tests
         env:
