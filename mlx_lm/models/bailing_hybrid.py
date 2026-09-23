@@ -62,6 +62,14 @@ class ModelArgs(BaseModelArgs):
     tie_word_embeddings: bool = False
     num_nextn_predict_layers: int = 0
 
+    def __post_init__(self):
+        head_dim = self.head_dim or self.hidden_size // self.num_attention_heads
+        dims = int(head_dim * self.partial_rotary_factor)
+        if dims <= 0 or dims > head_dim or dims % 2:
+            raise ValueError(
+                f"Invalid rotary dimension {dims} with head_dim={head_dim}"
+            )
+
 
 @mx.compile
 def _recurrent_gla_step(
