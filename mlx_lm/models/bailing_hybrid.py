@@ -569,14 +569,20 @@ class LanguageModel(PipelineMixin, nn.Module):
         self._gla_idx = next((i for i, l in enumerate(layers) if not l.is_global), None)
 
     def pipeline(self, group, split=None):
+        if split is None:
+            # Every rank needs an MLA layer for the position offset.
+            size = group.size()
+            n_groups, tail = divmod(len(self.layers), self.layer_group_size)
+            base, extra = divmod(n_groups, size)
+            split = [
+                (base + (1 if r < extra else 0)) * self.layer_group_size
+                for r in range(size)
+            ]
+            split[0] += tail
         super().pipeline(group, split=split)
         self._set_mask_indices()
         if self._attn_idx is None:
-            raise ValueError(
-                "Every pipeline rank needs one MLA layer, which carries the "
-                "position offset the linear layers rope with. Pass a split with "
-                f"at least {self.layer_group_size} layers per rank."
-            )
+            raise ValueError(f"split {split} leaves a rank without an MLA layer")
 
     def __call__(
         self,
