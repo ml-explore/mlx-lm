@@ -23,6 +23,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/ml-explore/mlx-lm"
+Repository = "https://github.com/ml-explore/mlx-lm"
+Issues = "https://github.com/ml-explore/mlx-lm/issues"
 
 [project.optional-dependencies]
 test = ["datasets", "lm-eval"]
