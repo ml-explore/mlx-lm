@@ -7,6 +7,7 @@ name = "mlx-lm"
 description = "LLMs with MLX and the Hugging Face Hub"
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "MLX Contributors", email = "mlx@group.apple.com" }]
 requires-python = ">=3.11"
 dynamic = ["version"]
@@ -51,15 +52,9 @@ mlx_lm = "mlx_lm.cli:main"
 "mlx_lm.manage" = "mlx_lm.manage:main"
 "mlx_lm.upload" = "mlx_lm.upload:main"
 
-[tool.setuptools]
-packages = [
-    "mlx_lm",
-    "mlx_lm.models",
-    "mlx_lm.quant",
-    "mlx_lm.tuner",
-    "mlx_lm.tool_parsers",
-    "mlx_lm.chat_templates",
-]
+[tool.setuptools.packages.find]
+include = ["mlx_lm*"]
+namespaces = false
 
 [tool.setuptools.dynamic]
 version = { attr = "mlx_lm._version.__version__" }
