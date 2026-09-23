@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=77"]
+requires = ["setuptools>=80", "setuptools-scm>=9"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -56,8 +56,9 @@ mlx_lm = "mlx_lm.cli:main"
 include = ["mlx_lm*"]
 namespaces = false
 
-[tool.setuptools.dynamic]
-version = { attr = "mlx_lm._version.__version__" }
+[tool.setuptools_scm]
+version_file = "mlx_lm/_version.py"
+version_file_template = "__version__ = {version!r}\n"
 
 [tool.ruff]
 target-version = "py311"

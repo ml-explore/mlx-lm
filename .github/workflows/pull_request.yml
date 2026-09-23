@@ -29,6 +29,8 @@ jobs:
     runs-on: 'macos-26-xlarge'
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v8.2.0
         with:
           enable-cache: false
