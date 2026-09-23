@@ -11,6 +11,16 @@ license-files = ["LICENSE"]
 authors = [{ name = "MLX Contributors", email = "mlx@group.apple.com" }]
 requires-python = ">=3.11"
 dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
 dependencies = [
     "mlx>=0.32.2; platform_system == 'Darwin'",
     "numpy",
