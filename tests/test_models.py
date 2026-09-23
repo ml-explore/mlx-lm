@@ -3670,7 +3670,7 @@ class TestModels(unittest.TestCase):
                 "num_experts_per_tok": 2,
                 "num_shared_experts": 1,
                 "n_group": 2,
-                "topk_group": 2,
+                "topk_group": 1,
                 "first_k_dense_replace": 1,
                 "layer_group_size": 2,
                 "group_norm_size": 4,

@@ -16,7 +16,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .mla import MultiLinear
-from .rope_utils import initialize_rope
+from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -48,6 +48,7 @@ class ModelArgs(BaseModelArgs):
     qk_nope_head_dim: int
     v_head_dim: int
     q_lora_rank: Optional[int] = None
+    moe_shared_expert_intermediate_size: Optional[int] = None
     rope_interleave: bool = True
     partial_rotary_factor: float = 0.5
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
@@ -61,112 +62,6 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 0
 
 
-def _make_recurrent_gla_kernel():
-    if not mx.metal.is_available():
-        return None
-    source = """
-        auto n = thread_position_in_grid.z;
-        auto b_idx = n / H;
-        auto h_idx = n % H;
-        constexpr int n_per_t = D / 32;
-
-        // q, k, v, y: [B, T, H, D]
-        auto q_ = q + b_idx * T * H * D + h_idx * D;
-        auto k_ = k + b_idx * T * H * D + h_idx * D;
-        auto v_ = v + b_idx * T * H * D + h_idx * D;
-        y += b_idx * T * H * D + h_idx * D;
-
-        auto dk_idx = thread_position_in_threadgroup.x;
-        auto dv_idx = thread_position_in_grid.y;
-
-        // state_in, state_out: [B, H, D, D]  (k_dim outer, v_dim inner)
-        auto i_state = state_in  + n * D * D;
-        auto o_state = state_out + n * D * D;
-
-        float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {
-          auto dk_glob = n_per_t * dk_idx + i;
-          state[i] = static_cast<float>(i_state[dk_glob * D + dv_idx]);
-        }
-
-        // g: [H], head-only decay (constant over time)
-        float decay = fast::exp(static_cast<float>(g[h_idx]));
-
-        for (int t = 0; t < T; ++t) {
-          float v_val = static_cast<float>(v_[dv_idx]);
-          float out = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {
-            auto dk_glob = n_per_t * dk_idx + i;
-            // h_t[dk, dv] = h_{t-1}[dk, dv] * exp(g_h) + k_t[dk] * v_t[dv]
-            state[i] = state[i] * decay
-                       + static_cast<float>(k_[dk_glob]) * v_val;
-            // y_t[dv] = sum_dk q_t[dk] * h_t[dk, dv]
-            out += state[i] * static_cast<float>(q_[dk_glob]);
-          }
-          out = simd_sum(out);
-          if (thread_index_in_simdgroup == 0) {
-            y[dv_idx] = static_cast<InT>(out);
-          }
-          q_ += H * D;
-          k_ += H * D;
-          v_ += H * D;
-          y  += H * D;
-        }
-        for (int i = 0; i < n_per_t; ++i) {
-          auto dk_glob = n_per_t * dk_idx + i;
-          o_state[dk_glob * D + dv_idx] = static_cast<StT>(state[i]);
-        }
-    """
-    return mx.fast.metal_kernel(
-        name="recurrent_gla_kernel",
-        input_names=["q", "k", "v", "g", "state_in", "T"],
-        output_names=["y", "state_out"],
-        source=source,
-    )
-
-
-_recurrent_gla_kernel = _make_recurrent_gla_kernel()
-
-
-def _cache_offset(cache):
-    offset = cache.offset if cache is not None else 0
-    if isinstance(offset, mx.array):
-        if offset.size == 1:
-            return offset.item()
-        return mx.array(offset.tolist(), dtype=offset.dtype)
-    return offset
-
-
-def _recurrent_gla_kernel_call(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    h: mx.array,
-) -> Tuple[mx.array, mx.array]:
-    # q, k, v: [B, H, T, D] -> [B, T, H, D] for the kernel
-    q = q.transpose(0, 2, 1, 3)
-    k = k.transpose(0, 2, 1, 3)
-    v = v.transpose(0, 2, 1, 3)
-    B, T, H, D = q.shape
-    in_dtype = q.dtype
-    state_dtype = h.dtype
-    y, h = _recurrent_gla_kernel(
-        inputs=[q, k, v, g.astype(mx.float32), h, T],
-        template=[
-            ("InT", in_dtype),
-            ("StT", state_dtype),
-            ("D", D),
-            ("H", H),
-        ],
-        grid=(32, D, B * H),
-        threadgroup=(32, 4, 1),
-        output_shapes=[(B, T, H, D), h.shape],
-        output_dtypes=[in_dtype, state_dtype],
-    )
-    return y.transpose(0, 2, 1, 3), h
-
-
 @mx.compile
 def _recurrent_gla_step(
     q_t: mx.array,
@@ -176,29 +71,7 @@ def _recurrent_gla_step(
     exp_g: mx.array,
 ) -> Tuple[mx.array, mx.array]:
     h = h * exp_g + k_t.transpose(0, 1, 3, 2) @ v_t
-    return q_t @ h, h
-
-
-def _recurrent_gla_ops(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    h: mx.array,
-) -> Tuple[mx.array, mx.array]:
-    L = q.shape[2]
-    exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
-    outputs = []
-    for t in range(L):
-        y_t, h = _recurrent_gla_step(
-            q[:, :, t : t + 1],
-            k[:, :, t : t + 1],
-            v[:, :, t : t + 1],
-            h,
-            exp_g,
-        )
-        outputs.append(y_t)
-    return mx.concatenate(outputs, axis=2), h
+    return (q_t @ h).astype(q_t.dtype), h
 
 
 def recurrent_gla(
@@ -208,24 +81,42 @@ def recurrent_gla(
     g: mx.array,
     scale: float,
     h: Optional[mx.array] = None,
-    use_kernel: bool = True,
+    mask: Optional[mx.array] = None,
 ) -> Tuple[mx.array, mx.array]:
-    B, H, _, K = q.shape
+    """
+    Lightning-attention recurrence, ``h_t = h_{t-1} * exp(g) + k_t^T v_t`` with
+    ``y_t = q_t h_t``, where ``g`` is a per-head decay constant over time.
+
+    Args:
+        mask (mx.array, optional): A ``[B, L]`` validity mask. Padded positions
+          leave the state untouched, so they contribute no ``k v^T`` and, just
+          as importantly, do not apply the decay.
+    """
+    B, H, L, K = q.shape
     V = v.shape[-1]
     if h is None:
-        h = mx.zeros((B, H, K, V), dtype=q.dtype)
+        # The state accumulates over the whole sequence, so hold it in float32
+        # like the reference implementation does.
+        h = mx.zeros((B, H, K, V), dtype=mx.float32)
     q = q * scale
-    use_kernel = (
-        use_kernel
-        and _recurrent_gla_kernel is not None
-        and mx.default_device() == mx.gpu
-        and K == V
-        and K % 32 == 0
-        and V % 4 == 0
-    )
-    if use_kernel:
-        return _recurrent_gla_kernel_call(q, k, v, g, h)
-    return _recurrent_gla_ops(q, k, v, g, h)
+    exp_g = mx.exp(g)[:, None, None].astype(h.dtype)
+    outputs = []
+    for t in range(L):
+        y_t, h_t = _recurrent_gla_step(
+            q[:, :, t : t + 1],
+            k[:, :, t : t + 1],
+            v[:, :, t : t + 1],
+            h,
+            exp_g,
+        )
+        if mask is None:
+            h = h_t
+        else:
+            keep = mask[:, t][:, None, None, None]
+            h = mx.where(keep, h_t, h)
+            y_t = mx.where(keep, y_t, 0)
+        outputs.append(y_t)
+    return mx.concatenate(outputs, axis=2), h
 
 
 class GroupRMSNorm(nn.Module):
@@ -244,7 +135,11 @@ class GroupRMSNorm(nn.Module):
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
-        dim = intermediate_size if intermediate_size is not None else args.intermediate_size
+        dim = (
+            intermediate_size
+            if intermediate_size is not None
+            else args.intermediate_size
+        )
         self.gate_proj = nn.Linear(args.hidden_size, dim, bias=args.use_bias)
         self.up_proj = nn.Linear(args.hidden_size, dim, bias=args.use_bias)
         self.down_proj = nn.Linear(dim, args.hidden_size, bias=args.use_bias)
@@ -299,12 +194,7 @@ class MultiLatentAttention(nn.Module):
             bias=args.use_qkv_bias,
         )
 
-        if args.rope_scaling is not None:
-            mscale_all_dim = args.rope_scaling.get("mscale_all_dim", 0)
-            scaling_factor = args.rope_scaling.get("factor", 1)
-            if mscale_all_dim and scaling_factor > 1:
-                s = 0.1 * mscale_all_dim * math.log(scaling_factor) + 1.0
-                self.scale = self.scale * s * s
+        self.scale = apply_yarn_mscale(self.scale, args.rope_scaling)
 
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
@@ -335,7 +225,7 @@ class MultiLatentAttention(nn.Module):
         k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv_latent = self.kv_a_layernorm(compressed_kv)
 
-        offset = _cache_offset(cache)
+        offset = cache.offset if cache is not None else 0
         q_pe = self.rope(q_pe, offset)
         k_pe = self.rope(k_pe, offset)
 
@@ -475,47 +365,14 @@ class LinearAttention(nn.Module):
             g=self._slope,
             scale=self.scale,
             h=cache[0],
-            use_kernel=not self.training,
+            mask=mask,
         )
+        if hasattr(cache, "advance"):
+            # Keeps ``lengths`` aligned with the next chunk of a padded prompt.
+            cache.advance(L)
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
-
-
-def group_expert_select(
-    gates: mx.array,
-    e_score_correction_bias: Optional[mx.array],
-    top_k: int,
-    n_group: int,
-    topk_group: int,
-    routed_scaling_factor: float,
-    norm_topk_prob: bool,
-    score_function: str,
-) -> Tuple[mx.array, mx.array]:
-    in_type = gates.dtype
-    if score_function == "sigmoid":
-        scores = mx.sigmoid(gates.astype(mx.float32))
-    else:
-        scores = mx.softmax(gates.astype(mx.float32), axis=-1)
-    orig_scores = scores
-    if e_score_correction_bias is not None:
-        scores = scores + e_score_correction_bias
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
-    scores = scores * routed_scaling_factor
-    return inds, scores.astype(in_type)
 
 
 class Gate(nn.Module):
@@ -536,16 +393,38 @@ class Gate(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> Tuple[mx.array, mx.array]:
-        return group_expert_select(
-            self.gate_proj(x),
-            self.expert_bias,
-            self.top_k,
-            self.n_group,
-            self.topk_group,
-            self.routed_scaling_factor,
-            self.norm_topk_prob,
-            self.score_function,
-        )
+        gates = self.gate_proj(x)
+        in_type = gates.dtype
+        gates = gates.astype(mx.float32)
+        if self.score_function == "sigmoid":
+            scores = mx.sigmoid(gates)
+        else:
+            scores = mx.softmax(gates, axis=-1)
+
+        # The bias steers the selection only, the weights use the raw scores.
+        orig_scores = scores
+        if self.expert_bias is not None:
+            scores = scores + self.expert_bias
+
+        n_drop = self.n_group - self.topk_group
+        if n_drop > 0:
+            scores = mx.unflatten(scores, axis=-1, shape=(self.n_group, -1))
+            group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+            group_idx = mx.argpartition(group_scores, kth=n_drop - 1, axis=-2)[
+                ..., :n_drop, :
+            ]
+            scores = mx.put_along_axis(
+                scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+            )
+            scores = mx.flatten(scores, -2, -1)
+
+        inds = mx.argpartition(-scores, kth=self.top_k - 1, axis=-1)[..., : self.top_k]
+        inds = mx.stop_gradient(inds)
+        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        if self.top_k > 1 and self.norm_topk_prob:
+            scores = scores / (scores.sum(axis=-1, keepdims=True) + 1e-20)
+        scores = scores * self.routed_scaling_factor
+        return inds, scores.astype(in_type)
 
 
 class SparseMoeBlock(nn.Module):
@@ -559,8 +438,12 @@ class SparseMoeBlock(nn.Module):
             bias=args.use_bias,
         )
         self.gate = Gate(args)
+        shared_size = (
+            args.moe_shared_expert_intermediate_size
+            or args.moe_intermediate_size * args.num_shared_experts
+        )
         self.shared_experts = (
-            MLP(args, intermediate_size=args.moe_intermediate_size * args.num_shared_experts)
+            MLP(args, intermediate_size=shared_size)
             if args.num_shared_experts > 0
             else None
         )
@@ -579,9 +462,9 @@ class DecoderLayer(nn.Module):
         super().__init__()
         n_layers = args.num_hidden_layers
         group = args.layer_group_size
-        self.is_global = (
-            (layer_idx + 1) % group == 0 or layer_idx >= (n_layers // group) * group
-        )
+        self.is_global = (layer_idx + 1) % group == 0 or layer_idx >= (
+            n_layers // group
+        ) * group
 
         if self.is_global:
             self.attention = MultiLatentAttention(args)
@@ -594,7 +477,9 @@ class DecoderLayer(nn.Module):
             self.mlp = MLP(args)
 
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
 
     def __call__(
         self,
@@ -622,9 +507,7 @@ class LanguageModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         # Find a representative attention layer index for offset/mask sizing.
-        self._attn_idx = next(
-            (i for i, l in enumerate(self.layers) if l.is_global), 0
-        )
+        self._attn_idx = next((i for i, l in enumerate(self.layers) if l.is_global), 0)
         self._gla_idx = next(
             (i for i, l in enumerate(self.layers) if not l.is_global), 0
         )
@@ -639,9 +522,10 @@ class LanguageModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        attn_mask = create_attention_mask(h, cache[self._attn_idx], return_array=True)
+        attn_cache = cache[self._attn_idx]
+        attn_mask = create_attention_mask(h, attn_cache, return_array=True)
         gla_mask = create_ssm_mask(h, cache[self._gla_idx])
-        offset = _cache_offset(cache[self._attn_idx])
+        offset = attn_cache.offset if attn_cache is not None else 0
 
         for layer, c in zip(self.layers, cache):
             mask = attn_mask if layer.is_global else gla_mask
@@ -733,6 +617,9 @@ class Model(nn.Module):
         def predicate(path, _):
             if path.endswith("mlp.gate.gate_proj"):
                 return {"group_size": 64, "bits": 8}
+            # The absorbed MLA matrices stay unquantized, as in bailing_moe_v3.
+            if path.endswith(("attention.embed_q", "attention.unembed_out")):
+                return False
             return True
 
         return predicate
