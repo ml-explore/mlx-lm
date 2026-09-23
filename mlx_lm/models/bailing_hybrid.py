@@ -80,44 +80,93 @@ def recurrent_gla(
     k: mx.array,
     v: mx.array,
     g: mx.array,
+    *,
     scale: float,
     h: Optional[mx.array] = None,
     mask: Optional[mx.array] = None,
+    chunk: int = 128,
 ) -> Tuple[mx.array, mx.array]:
     """
-    Lightning-attention recurrence, ``h_t = h_{t-1} * exp(g) + k_t^T v_t`` with
-    ``y_t = q_t h_t``, where ``g`` is a per-head decay constant over time.
+    Lightning-attention recurrence ``h_t = h_{t-1} exp(g) + k_t^T v_t``,
+    ``y_t = q_t h_t``, with ``g`` a per-head decay constant over time.
+
+    Past one step it runs chunked. With ``r_t`` the number of valid positions up
+    to ``t``, unrolling gives
+
+        y_t = sum_{s <= t} exp(g (r_t - r_s)) (q_t . k_s) v_s + exp(g r_t) q_t h_0
+
+    so each block of ``C`` steps is one decay-weighted causal attention plus one
+    state carry, both matmuls.
 
     Args:
         mask (mx.array, optional): A ``[B, L]`` validity mask. Padded positions
-          leave the state untouched, so they contribute no ``k v^T`` and, just
-          as importantly, do not apply the decay.
+          contribute no ``k v^T`` and do not decay the state.
     """
     B, H, L, K = q.shape
     V = v.shape[-1]
+    out_dtype = q.dtype
     if h is None:
-        # The state accumulates over the whole sequence, so hold it in float32
-        # like the reference implementation does.
+        # Hold the state in float32, as the reference does.
         h = mx.zeros((B, H, K, V), dtype=mx.float32)
-    q = q * scale
-    exp_g = mx.exp(g)[:, None, None].astype(h.dtype)
-    outputs = []
-    for t in range(L):
-        y_t, h_t = _recurrent_gla_step(
-            q[:, :, t : t + 1],
-            k[:, :, t : t + 1],
-            v[:, :, t : t + 1],
-            h,
-            exp_g,
-        )
+
+    if L == 1:
+        exp_g = mx.exp(g)[:, None, None].astype(h.dtype)
+        y, h_t = _recurrent_gla_step(q * scale, k, v, h, exp_g)
         if mask is None:
-            h = h_t
-        else:
-            keep = mask[:, t][:, None, None, None]
-            h = mx.where(keep, h_t, h)
-            y_t = mx.where(keep, y_t, 0)
-        outputs.append(y_t)
-    return mx.concatenate(outputs, axis=2), h
+            return y, h_t
+        keep = mask[:, 0][:, None, None, None]
+        return mx.where(keep, y, 0), mx.where(keep, h_t, h)
+
+    # exp(|g| C / 2) must stay in float32 and |g| < 1, so 176 is the ceiling.
+    C = min(chunk, L, 128)
+    n_chunks = (L + C - 1) // C
+    pad = n_chunks * C - L
+
+    # Rank counts valid positions, so padding neither contributes nor decays.
+    if mask is None:
+        m = (mx.arange(n_chunks * C) < L).astype(mx.float32)[None]
+    else:
+        m = mx.pad(mask.astype(mx.float32), [(0, 0), (0, pad)])
+    if pad:
+        pad_width = [(0, 0), (0, 0), (0, pad), (0, 0)]
+        q = mx.pad(q, pad_width)
+        k = mx.pad(k, pad_width)
+        v = mx.pad(v, pad_width)
+
+    q = mx.unflatten(q, 2, (n_chunks, C))
+    k = mx.unflatten(k, 2, (n_chunks, C))
+    v = mx.unflatten(v, 2, (n_chunks, C)).astype(mx.float32)
+
+    m = mx.unflatten(m, 1, (n_chunks, C))[:, None]
+    rank = mx.cumsum(m, axis=-1)
+    total = rank[..., -1:]
+    gh = g.reshape(1, H, 1, 1)
+
+    # Centring the rank splits exp(g (r_i - r_j)) over i and j within float32.
+    centre = 0.5 * C
+    e = gh * (rank - centre)
+    eq = mx.exp(e) * scale * m
+    ek = mx.exp(-e) * m
+    q = q * eq[..., None]
+    k = k * ek[..., None]
+
+    # The strict upper triangle overflows to +-inf; `tril` selects, so it drops
+    # those instead of multiplying them into NaN.
+    scores = mx.tril(q @ k.swapaxes(-1, -2))
+    intra = scores @ v
+    carry = k.swapaxes(-1, -2) @ v
+    decay = mx.exp(gh * (total - centre))[..., None]
+    state_decay = mx.exp(gh * total)[..., None]
+
+    cross = []
+    for i in range(n_chunks):
+        cross.append(q[:, :, i] @ h)
+        h = state_decay[:, :, i] * h + carry[:, :, i] * decay[:, :, i]
+    cross = mx.stack(cross, axis=2)
+
+    cross_scale = mx.exp(g * centre).reshape(1, H, 1, 1, 1)
+    y = (intra + cross * cross_scale).astype(out_dtype)
+    return mx.flatten(y, 2, 3)[:, :, :L], h
 
 
 class GroupRMSNorm(nn.Module):
