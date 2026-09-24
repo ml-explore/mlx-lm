@@ -12,8 +12,6 @@ from .base import BaseModelArgs
 from .rope_utils import YarnRoPE
 from .switch_layers import SwitchGLU, SwitchLinear
 
-NEG_INF = -1e30
-
 
 @dataclass
 class ModelArgs(BaseModelArgs):
@@ -386,21 +384,20 @@ def _sparse_attention(
     q: mx.array, kv: mx.array, sinks: mx.array, indices: mx.array, scale: float
 ) -> mx.array:
     # q [B,S,H,D], kv [B,K,D], indices [B,S,Ksel].
-    selected = _gather_rows(kv, indices).astype(mx.float32)
-    qf = q.astype(mx.float32)
-    logits = mx.matmul(qf, selected.swapaxes(-1, -2)) * scale
-    valid = indices[:, :, None, :] >= 0
-    logits = mx.where(valid, logits, NEG_INF)
-    max_logit = mx.maximum(
-        mx.max(logits, axis=-1, keepdims=True), sinks.reshape(1, 1, -1, 1)
+    batch, length, heads, dim = q.shape
+    # Each query has its own keys, so each query is one batch entry.
+    selected = _gather_rows(kv, indices).reshape(batch * length, 1, -1, dim)
+    selected = selected.astype(mx.float32)
+    # SDPA rounds the scores to the input dtype at this head size, so use fp32.
+    out = mx.fast.scaled_dot_product_attention(
+        q.reshape(batch * length, heads, 1, dim).astype(mx.float32),
+        selected,
+        selected,
+        scale=scale,
+        mask=(indices >= 0).reshape(batch * length, 1, 1, -1),
+        sinks=sinks.astype(mx.float32),
     )
-    weights = mx.exp(logits - max_logit)
-    weights = mx.where(valid, weights, 0.0)
-    denom = mx.sum(weights, axis=-1, keepdims=True) + mx.exp(
-        sinks.reshape(1, 1, -1, 1) - max_logit
-    )
-    out = mx.matmul(weights, selected) / denom
-    return out.astype(q.dtype)
+    return out.reshape(batch, length, heads, dim).astype(q.dtype)
 
 
 class Indexer(nn.Module):
