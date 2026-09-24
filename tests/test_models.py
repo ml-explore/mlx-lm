@@ -888,6 +888,58 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_qwen3_rope_parameters(self):
+        # Regression test: configs saved by transformers >= 5 nest rope_theta
+        # and rope_scaling under rope_parameters and drop the flat fields.
+        from mlx_lm.models import qwen3
+
+        config = {
+            "model_type": "qwen3",
+            "hidden_size": 1024,
+            "num_hidden_layers": 4,
+            "intermediate_size": 2048,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 10_000,
+            "head_dim": 128,
+            "max_position_embeddings": 4096,
+            "tie_word_embeddings": False,
+            "rope_parameters": {"rope_theta": 1000.0, "rope_type": "default"},
+        }
+        args = qwen3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000.0)
+        model = qwen3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Scaling parameters must reach the rope layer.
+        config["rope_parameters"] = {
+            "rope_theta": 1000.0,
+            "rope_type": "yarn",
+            "factor": 4.0,
+            "original_max_position_embeddings": 1024,
+        }
+        args = qwen3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000.0)
+        self.assertEqual(args.rope_scaling, config["rope_parameters"])
+        model = qwen3.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, rope_utils.YarnRoPE)
+
+        # Flat fields from older configs still take priority.
+        config["rope_theta"] = 2000.0
+        config["rope_scaling"] = {"rope_type": "linear", "factor": 2.0}
+        args = qwen3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 2000.0)
+        self.assertEqual(args.rope_scaling, config["rope_scaling"])
+
+        # No rope_theta anywhere is an error, not a silent default.
+        del config["rope_theta"], config["rope_scaling"]
+        del config["rope_parameters"]["rope_theta"]
+        with self.assertRaises(ValueError):
+            qwen3.ModelArgs.from_dict(config)
+
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
             "hidden_size": 8,
@@ -2017,6 +2069,58 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gemma3n_kv_shared_layers_ignore_chunking(self):
+        # KV-shared layers reuse an earlier layer's cache, which that layer has
+        # already advanced by L, so they must not read its offset for RoPE.
+        from mlx_lm.models import gemma3n
+
+        args = gemma3n.ModelArgs(
+            model_type="gemma3n",
+            text_config={
+                "model_type": "gemma3n",
+                "hidden_size": 32,
+                "num_hidden_layers": 4,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-5,
+                "vocab_size": 64,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 2,
+                "vocab_size_per_layer_input": 64,
+                "sliding_window": 8,
+                "max_position_embeddings": 128,
+                "rope_local_base_freq": 1.0,
+                "rope_theta": 1000.0,
+                "final_logit_softcapping": 1.0,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "activation_sparsity_pattern": [0.0, 0.0, 0.0, 0.0],
+                "hidden_size_per_layer_input": 8,
+                "altup_num_inputs": 1,
+                "altup_coef_clip": 1.0,
+                "altup_correct_scale": True,
+                "altup_active_idx": 0,
+                "laurel_rank": 4,
+            },
+        )
+        model = gemma3n.Model(args)
+        mx.eval(model.parameters())
+
+        def last_logits(chunks):
+            cache = model.model.language_model.make_cache()
+            for chunk in chunks:
+                out = model(mx.array([chunk]), cache=cache)
+            return out[:, -1]
+
+        whole = last_logits([[1, 2, 3, 4]])
+        chunked = last_logits([[1, 2], [3, 4]])
+        self.assertTrue(mx.allclose(whole, chunked).item())
 
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text
@@ -3555,6 +3659,40 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
             },
             {
+                "model_type": "bailing_hybrid",
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "num_shared_experts": 1,
+                "n_group": 2,
+                "topk_group": 1,
+                "first_k_dense_replace": 1,
+                "layer_group_size": 2,
+                "group_norm_size": 4,
+                "vocab_size": 1000,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "max_position_embeddings": 1000,
+                "routed_scaling_factor": 2.5,
+                "head_dim": 64,
+                "kv_lora_rank": 64,
+                "q_lora_rank": 96,
+                "qk_rope_head_dim": 16,
+                "qk_nope_head_dim": 32,
+                "v_head_dim": 32,
+                "rope_interleave": True,
+                "partial_rotary_factor": 0.5,
+                "use_qk_norm": True,
+                "score_function": "sigmoid",
+                "norm_topk_prob": True,
+                "moe_router_enable_expert_bias": True,
+            },
+            {
                 "model_type": "qwen3_next",
                 "hidden_size": 128,
                 "num_hidden_layers": 4,
@@ -3835,6 +3973,30 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
             },
             {
+                "model_type": "minimax_m3_vl",
+                "vocab_size": 128,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "model_type": "minimax_m3_vl",
+                    "vocab_size": 128,
+                    "hidden_size": 64,
+                    "intermediate_size": 32,
+                    "dense_intermediate_size": 64,
+                    "shared_intermediate_size": 32,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 16,
+                    "rotary_dim": 8,
+                    "num_local_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "moe_layer_freq": [0, 0, 1, 1],
+                    "rms_norm_eps": 1e-5,
+                    "rope_theta": 1000.0,
+                    "max_position_embeddings": 1000,
+                },
+            },
+            {
                 "model_type": "talkie",
                 "vocab_size": 1000,
                 "hidden_size": 128,
@@ -3879,6 +4041,83 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_minimax_m3_vl(self):
+        from mlx_lm.generate import _merge_caches
+        from mlx_lm.models import minimax_m3_vl
+
+        blk, topk = 4, 2
+        budget = blk * topk
+        base = {
+            "model_type": "minimax_m3_vl",
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "intermediate_size": 32,
+            "dense_intermediate_size": 32,
+            "shared_intermediate_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rotary_dim": 8,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1000.0,
+            "max_position_embeddings": 512,
+            "mlp_layer_types": ["dense", "sparse"],
+            "layer_types": ["full_attention", "minimax_m3_sparse"],
+            "index_n_heads": 2,
+            "index_head_dim": 8,
+            "index_block_size": blk,
+            "index_topk_blocks": topk,
+            "index_local_blocks": 1,
+        }
+
+        def build(**overrides):
+            config = {
+                "model_type": "minimax_m3_vl",
+                "text_config": {**base, **overrides},
+            }
+            return minimax_m3_vl.Model(minimax_m3_vl.ModelArgs.from_dict(config))
+
+        model = build()
+        self.assertEqual([l.is_moe for l in model.layers], [False, True])
+        self.assertEqual(
+            [l.self_attn.is_sparse_attn for l in model.layers], [False, True]
+        )
+
+        # The published config nests the same values.
+        nested = build(
+            layer_types=None,
+            index_block_size=None,
+            sparse_attention_config={
+                "use_sparse_attention": True,
+                "sparse_num_index_heads": 2,
+                "sparse_index_dim": 8,
+                "sparse_block_size": blk,
+                "sparse_topk_blocks": topk,
+                "sparse_local_block": 1,
+                "sparse_attention_freq": [0, 1],
+            },
+        )
+        self.assertEqual(
+            [l.self_attn.is_sparse_attn for l in nested.layers], [False, True]
+        )
+
+        dense = build(index_block_size=None)
+        model.update(dense.parameters())
+        for n in (budget, budget + blk):
+            x = mx.arange(n)[None] % base["vocab_size"]
+            same = bool(mx.allclose(model(x), dense(x), atol=1e-5))
+            self.assertEqual(same, n <= budget, f"length {n}")
+
+        # A batched cache holds a per-row offset array and advances it in place.
+        n = budget * 5
+        ids = mx.arange(n)[None] % base["vocab_size"]
+        want = model(ids)
+        got = model(ids, cache=_merge_caches([model.make_cache()]))
+        self.assertTrue(mx.allclose(got, want, atol=1e-5))
 
     def test_llama4_chunked_kv_cache(self):
         # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on

@@ -9,6 +9,7 @@ To run, first start the server:
 
 Then run this script.
 """
+
 import json
 
 from openai import OpenAI

@@ -19,6 +19,26 @@ def precise_swiglu(h, gate, x):
 
 
 @partial(mx.compile, shapeless=True)
+def swiglu_oai(
+    gate: mx.array, x: mx.array, alpha: float = 1.702, limit: float = 7.0
+) -> mx.array:
+    # GPT-OSS variant: clip the gate from above only, and add 1 to the linear part.
+    gate = mx.minimum(gate, limit)
+    x = mx.clip(x, -limit, limit)
+    return (x + 1.0) * (gate * mx.sigmoid(alpha * gate))
+
+
+class SwigluOAI(nn.Module):
+    def __init__(self, alpha: float = 1.702, limit: float = 7.0):
+        super().__init__()
+        self._alpha = alpha
+        self._limit = limit
+
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return swiglu_oai(gate, x, alpha=self._alpha, limit=self._limit)
+
+
+@partial(mx.compile, shapeless=True)
 def xielu(x, alpha_p, alpha_n, beta, eps):
     alpha_p = nn.softplus(alpha_p)
     alpha_n = beta + nn.softplus(alpha_n)
