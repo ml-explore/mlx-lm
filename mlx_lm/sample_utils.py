@@ -220,13 +220,13 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
     Returns:
         token selected based on the top-p criterion.
     """
-    srt = mx.sort(logprobs, axis=-1)
-    probs = mx.exp(srt.astype(mx.float32))
-    above = mx.cumsum(probs, axis=-1, reverse=True, inclusive=False)
-    total = above[..., :1] + probs[..., :1]
-    cut = (above >= top_p * total).sum(axis=-1, keepdims=True)
-    kth = mx.take_along_axis(srt, cut, axis=-1)
-    return mx.where(logprobs < kth, -float("inf"), logprobs)
+    sorted_logprobs = mx.sort(logprobs, axis=-1)
+    sorted_probs = mx.exp(sorted_logprobs.astype(mx.float32))
+    mass_above = mx.cumsum(sorted_probs, axis=-1, reverse=True, inclusive=False)
+    total_mass = mass_above[..., :1] + sorted_probs[..., :1]
+    num_dropped = (mass_above >= top_p * total_mass).sum(axis=-1, keepdims=True)
+    threshold = mx.take_along_axis(sorted_logprobs, num_dropped, axis=-1)
+    return mx.where(logprobs < threshold, -float("inf"), logprobs)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
