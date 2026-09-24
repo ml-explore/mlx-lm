@@ -1,2 +1,5 @@
-include requirements.txt
-recursive-include mlx_lm/ *.py
+global-exclude *
+recursive-include mlx_lm *.py py.typed *.md
+recursive-include tests *.py
+include pyproject.toml
+include README.md
