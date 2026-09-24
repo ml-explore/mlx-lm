@@ -39,7 +39,11 @@ from .generate import (
     make_text_state_machine,
     stream_generate,
 )
-from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.cache import (
+    LRUPromptCache,
+    make_prealloc_prompt_cache,
+    make_prompt_cache,
+)
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -789,6 +793,9 @@ class ResponseGenerator:
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
+                        kv_bits=self.cli_args.kv_bits,
+                        kv_group_size=self.cli_args.kv_group_size,
+                        kv_preallocate_size=self.cli_args.kv_preallocate_size,
                         stream=generation_stream,
                     )
                     unprocessed_requests.append((rqueue, request, args))
@@ -942,13 +949,24 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
+            pop = self.cli_args.kv_preallocate_size is not None
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, prompt, pop=pop
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
+                if self.cli_args.kv_preallocate_size is not None:
+                    self.prompt_cache.clear()
+                    mx.clear_cache()
+                    cache = make_prealloc_prompt_cache(
+                        self.model_provider.model,
+                        max_size=self.cli_args.kv_preallocate_size,
+                        kv_bits=self.cli_args.kv_bits,
+                        kv_group_size=self.cli_args.kv_group_size,
+                    )
+                else:
+                    cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
@@ -1923,6 +1941,18 @@ def main():
         f"(default: {DEFAULT_QUANTIZED_KV_START})",
     )
     parser.add_argument(
+        "--kv-preallocate-size",
+        type=int,
+        default=None,
+        help=(
+            "Preallocate the KV cache to this many tokens up front instead of "
+            "growing it in step=256 chunks during generation, avoiding wired-"
+            "memory spikes on constrained hosts. Independent of --max-kv-size "
+            "(which uses RotatingKVCache and evicts old tokens); this retains "
+            "full history. Typically combined with --kv-bits."
+        ),
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
@@ -1934,6 +1964,15 @@ def main():
         level=getattr(logging, args.log_level.upper(), None),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+
+    if args.kv_preallocate_size is not None and args.prompt_cache_size > 1:
+        logging.warning(
+            "--kv-preallocate-size is set; forcing --prompt-cache-size=1 "
+            "since multiple preallocated full-context caches will exceed "
+            "available memory. Set --prompt-cache-size explicitly to override."
+        )
+        args.prompt_cache_size = 1
+
     run(args.host, args.port, ModelProvider(args))
 
 

@@ -40,6 +40,42 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
+def make_prealloc_prompt_cache(
+    model: nn.Module,
+    max_size: int,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+) -> List[Any]:
+    """
+    Construct preallocated prompt cache with fixed max_size.
+    """
+    if hasattr(model, "make_cache"):
+        base_cache = model.make_cache()
+        out = []
+        for c in base_cache:
+            if isinstance(c, KVCache):
+                if kv_bits is not None:
+                    out.append(
+                        QuantizedKVCache(
+                            group_size=kv_group_size, bits=kv_bits, max_size=max_size
+                        )
+                    )
+                else:
+                    out.append(KVCache(max_size=max_size))
+            else:
+                out.append(c)
+        return out
+
+    num_layers = len(model.layers)
+    if kv_bits is not None:
+        return [
+            QuantizedKVCache(group_size=kv_group_size, bits=kv_bits, max_size=max_size)
+            for _ in range(num_layers)
+        ]
+    return [KVCache(max_size=max_size) for _ in range(num_layers)]
+
+
+
 def save_prompt_cache(
     file_name: str, cache: List[Any], metadata: Optional[Dict[str, str]] = None
 ):
@@ -251,22 +287,31 @@ class ConcatenateKVCache(_BaseCache):
 class QuantizedKVCache(_BaseCache):
     step = 256
 
-    def __init__(self, group_size: int = 64, bits: int = 8):
+    def __init__(
+        self,
+        group_size: int = 64,
+        bits: int = 8,
+        max_size: Optional[int] = None,
+    ):
         self.keys = None
         self.values = None
         self.offset = 0
         self.group_size = group_size
         self.bits = bits
+        self.max_size = max_size
 
     def update_and_fetch(self, keys, values):
         B, n_kv_heads, num_steps, k_head_dim = keys.shape
         v_head_dim = values.shape[-1]
         prev = self.offset
 
-        if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
+        if self.keys is None:
             el_per_int = 8 * mx.uint32.size // self.bits
-            new_steps = (self.step + num_steps - 1) // self.step * self.step
-            shape = (B, n_kv_heads, new_steps)
+            if self.max_size is not None:
+                alloc_len = ((self.max_size + self.step - 1) // self.step) * self.step
+            else:
+                alloc_len = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_kv_heads, alloc_len)
 
             def init_quant(dim):
                 return (
@@ -275,24 +320,30 @@ class QuantizedKVCache(_BaseCache):
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                 )
 
+            self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+            mx.eval(*self.keys, *self.values)
+
+        elif (prev + num_steps) > self.keys[0].shape[-2]:
+            if self.max_size is not None:
+                raise ValueError(
+                    f"QuantizedKVCache exceeded preallocated max_size="
+                    f"{self.max_size} tokens (requested offset "
+                    f"{prev + num_steps}). Increase --kv-preallocate-size."
+                )
+            new_steps = (self.step + num_steps - 1) // self.step * self.step
+            shape = (B, n_kv_heads, new_steps)
+
             def expand_quant(x):
                 new_x = mx.zeros((*shape, x.shape[-1]), dtype=x.dtype)
                 return mx.concatenate([x, new_x], axis=-2)
 
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys, self.values = tree_map(
-                        lambda x: x[..., :prev, :], (self.keys, self.values)
-                    )
-
+            if prev % self.step != 0:
                 self.keys, self.values = tree_map(
-                    expand_quant, (self.keys, self.values)
+                    lambda x: x[..., :prev, :], (self.keys, self.values)
                 )
-            else:
-                self.keys, self.values = init_quant(k_head_dim), init_quant(v_head_dim)
+            self.keys, self.values = tree_map(expand_quant, (self.keys, self.values))
 
         self.offset += num_steps
-
         keys = mx.quantize(keys, group_size=self.group_size, bits=self.bits)
         values = mx.quantize(values, group_size=self.group_size, bits=self.bits)
         for i in range(len(self.keys)):
@@ -333,20 +384,48 @@ class QuantizedKVCache(_BaseCache):
 
     @property
     def nbytes(self):
-        return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+        if self.keys is None:
+            return 0
+        return tree_reduce(
+            lambda a, x: a + (x.nbytes if hasattr(x, "nbytes") else 0),
+            (self.keys, self.values),
+            0,
+        )
 
 
 class KVCache(_BaseCache):
     step = 256
 
-    def __init__(self):
+    def __init__(self, max_size: Optional[int] = None):
         self.keys = None
         self.values = None
         self.offset = 0
+        self.max_size = max_size
 
     def update_and_fetch(self, keys, values):
         prev = self.offset
-        if self.keys is None or (prev + keys.shape[2]) > self.keys.shape[2]:
+
+        if self.keys is None:
+            B, n_kv_heads, _, k_head_dim = keys.shape
+            v_head_dim = values.shape[3]
+            if self.max_size is not None:
+                alloc_len = ((self.max_size + self.step - 1) // self.step) * self.step
+            else:
+                n_steps = (self.step + keys.shape[2] - 1) // self.step
+                alloc_len = n_steps * self.step
+            k_shape = (B, n_kv_heads, alloc_len, k_head_dim)
+            v_shape = (B, n_kv_heads, alloc_len, v_head_dim)
+            self.keys = mx.zeros(k_shape, keys.dtype)
+            self.values = mx.zeros(v_shape, values.dtype)
+            mx.eval(self.keys, self.values)
+
+        elif (prev + keys.shape[2]) > self.keys.shape[2]:
+            if self.max_size is not None:
+                raise ValueError(
+                    f"KVCache exceeded preallocated max_size={self.max_size} "
+                    f"tokens (requested offset {prev + keys.shape[2]}). "
+                    "Increase --kv-preallocate-size."
+                )
             B, n_kv_heads, _, k_head_dim = keys.shape
             v_head_dim = values.shape[3]
             n_steps = (self.step + keys.shape[2] - 1) // self.step
@@ -354,14 +433,11 @@ class KVCache(_BaseCache):
             v_shape = (B, n_kv_heads, n_steps * self.step, v_head_dim)
             new_k = mx.zeros(k_shape, keys.dtype)
             new_v = mx.zeros(v_shape, values.dtype)
-            if self.keys is not None:
-                if prev % self.step != 0:
-                    self.keys = self.keys[..., :prev, :]
-                    self.values = self.values[..., :prev, :]
-                self.keys = mx.concatenate([self.keys, new_k], axis=2)
-                self.values = mx.concatenate([self.values, new_v], axis=2)
-            else:
-                self.keys, self.values = new_k, new_v
+            if prev % self.step != 0:
+                self.keys = self.keys[..., :prev, :]
+                self.values = self.values[..., :prev, :]
+            self.keys = mx.concatenate([self.keys, new_k], axis=2)
+            self.values = mx.concatenate([self.values, new_v], axis=2)
 
         self.offset += keys.shape[2]
         self.keys[..., prev : self.offset, :] = keys
@@ -1649,9 +1725,17 @@ class LRUPromptCache:
     def nbytes(self):
         return self._n_bytes
 
-    def fetch_nearest_cache(self, model: Any, tokens: List[int]):
+    def fetch_nearest_cache(
+        self, model: Any, tokens: List[int], pop: bool = False
+    ):
         result = self._trie.search(model, tokens)
         if result.exact is not None:
+            if pop:
+                self._lru.remove(result.model, result.exact)
+                cache_entry = self._trie.pop(result.model, result.exact)
+                self._n_bytes -= cache_entry.nbytes
+                self._n_bytes_by_type[cache_entry.cache_type] -= cache_entry.nbytes
+                return cache_entry.prompt_cache, []
             cache_entry = self._trie.get(result.model, result.exact)
             return copy.deepcopy(cache_entry.prompt_cache), []
 
@@ -1659,17 +1743,33 @@ class LRUPromptCache:
         if result.longer is not None and result.common_prefix > short_length:
             cache_entry = self._trie.get(result.model, result.longer)
             if can_trim_prompt_cache(cache_entry.prompt_cache):
-                cache = copy.deepcopy(cache_entry.prompt_cache)
+                if pop:
+                    self._lru.remove(result.model, result.longer)
+                    cache_entry = self._trie.pop(result.model, result.longer)
+                    self._n_bytes -= cache_entry.nbytes
+                    self._n_bytes_by_type[cache_entry.cache_type] -= cache_entry.nbytes
+                    cache = cache_entry.prompt_cache
+                else:
+                    cache = copy.deepcopy(cache_entry.prompt_cache)
                 prefix = min(len(tokens) - 1, result.common_prefix)
                 num_to_trim = len(result.longer) - prefix
                 trim_prompt_cache(cache, num_to_trim)
                 return cache, tokens[prefix:]
 
         if short_length > 0:
+            if pop:
+                self._lru.remove(result.model, result.shorter)
+                cache_entry = self._trie.pop(result.model, result.shorter)
+                self._n_bytes -= cache_entry.nbytes
+                self._n_bytes_by_type[cache_entry.cache_type] -= cache_entry.nbytes
+                return cache_entry.prompt_cache, tokens[short_length:]
             cache_entry = self._trie.get(result.model, result.shorter)
             return copy.deepcopy(cache_entry.prompt_cache), tokens[short_length:]
 
         return None, tokens
+
+    def clear(self):
+        self.trim_to(n_sequences=0)
 
     def insert_cache(
         self,
