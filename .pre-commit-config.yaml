@@ -1,15 +1,15 @@
 repos:
 -   repo: https://github.com/psf/black-pre-commit-mirror
-    rev: 25.1.0
+    rev: 26.5.1
     hooks:
     -   id: black
 -   repo: https://github.com/pycqa/isort
-    rev: 6.0.0
+    rev: 9.0.1
     hooks:
     -   id: isort
         args:
             - --profile=black
 -   repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.6
+    rev: v0.16.8
     hooks:
     -   id: ruff-check
