@@ -2833,8 +2833,74 @@ class TestModels(unittest.TestCase):
                 original[k] = v
         check(original)
 
+    def test_nemotron_labs_diffusion(self):
+        from mlx_lm.models import nemotron_labs_diffusion
+
+        args = nemotron_labs_diffusion.ModelArgs(
+            model_type="nemotron_labs_diffusion",
+            vocab_size=100,
+            hidden_size=32,
+            num_hidden_layers=2,
+            intermediate_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            tie_word_embeddings=False,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "llama_4_scaling_beta": 0.5,
+                "original_max_position_embeddings": 512,
+            },
+        )
+        model = nemotron_labs_diffusion.Model(args)
+        self.assertFalse(args.tie_word_embeddings)
+        self.assertIsNot(model.model.embed_tokens.weight, model.lm_head.weight)
+
+        reference = dict(tree_flatten(model.parameters()))
+
+        def check(weights):
+            m = nemotron_labs_diffusion.Model(args)
+            m.load_weights(list(m.sanitize(weights).items()), strict=True)
+            out = m(mx.array([[0, 1, 2]]))
+            self.assertEqual(out.shape, (1, 3, args.vocab_size))
+
+        # Native layout loads unchanged
+        check(dict(reference))
+
+        # NLD checkpoint layout: encoder.* backbone and diffusion_head.*
+        nld_raw = {}
+        for k, v in reference.items():
+            if k.startswith("model."):
+                nld_raw["encoder." + k[len("model.") :]] = v
+            elif k.startswith("lm_head."):
+                nld_raw["diffusion_head." + k[len("lm_head.") :]] = v
+            else:
+                nld_raw[k] = v
+        check(nld_raw)
+
+        # Community repack layout: language_model.* prefix
+        check({f"language_model.{k}": v for k, v in reference.items()})
+
     def test_all_models(self):
         test_configs = [
+            {
+                "model_type": "nemotron_labs_diffusion",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-5,
+                "max_position_embeddings": 512,
+                "tie_word_embeddings": False,
+                "rope_parameters": {
+                    "rope_theta": 10000.0,
+                    "llama_4_scaling_beta": 0.5,
+                    "original_max_position_embeddings": 512,
+                },
+            },
             {
                 "model_type": "afm7",
                 "vocab_size": 1000,
