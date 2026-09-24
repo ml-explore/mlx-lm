@@ -55,6 +55,24 @@ def create_attention_mask(
     return "causal"
 
 
+def image_bidirectional_mask(mask, h, cache, window_size, image_groups):
+    """Tokens of one image attend to each other in both directions.
+
+    ``image_groups`` holds one id per token of this call (-1 for text). Only
+    the tokens of the current call can share an image, so the extra
+    permissions go into the last ``N`` columns of the mask. Sharded layers
+    apply the same rule themselves.
+    """
+    N = h.shape[1]
+    if image_groups is None or N == 1 or getattr(cache, "group", None) is not None:
+        return mask
+    if not isinstance(mask, mx.array):
+        mask = create_attention_mask(h, cache, window_size=window_size, return_array=True)
+    same = (image_groups[:, None] == image_groups[None, :]) & (image_groups[:, None] >= 0)
+    S = mask.shape[-1]
+    return mx.concatenate([mask[..., : S - N], mask[..., S - N :] | same], axis=-1)
+
+
 def create_ssm_mask(h, cache=None):
     if cache and hasattr(cache, "make_mask"):
         return cache.make_mask(h.shape[1])
@@ -116,6 +134,10 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    if getattr(cache, "group", None) is not None:
+        if sinks is not None:
+            raise ValueError("Sharded attention does not support attention sinks.")
+        return cache.attend(queries, keys, values, scale)
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")

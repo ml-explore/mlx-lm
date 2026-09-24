@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    image_bidirectional_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -237,6 +242,7 @@ class Attention(nn.Module):
         cache: Optional[Any] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        shared_cache: Optional[Any] = None,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -270,8 +276,15 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
+        # A shared layer holds no cache. If the source cache is sharded, it still
+        # has to merge its attention across the ranks.
         output = scaled_dot_product_attention(
-            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+            queries,
+            keys,
+            values,
+            cache=cache if cache is not None else shared_cache,
+            scale=self.scale,
+            mask=mask,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
@@ -340,12 +353,18 @@ class DecoderLayer(nn.Module):
         per_layer_input: Optional[mx.array] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        shared_cache: Optional[Any] = None,
     ) -> mx.array:
         residual = x
 
         h = self.input_layernorm(x)
         h, shared_kv, offset = self.self_attn(
-            h, mask, cache, shared_kv=shared_kv, offset=offset
+            h,
+            mask,
+            cache,
+            shared_kv=shared_kv,
+            offset=offset,
+            shared_cache=shared_cache,
         )
         h = self.post_attention_layernorm(h)
         h = residual + h
@@ -502,16 +521,22 @@ class Gemma4TextModel(nn.Module):
 
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
-    def _make_masks(self, h, cache):
+    def _make_masks(self, h, cache, image_groups=None):
         mask = {}
         masks = []
         for l, c in zip(self.layers, cache):
             if l.layer_type not in mask:
                 if l.layer_type == "full_attention":
-                    mask["full_attention"] = create_attention_mask(h, c)
+                    mask["full_attention"] = image_bidirectional_mask(
+                        create_attention_mask(h, c), h, c, None, image_groups
+                    )
                 elif l.layer_type == "sliding_attention":
-                    mask["sliding_attention"] = create_attention_mask(
-                        h, c, window_size=self.window_size
+                    mask["sliding_attention"] = image_bidirectional_mask(
+                        create_attention_mask(h, c, window_size=self.window_size),
+                        h,
+                        c,
+                        self.window_size,
+                        image_groups,
                     )
             masks.append(mask[l.layer_type])
         return masks
@@ -522,6 +547,7 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
         # Make the initial hidden state
         if input_embeddings is None:
@@ -550,7 +576,7 @@ class Gemma4TextModel(nn.Module):
 
         # Apply each layer. We save all intermediate kvs and offset and grab
         # the previous one for the shared kv layers.
-        masks = self._make_masks(h, cache)
+        masks = self._make_masks(h, cache, image_groups)
         intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
             zip(
@@ -562,6 +588,12 @@ class Gemma4TextModel(nn.Module):
             )
         ):
             kvs, offset = intermediates[prev_idx]
+            source = cache[prev_idx]
+            shared_cache = (
+                source
+                if c is None and getattr(source, "group", None) is not None
+                else None
+            )
 
             h, kvs, offset = layer(
                 h,
@@ -570,6 +602,7 @@ class Gemma4TextModel(nn.Module):
                 per_layer_input=per_layer_input,
                 shared_kv=kvs,
                 offset=offset,
+                shared_cache=shared_cache,
             )
 
             intermediates[idx] = (kvs, offset)
@@ -594,12 +627,14 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
         out = self.model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            image_groups=image_groups,
         )
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
