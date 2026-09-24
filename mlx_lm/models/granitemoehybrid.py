@@ -181,8 +181,9 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
         C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
         if cache:
             state = cache[1]
+            lengths = cache.lengths
         else:
-            state = None
+            state, lengths = None, None
 
         y, state = ssm_update(
             hidden_states,
@@ -195,6 +196,7 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             state,
             self.time_step_limit,
             mask,
+            lengths,
         )
         if cache:
             cache[1] = state
