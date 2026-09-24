@@ -302,6 +302,17 @@ class ModelProvider:
         self._adapter_map["default_model"] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
 
+        # Optional allow-list: when set, a request may only load these model
+        # paths (the --model given at start is always allowed). Anything else
+        # is refused instead of loaded, so one caller naming a different model
+        # cannot swap out the resident model for everyone else.
+        allowed = getattr(self.cli_args, "allowed_models", None)
+        self.allowed_models = None
+        if allowed:
+            self.allowed_models = set(allowed)
+            if self.cli_args.model is not None:
+                self.allowed_models.add(self.cli_args.model)
+
         # Build the tokenizer config for later use in load
         self._tokenizer_config = {"trust_remote_code": cli_args.trust_remote_code}
         if cli_args.chat_template:
@@ -382,6 +393,12 @@ class ModelProvider:
         adapter_path = self._adapter_map.get(model_path, adapter_path)
         model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
+
+        if self.allowed_models is not None and model_path not in self.allowed_models:
+            raise ValueError(
+                f"Model '{model_path}' is not in --allowed-models; "
+                f"this server only serves: {sorted(self.allowed_models)}"
+            )
 
         model_key = (model_path, adapter_path, draft_model_path)
         if self.model_key != model_key:
@@ -1776,6 +1793,17 @@ def main():
         "--model",
         type=str,
         help="The path to the MLX model weights, tokenizer, and config",
+    )
+    parser.add_argument(
+        "--allowed-models",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Restrict which model paths a request may load. The --model given "
+            "at start is always allowed. Requests naming any other model are "
+            "refused (HTTP 404 with an error) instead of loaded. Default: any."
+        ),
     )
     parser.add_argument(
         "--adapter-path",
