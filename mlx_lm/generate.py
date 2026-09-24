@@ -1402,7 +1402,19 @@ class GenerationBatch:
         # asynchronously
         self._next_tokens = sampled
         self._next_logprobs = list(logprobs)
-        mx.async_eval(self._next_tokens, self._next_logprobs, token_context)
+        # Materialize the cache writes each step, not just the token/logprob
+        # outputs. The prompt (prefill) loop already evals the cache state per
+        # chunk; the decode loop did not, so the lazy cache-write graph (KV
+        # appends plus any recurrent/conv state updates) accumulated a
+        # generation of live Metal buffers per step and eventually hit the
+        # backend's resource limit after a few thousand generated tokens.
+        # Including the cache state here keeps the live-buffer count flat.
+        mx.async_eval(
+            self._next_tokens,
+            self._next_logprobs,
+            token_context,
+            [c.state for c in self.prompt_cache],
+        )
 
         # Eval the current tokens and current logprobs. After that also add
         # them to self.tokens so that it always represents the tokens contained
