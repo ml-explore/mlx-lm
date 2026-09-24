@@ -16,11 +16,14 @@ from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
+    LogitsProcessorArguments,
     LRUPromptCache,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
+    _make_logits_processors,
     _make_sampler,
+    _max_model_len,
 )
 from mlx_lm.tool_parsers import pythonic
 from mlx_lm.utils import load
@@ -29,7 +32,8 @@ from mlx_lm.utils import load
 class DummyModelProvider:
     def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
-        self.model, self.tokenizer = load(HF_MODEL_PATH)
+        self.model, self.tokenizer, config = load(HF_MODEL_PATH, return_config=True)
+        self.max_model_len = _max_model_len(config)
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
 
@@ -83,6 +87,7 @@ class DummyModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.max_model_len = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -283,6 +288,27 @@ class TestServer(unittest.TestCase):
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
 
+    def test_handle_completions_ignore_eos(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        eos_ids = self.response_generator.model_provider.tokenizer.eos_token_ids
+        # The bias makes the model pick EOS at once.
+        post_data = {
+            "prompt": "Once upon a time",
+            "max_tokens": 8,
+            "logit_bias": {str(t): 100.0 for t in eos_ids},
+        }
+
+        body = requests.post(url, json=post_data).json()
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop")
+
+        # A seed disables batching, so this also tests the single path.
+        for extra in ({}, {"seed": 0}):
+            body = requests.post(
+                url, json={**post_data, "ignore_eos": True, **extra}
+            ).json()
+            self.assertEqual(body["choices"][0]["finish_reason"], "length")
+            self.assertEqual(body["usage"]["completion_tokens"], 8)
+
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
         chat_post_data = {
@@ -425,6 +451,115 @@ class TestServer(unittest.TestCase):
         response = requests.get(url)
         self.assertEqual(response.status_code, 503)
         self.assertEqual(response.json(), {"status": "unavailable"})
+
+
+class TestTokenize(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.provider = cls.response_generator.model_provider
+        cls.tokenizer = cls.provider.tokenizer
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def post(self, path, body):
+        return requests.post(f"http://localhost:{self.port}{path}", json=body)
+
+    def test_tokenize_prompt(self):
+        prompt = "Once upon a time"
+
+        response = self.post("/tokenize", {"model": "default_model", "prompt": prompt})
+        self.assertEqual(response.status_code, 200)
+        expected = self.tokenizer.encode(prompt)
+        self.assertEqual(
+            response.json(),
+            {"tokens": expected, "count": len(expected), "max_model_len": 32768},
+        )
+
+        response = self.post(
+            "/tokenize", {"prompt": prompt, "add_special_tokens": False}
+        )
+        expected = self.tokenizer.encode(prompt, add_special_tokens=False)
+        self.assertEqual(response.json()["tokens"], expected)
+
+        response = self.post("/tokenize", {"prompt": prompt, "return_token_strs": True})
+        body = response.json()
+        self.assertEqual(
+            body["token_strs"], self.tokenizer.convert_ids_to_tokens(body["tokens"])
+        )
+
+    def test_tokenize_count_matches_usage(self):
+        prompt = "Once upon a time"
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": [{"type": "text", "text": "Hello!"}]},
+        ]
+        cases = [
+            ("/v1/completions", {"prompt": prompt}),
+            ("/v1/chat/completions", {"messages": messages}),
+        ]
+        for path, body in cases:
+            count = self.post("/tokenize", body).json()["count"]
+            usage = self.post(path, {**body, "max_tokens": 1}).json()["usage"]
+            self.assertEqual(count, usage["prompt_tokens"])
+
+    def test_tokenize_messages(self):
+        messages = [{"role": "user", "content": "Hello!"}]
+        response = self.post("/tokenize", {"messages": messages})
+        self.assertEqual(response.status_code, 200)
+        expected = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=True
+        )
+        self.assertEqual(response.json()["tokens"], expected)
+
+    def test_tokenize_rejects_bad_requests(self):
+        messages = [{"role": "user", "content": "Hello!"}]
+        bad_bodies = [
+            {},
+            {"prompt": "a", "messages": messages},
+            {"prompt": 1},
+            {"messages": "Hello!"},
+            {"prompt": "a", "add_special_tokens": 1},
+            {"prompt": "a", "return_token_strs": "yes"},
+            {"messages": [{"role": "user", "content": [{"type": "image"}]}]},
+        ]
+        for body in bad_bodies:
+            response = self.post("/tokenize", body)
+            self.assertEqual(response.status_code, 400, body)
+            self.assertIn("error", response.json())
+
+    def test_no_model_loaded(self):
+        with mock.patch.object(self.provider, "tokenizer", None):
+            response = self.post("/tokenize", {"prompt": "a"})
+            self.assertEqual(response.status_code, 503)
+
+
+class TestMaxModelLen(unittest.TestCase):
+    def test_max_model_len(self):
+        self.assertEqual(_max_model_len({"max_position_embeddings": 4096}), 4096)
+        self.assertEqual(
+            _max_model_len({"max_position_embeddings": 4096, "seq_length": 2048}),
+            2048,
+        )
+        self.assertEqual(
+            _max_model_len({"text_config": {"max_position_embeddings": 8192}}), 8192
+        )
+        self.assertIsNone(_max_model_len({"hidden_size": 64}))
 
 
 class TestServerWithDraftModel(unittest.TestCase):
@@ -875,6 +1010,37 @@ class TestMakeSampler(unittest.TestCase):
         self.assertEqual(token.shape, (1,))
 
 
+class TestMakeLogitsProcessors(unittest.TestCase):
+    def test_ignore_eos(self):
+        class FakeTokenizer:
+            eos_token_ids = {2, 3}
+
+        def make_args(logit_bias, ignore_eos):
+            logits = LogitsProcessorArguments(
+                logit_bias=logit_bias,
+                repetition_penalty=0.0,
+                repetition_context_size=20,
+                presence_penalty=0.0,
+                presence_context_size=20,
+                frequency_penalty=0.0,
+                frequency_context_size=20,
+                ignore_eos=ignore_eos,
+            )
+            return type("Args", (), {"logits": logits})
+
+        tokenizer = FakeTokenizer()
+        self.assertEqual(_make_logits_processors(make_args(None, False), tokenizer), [])
+
+        # EOS is blocked even when the request gives it a bias.
+        args = make_args({1: 5.0, 2: 5.0}, True)
+        (processor,) = _make_logits_processors(args, tokenizer)
+        logits = processor(mx.array([[0]]), mx.zeros((1, 5)))
+        inf = float("inf")
+        self.assertEqual(logits.tolist(), [[0.0, 5.0, -inf, -inf, 0.0]])
+        # The request bias is not changed.
+        self.assertEqual(args.logits.logit_bias, {1: 5.0, 2: 5.0})
+
+
 class TestModelSwapClearsCache(unittest.TestCase):
     @mock.patch("mlx_lm.server.mx.clear_cache")
     @mock.patch("mlx_lm.server.make_prompt_cache", return_value=[])
@@ -897,7 +1063,7 @@ class TestModelSwapClearsCache(unittest.TestCase):
         tokenizer = mock.Mock()
         tokenizer.chat_template = None
         tokenizer.default_chat_template = None
-        load.return_value = (mock.Mock(), tokenizer)
+        load.return_value = (mock.Mock(), tokenizer, {})
         init.return_value.size.return_value = 1
 
         provider = ModelProvider(args)

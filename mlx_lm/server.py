@@ -179,6 +179,7 @@ class LogitsProcessorArguments:
     presence_context_size: int
     frequency_penalty: float
     frequency_context_size: int
+    ignore_eos: bool
 
 
 @dataclass
@@ -282,6 +283,7 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.max_model_len = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -311,6 +313,7 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.max_model_len = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -331,18 +334,20 @@ class ModelProvider:
 
         # Load the model and tokenizer
         if self.is_distributed:
-            model, tokenizer = sharded_load(
+            model, tokenizer, config = sharded_load(
                 model_path,
                 pipeline_group=self.pipeline_group,
                 tensor_group=self.tensor_group,
+                return_config=True,
                 tokenizer_config=self._tokenizer_config,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
-            model, tokenizer = load(
+            model, tokenizer, config = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                return_config=True,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
 
@@ -371,6 +376,7 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
+        self.max_model_len = _max_model_len(config)
         self.draft_model = draft_model
         self.is_batchable = is_batchable
 
@@ -390,6 +396,24 @@ class ModelProvider:
         return self.model, self.tokenizer
 
 
+def _max_model_len(config):
+    """Return the context length in the model config, or None."""
+    keys = [
+        "max_position_embeddings",
+        "max_seq_len",
+        "max_sequence_length",
+        "seq_length",
+        "n_positions",
+    ]
+    lengths = [
+        c[k]
+        for c in (config, config.get("text_config") or {})
+        for k in keys
+        if isinstance(c.get(k), int)
+    ]
+    return min(lengths, default=None)
+
+
 def _make_sampler(args, tokenizer):
     return make_sampler(
         args.sampling.temperature,
@@ -402,9 +426,14 @@ def _make_sampler(args, tokenizer):
     )
 
 
-def _make_logits_processors(args):
+def _make_logits_processors(args, tokenizer):
+    logit_bias = args.logits.logit_bias
+    if args.logits.ignore_eos:
+        # Block EOS tokens the same way llama.cpp does.
+        logit_bias = dict(logit_bias or {})
+        logit_bias.update({t: float("-inf") for t in tokenizer.eos_token_ids})
     return make_logits_processors(
-        args.logits.logit_bias,
+        logit_bias,
         args.logits.repetition_penalty,
         args.logits.repetition_context_size,
         args.logits.presence_penalty,
@@ -519,7 +548,7 @@ class ResponseGenerator:
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
 
-    def _tokenize(self, tokenizer, request, args):
+    def _tokenize(self, tokenizer, request, chat_template_kwargs=None):
         """Tokenize a request and split the prompt into segments.
 
         Returns a tuple
@@ -548,9 +577,9 @@ class ResponseGenerator:
                     )
 
                 chat_template_args = self.model_provider.cli_args.chat_template_args
-                if args.chat_template_kwargs:
+                if chat_template_kwargs:
                     chat_template_args = chat_template_args.copy()
-                    chat_template_args.update(args.chat_template_kwargs)
+                    chat_template_args.update(chat_template_kwargs)
                 template_kwargs = dict(
                     tools=tools,
                     tokenize=True,
@@ -702,7 +731,7 @@ class ResponseGenerator:
                 ):
                     try:
                         prompt, segments, segment_types, initial_state = self._tokenize(
-                            current_tokenizer, request, args
+                            current_tokenizer, request, args.chat_template_kwargs
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -745,7 +774,9 @@ class ResponseGenerator:
                         caches=[cache],
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, current_tokenizer)],
-                        logits_processors=[_make_logits_processors(args)],
+                        logits_processors=[
+                            _make_logits_processors(args, current_tokenizer)
+                        ],
                         stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
@@ -914,7 +945,9 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, _, _, initial_state = self._tokenize(
+                tokenizer, request, args.chat_template_kwargs
+            )
             stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -938,7 +971,7 @@ class ResponseGenerator:
 
             # Make the sampler and logit processor
             sampler = _make_sampler(args, tokenizer)
-            logits_processors = _make_logits_processors(args)
+            logits_processors = _make_logits_processors(args, tokenizer)
 
             # Load the KV cache
             self._log_cache_stats()
@@ -1106,7 +1139,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "/chat/completions": self.handle_chat_completions,
         }
 
-        if self.path not in request_factories:
+        if self.path not in request_factories and self.path != "/tokenize":
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
@@ -1155,6 +1188,10 @@ class APIHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if self.path == "/tokenize":
+            self.handle_tokenize()
+            return
+
         # Extract request parameters from the body
         self.stream = self.body.get("stream", False)
         self.stream_options = self.body.get("stream_options", None)
@@ -1184,6 +1221,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.1)
         self.logit_bias = self.body.get("logit_bias", None)
+        self.ignore_eos = self.body.get("ignore_eos", False)
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
@@ -1247,6 +1285,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("ignore_eos", bool)
 
         if self.logit_bias is not None:
             try:
@@ -1396,6 +1435,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 presence_context_size=self.presence_context_size,
                 frequency_penalty=self.frequency_penalty,
                 frequency_context_size=self.frequency_context_size,
+                ignore_eos=self.ignore_eos,
             ),
             stop_words=stop_words,
             max_tokens=self.max_tokens,
@@ -1634,6 +1674,69 @@ class APIHandler(BaseHTTPRequestHandler):
             None,
             None,
         )
+
+    def _send_json(self, status_code, body):
+        self._set_completion_headers(status_code)
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+        self.wfile.flush()
+
+    def handle_tokenize(self):
+        """
+        Handle a POST request for the /tokenize endpoint.
+        """
+        body = self.body
+        prompt = body.get("prompt")
+        messages = body.get("messages")
+        add_special_tokens = body.get("add_special_tokens", True)
+        return_token_strs = body.get("return_token_strs", False)
+        # Use the model that is loaded now.
+        provider = self.response_generator.model_provider
+        tokenizer = provider.tokenizer
+
+        if (prompt is None) == (messages is None):
+            error = "Exactly one of prompt or messages is required"
+        elif prompt is not None and not isinstance(prompt, str):
+            error = "prompt must be of type str"
+        elif messages is not None and not isinstance(messages, list):
+            error = "messages must be of type list"
+        elif not isinstance(add_special_tokens, bool):
+            error = "add_special_tokens must be of type bool"
+        elif not isinstance(return_token_strs, bool):
+            error = "return_token_strs must be of type bool"
+        else:
+            error = None
+        if error is not None:
+            self._send_json(400, {"error": error})
+            return
+        if tokenizer is None:
+            self._send_json(503, {"error": "No model is loaded"})
+            return
+
+        try:
+            if prompt is not None:
+                tokens = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            else:
+                # Tokenize the same way as /v1/chat/completions.
+                request = CompletionRequest(
+                    "chat",
+                    "",
+                    messages,
+                    body.get("tools") or None,
+                    body.get("role_mapping"),
+                )
+                tokens = self.response_generator._tokenize(
+                    tokenizer, request, body.get("chat_template_kwargs")
+                )[0]
+            response = {"tokens": tokens, "count": len(tokens)}
+            if provider.max_model_len is not None:
+                response["max_model_len"] = provider.max_model_len
+            if return_token_strs:
+                response["token_strs"] = tokenizer.convert_ids_to_tokens(tokens)
+        except Exception as e:
+            self._send_json(400, {"error": str(e)})
+            return
+        self._send_json(200, response)
 
     def do_GET(self):
         """

@@ -113,6 +113,10 @@ curl localhost:8080/v1/chat/completions \
 - `logit_bias`: (Optional) A dictionary mapping token IDs to their bias
   values. Defaults to `None`.
 
+- `ignore_eos`: (Optional) A boolean. If true, EOS tokens cannot be sampled,
+  so generation continues to `max_tokens` or a stop word. This overrides
+  `logit_bias` for EOS tokens. Defaults to `false`.
+
 - `logprobs`: (Optional) An integer specifying the number of top tokens and
   corresponding log probabilities to return for each output in the generated
   sequence. If set, this can be any value between 1 and 10, inclusive.
@@ -173,3 +177,36 @@ list contains the following fields:
 
 - `id`: The Hugging Face repo id.
 - `created`: A time-stamp representing the model creation time.
+
+### Tokenize
+
+Use the `tokenize` endpoint to get the token ids of a prompt or of chat
+messages:
+
+```shell
+curl localhost:8080/tokenize \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "hello"}'
+```
+
+The endpoint uses the tokenizer of the model that is loaded now. It returns
+503 if no model is loaded, for example while the server loads the model. The
+request accepts the following fields:
+
+- `prompt`: The string to tokenize. Give `prompt` or `messages`, not both.
+- `messages`: Chat messages to tokenize. They are tokenized the same way as
+  in `v1/chat/completions`, with the generation prompt added.
+- `tools`, `role_mapping`, `chat_template_kwargs`: (Optional) Used with
+  `messages`, the same as in `v1/chat/completions`.
+- `add_special_tokens`: (Optional) Add special tokens such as BOS to
+  `prompt`. Defaults to `true`, the same as `v1/completions`.
+- `return_token_strs`: (Optional) Also return the token strings. Defaults to
+  `false`.
+
+The response contains the following fields:
+
+- `tokens`: A list of the token ids.
+- `count`: The number of tokens.
+- `max_model_len`: The context length from the model config. It is not
+  present if the config does not give one.
+- `token_strs`: The token strings, if `return_token_strs` is true.
