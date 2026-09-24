@@ -1643,6 +1643,85 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_minicpm3_batch_padding(self):
+        from mlx_lm.generate import BatchGenerator, generate_step
+        from mlx_lm.models import minicpm3
+
+        # Use CPU float32 to avoid reduced-precision GPU matmul differences.
+        stream = mx.default_stream(mx.cpu)
+        with mx.stream(stream):
+            mx.random.seed(0)
+            args = minicpm3.ModelArgs(
+                model_type="minicpm3",
+                hidden_size=64,
+                dim_model_base=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                num_key_value_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=100,
+                q_lora_rank=32,
+                qk_nope_head_dim=8,
+                qk_rope_head_dim=8,
+                kv_lora_rank=16,
+                scale_depth=1.4,
+                scale_emb=1.0,
+                max_position_embeddings=512,
+                rope_scaling={
+                    "type": "longrope",
+                    "long_factor": [1.0] * 4,
+                    "short_factor": [1.0] * 4,
+                    "original_max_position_embeddings": 512,
+                },
+            )
+            model = minicpm3.Model(args)
+            mx.eval(model.parameters())
+            prompts = [list(range(1, 13)), [7, 8, 9]]
+            max_tokens = 3
+            expected = [
+                list(
+                    generate_step(
+                        mx.array(prompt), model, stream=stream, max_tokens=max_tokens
+                    )
+                )
+                for prompt in prompts
+            ]
+
+            for prefill_step_size in (4, 32):
+                with self.subTest(prefill_step_size=prefill_step_size):
+                    gen = BatchGenerator(
+                        model,
+                        stream=stream,
+                        max_tokens=max_tokens,
+                        prefill_step_size=prefill_step_size,
+                    )
+                    try:
+                        uids = gen.insert(prompts)
+                        batched = {uid: [] for uid in uids}
+                        while responses := gen.next_generated():
+                            for response in responses:
+                                batched[response.uid].append(response)
+                    finally:
+                        gen.close()
+
+                    for uid, prompt, reference in zip(uids, prompts, expected):
+                        self.assertEqual(len(batched[uid]), max_tokens)
+                        self.assertEqual(len(reference), max_tokens)
+                        for step, (response, (token, logprobs)) in enumerate(
+                            zip(batched[uid], reference)
+                        ):
+                            with self.subTest(prompt=prompt, step=step):
+                                self.assertEqual(response.token, token)
+                                self.assertTrue(
+                                    mx.allclose(
+                                        response.logprobs,
+                                        logprobs,
+                                        rtol=1e-4,
+                                        atol=1e-4,
+                                    )
+                                )
+
     def test_mamba(self):
         from mlx_lm.models import mamba
 
