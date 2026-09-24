@@ -10,7 +10,7 @@ import mlx.nn as nn
 from .activations import swiglu
 from .base import BaseModelArgs
 from .rope_utils import YarnRoPE
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, SwitchLinear
 
 NEG_INF = -1e30
 
@@ -70,6 +70,20 @@ class ModelArgs(BaseModelArgs):
     num_nextn_predict_layers: int = 3
     dspark_target_layer_ids: tuple = ()
     vision_n_layers: int = 0
+
+    @classmethod
+    def from_dict(cls, params):
+        if "text_config" in params:
+            params = {**params["text_config"], "model_type": params["model_type"]}
+        return super().from_dict(params)
+
+    def __post_init__(self):
+        if self.engram_layer_ids:
+            raise ValueError(
+                f"Layers {list(self.engram_layer_ids)} use engram memory, which "
+                "this implementation does not have: the n-gram hash tables, the "
+                "hashed embedding lookup and the engram attention are all missing."
+            )
 
 
 class UnweightedRMSNorm(nn.Module):
@@ -144,9 +158,7 @@ def _fake_quant_fp4(x: mx.array, block_size: int, e4m3_scale: bool = False) -> m
     floor = 6.0 * 2.0**-9 if e4m3_scale else 6.0 * 2.0**-126
     amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), floor)
     if e4m3_scale:
-        # e4m3 scale rounding is a small approximation on MLX versions without
-        # a public float8 dtype; the quantization grid remains exact.
-        scale = mx.power(2.0, mx.round(mx.log2(amax / 6.0)))
+        scale = mx.from_fp8(mx.to_fp8(amax / 6.0), mx.float32)
     else:
         scale = mx.power(2.0, mx.ceil(mx.log2(amax / 6.0)))
     q = _round_fp4(mx.clip(blocks / scale, -6.0, 6.0)) * scale
@@ -324,7 +336,8 @@ class Compressor(nn.Module):
 
         kv = x.astype(mx.float32) @ self.kv_proj.weight.astype(mx.float32).T
         gate = x.astype(mx.float32) @ self.gate_proj.weight.astype(mx.float32).T
-        if cache.pending_len:
+        pending = cache.pending_len
+        if pending:
             kv = mx.concatenate([cache.pending_kv, kv], axis=1)
             gate = mx.concatenate([cache.pending_gate, gate], axis=1)
         total = kv.shape[1]
@@ -346,10 +359,9 @@ class Compressor(nn.Module):
         )
         latent = mx.sum(kv * mx.softmax(gate, axis=2), axis=2)
         latent = self.kv_norm(latent.astype(x.dtype))
-        # pending_len has already been updated, so derive the first group from
-        # the current absolute position and the number of newly emitted groups.
-        group_start = start_pos - ((total - x.shape[1]) % self.ratio)
-        return latent, group_start
+        # A group takes the position of its first token, and the RoPE scale
+        # multiplies the offset by the ratio, so return the group index.
+        return latent, (start_pos - pending) // self.ratio
 
 
 def _window_indices(previous: int, length: int, window: int) -> mx.array:
@@ -442,24 +454,31 @@ class Indexer(nn.Module):
         scores = mx.sum(scores * weights[..., None], axis=2)
         lens = ((positions + 1) // self.ratio).astype(mx.int32)[:, None]
         visible = mx.arange(index_k.shape[1])[None, :] < lens
-        scores = mx.where(visible[None], scores, NEG_INF)
+        scores = mx.where(visible[None], scores, -mx.inf)
 
         if self.is_candidate_source and self.candidate_topk_blocks > 0:
             block = self.candidate_block_size
             pad = (-scores.shape[-1]) % block
-            padded = mx.pad(scores, [(0, 0), (0, 0), (0, pad)], constant_values=NEG_INF)
+            padded = mx.pad(scores, [(0, 0), (0, 0), (0, pad)], constant_values=-mx.inf)
             block_scores = padded.reshape(batch, length, -1, block).max(axis=-1)
-            k_blocks = min(self.candidate_topk_blocks, block_scores.shape[-1])
+            # Always keep the newest block: it is only partly full, so an older
+            # full block can have a higher score.
+            last = mx.where(lens > 0, (lens - 1) // block, -1)
+            num_blocks = block_scores.shape[-1]
+            block_scores = mx.where(mx.arange(num_blocks) == last, mx.inf, block_scores)
+            k_blocks = min(self.candidate_topk_blocks, num_blocks)
             chosen = mx.argpartition(-block_scores, k_blocks - 1, axis=-1)[
                 ..., :k_blocks
             ]
+            # With fewer reachable blocks than k_blocks, the extra picks are -inf.
+            reachable = mx.take_along_axis(block_scores, chosen, axis=-1) > -mx.inf
             candidate = mx.zeros(block_scores.shape, dtype=mx.bool_)
-            candidate = mx.put_along_axis(candidate, chosen, True, axis=-1)
+            candidate = mx.put_along_axis(candidate, chosen, reachable, axis=-1)
             shared["candidates"] = mx.repeat(candidate, block, axis=-1)[
                 ..., : scores.shape[-1]
             ]
         elif self.uses_candidates and shared.get("candidates") is not None:
-            scores = mx.where(shared["candidates"], scores, NEG_INF)
+            scores = mx.where(shared["candidates"], scores, -mx.inf)
 
         k = min(self.index_topk, index_k.shape[1])
         chosen = mx.argpartition(-scores, k - 1, axis=-1)[..., :k].astype(mx.int32)
@@ -486,9 +505,12 @@ class Attention(nn.Module):
         )
         self.kv_proj = nn.Linear(args.hidden_size, args.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(args.head_dim, args.rms_norm_eps)
-        self.o_a_proj = nn.Linear(
+        # wo_a is block diagonal over the output groups, so it is one small
+        # projection per group rather than a single dense matrix.
+        self.o_a_proj = SwitchLinear(
             args.num_attention_heads * args.head_dim // args.o_groups,
-            args.o_groups * args.o_lora_rank,
+            args.o_lora_rank,
+            args.o_groups,
             bias=False,
         )
         self.o_b_proj = nn.Linear(
@@ -639,14 +661,9 @@ class Attention(nn.Module):
             offset=start_pos,
             inverse=True,
         )
-        output = output.reshape(batch, length, self.args.o_groups, -1)
-        grouped = self.o_a_proj.weight.reshape(
-            self.args.o_groups, self.args.o_lora_rank, -1
-        )
-        output = mx.einsum(
-            "bsgd,grd->bsgr", output.astype(mx.float32), grouped.astype(mx.float32)
-        )
-        return self.o_b_proj(output.reshape(batch, length, -1).astype(x.dtype))
+        output = output.reshape(batch * length, self.args.o_groups, 1, -1)
+        output = self.o_a_proj(output, mx.arange(self.args.o_groups)[None])
+        return self.o_b_proj(output.reshape(batch, length, -1))
 
 
 class DeepseekV41SwiGLU(nn.Module):
@@ -693,9 +710,6 @@ class Router(nn.Module):
             (args.n_routed_experts, args.hidden_size), dtype=mx.float32
         )
         self.e_score_correction_bias = mx.zeros(
-            (args.n_routed_experts,), dtype=mx.float32
-        )
-        self.e_score_correction_bias_vl = mx.zeros(
             (args.n_routed_experts,), dtype=mx.float32
         )
         self.top_k = args.num_experts_per_tok
@@ -824,6 +838,51 @@ class TextModel(nn.Module):
         return self.norm(_collapse(streams, pre_mix))
 
 
+_DROP_PREFIXES = ("vision.", "aligner.", "image_", "mtp.")
+_EXPERT_KEY = r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)"
+_EXPERT_PROJ = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
+
+
+def _rename(key: str) -> str:
+    """Map one DeepSeek checkpoint name to its MLX name."""
+    if key == "head.weight":
+        return "lm_head.weight"
+    if key == "embed.weight":
+        return "model.embed_tokens.weight"
+    key = f"model.{key}"
+    key = key.replace(".attn.", ".self_attn.")
+    key = key.replace(".ffn.", ".mlp.")
+    key = key.replace(".attn_norm.", ".input_layernorm.")
+    key = key.replace(".ffn_norm.", ".post_attention_layernorm.")
+    key = key.replace(".hc_attn_", ".attn_hc.")
+    key = key.replace(".hc_ffn_", ".ffn_hc.")
+    key = key.replace(".attn_sink", ".sinks")
+    key = key.replace(".wq_a.", ".q_a_proj.")
+    key = key.replace(".wq_b.", ".q_b_proj.")
+    key = key.replace(".wkv.", ".kv_proj.")
+    key = key.replace(".wgate.", ".gate_proj.")
+    key = key.replace(".wo_a.", ".o_a_proj.")
+    key = key.replace(".wo_b.", ".o_b_proj.")
+    key = key.replace(".q_norm.", ".q_a_norm.")
+    key = key.replace(".compressor.norm.", ".compressor.kv_norm.")
+    key = key.replace(".indexer.wk.", ".indexer.k_proj.")
+    key = key.replace(".gate.bias", ".gate.e_score_correction_bias")
+    key = key.replace(".shared_experts.w1.", ".shared_experts.gate_proj.")
+    key = key.replace(".shared_experts.w2.", ".shared_experts.down_proj.")
+    key = key.replace(".shared_experts.w3.", ".shared_experts.up_proj.")
+    return key
+
+
+def _repack(weight: mx.array, scale: mx.array):
+    """Put an fp8 or fp4 weight and its ue8m0 scale in MLX's quantized layout."""
+    if scale.dtype != mx.uint8:
+        scale = (mx.log2(scale.astype(mx.float32)) + 127).astype(mx.uint8)
+    if scale.shape[-2] != weight.shape[-2]:
+        # fp8 keeps one scale per 32x32 tile, MLX one per output row.
+        scale = mx.repeat(scale, 32, axis=-2)[..., : weight.shape[-2], :]
+    return weight.view(mx.uint32), scale
+
+
 class Model(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -843,85 +902,57 @@ class Model(nn.Module):
         return self.lm_head(self.model(inputs, cache))
 
     def sanitize(self, weights: dict[str, mx.array]):
-        """Drop non-text tensors and normalize Transformer checkpoint names."""
+        """Rename the checkpoint keys and keep the fp8/fp4 weights packed."""
+        text = {
+            key: value
+            for key, value in weights.items()
+            if not key.startswith(_DROP_PREFIXES) and ".engram." not in key
+        }
         clean = {}
         experts = {}
-        for key, value in weights.items():
-            if (
-                key.startswith("vision.")
-                or key.startswith("aligner.")
-                or key.startswith("image_")
-                or key.startswith("mtp.")
-                or ".engram." in key
-                or key.startswith("model.engram_tables.")
-                or key.startswith("model.engram_hash_state.")
-            ):
-                continue
-
-            expert = re.fullmatch(
-                r"(model\.layers\.\d+)\.ffn\.experts\.(\d+)\.(w[123])\.weight", key
-            )
+        for key, value in text.items():
+            expert = re.fullmatch(_EXPERT_KEY, key)
             if expert is not None:
-                experts.setdefault(expert.group(1), {}).setdefault(
-                    expert.group(3), []
-                ).append((int(expert.group(2)), value))
+                layer, index, proj, kind = expert.groups()
+                experts.setdefault((int(layer), proj), {}).setdefault(int(index), {})[
+                    kind
+                ] = value
                 continue
-
-            if key == "head.weight":
-                key = "lm_head.weight"
-            elif key == "embed.weight":
-                key = "model.embed_tokens.weight"
-            key = key.replace(".attn.", ".self_attn.")
-            key = key.replace(".ffn.", ".mlp.")
-            key = key.replace(".attn_norm.", ".input_layernorm.")
-            key = key.replace(".ffn_norm.", ".post_attention_layernorm.")
-            key = key.replace(".hc_attn_fn", ".attn_hc.fn")
-            key = key.replace(".hc_attn_base", ".attn_hc.base")
-            key = key.replace(".hc_attn_scale", ".attn_hc.scale")
-            key = key.replace(".hc_ffn_fn", ".ffn_hc.fn")
-            key = key.replace(".hc_ffn_base", ".ffn_hc.base")
-            key = key.replace(".hc_ffn_scale", ".ffn_hc.scale")
-            key = key.replace(".attn_sink", ".sinks")
-            key = key.replace(".wq_a.", ".q_a_proj.")
-            key = key.replace(".wq_b.", ".q_b_proj.")
-            key = key.replace(".wkv.", ".kv_proj.")
-            key = key.replace(".wgate.", ".gate_proj.")
-            key = key.replace(".wo_a.", ".o_a_proj.")
-            key = key.replace(".wo_b.", ".o_b_proj.")
-            key = key.replace(".q_norm.", ".q_a_norm.")
-            key = key.replace(".compressor.norm.", ".compressor.kv_norm.")
-            key = key.replace(".indexer.wk.", ".indexer.k_proj.")
-            key = key.replace(".gate.bias_vl", ".gate.e_score_correction_bias_vl")
-            key = key.replace(".gate.bias", ".gate.e_score_correction_bias")
-            key = key.replace(".shared_experts.w1.", ".shared_experts.gate_proj.")
-            key = key.replace(".shared_experts.w2.", ".shared_experts.down_proj.")
-            key = key.replace(".shared_experts.w3.", ".shared_experts.up_proj.")
-            clean[key] = value
-
-        for prefix, parts in experts.items():
-            for _name, rows in parts.items():
-                rows.sort(key=lambda item: item[0])
-            if all(
-                name in parts and len(parts[name]) == self.args.n_routed_experts
-                for name in ("w1", "w2", "w3")
-            ):
-                gate = mx.stack([value for _, value in parts["w1"]])
-                up = mx.stack([value for _, value in parts["w3"]])
-                down = mx.stack([value for _, value in parts["w2"]])
-                clean[f"{prefix}.mlp.experts.switch_mlp.gate_proj.weight"] = gate
-                clean[f"{prefix}.mlp.experts.switch_mlp.up_proj.weight"] = up
-                clean[f"{prefix}.mlp.experts.switch_mlp.down_proj.weight"] = down
-
-        for layer_id in range(self.args.num_hidden_layers):
-            prefix = f"model.layers.{layer_id}.mlp.experts"
-            gate_up_key = f"{prefix}.gate_up_proj"
-            if gate_up_key not in clean:
+            # bias_vl routes image tokens, which the text model never sees.
+            if key.endswith(".gate.bias_vl"):
                 continue
-            gate_up = clean.pop(gate_up_key)
-            mid = gate_up.shape[-2] // 2
-            clean[f"{prefix}.switch_mlp.gate_proj.weight"] = gate_up[..., :mid, :]
-            clean[f"{prefix}.switch_mlp.up_proj.weight"] = gate_up[..., mid:, :]
-            clean[f"{prefix}.switch_mlp.down_proj.weight"] = clean.pop(
-                f"{prefix}.down_proj"
+            if key.endswith(".scale") and f"{key[: -len('.scale')]}.weight" in text:
+                continue
+            scale = (
+                text.get(f"{key[: -len('.weight')]}.scale")
+                if key.endswith(".weight")
+                else None
             )
+            name = _rename(key)
+            if scale is not None:
+                value, scale = _repack(value, scale)
+            if name.endswith(".o_a_proj.weight"):
+                # wo_a is block diagonal, so split it back into its groups.
+                value = value.reshape(self.args.o_groups, -1, value.shape[-1])
+                if scale is not None:
+                    scale = scale.reshape(self.args.o_groups, -1, scale.shape[-1])
+            clean[name] = value
+            if scale is not None:
+                clean[f"{name[: -len('weight')]}scales"] = scale
+
+        n_experts = self.args.n_routed_experts
+        for (layer, proj), rows in experts.items():
+            if len(rows) != n_experts:
+                raise ValueError(
+                    f"Layer {layer} has {len(rows)} {proj} expert weights, "
+                    f"but the config declares {n_experts} experts."
+                )
+            parts = [rows[index] for index in sorted(rows)]
+            name = f"model.layers.{layer}.mlp.experts.switch_mlp.{_EXPERT_PROJ[proj]}"
+            value = mx.stack([part["weight"] for part in parts])
+            if "scale" in parts[0]:
+                scales = mx.stack([part["scale"] for part in parts])
+                value, scales = _repack(value, scales)
+                clean[f"{name}.scales"] = scales
+            clean[f"{name}.weight"] = value
         return clean
