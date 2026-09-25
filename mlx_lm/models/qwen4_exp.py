@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
@@ -679,6 +680,9 @@ class NGramEmbedding(nn.Module):
         return self.ngram_embedding(gid).reshape(*gid.shape[:2], -1)
 
 
+_NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.")
+
+
 class _ShardedEmbedding(nn.Module):
     """N embedding tables concatenated logically, addressed by global index."""
 
@@ -687,8 +691,9 @@ class _ShardedEmbedding(nn.Module):
         self.n_shards = n_shards
         self.rows = rows
         self.dim = dim
-        for i in range(n_shards):
-            setattr(self, f"shard_{i}", nn.Embedding(rows, dim))
+        # a list, so the keys are `shards.{i}.weight`: the layout mlx-vlm writes
+        # and `nn.quantize` walks; `sanitize` maps the HF `shard_{i}` onto it
+        self.shards = [nn.Embedding(rows, dim) for _ in range(n_shards)]
 
     def __call__(self, gid: mx.array) -> mx.array:
         flat = gid.reshape(-1)
@@ -700,7 +705,7 @@ class _ShardedEmbedding(nn.Module):
         out = mx.zeros((flat.size, self.dim), dtype=mx.float32)
         for s in touched.tolist():
             sel = mx.array(np.nonzero(np.array(shard_of, copy=False) == s)[0])
-            emb = getattr(self, f"shard_{s}")(mx.take(row_of, sel))
+            emb = self.shards[s](mx.take(row_of, sel))
             out = mx.put_along_axis(out, sel[:, None], emb.astype(mx.float32), axis=0)
         return out.reshape(*gid.shape, self.dim)
 
@@ -1087,10 +1092,14 @@ class Model(nn.Module):
     # Norms scaled by `1 + w` in the reference (RMSNorm above); `linear_attn.norm` is
     # RMSNormGated and scales by `w` alone, so it must stay out of this list.
     _FOLD_ONE = (
-        "q_layernorm.weight", "k_layernorm.weight",
-        "q_norm.weight", "k_norm.weight",
+        "q_layernorm.weight",
+        "k_layernorm.weight",
+        "q_norm.weight",
+        "k_norm.weight",
         "hc_norm.weight",
-        "norm_key.weight", "norm_query.weight", "norm_conv.weight",
+        "norm_key.weight",
+        "norm_query.weight",
+        "norm_conv.weight",
     )
 
     def sanitize(self, weights):
@@ -1117,6 +1126,9 @@ class Model(nn.Module):
                 k = "model." + k[len("model.language_model.") :]
             elif k.startswith("language_model."):
                 k = k[len("language_model.") :]
+
+            # N-gram table: HF names the shards `shard_{i}`, this file `shards.{i}`.
+            k = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1.", k)
 
             # Experts. Upstream stacks them as `experts.gate_up_proj`
             # (E, 2 * moe_intermediate, hidden) and `experts.down_proj`

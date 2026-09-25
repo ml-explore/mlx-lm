@@ -755,6 +755,19 @@ class TestModels(unittest.TestCase):
             ),
         )
         model = qwen4_exp.Model(args)
+
+        # The n-gram shards load under both names: `shard_{i}` (HF) and
+        # `shards.{i}` (this file, and mlx-vlm conversions).
+        weights = dict(tree_flatten(model.parameters()))
+        shard_keys = [k for k in weights if ".ngram_embedding.shards." in k]
+        self.assertEqual(len(shard_keys), 4)
+        hf = {
+            k.replace(".ngram_embedding.shards.", ".ngram_embedding.shard_"): v
+            for k, v in weights.items()
+        }
+        self.assertEqual(set(model.sanitize(hf)), set(weights))
+        self.assertEqual(set(model.sanitize(weights)), set(weights))
+
         self.model_test_runner(
             model, args.model_type, args.text.vocab_size, args.text.num_hidden_layers
         )
