@@ -137,6 +137,82 @@ class TestGenerate(unittest.TestCase):
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
 
+    def test_stream_generate_speculative_non_trimmable(self):
+        class NonTrimmableKVCache(KVCache):
+            def is_trimmable(self):
+                return False
+
+        sampler = make_sampler(temp=0.0)
+        messages = [{"role": "user", "content": "hello"}]
+        prompt = self.tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+        )
+
+        # Baseline generation text
+        expected = generate(
+            self.model,
+            self.tokenizer,
+            prompt=prompt,
+            max_tokens=5,
+            sampler=sampler,
+            verbose=False,
+        )
+
+        # Speculative generation when draft tokens are accepted
+        cache = [NonTrimmableKVCache() for _ in range(len(self.model.layers) * 2)]
+        responses = list(
+            stream_generate(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                prompt=prompt,
+                max_tokens=5,
+                draft_model=self.model,
+                num_draft_tokens=2,
+                sampler=sampler,
+                prompt_cache=cache,
+            )
+        )
+        self.assertEqual("".join(r.text for r in responses), expected)
+        self.assertEqual(
+            [r.from_draft for r in responses], [True, True, False, True, True]
+        )
+
+        # Speculative generation when draft tokens are rejected
+        cache = [NonTrimmableKVCache() for _ in range(len(self.model.layers) * 2)]
+        draft_model = lambda x, cache=None: mx.roll(
+            self.model(x, cache=cache), shift=1, axis=-1
+        )
+        responses = list(
+            stream_generate(
+                model=self.model,
+                tokenizer=self.tokenizer,
+                prompt=prompt,
+                max_tokens=5,
+                draft_model=draft_model,
+                num_draft_tokens=2,
+                sampler=sampler,
+                prompt_cache=cache,
+            )
+        )
+        self.assertEqual("".join(r.text for r in responses), expected)
+        self.assertEqual([r.from_draft for r in responses], [False] * 5)
+
+        # Early termination cleanup
+        cache = [NonTrimmableKVCache() for _ in range(len(self.model.layers) * 2)]
+        gen = stream_generate(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            prompt=prompt,
+            max_tokens=5,
+            draft_model=draft_model,
+            num_draft_tokens=2,
+            sampler=sampler,
+            prompt_cache=cache,
+        )
+        next(gen)
+        gen.close()
+
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
 

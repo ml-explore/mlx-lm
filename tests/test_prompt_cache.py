@@ -19,8 +19,10 @@ from mlx_lm.models.cache import (
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
+    checkpoint_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
+    rollback_prompt_cache,
     save_prompt_cache,
     trim_prompt_cache,
 )
@@ -834,6 +836,59 @@ class TestPromptCache(unittest.TestCase):
         mask = create_attention_mask(h, c, window_size=4)
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
+
+    def test_checkpoint_and_rollback(self):
+        # KVCache checkpoint & rollback as explicit value
+        kv = KVCache()
+        k, v = mx.ones((1, 2, 4, 8)), mx.ones((1, 2, 4, 8))
+        kv.update_and_fetch(k, v)
+        self.assertEqual(kv.offset, 4)
+        c0 = kv.checkpoint()
+
+        k2, v2 = mx.zeros((1, 2, 2, 8)), mx.zeros((1, 2, 2, 8))
+        kv.update_and_fetch(k2, v2)
+        self.assertEqual(kv.offset, 6)
+        c1 = kv.checkpoint()
+
+        k3, v3 = mx.zeros((1, 2, 3, 8)), mx.zeros((1, 2, 3, 8))
+        kv.update_and_fetch(k3, v3)
+        self.assertEqual(kv.offset, 9)
+
+        # Rollback to c1 then c0 (nested checkpoint support)
+        kv.rollback(c1)
+        self.assertEqual(kv.offset, 6)
+        kv.rollback(c0)
+        self.assertEqual(kv.offset, 4)
+
+        # ArraysCache checkpoint & rollback with container safety
+        arr = ArraysCache(2)
+        arr[0] = mx.array([1, 2, 3])
+        arr[1] = mx.array([4, 5, 6])
+        arr_c0 = arr.checkpoint()
+
+        arr[0] = mx.array([7, 8, 9])
+        arr_c1 = arr.checkpoint()
+
+        arr[0] = mx.array([99, 99, 99])
+        arr.rollback(arr_c1)
+        self.assertTrue(mx.array_equal(arr[0], mx.array([7, 8, 9])))
+        arr.rollback(arr_c0)
+        self.assertTrue(mx.array_equal(arr[0], mx.array([1, 2, 3])))
+
+        # CacheList and prompt_cache checkpoint & rollback
+        cl = CacheList(ArraysCache(1), KVCache())
+        cl[0][0] = mx.array([10])
+        cl[1].update_and_fetch(k, v)
+        cache = [cl]
+
+        prompt_c0 = checkpoint_prompt_cache(cache)
+        cl[0][0] = mx.array([99])
+        cl[1].update_and_fetch(k2, v2)
+        self.assertEqual(cl[1].offset, 6)
+
+        rollback_prompt_cache(cache, prompt_c0)
+        self.assertTrue(mx.array_equal(cl[0][0], mx.array([10])))
+        self.assertEqual(cl[1].offset, 4)
 
 
 if __name__ == "__main__":
