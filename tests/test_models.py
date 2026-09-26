@@ -711,6 +711,72 @@ class TestModels(unittest.TestCase):
             args.n_layers,
         )
 
+    def test_qwen4_exp_ngram_constants_are_checked(self):
+        """The n-gram hash constants (layer_multipliers and friends) are rebuilt
+        from the config -- the seed is not in config.json -- and the checkpoint
+        carries the reference's copies. A rebuild that disagrees must fail loudly
+        at load, not read the wrong rows of the n-gram table in silence."""
+        from mlx_lm.models import qwen4_exp
+
+        text_config = dict(
+            hidden_size=64,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            vocab_size=10_000,
+            rms_norm_eps=1e-6,
+            full_attention_interval=4,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=32,
+            shared_expert_intermediate_size=32,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=16,
+            linear_value_head_dim=16,
+            linear_conv_kernel_dim=4,
+            hc_count=4,
+            hc_lowrank=16,
+            indexer_n_heads=2,
+            indexer_kv_heads=1,
+            indexer_head_dim=16,
+            indexer_budget=8,
+            indexer_compress_ratio=4,
+            ngram_size=3,
+            heads_per_ngram=2,
+            ngram_vocab_size_base=101,
+            split_ngram_parts=4,
+            ple_embed_dim=64,
+            ple_layer_ids=[2],
+            eos_token_id=1,
+            rope_parameters={
+                "rope_theta": 10000000,
+                "partial_rotary_factor": 0.25,
+            },
+        )
+        model = qwen4_exp.Model(
+            qwen4_exp.ModelArgs(model_type="qwen4_exp", text_config=text_config)
+        )
+        weights = dict(tree_flatten(model.parameters()))
+        key = next(k for k in weights if k.endswith("ple_embedding.layer_multipliers"))
+        layer = int(key.split(".layers.")[1].split(".")[0])
+        table = model.model.layers[layer].ple.ple_embedding
+        self.assertTrue(mx.array_equal(weights[key], table._mults))
+        model.sanitize(dict(weights))  # matching constants pass
+
+        # A different seed rebuilds the hash constants, so the checkpoint's copies
+        # no longer match and sanitize must reject them instead of degrading.
+        wrong = qwen4_exp.Model(
+            qwen4_exp.ModelArgs(
+                model_type="qwen4_exp", text_config={**text_config, "seed": 0}
+            )
+        )
+        bad = dict(tree_flatten(wrong.parameters()))
+        self.assertFalse(mx.array_equal(bad[key], weights[key]))
+        with self.assertRaises(ValueError):
+            model.sanitize(bad)
+
     def test_qwen4_exp(self):
         from mlx_lm.models import qwen4_exp
 

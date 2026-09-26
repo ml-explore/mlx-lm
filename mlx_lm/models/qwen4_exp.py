@@ -66,7 +66,10 @@ class TextArgs(BaseModelArgs):
     ple_embed_dim: int = 2560
     ple_layer_ids: list = field(default_factory=lambda: [2])
     ple_conv_kernel_size: int = 4
-    seed: int = 0
+    # The n-gram hash seed of the reference implementation. config.json does
+    # not carry it, so the default is load-bearing: a different seed rebuilds
+    # different multipliers and every PLE lookup lands on the wrong rows.
+    seed: int = 1234
     eos_token_id: Any = 248044
     partial_rotary_factor: float = 0.25
     rope_parameters: dict = field(default_factory=dict)
@@ -634,7 +637,9 @@ class NGramEmbedding(nn.Module):
         # Public attributes: only there to absorb the checkpoint tensors. They live
         # in parameters(), so an astype(float16) would destroy them; the values
         # actually used live in the `_`-prefixed copies, outside parameters() and
-        # rebuilt identically from the config.
+        # rebuilt from the config. `Model.sanitize` checks the rebuilt values
+        # against the checkpoint's, so a seed or hash mismatch fails loudly
+        # instead of silently reading the wrong rows.
         self.layer_multipliers = mx.array(mults, dtype=mx.int64)
         self.ngram_heads_vocab_sizes = mx.array(sizes, dtype=mx.int64)
         self.ngram_heads_offsets = mx.array(offsets, dtype=mx.int64)
@@ -1127,6 +1132,11 @@ class Model(nn.Module):
             elif k.startswith("language_model."):
                 k = k[len("language_model.") :]
 
+            # The hash constants are rebuilt from the config; the checkpoint's
+            # copies are the ground truth they must reproduce.
+            if k.endswith(self._NGRAM_CONSTANTS):
+                self._check_ngram_constant(k, v)
+
             # N-gram table: HF names the shards `shard_{i}`, this file `shards.{i}`.
             k = _NGRAM_SHARD_RE.sub(r".ngram_embedding.shards.\1.", k)
 
@@ -1157,6 +1167,27 @@ class Model(nn.Module):
 
             out[k] = v
         return out
+
+    _NGRAM_CONSTANTS = (
+        "ple_embedding.layer_multipliers",
+        "ple_embedding.ngram_heads_vocab_sizes",
+        "ple_embedding.ngram_heads_offsets",
+    )
+
+    def _check_ngram_constant(self, key: str, value: mx.array) -> None:
+        layer = int(key.split(".layers.")[1].split(".")[0])
+        table = self.model.layers[layer].ple.ple_embedding
+        rebuilt = {
+            "layer_multipliers": table._mults,
+            "ngram_heads_vocab_sizes": table._sizes,
+            "ngram_heads_offsets": table._offsets,
+        }[key.rsplit(".", 1)[1]]
+        if not mx.array_equal(rebuilt, value.astype(rebuilt.dtype)):
+            raise ValueError(
+                f"{key}: the n-gram hash constants rebuilt from the config do "
+                f"not match the checkpoint ({rebuilt.tolist()} vs "
+                f"{value.tolist()}); check `seed` and the hash parameters"
+            )
 
     @property
     def quant_predicate(self):
