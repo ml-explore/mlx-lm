@@ -1711,6 +1711,43 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_falcon_h1_without_cache(self):
+        from mlx_lm.models import falcon_h1
+
+        mx.random.seed(0)
+        args = falcon_h1.ModelArgs(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=3,
+            vocab_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            mamba_d_ssm=32,
+            mamba_n_heads=2,
+            mamba_d_head=16,
+            mamba_d_state=8,
+        )
+        model = falcon_h1.Model(args)
+        inputs = mx.array([[0, 1, 2], [2, 1, 0]])
+        targets = mx.array([[1, 2, 3], [1, 0, 3]])
+
+        with self.subTest("logits"):
+            logits = model(inputs)
+            cached_logits = model(inputs, cache=model.make_cache())
+            self.assertTrue(mx.allclose(logits, cached_logits, atol=1e-5))
+
+        def loss_fn(model):
+            return nn.losses.cross_entropy(model(inputs), targets).mean()
+
+        loss, grads = nn.value_and_grad(model, loss_fn)(model)
+        self.assertTrue(mx.isfinite(loss).item())
+        for i, layer_grads in enumerate(grads["model"]["layers"]):
+            with self.subTest(layer=i):
+                grad = layer_grads["feed_forward"]["down_proj"]["weight"]
+                self.assertTrue(mx.all(mx.isfinite(grad)).item())
+                self.assertGreater(mx.max(mx.abs(grad)).item(), 0)
+
     def test_gpt2(self):
         from mlx_lm.models import gpt2
 
