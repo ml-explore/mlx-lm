@@ -266,7 +266,8 @@ class LayerCache:
         )
 
     def is_trimmable(self):
-        return True
+        # Evicted window rows and closed compressed groups cannot be restored.
+        return False
 
     def empty(self):
         return self.offset == 0
@@ -281,25 +282,6 @@ class LayerCache:
             self.pending_gate,
         )
         return sum(a.nbytes for a in arrays if a is not None)
-
-    def trim(self, n: int):
-        n = min(n, self.offset)
-        self.offset -= n
-        if self.window is not None:
-            self.window = self.window[:, : max(self.window.shape[1] - n, 0)]
-        ratio = (
-            self.args.compress_ratios[self.layer_id]
-            if self.layer_id < len(self.args.compress_ratios)
-            else 0
-        )
-        if ratio:
-            keep = max((self.offset // ratio), 0)
-            self.comp_kv = self.comp_kv[:, :keep]
-            self.index_k = self.index_k[:, :keep]
-        self.pending_kv = self.pending_kv[:, :0]
-        self.pending_gate = self.pending_gate[:, :0]
-        self.pending_len = 0
-        return n
 
     def extract(self, idx: int):
         other = LayerCache(self.args, self.layer_id)
