@@ -2,6 +2,7 @@
 
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Optional, Union
 
 import mlx.core as mx
@@ -9,6 +10,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs
+from .pipeline import PipelineMixin
 from .rope_utils import YarnRoPE
 from .switch_layers import SwitchGLU, SwitchLinear
 
@@ -115,6 +117,8 @@ def _apply_rope(
     return mx.concatenate([head, tail.astype(x.dtype)], axis=-1)
 
 
+# The reference also rounds the input of every fp8/fp4 matmul to fp8. The
+# quantized matmuls here keep the activation dtype, which is more precise.
 def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
     """Round-trip FP8 e4m3 with power-of-two block scales."""
     if x.shape[-1] % block_size:
@@ -176,9 +180,9 @@ class HyperConnection(nn.Module):
         self.scale = mx.ones((3,), dtype=mx.float32)
 
     def __call__(self, streams: mx.array):
-        flat = self.input_norm(streams.reshape(*streams.shape[:2], -1)).astype(
-            mx.float32
-        )
+        # Normalize in float32, as the reference does, not in the stream dtype.
+        flat = streams.reshape(*streams.shape[:2], -1).astype(mx.float32)
+        flat = self.input_norm(flat)
         weights = flat @ self.fn.astype(mx.float32).T
         pre_w, post_w, comb_w = mx.split(weights, [self.hc, 2 * self.hc], axis=-1)
         pre_b, post_b, comb_b = mx.split(
@@ -804,7 +808,75 @@ class DecoderLayer(nn.Module):
         return streams, ffn_pre
 
 
-class TextModel(nn.Module):
+def _shared_sources(args: ModelArgs, layer: int) -> list:
+    """Earlier layers whose shared state this layer reads: compressed KV, index
+    keys, top-k picks and candidate blocks."""
+    ratios = args.compress_ratios
+    if layer >= len(ratios) or not ratios[layer]:
+        return []
+    kv, index = set(args.kv_source_layer_ids), set(args.index_source_layer_ids)
+
+    def last(match):
+        return max((j for j in range(layer + 1) if match(j)), default=None)
+
+    sources = [last(lambda j: j in kv and ratios[j])]
+    if layer in index:
+        sources.append(last(lambda j: j in kv and j in index))
+        if 0 <= args.candidate_source_layer_id < layer:
+            sources.append(args.candidate_source_layer_id)
+    else:
+        sources.append(last(lambda j: j in index))
+    return [s for s in sources if s is not None]
+
+
+def _stage_starts(args: ModelArgs) -> list:
+    """Layers a pipeline stage can start at: no later layer reads shared state
+    from a layer before it."""
+    n = args.num_hidden_layers
+    return [0] + [
+        start
+        for start in range(1, n)
+        if all(s >= start for i in range(start, n) for s in _shared_sources(args, i))
+    ]
+
+
+def _pack(streams: mx.array, pre_mix: mx.array) -> mx.array:
+    """One array per stage boundary: two sends can run in a different order
+    than the two receives on the other rank."""
+    flat = streams.reshape(*streams.shape[:2], -1).astype(mx.float32)
+    return mx.concatenate([flat, pre_mix.astype(mx.float32)], axis=-1)
+
+
+def _unpack(packed: mx.array, like: mx.array):
+    split = like.shape[2] * like.shape[3]
+    streams = packed[..., :split].reshape(like.shape).astype(like.dtype)
+    return streams, packed[..., split:]
+
+
+def _pipeline_split(args: ModelArgs, size: int) -> list:
+    """The most even split over the stage starts, as layers per rank."""
+    n = args.num_hidden_layers
+    starts = _stage_starts(args)[1:]
+    if size - 1 > len(starts):
+        raise ValueError(
+            f"{size} pipeline stages need {size - 1} boundaries, but only "
+            f"layers {starts} can start a stage."
+        )
+
+    def sizes(bounds):
+        edges = (0, *bounds, n)
+        return [b - a for a, b in zip(edges, edges[1:])]
+
+    def spread(bounds):
+        s = sizes(bounds)
+        return max(s), sum(x * x for x in s)
+
+    best = min(combinations(starts, size - 1), key=spread)
+    # PipelineMixin gives rank 0 the last layers.
+    return sizes(best)[::-1]
+
+
+class TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -812,15 +884,32 @@ class TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, args.rms_norm_eps)
         self.args = args
 
+    def pipeline(self, group, split=None):
+        # A stage can only start where no shared state crosses from the stage
+        # before, because only the residual streams are sent between stages.
+        split = split or _pipeline_split(self.args, group.size())
+        starts = {sum(split[rank + 1 :]) for rank in range(len(split))}
+        unsafe = sorted(starts - set(_stage_starts(self.args)))
+        if unsafe:
+            raise ValueError(
+                f"Pipeline stages cannot start at layers {unsafe}; "
+                f"they can start at {_stage_starts(self.args)}."
+            )
+        super().pipeline(group, split)
+
     def make_cache(self):
-        return [LayerCache(self.args, i) for i in range(self.args.num_hidden_layers)]
+        return [
+            LayerCache(self.args, layer.layer_idx) for layer in self.pipeline_layers
+        ]
 
     def __call__(self, inputs: mx.array, cache=None):
         h = self.embed_tokens(inputs)
         batch, length, _ = h.shape
-        start_pos = cache[0].offset if cache is not None else 0
-        if cache is not None:
-            for c in cache:
+        layers = self.pipeline_layers
+        cache = cache or [None] * len(layers)
+        start_pos = cache[0].offset if cache[0] is not None else 0
+        for c in cache:
+            if c is not None:
                 c.ensure_batch(batch, h.dtype)
 
         streams = mx.broadcast_to(
@@ -828,11 +917,26 @@ class TextModel(nn.Module):
         )
         pre_mix = mx.zeros((batch, length, self.args.hc_mult), dtype=mx.float32)
         pre_mix[..., 0] = 1.0
+        rank, size = self.pipeline_rank, self.pipeline_size
+        if rank < size - 1:
+            packed = mx.distributed.recv_like(_pack(streams, pre_mix), rank + 1)
+            streams, pre_mix = _unpack(packed, streams)
+
         shared = {}
-        for idx, layer in enumerate(self.layers):
-            layer_cache = cache[idx] if cache is not None else None
+        for layer, layer_cache in zip(layers, cache):
             streams, pre_mix = layer(streams, pre_mix, start_pos, layer_cache, shared)
-        return self.norm(_collapse(streams, pre_mix))
+
+        if rank > 0:
+            sent = mx.distributed.send(_pack(streams, pre_mix), rank - 1)
+            streams, pre_mix = mx.depends([streams, pre_mix], sent)
+            if cache[-1] is not None:
+                # Prefill only evaluates the cache, which must still send.
+                cache[-1].window = mx.depends(cache[-1].window, sent)
+        out = _collapse(streams, pre_mix)
+        if size > 1:
+            # Rank 0 runs the last layers, and every rank needs its output.
+            out = mx.distributed.all_gather(out)[:batch]
+        return self.norm(out)
 
 
 _DROP_PREFIXES = ("vision.", "aligner.", "image_", "mtp.")
@@ -890,7 +994,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return self.model.make_cache()
@@ -900,6 +1004,10 @@ class Model(nn.Module):
 
     def sanitize(self, weights: dict[str, mx.array]):
         """Rename the checkpoint keys and keep the fp8/fp4 weights packed."""
+        # A converted checkpoint already has MLX names; the published one never
+        # starts a key with "model.".
+        if any(key.startswith("model.") for key in weights):
+            return weights
         text = {
             key: value
             for key, value in weights.items()
@@ -953,3 +1061,19 @@ class Model(nn.Module):
                 clean[f"{name}.scales"] = scales
             clean[f"{name}.weight"] = value
         return clean
+
+    @property
+    def cast_predicate(self):
+        # The reference runtime keeps these in float32.
+        keep = (
+            "attn_hc.",
+            "ffn_hc.",
+            "sinks",
+            "e_score_correction_bias",
+            "compressor.",
+        )
+
+        def predicate(k):
+            return not any(s in k for s in keep)
+
+        return predicate
