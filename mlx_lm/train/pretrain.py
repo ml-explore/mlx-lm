@@ -189,9 +189,9 @@ def build_parser():
     parser.add_argument(
         "-c",
         "--config",
-        required=True,
-        help="Path to an experiment config, or a bundled name under "
-        "configs/experiments, e.g. qwen/4B",
+        default="qwen/4B_gated_delta",
+        help="Path to an experiment config, or a bundled name under configs, "
+        "e.g. qwen/4B. Default: qwen/4B_gated_delta",
     )
     parser.add_argument(
         "--stage",
