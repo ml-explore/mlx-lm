@@ -45,7 +45,11 @@ def main(config, save_dir):
     )
     init_step, data_state = load_training_state(model, optimizer, config, mesh)
 
-    tokenizer = utils.load_tokenizer(config.get("tokenizer", "Qwen/Qwen3.5-4B-Base"))
+    tokenizer = None
+    if config.dataset.source != "random":
+        tokenizer = utils.load_tokenizer(
+            config.get("tokenizer", "Qwen/Qwen3.5-4B-Base")
+        )
 
     documents = data.get_documents(
         config.dataset, tokenizer, mesh, data_state, seed=config.seed
@@ -198,8 +202,10 @@ def build_parser():
     parser.add_argument(
         "--source",
         default=None,
-        choices=("hf", "s3"),
-        help="Where to read the data from. Default: hf. Options: hf (Hugging Face), s3 (Dolma corpus in S3)",
+        choices=("hf", "s3", "random"),
+        help="Where to read the data from. Default: hf. Options: hf (Hugging "
+        "Face), s3 (Dolma corpus in S3), random (uniform random tokens, to "
+        "benchmark or test a run without data; ignores --stage)",
     )
     parser.add_argument(
         "--batch-size",
@@ -294,7 +300,10 @@ def cli():
     if args.resume_from_step is not None:
         config.resume_from_step = args.resume_from_step
 
-    if args.stage or args.source or config.get("dataset") is None:
+    if args.source == "random":
+        # The tokenizer vocab can be larger than the model embedding.
+        config.dataset = {"source": "random", "vocab_size": config.model.vocab_size}
+    elif args.stage or args.source or config.get("dataset") is None:
         config.dataset = data.dolma(args.stage or "pre", args.source or "hf")
 
     init_wandb(config, args, os.environ.get("MLX_RANK", "0") == "0")

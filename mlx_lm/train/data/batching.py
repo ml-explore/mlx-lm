@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import itertools
 import multiprocessing as mp
 
 import ml_collections
@@ -19,6 +20,16 @@ def dolma(stage="pre", source="hf"):
         raise ValueError(f"unknown source {source!r}; expected one of {SOURCES}")
     corpora = data.hf.DOLMA if source == "hf" else data.s3.DOLMA
     return ml_collections.ConfigDict({"source": source, **corpora[stage]})
+
+
+def load_random(vocab_size, rank, doc_len=2048, seed=0, start_sample_idx=0):
+    for sample_idx in itertools.count(start_sample_idx):
+        rng = np.random.default_rng((seed, rank, sample_idx))
+        yield {
+            "input_ids": rng.integers(0, vocab_size, doc_len).tolist(),
+            "file_name": None,
+            "sample_idx": sample_idx,
+        }
 
 
 def get_documents(dataset, tokenizer, mesh, data_state, seed=0):
@@ -50,11 +61,19 @@ def get_documents(dataset, tokenizer, mesh, data_state, seed=0):
             start_file_name=data_state.get("file_name"),
             start_sample_idx=resume_sample_idx,
         )
+    elif dataset.source == "random":
+        documents = load_random(
+            dataset.vocab_size,
+            mesh.world.rank,
+            seed=seed,
+            start_sample_idx=resume_sample_idx,
+        )
     else:
         raise ValueError(
             f"unknown config.dataset.source {dataset.source!r}; expected 's3', "
-            "with config.dataset.uri an s3:// prefix, or 'hf', with "
-            "config.dataset.name a Hugging Face id"
+            "with config.dataset.uri an s3:// prefix, 'hf', with "
+            "config.dataset.name a Hugging Face id, or 'random', with "
+            "config.dataset.vocab_size"
         )
     return documents
 
