@@ -228,6 +228,45 @@ class TestTunerTrainer(unittest.TestCase):
 
                 mx.eval(mx.grad(loss_fn)(mx.random.normal((2, 3, 8))))
 
+    def test_mistral4_expert_select_backward(self):
+        from mlx_lm.models.mistral4 import mistral4_expert_select
+
+        for n_group in (1, 2):
+            with self.subTest(n_group=n_group):
+
+                def loss_fn(gates):
+                    _, scores = mistral4_expert_select(gates, 2, n_group, 1, 1.0, True)
+                    return scores.sum()
+
+                mx.eval(mx.grad(loss_fn)(mx.random.normal((4, 8))))
+
+    def test_minimax_m3_vl_backward(self):
+        from mlx_lm.models import minimax_m3_vl
+
+        args = minimax_m3_vl.TextArgs(
+            hidden_size=16,
+            intermediate_size=8,
+            shared_intermediate_size=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            num_local_experts=8,
+            num_experts_per_tok=2,
+            head_dim=4,
+            rotary_dim=4,
+            mlp_layer_types=["sparse"],
+            layer_types=["minimax_m3_sparse"],
+            index_n_heads=2,
+            index_head_dim=4,
+            index_block_size=2,
+            index_topk_blocks=1,
+            index_local_blocks=0,
+        )
+        layer = minimax_m3_vl.DecoderLayer(args, 0)
+        # Three key blocks exceed the top-1 budget and exercise sparse selection.
+        inputs = mx.random.normal((1, 6, args.hidden_size))
+
+        mx.eval(mx.grad(lambda x: layer(x).sum())(inputs))
+
     def test_gemma4_per_layer_inputs_backward(self):
         # With embeddings instead of token ids, the lookup gathers with argmin output.
         from mlx_lm.models import gemma4_text

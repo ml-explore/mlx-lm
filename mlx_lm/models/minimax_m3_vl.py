@@ -169,6 +169,7 @@ class SparseMoeBlock(nn.Module):
 
         k = self.num_experts_per_tok
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(orig_scores, inds, axis=-1)
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
         scores = (scores * self.routed_scaling_factor).astype(x_flat.dtype)
@@ -295,6 +296,7 @@ class Attention(nn.Module):
             block_scores = mx.where(is_local, mx.inf, block_scores)
 
         inds = mx.argpartition(-block_scores, kth=topk - 1, axis=-1)[..., :topk]
+        inds = mx.stop_gradient(inds)
         keep = mx.put_along_axis(
             mx.zeros(block_scores.shape, dtype=mx.bool_),
             inds,
