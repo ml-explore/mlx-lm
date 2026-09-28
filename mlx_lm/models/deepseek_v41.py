@@ -168,12 +168,84 @@ def _fake_quant_fp4(x: mx.array, block_size: int, e4m3_scale: bool = False) -> m
     return q.reshape(shape).astype(dtype)
 
 
+def _make_sinkhorn_kernel():
+    if not mx.metal.is_available():
+        return None
+    # One thread per matrix, in registers: the loop in _sinkhorn, in the same
+    # order and form, as one launch instead of about 115 small ones.
+    source = """
+        uint n = thread_position_in_grid.x;
+        if (n >= comb_shape[0]) {
+            return;
+        }
+        float m[HC * HC];
+        for (int k = 0; k < HC * HC; k++) {
+            m[k] = comb[n * HC * HC + k];
+        }
+        float e = eps[0];
+        for (int t = 0; t < 2 * ITERS - 1; t++) {
+            bool rows = t % 2 == 1;
+            for (int a = 0; a < HC; a++) {
+                float s = 0.0f;
+                for (int b = 0; b < HC; b++) {
+                    s += rows ? m[a * HC + b] : m[b * HC + a];
+                }
+                float d = s + e;
+                for (int b = 0; b < HC; b++) {
+                    int k = rows ? a * HC + b : b * HC + a;
+                    m[k] = m[k] / d;
+                }
+            }
+        }
+        for (int k = 0; k < HC * HC; k++) {
+            out[n * HC * HC + k] = m[k];
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="deepseek_v41_sinkhorn",
+        input_names=["comb", "eps"],
+        output_names=["out"],
+        source=source,
+    )
+
+
+_sinkhorn_kernel = _make_sinkhorn_kernel()
+
+
+def _sinkhorn(comb: mx.array, iters: int, eps: mx.array) -> mx.array:
+    """Normalize the columns, then the rows and columns iters - 1 more times."""
+    if (
+        _sinkhorn_kernel is None
+        or mx.default_device() != mx.gpu
+        or iters < 1
+        or comb.size == 0
+    ):
+        comb = comb / (mx.sum(comb, axis=-2, keepdims=True) + eps)
+        for _ in range(max(iters - 1, 0)):
+            comb = comb / (mx.sum(comb, axis=-1, keepdims=True) + eps)
+            comb = comb / (mx.sum(comb, axis=-2, keepdims=True) + eps)
+        return comb
+    hc = comb.shape[-1]
+    flat = comb.reshape(-1, hc, hc)
+    (out,) = _sinkhorn_kernel(
+        inputs=[flat, eps],
+        template=[("HC", hc), ("ITERS", iters)],
+        grid=(flat.shape[0], 1, 1),
+        threadgroup=(min(flat.shape[0], 256), 1, 1),
+        output_shapes=[flat.shape],
+        output_dtypes=[mx.float32],
+    )
+    return out.reshape(comb.shape)
+
+
 class HyperConnection(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.hc = args.hc_mult
         self.iters = args.hc_sinkhorn_iters
         self.hc_eps = args.hc_eps
+        # The leading underscore keeps it out of the parameters.
+        self._eps = mx.array([args.hc_eps], dtype=mx.float32)
         mix = (2 + self.hc) * self.hc
         self.input_norm = UnweightedRMSNorm(args.rms_norm_eps)
         self.fn = mx.zeros((mix, self.hc * args.hidden_size), dtype=mx.float32)
@@ -195,11 +267,7 @@ class HyperConnection(nn.Module):
         comb = comb_w.reshape(*comb_w.shape[:-1], self.hc, self.hc)
         comb = comb * comb_scale + comb_b.reshape(self.hc, self.hc)
         comb = mx.softmax(comb, axis=-1) + self.hc_eps
-        comb = comb / (mx.sum(comb, axis=-2, keepdims=True) + self.hc_eps)
-        for _ in range(max(self.iters - 1, 0)):
-            comb = comb / (mx.sum(comb, axis=-1, keepdims=True) + self.hc_eps)
-            comb = comb / (mx.sum(comb, axis=-2, keepdims=True) + self.hc_eps)
-        return pre, post, comb
+        return pre, post, _sinkhorn(comb, self.iters, self._eps)
 
 
 def _collapse(streams: mx.array, mix: mx.array) -> mx.array:
