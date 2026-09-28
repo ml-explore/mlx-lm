@@ -7,6 +7,7 @@ from typing import Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs
@@ -474,6 +475,8 @@ class Attention(nn.Module):
         super().__init__()
         self.args = args
         self.layer_id = layer_id
+        self.num_heads = args.num_attention_heads
+        self.o_groups = args.o_groups
         self.ratio = (
             int(args.compress_ratios[layer_id])
             if layer_id < len(args.compress_ratios)
@@ -541,7 +544,7 @@ class Attention(nn.Module):
 
         q_residual = self.q_a_norm(self.q_a_proj(x))
         q = self.q_b_proj(q_residual).reshape(
-            batch, length, self.args.num_attention_heads, self.args.head_dim
+            batch, length, self.num_heads, self.args.head_dim
         )
         q = _apply_rope(q, rope, self.args.qk_rope_head_dim, offset=start_pos)
 
@@ -644,8 +647,8 @@ class Attention(nn.Module):
             offset=start_pos,
             inverse=True,
         )
-        output = output.reshape(batch * length, self.args.o_groups, 1, -1)
-        output = self.o_a_proj(output, mx.arange(self.args.o_groups)[None])
+        output = output.reshape(batch * length, self.o_groups, 1, -1)
+        output = self.o_a_proj(output, mx.arange(self.o_groups)[None])
         return self.o_b_proj(output.reshape(batch, length, -1))
 
 
@@ -745,14 +748,19 @@ class MoE(nn.Module):
         self.experts = Experts(args)
         self.shared_experts = SharedMLP(args)
         self.dim = args.hidden_size
+        self.sharding_group = None
 
     def __call__(self, x: mx.array):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
         shape = x.shape
         flat = x.reshape(-1, self.dim)
         indices, weights = self.gate(flat)
         routed = self.experts(flat, indices, weights)
-        shared = self.shared_experts(flat)
-        return (routed + shared.astype(mx.float32)).reshape(shape).astype(x.dtype)
+        out = routed + self.shared_experts(flat).astype(mx.float32)
+        if self.sharding_group is not None:
+            out = mx.distributed.all_sum(out, group=self.sharding_group)
+        return out.reshape(shape).astype(x.dtype)
 
 
 class DecoderLayer(nn.Module):
@@ -980,6 +988,32 @@ class Model(nn.Module):
 
     def make_cache(self):
         return self.model.make_cache()
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        group = group or mx.distributed.init()
+        size, rank = group.size(), group.rank()
+        heads, groups = self.args.num_attention_heads, self.args.o_groups
+        if heads % size or groups % size:
+            raise ValueError(
+                f"Tensor parallelism over {size} ranks needs {size} to divide the "
+                f"{heads} attention heads and the {groups} output groups."
+            )
+        for layer in self.layers:
+            attn = layer.self_attn
+            attn.q_b_proj = shard_linear(attn.q_b_proj, "all-to-sharded", group=group)
+            # An output group reads only its own heads, so a rank keeps whole groups.
+            shard_inplace(attn.o_a_proj, lambda path, weight: 0, group=group)
+            attn.o_b_proj = shard_linear(attn.o_b_proj, "sharded-to-all", group=group)
+            attn.num_heads //= size
+            attn.o_groups //= size
+            attn.sinks = attn.sinks[rank * attn.num_heads : (rank + 1) * attn.num_heads]
+
+            # The MoE sums the partial outputs of the experts over the group.
+            layer.mlp.sharding_group = group
+            for mlp in (layer.mlp.experts.switch_mlp, layer.mlp.shared_experts):
+                shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
+                shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
+                shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
 
     def __call__(self, inputs: mx.array, cache=None):
         return self.lm_head(self.model(inputs, cache))
