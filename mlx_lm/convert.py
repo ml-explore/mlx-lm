@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import argparse
 from pathlib import Path
@@ -40,7 +40,7 @@ def mixed_quant_predicate_builder(
         raise ValueError("Model does not have expected keys for mixed quant.")
 
     # Look for the layer index location in the path:
-    for layer_location, k in enumerate(down_keys[0].split(".")):
+    for layer_location, k in enumerate(down_keys[0].split(".")):  # noqa: B007
         if k.isdigit():
             break
     num_layers = len(model.layers)
@@ -90,7 +90,7 @@ def convert(
     q_bits: Optional[int] = None,
     q_mode: str = "affine",
     dtype: Optional[str] = None,
-    upload_repo: str = None,
+    upload_repo: Optional[str] = None,
     revision: Optional[str] = None,
     dequantize: bool = False,
     quant_predicate: Optional[
@@ -120,7 +120,7 @@ def convert(
 
     if isinstance(quant_predicate, str):
         if q_mode != "affine":
-            raise ValueError(f"Quant predicates only support 'affine' quantization.")
+            raise ValueError("Quant predicates only support 'affine' quantization.")
         quant_predicate = mixed_quant_predicate_builder(
             quant_predicate,
             model,
@@ -220,7 +220,7 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
+        help="Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
         type=str,
         required=False,

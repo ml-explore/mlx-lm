@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 import json
 from typing import Any
 

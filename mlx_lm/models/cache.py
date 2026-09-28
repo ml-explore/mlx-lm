@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import copy
 from collections import deque
@@ -40,7 +40,9 @@ def make_prompt_cache(
         return [KVCache() for _ in range(num_layers)]
 
 
-def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str] = {}):
+def save_prompt_cache(
+    file_name: str, cache: List[Any], metadata: Optional[Dict[str, str]] = None
+):
     """
     Save a pre-computed prompt cache to a file.
 
@@ -50,6 +52,7 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
+    metadata = {} if metadata is None else metadata
     cache_data = [c.state for c in cache]
     cache_info = [c.meta_state for c in cache]
     cache_data = dict(tree_flatten(cache_data))
@@ -1033,7 +1036,7 @@ class BatchKVCache(_BaseCache):
         self.left_padding = self.left_padding[batch_indices]
 
         # Shift left to reduce padding
-        min_left_pad = self.left_padding.min().item()
+        min_left_pad = min(self.left_padding.tolist())
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
@@ -1089,7 +1092,8 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
-        padding = self.left_padding[idx].item()
+        mx.eval(self.left_padding)
+        padding = self.left_padding.tolist()[idx]
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
@@ -1504,7 +1508,8 @@ class TokenBuffer:
 
     step = 256
 
-    def __init__(self, tokens=[]):
+    def __init__(self, tokens=None):
+        tokens = [] if tokens is None else tokens
         self._buffer = mx.array(tokens, dtype=mx.int32)
         self._size = len(tokens)
 
@@ -1639,9 +1644,11 @@ class LRUPromptCache:
         cache_type: str
 
     class CacheOrder:
-        def __init__(self, ordering: List[str] = ["assistant", "user", "system"]):
-            self._ordering = ordering
-            self._lrus = {k: deque() for k in ordering}
+        def __init__(self, ordering: Optional[List[str]] = None):
+            self._ordering = (
+                ["assistant", "user", "system"] if ordering is None else ordering
+            )
+            self._lrus = {k: deque() for k in self._ordering}
 
         def __len__(self):
             return sum(len(lru) for lru in self._lrus.values())

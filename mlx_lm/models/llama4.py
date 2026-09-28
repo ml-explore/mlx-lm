@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -135,7 +135,7 @@ class Attention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size: int = None):
+    def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
 
         dim = args.hidden_size

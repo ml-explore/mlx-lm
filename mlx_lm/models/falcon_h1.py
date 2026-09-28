@@ -419,8 +419,6 @@ class FalconH1Model(nn.Module):
 
         h = self.embed_tokens(inputs)
 
-        h = h
-
         if cache is None:
             cache = [(None, None) * len(self.layers)]
 

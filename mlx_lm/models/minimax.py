@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -329,7 +329,6 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
-        rank = group.rank()
         for layer in self.model.layers:
             # Shard the self attention
             layer.self_attn.q_proj = shard_linear(

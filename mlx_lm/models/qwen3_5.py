@@ -252,8 +252,8 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
-    def pipeline(self, group):
-        super().pipeline(group)
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
         self.ssm_idx = None
         self.fa_idx = None
         for e, l in enumerate(self.pipeline_layers):

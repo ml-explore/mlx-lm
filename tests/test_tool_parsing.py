@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 import unittest
 
 from mlx_lm.tool_parsers import (

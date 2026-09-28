@@ -76,8 +76,6 @@ def recurrent_gla(
     Returns y with shape [B, H, T, Dv].
     """
     B, Hq, L, K = q.shape
-    Hv = k.shape[1]
-    V = v.shape[-1]
 
     outputs = []
     exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
@@ -105,7 +103,6 @@ class GroupRMSNorm(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        shape = x.shape
         x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
         x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
         return self.weight * mx.flatten(x, -2)
