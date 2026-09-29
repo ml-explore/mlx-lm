@@ -77,6 +77,7 @@ class ModelArgs(BaseModelArgs):
 def _apply_rope(
     x: mx.array,
     rope: YarnRoPE,
+    *,
     rope_dim: int,
     offset: int = 0,
     scale: float = 1.0,
@@ -96,8 +97,7 @@ def _apply_rope(
     return mx.concatenate([head, tail.astype(x.dtype)], axis=-1)
 
 
-# The reference also rounds the input of every fp8/fp4 matmul to fp8. The
-# quantized matmuls here keep the activation dtype, which is more precise.
+# The reference also rounds fp8/fp4 matmul inputs to fp8; skipping it is more precise.
 def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
     """Round-trip FP8 e4m3 with power-of-two block scales."""
     if x.shape[-1] % block_size:
@@ -106,7 +106,6 @@ def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
     shape = x.shape
     blocks = x.astype(mx.float32).reshape(*shape[:-1], -1, block_size)
     amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), 1e-4)
-    # MLX exposes the same e4m3 conversion used by the reference runtime.
     exponent = mx.ceil(mx.log2(amax / 448.0))
     scale = mx.power(2.0, exponent)
     quantized = mx.clip(blocks / scale, -448.0, 448.0)
@@ -130,7 +129,9 @@ def _round_fp4(x: mx.array) -> mx.array:
     return mx.sign(x) * _FP4_LUT[idx]
 
 
-def _fake_quant_fp4(x: mx.array, block_size: int, e4m3_scale: bool = False) -> mx.array:
+def _fake_quant_fp4(
+    x: mx.array, *, block_size: int, e4m3_scale: bool = False
+) -> mx.array:
     if x.shape[-1] % block_size:
         return x
     dtype = x.dtype
@@ -149,8 +150,7 @@ def _fake_quant_fp4(x: mx.array, block_size: int, e4m3_scale: bool = False) -> m
 def _make_sinkhorn_kernel() -> Optional[Callable]:
     if not mx.metal.is_available():
         return None
-    # One thread per matrix, in registers: the loop in _sinkhorn, in the same
-    # order and form, as one launch instead of about 115 small ones.
+    # The loop of _sinkhorn in one launch, one thread per matrix, in the same order.
     source = """
         uint n = thread_position_in_grid.x;
         if (n >= comb_shape[0]) {
@@ -190,7 +190,7 @@ def _make_sinkhorn_kernel() -> Optional[Callable]:
 _sinkhorn_kernel = _make_sinkhorn_kernel()
 
 
-def _sinkhorn(comb: mx.array, iters: int, eps: mx.array) -> mx.array:
+def _sinkhorn(comb: mx.array, *, iters: int, eps: mx.array) -> mx.array:
     """Normalize the columns, then the rows and columns iters - 1 more times."""
     if (
         _sinkhorn_kernel is None
@@ -233,7 +233,7 @@ class HyperConnection(nn.Module):
         self.scale = mx.ones((3,), dtype=mx.float32)
 
     def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array, mx.array]:
-        # Normalize in float32, as the reference does, not in the stream dtype.
+        # The reference normalizes in float32.
         flat = streams.reshape(*streams.shape[:2], -1).astype(mx.float32)
         flat = mx.fast.rms_norm(flat, weight=None, eps=self.norm_eps)
         mix = (flat @ self.fn.T) * self.scale[self._scale_ids] + self.base
@@ -242,7 +242,7 @@ class HyperConnection(nn.Module):
         post = 2.0 * mx.sigmoid(post)
         comb = comb.reshape(*comb.shape[:-1], self.hc, self.hc)
         comb = mx.softmax(comb, axis=-1) + self.hc_eps
-        return pre, post, _sinkhorn(comb, self.iters, self._eps)
+        return pre, post, _sinkhorn(comb, iters=self.iters, eps=self._eps)
 
 
 def _collapse(streams: mx.array, mix: mx.array) -> mx.array:
@@ -337,7 +337,6 @@ class Compressor(nn.Module):
         kv = _append(cache.pending_kv, self.kv_proj(h))
         gate = _append(cache.pending_gate, self.gate_proj(h))
         full = kv.shape[1] - kv.shape[1] % self.ratio
-        # The rows of the open group wait for the next call.
         cache.pending_kv = kv[:, full:]
         cache.pending_gate = gate[:, full:]
         # A group takes the position of its first token, and the RoPE scale
@@ -352,7 +351,7 @@ class Compressor(nn.Module):
         return self.kv_norm(latent.astype(x.dtype)), first
 
 
-def _window_indices(previous: int, length: int, window: int) -> mx.array:
+def _window_indices(*, previous: int, length: int, window: int) -> mx.array:
     """The window rows each query attends to, -1 for none. The window holds
     the previous rows, then the new ones."""
     width = min(window, previous + length)
@@ -440,8 +439,8 @@ class Indexer(nn.Module):
         q = self.q_b_proj(q_residual).reshape(
             batch, length, self.num_heads, self.head_dim
         )
-        q = _apply_rope(q, rope, self.rope_dim, offset=start_pos)
-        q = _fake_quant_fp4(q, 32)
+        q = _apply_rope(q, rope, rope_dim=self.rope_dim, offset=start_pos)
+        q = _fake_quant_fp4(q, block_size=32)
         keys = index_k.astype(mx.float32)
         weights = self.weights_proj(x).astype(mx.float32) * (self.num_heads**-0.5)
         scores = mx.matmul(q.astype(mx.float32), keys[:, None].swapaxes(-1, -2))
@@ -472,7 +471,6 @@ class Indexer(nn.Module):
             candidates = mx.put_along_axis(candidates, chosen, reachable, axis=-1)
             candidates = mx.repeat(candidates, block, axis=-1)[..., : scores.shape[-1]]
         elif candidates is not None:
-            # Only layers after the candidate source get candidates.
             scores = mx.where(candidates, scores, -mx.inf)
 
         k = min(self.index_topk, index_k.shape[1])
@@ -498,8 +496,7 @@ class Attention(nn.Module):
         )
         self.kv_proj = nn.Linear(args.hidden_size, args.head_dim, bias=False)
         self.kv_norm = nn.RMSNorm(args.head_dim, eps=args.rms_norm_eps)
-        # wo_a is block diagonal over the output groups, so it is one small
-        # projection per group rather than a single dense matrix.
+        # wo_a is block diagonal: one projection per output group.
         self.o_a_proj = SwitchLinear(
             args.num_attention_heads * args.head_dim // args.o_groups,
             args.o_lora_rank,
@@ -510,7 +507,6 @@ class Attention(nn.Module):
             args.o_groups * args.o_lora_rank, args.hidden_size, bias=False
         )
         self.sinks = mx.zeros((args.num_attention_heads,), dtype=mx.float32)
-        # The leading underscore keeps it out of the parameters.
         self._group_ids = mx.arange(args.o_groups)[None]
         if self.is_kv_source:
             self.compressor = Compressor(args, layer_id)
@@ -553,10 +549,10 @@ class Attention(nn.Module):
         q = self.q_b_proj(q_residual).reshape(
             batch, length, self.num_heads, self.head_dim
         )
-        q = _apply_rope(q, self.rope, self.rope_dim, offset=start_pos)
+        q = _apply_rope(q, self.rope, rope_dim=self.rope_dim, offset=start_pos)
 
         kv = self.kv_norm(self.kv_proj(x))
-        kv = _apply_rope(kv, self.rope, self.rope_dim, offset=start_pos)
+        kv = _apply_rope(kv, self.rope, rope_dim=self.rope_dim, offset=start_pos)
         kv = _fake_quant_fp8(kv, 32)
         kvs = [cache.update_window(kv)]
         indices = [window_idx]
@@ -585,7 +581,7 @@ class Attention(nn.Module):
             q, kvs, indices, sinks=self.sinks, scale=self.head_dim**-0.5
         )
         output = _apply_rope(
-            output, self.rope, self.rope_dim, offset=start_pos, inverse=True
+            output, self.rope, rope_dim=self.rope_dim, offset=start_pos, inverse=True
         )
         output = output.reshape(batch * length, self.o_groups, 1, -1)
         output = self.o_a_proj(output, self._group_ids)
@@ -599,21 +595,28 @@ class Attention(nn.Module):
         cache: LayerCache,
         shared: dict[str, Optional[mx.array]],
     ) -> None:
-        """Add the new compressed KV and index keys to the cache, and share
-        them with the layers that read them."""
+        """Add the new compressed KV and index keys to the cache, and share them."""
         latent, first = self.compressor(x, start_pos, cache)
         if latent is not None:
             kv = _apply_rope(
-                latent, self.rope, self.rope_dim, offset=first, scale=self.ratio
+                latent,
+                self.rope,
+                rope_dim=self.rope_dim,
+                offset=first,
+                scale=self.ratio,
             )
-            kv = _fake_quant_fp4(kv, 16, e4m3_scale=True)
+            kv = _fake_quant_fp4(kv, block_size=16, e4m3_scale=True)
             cache.compress_kv = _append(cache.compress_kv, kv)
             if self.is_index_source:
                 k = self.indexer.k_norm(self.indexer.k_proj(latent))
                 k = _apply_rope(
-                    k, self.rope, self.rope_dim, offset=first, scale=self.ratio
+                    k,
+                    self.rope,
+                    rope_dim=self.rope_dim,
+                    offset=first,
+                    scale=self.ratio,
                 )
-                k = _fake_quant_fp4(k, 32)
+                k = _fake_quant_fp4(k, block_size=32)
                 cache.index_k = _append(cache.index_k, k)
         shared["compress_kv"] = cache.compress_kv
         if self.is_index_source:
@@ -681,9 +684,8 @@ class Router(nn.Module):
             scores = mx.softmax(logits, axis=-1)
         else:
             scores = mx.sqrt(nn.softplus(logits))
-        chosen = mx.argpartition(
-            -(scores + self.e_score_correction_bias), self.top_k - 1, axis=-1
-        )[..., : self.top_k].astype(mx.int32)
+        biased = scores + self.e_score_correction_bias
+        chosen = mx.argpartition(-biased, self.top_k - 1, axis=-1)[..., : self.top_k]
         weights = mx.take_along_axis(scores, chosen, axis=-1)
         if self.norm_topk_prob and self.top_k > 1:
             weights = weights / (mx.sum(weights, axis=-1, keepdims=True) + 1e-20)
@@ -691,8 +693,6 @@ class Router(nn.Module):
 
 
 class Experts(nn.Module):
-    """Sparse V4.1 experts backed by the shared SwitchGLU implementation."""
-
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.switch_mlp = SwitchGLU(
@@ -809,12 +809,8 @@ def _index_keys(args: ModelArgs, layer: int, position: int) -> int:
     return _entries(args, _shared_reads(args, layer).get("index_k"), position)
 
 
-# The shared state that grows each step, kept in the LayerCache field of the
-# same name.
+# The shared state that grows each step, kept in the LayerCache field of that name.
 _CACHE_FIELDS = ("compress_kv", "index_k")
-
-# One part of a message at a stage boundary: its key, shape and dtype.
-_Part = tuple[str, tuple[int, ...], mx.Dtype]
 
 
 def _layout(
@@ -824,7 +820,7 @@ def _layout(
     length: int,
     start_pos: int,
     dtype: mx.Dtype,
-) -> list[_Part]:
+) -> list[tuple[str, tuple[int, ...], mx.Dtype]]:
     """The parts of the message at a stage boundary, as (key, shape, dtype).
 
     The compressed KV and the index keys have the dtype of the streams, because
@@ -874,7 +870,9 @@ def _pack(parts: list[mx.array]) -> mx.array:
     return mx.concatenate(data)
 
 
-def _unpack(packed: mx.array, layout: list[_Part]) -> dict[str, mx.array]:
+def _unpack(
+    packed: mx.array, layout: list[tuple[str, tuple[int, ...], mx.Dtype]]
+) -> dict[str, mx.array]:
     parts = {}
     start = 0
     for key, shape, dtype in layout:
@@ -896,8 +894,6 @@ class TextModel(PipelineMixin, nn.Module):
         self, group: mx.distributed.Group, split: Optional[list[int]] = None
     ) -> None:
         super().pipeline(group, split)
-        # Besides the streams, a stage receives and sends the shared state that
-        # crosses its boundaries.
         self._shared_in = _crossing(self.args, self.start_idx)
         self._shared_out = _crossing(self.args, self.end_idx)
 
@@ -974,12 +970,13 @@ class TextModel(PipelineMixin, nn.Module):
         h = self.embed_tokens(inputs)
         batch, length, _ = h.shape
         layers = self.pipeline_layers
-        # Without a cache, fresh caches hold the state of this call.
         cache = cache or self.make_cache()
         start_pos = cache[0].offset
         # Every layer's window holds the same rows, so all use the same indices.
         previous = 0 if cache[0].window is None else cache[0].window.shape[1]
-        window_idx = _window_indices(previous, length, self.args.sliding_window)
+        window_idx = _window_indices(
+            previous=previous, length=length, window=self.args.sliding_window
+        )
         window_idx = mx.broadcast_to(window_idx, (batch, *window_idx.shape))
 
         streams = mx.broadcast_to(
@@ -1067,6 +1064,11 @@ class Model(nn.Module):
         self.model = TextModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def __call__(
+        self, inputs: mx.array, cache: Optional[list[LayerCache]] = None
+    ) -> mx.array:
+        return self.lm_head(self.model(inputs, cache))
+
     @property
     def layers(self) -> list[DecoderLayer]:
         return self.model.pipeline_layers
@@ -1094,17 +1096,11 @@ class Model(nn.Module):
             attn._group_ids = mx.arange(attn.o_groups)[None]
             attn.sinks = attn.sinks[rank * attn.num_heads : (rank + 1) * attn.num_heads]
 
-            # The MoE sums the partial outputs of the experts over the group.
             layer.mlp.sharding_group = group
             for mlp in (layer.mlp.experts.switch_mlp, layer.mlp.shared_experts):
                 shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
                 shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
                 shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
-
-    def __call__(
-        self, inputs: mx.array, cache: Optional[list[LayerCache]] = None
-    ) -> mx.array:
-        return self.lm_head(self.model(inputs, cache))
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         """Rename the checkpoint keys and keep the fp8/fp4 weights packed."""
