@@ -3,7 +3,7 @@
 import math
 import re
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -39,9 +39,9 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-20
 
     sliding_window: int = 128
-    compress_ratios: tuple = ()
-    kv_source_layer_ids: tuple = ()
-    index_source_layer_ids: tuple = ()
+    compress_ratios: tuple[int, ...] = ()
+    kv_source_layer_ids: tuple[int, ...] = ()
+    index_source_layer_ids: tuple[int, ...] = ()
     compress_rope_theta: float = 160000.0
     candidate_source_layer_id: int = -1
     candidate_topk_blocks: int = 2048
@@ -51,16 +51,16 @@ class ModelArgs(BaseModelArgs):
     index_topk: int = 512
 
     rope_theta: float = 10000.0
-    rope_scaling: Optional[dict] = None
+    rope_scaling: Optional[dict[str, Union[float, str]]] = None
     max_position_embeddings: int = 1048576
     hc_mult: int = 4
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
 
-    engram_layer_ids: tuple = ()
+    engram_layer_ids: tuple[int, ...] = ()
 
     @classmethod
-    def from_dict(cls, params: dict) -> "ModelArgs":
+    def from_dict(cls, params: dict[str, Any]) -> "ModelArgs":
         if "text_config" in params:
             params = {**params["text_config"], "model_type": params["model_type"]}
         return super().from_dict(params)
@@ -286,7 +286,7 @@ class LayerCache:
         return window
 
     @property
-    def state(self) -> tuple:
+    def state(self) -> tuple[Optional[mx.array], ...]:
         return (
             self.window,
             self.compress_kv,
