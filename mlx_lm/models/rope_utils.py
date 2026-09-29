@@ -136,6 +136,7 @@ class YarnRoPE(nn.Module):
         beta_slow=1,
         mscale=1,
         mscale_all_dim=0,
+        truncate=True,
     ):
         super().__init__()
 
@@ -148,8 +149,10 @@ class YarnRoPE(nn.Module):
             ) / (2 * math.log(base))
 
         def yarn_find_correction_range():
-            low = math.floor(yarn_find_correction_dim(beta_fast))
-            high = math.ceil(yarn_find_correction_dim(beta_slow))
+            low = yarn_find_correction_dim(beta_fast)
+            high = yarn_find_correction_dim(beta_slow)
+            if truncate:
+                low, high = math.floor(low), math.ceil(high)
             return max(low, 0), min(high, dims - 1)
 
         def yarn_get_mscale(scale=1, mscale=1):
@@ -333,6 +336,7 @@ def initialize_rope(
                 "beta_slow",
                 "mscale",
                 "mscale_all_dim",
+                "truncate",
             ]
             if key in scaling_config
         }
