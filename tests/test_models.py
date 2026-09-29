@@ -1404,6 +1404,217 @@ class TestModels(unittest.TestCase):
             ],
         )
 
+    def test_plamo3_yarn(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256.0,
+            initial_context_length=4096,
+            max_position_embeddings=262144,
+        )
+        full = plamo3.Attention(args, layer_idx=1)
+        local = plamo3.Attention(args, layer_idx=0)
+
+        dims = args.head_dim
+        freq = args.rope_theta ** (np.arange(0, dims, 2, dtype=np.float32) / dims)
+        low = (
+            dims * math.log(4096 / (32 * 2 * math.pi)) / (2 * math.log(args.rope_theta))
+        )
+        high = dims * math.log(4096 / (2 * math.pi)) / (2 * math.log(args.rope_theta))
+        ramp = np.clip(
+            (np.arange(dims // 2, dtype=np.float32) - low) / (high - low), 0, 1
+        )
+        inv_freq = ((1 - ramp) / freq + ramp / (256 * freq)).astype(np.float32)
+        np.testing.assert_allclose(1 / np.array(full.rope._freqs), inv_freq, rtol=3e-7)
+
+        x = mx.sin(mx.arange(6 * dims, dtype=mx.float32)).reshape(1, 2, 3, dims)
+        x_np = np.array(x)
+        rotated = np.concatenate(
+            (-x_np[..., dims // 2 :], x_np[..., : dims // 2]), axis=-1
+        )
+        for offset in (0, 4096):
+            phase = np.arange(offset, offset + 3, dtype=np.float32)[:, None] * inv_freq
+            phase = np.concatenate((phase, phase), axis=-1)
+            expected = (x_np * np.cos(phase) + rotated * np.sin(phase)) * (
+                1 + 0.1 * math.log(256)
+            )
+            np.testing.assert_allclose(
+                np.array(full.rope(x, offset=offset)), expected, atol=1e-3, rtol=2e-4
+            )
+        expected_local = nn.RoPE(dims, traditional=False, base=args.rope_local_theta)
+        self.assertTrue(mx.array_equal(local.rope(x), expected_local(x)))
+
+        with self.assertRaisesRegex(ValueError, "initial_context_length"):
+            plamo3.ModelArgs(rope_scaling_factor=256)
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is required")
+    def test_plamo3_fused_qk_norm_rope(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256,
+            initial_context_length=4096,
+        )
+        mx.random.seed(0)
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            for layer_idx in (0, 1):
+                attention = plamo3.Attention(args, layer_idx)
+                attention.q_norm.weight = mx.random.normal((128,)) * 0.2
+                attention.k_norm.weight = mx.random.normal((128,)) * 0.2
+                attention.set_dtype(dtype)
+                attention.eval()
+                qkv = mx.random.normal((1, 1, 6 * 128)).astype(dtype)
+                q, k, _ = mx.split(qkv, [4 * 128, 5 * 128], axis=-1)
+                q = q.reshape(1, 4, 1, 128)
+                k = k.reshape(1, 1, 1, 128)
+                for offset in (0, 9, 2048, 4096, 262143):
+                    actual = plamo3._qk_norm_rope_kernel(
+                        inputs=[
+                            qkv,
+                            attention.q_norm.scale,
+                            attention.k_norm.scale,
+                            attention._rope_freqs,
+                            mx.array(offset),
+                            attention._norm_eps,
+                            attention._rope_mscale,
+                            attention._rope_base,
+                        ],
+                        template=[("T", dtype), ("NQ", 4), ("YARN", attention._yarn)],
+                        grid=(32 * 5, 1, 1),
+                        threadgroup=(32, 1, 1),
+                        output_shapes=[q.shape, k.shape],
+                        output_dtypes=[dtype, dtype],
+                    )
+                    expected = [
+                        attention.rope(attention.q_norm(q), offset=offset),
+                        attention.rope(attention.k_norm(k), offset=offset),
+                    ]
+                    for a, b in zip(actual, expected):
+                        self.assertTrue(
+                            mx.array_equal(a, b), (dtype, layer_idx, offset)
+                        )
+
+    @unittest.skipUnless(mx.metal.is_available(), "Metal is required")
+    def test_plamo3_fused_residual_norm(self):
+        from mlx_lm.models import plamo3
+
+        mx.random.seed(0)
+        for dims in (128, 1536, 4096):
+            for dtype in (mx.float32, mx.float16, mx.bfloat16):
+                x = mx.random.normal((1, 1, dims)).astype(dtype)
+                residual = mx.random.normal(x.shape).astype(dtype)
+                post = mx.random.uniform(0.1, 0.3, (dims,)).astype(dtype)
+                pre = mx.random.uniform(0.8, 1.2, (dims,)).astype(dtype)
+                h = residual + mx.fast.rms_norm(x, post, 1e-6)
+                normalized = mx.fast.rms_norm(h, pre, 1e-6)
+                actual = plamo3._residual_norm_kernel(
+                    inputs=[x, residual, post, pre, mx.array(1e-6)],
+                    template=[("T", dtype), ("D", dims)],
+                    grid=(dims // 4, 1, 1),
+                    threadgroup=(dims // 4, 1, 1),
+                    output_shapes=[x.shape, x.shape],
+                    output_dtypes=[dtype, dtype],
+                )
+                for a, b in zip(actual, (h, normalized)):
+                    self.assertTrue(mx.array_equal(a, b), (dims, dtype))
+
+    def test_plamo3_fused_attention_fallback(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=64,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256,
+            initial_context_length=4096,
+        )
+        for layer_idx in (0, 1):
+            attention = plamo3.Attention(args, layer_idx)
+            attention.eval()
+            cache = KVCache()
+            mx.eval(attention(mx.random.normal((1, 7, 64)), mask="causal", cache=cache))
+            baseline_cache = copy.deepcopy(cache)
+            x = mx.random.normal((1, 1, 64))
+            actual = attention(x, cache=cache)
+            with mock.patch.object(plamo3, "_qk_norm_rope_kernel", None):
+                expected = attention(x, cache=baseline_cache)
+            self.assertTrue(mx.array_equal(actual, expected))
+            attention.train()
+            grad = mx.grad(lambda x: attention(x).sum())(x)
+            self.assertTrue(mx.all(mx.isfinite(grad)))
+
+    def test_plamo3_sliding_window_cache_equivalence(self):
+        from mlx_lm.models import plamo3
+
+        for factor in (None, 1.0, 256.0):
+            with self.subTest(factor=factor):
+                args = plamo3.ModelArgs(
+                    hidden_size=64,
+                    intermediate_size=128,
+                    num_hidden_layers=2,
+                    num_attention_heads=2,
+                    num_key_value_heads=1,
+                    head_dim=32,
+                    vocab_size=100,
+                    window_size=8,
+                    sliding_window_pattern=2,
+                    rope_scaling_factor=factor,
+                    initial_context_length=4096 if factor == 256 else None,
+                    tie_word_embeddings=False,
+                )
+                model = plamo3.Model(args)
+                model.eval()
+                window_size = 9 if factor is None else 8
+                self.assertEqual(model.make_cache()[0].max_size, window_size)
+                mask = model.make_cache()[0].make_mask(10, return_array=True)
+                self.assertEqual(int(mask[-1].sum()), window_size)
+                tokens = mx.random.randint(0, args.vocab_size, (1, 23))
+                expected = model(tokens)
+                for chunks in ([1] * 23, [7, 1, 6, 9], [11, 12]):
+                    cache = model.make_cache()
+                    outputs = []
+                    offset = 0
+                    for size in chunks:
+                        outputs.append(
+                            model(tokens[:, offset : offset + size], cache=cache)
+                        )
+                        offset += size
+                    actual = mx.concatenate(outputs, axis=1)
+                    self.assertTrue(mx.allclose(actual, expected, atol=2e-5, rtol=2e-5))
+
+    def test_plamo3_scaled_embeddings(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            vocab_size=100,
+            sliding_window_pattern=2,
+            scale_embedding=True,
+        )
+        model = plamo3.Model(args)
+        tokens = mx.array([[1, 2, 3]])
+        embeddings = model.model.embed_tokens(tokens) * args.hidden_size**0.5
+        self.assertTrue(
+            mx.array_equal(model(tokens), model(tokens, input_embeddings=embeddings))
+        )
+
     def test_stablelm(self):
         from mlx_lm.models import stablelm
 
