@@ -1,8 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
+import math
 import re
 from dataclasses import dataclass
-from itertools import combinations
 from typing import Callable, Optional
 
 import mlx.core as mx
@@ -273,7 +273,7 @@ class LayerCache:
         self.window_size = window_size
         self.offset = 0
         self.window = None
-        self.comp_kv = None
+        self.compress_kv = None
         self.index_k = None
         self.pending_kv = None
         self.pending_gate = None
@@ -289,7 +289,7 @@ class LayerCache:
     def state(self) -> tuple:
         return (
             self.window,
-            self.comp_kv,
+            self.compress_kv,
             self.index_k,
             self.pending_kv,
             self.pending_gate,
@@ -307,7 +307,7 @@ class LayerCache:
     def nbytes(self) -> int:
         arrays = (
             self.window,
-            self.comp_kv,
+            self.compress_kv,
             self.index_k,
             self.pending_kv,
             self.pending_gate,
@@ -406,7 +406,6 @@ class Indexer(nn.Module):
         super().__init__()
         self.ratio = int(args.compress_ratios[layer_id])
         self.is_candidate_source = layer_id == args.candidate_source_layer_id
-        self.uses_candidates = 0 <= args.candidate_source_layer_id < layer_id
         self.candidate_topk_blocks = args.candidate_topk_blocks
         self.candidate_block_size = args.candidate_block_size
         self.num_heads = args.index_n_heads
@@ -472,7 +471,8 @@ class Indexer(nn.Module):
             candidates = mx.zeros(block_scores.shape, dtype=mx.bool_)
             candidates = mx.put_along_axis(candidates, chosen, reachable, axis=-1)
             candidates = mx.repeat(candidates, block, axis=-1)[..., : scores.shape[-1]]
-        elif self.uses_candidates and candidates is not None:
+        elif candidates is not None:
+            # Only layers after the candidate source get candidates.
             scores = mx.where(candidates, scores, -mx.inf)
 
         k = min(self.index_topk, index_k.shape[1])
@@ -607,7 +607,7 @@ class Attention(nn.Module):
                 latent, self.rope, self.rope_dim, offset=first, scale=self.ratio
             )
             kv = _fake_quant_fp4(kv, 16, e4m3_scale=True)
-            cache.comp_kv = _append(cache.comp_kv, kv)
+            cache.compress_kv = _append(cache.compress_kv, kv)
             if self.is_index_source:
                 k = self.indexer.k_norm(self.indexer.k_proj(latent))
                 k = _apply_rope(
@@ -615,7 +615,7 @@ class Attention(nn.Module):
                 )
                 k = _fake_quant_fp4(k, 32)
                 cache.index_k = _append(cache.index_k, k)
-        shared["compress_kv"] = cache.comp_kv
+        shared["compress_kv"] = cache.compress_kv
         if self.is_index_source:
             shared["index_k"] = cache.index_k
 
@@ -767,72 +767,121 @@ class DecoderLayer(nn.Module):
         return streams, ffn_pre
 
 
-def _shared_sources(args: ModelArgs, layer: int) -> list:
-    """Earlier layers whose shared state this layer reads: compressed KV, index
-    keys, top-k picks and candidate blocks."""
+def _shared_reads(args: ModelArgs, layer: int) -> dict[str, int]:
+    """The shared state a layer reads, as {key: layer that writes it}."""
     ratios = args.compress_ratios
     if layer >= len(ratios) or not ratios[layer]:
-        return []
+        return {}
     kv, index = set(args.kv_source_layer_ids), set(args.index_source_layer_ids)
 
-    def last(match):
+    def last(match: Callable[[int], bool]) -> Optional[int]:
         return max((j for j in range(layer + 1) if match(j)), default=None)
 
-    sources = [last(lambda j: j in kv and ratios[j])]
+    reads = {"compress_kv": last(lambda j: j in kv and ratios[j])}
     if layer in index:
-        sources.append(last(lambda j: j in kv and j in index))
-        if 0 <= args.candidate_source_layer_id < layer:
-            sources.append(args.candidate_source_layer_id)
+        reads["index_k"] = last(lambda j: j in kv and j in index)
+        source = args.candidate_source_layer_id
+        if 0 <= source < layer and args.candidate_topk_blocks > 0:
+            reads["candidates"] = source
     else:
-        sources.append(last(lambda j: j in index))
-    return [s for s in sources if s is not None]
+        reads["topk_idx"] = last(lambda j: j in index)
+    return {key: source for key, source in reads.items() if source is not None}
 
 
-def _stage_starts(args: ModelArgs) -> list:
-    """Layers a pipeline stage can start at: no later layer reads shared state
-    from a layer before it."""
-    n = args.num_hidden_layers
-    return [0] + [
-        start
-        for start in range(1, n)
-        if all(s >= start for i in range(start, n) for s in _shared_sources(args, i))
+def _crossing(args: ModelArgs, boundary: int) -> dict[str, int]:
+    """The shared state that layers from `boundary` on read from layers before
+    it, as {key: layer that writes it}."""
+    crossing = {}
+    for layer in range(boundary, args.num_hidden_layers):
+        for key, source in _shared_reads(args, layer).items():
+            if source < boundary:
+                crossing[key] = source
+    return crossing
+
+
+def _entries(args: ModelArgs, source: Optional[int], position: int) -> int:
+    """The compressed entries of kv source `source` after `position` tokens."""
+    return position // args.compress_ratios[source] if source is not None else 0
+
+
+def _index_keys(args: ModelArgs, layer: int, position: int) -> int:
+    """The index keys that index layer `layer` scores after `position` tokens."""
+    return _entries(args, _shared_reads(args, layer).get("index_k"), position)
+
+
+# The shared state that grows each step, kept in the LayerCache field of the
+# same name.
+_CACHE_FIELDS = ("compress_kv", "index_k")
+
+# One part of a message at a stage boundary: its key, shape and dtype.
+_Part = tuple[str, tuple[int, ...], mx.Dtype]
+
+
+def _layout(
+    args: ModelArgs,
+    crossing: dict[str, int],
+    batch: int,
+    length: int,
+    start_pos: int,
+    dtype: mx.Dtype,
+) -> list[_Part]:
+    """The parts of the message at a stage boundary, as (key, shape, dtype).
+
+    The compressed KV and the index keys have the dtype of the streams, because
+    the next stage cannot know the dtype the stage before makes them in.
+    """
+    end = start_pos + length
+    layout = [
+        ("streams", (batch, length, args.hc_mult, args.hidden_size), dtype),
+        ("pre_mix", (batch, length, args.hc_mult), mx.float32),
     ]
+    for key, source in crossing.items():
+        if key in _CACHE_FIELDS:
+            # Only the new entries: the next stage keeps the earlier ones.
+            new = _entries(args, source, end) - _entries(args, source, start_pos)
+            width = args.head_dim if key == "compress_kv" else args.index_head_dim
+            layout.append((key, (batch, new, width), dtype))
+        elif key == "candidates":
+            # One flag for each candidate block.
+            block = args.candidate_block_size
+            blocks = (_index_keys(args, source, end) + block - 1) // block
+            layout.append((key, (batch, length, blocks), mx.bool_))
+        else:
+            topk = min(args.index_topk, _index_keys(args, source, end))
+            layout.append((key, (batch, length, topk), mx.int32))
+    return layout
 
 
-def _pack(streams: mx.array, pre_mix: mx.array) -> mx.array:
-    """One array per stage boundary: two sends can run in a different order
-    than the two receives on the other rank."""
-    flat = streams.reshape(*streams.shape[:2], -1).astype(mx.float32)
-    return mx.concatenate([flat, pre_mix.astype(mx.float32)], axis=-1)
+# A view at a byte offset that is not a multiple of its item size reads the
+# wrong bytes, so each part of a message starts at a multiple of 8 bytes.
+_ALIGN = 8
 
 
-def _unpack(packed: mx.array, like: mx.array):
-    split = like.shape[2] * like.shape[3]
-    streams = packed[..., :split].reshape(like.shape).astype(like.dtype)
-    return streams, packed[..., split:]
+def _nbytes(shape: tuple[int, ...], dtype: mx.Dtype) -> int:
+    """The bytes of one part in a message, with its padding."""
+    size = math.prod(shape) * dtype.size
+    return (size + _ALIGN - 1) // _ALIGN * _ALIGN
 
 
-def _pipeline_split(args: ModelArgs, size: int) -> list:
-    """The most even split over the stage starts, as layers per rank."""
-    n = args.num_hidden_layers
-    starts = _stage_starts(args)[1:]
-    if size - 1 > len(starts):
-        raise ValueError(
-            f"{size} pipeline stages need {size - 1} boundaries, but only "
-            f"layers {starts} can start a stage."
-        )
+def _pack(parts: list[mx.array]) -> mx.array:
+    """The bytes of all parts in one array: two sends can run in a different
+    order than the two receives on the other rank."""
+    data = []
+    for part in parts:
+        flat = part.view(mx.uint8).reshape(-1)
+        pad = _nbytes(part.shape, part.dtype) - flat.size
+        data.append(mx.pad(flat, (0, pad)) if pad else flat)
+    return mx.concatenate(data)
 
-    def sizes(bounds):
-        edges = (0, *bounds, n)
-        return [b - a for a, b in zip(edges, edges[1:])]
 
-    def spread(bounds):
-        s = sizes(bounds)
-        return max(s), sum(x * x for x in s)
-
-    best = min(combinations(starts, size - 1), key=spread)
-    # PipelineMixin gives rank 0 the last layers.
-    return sizes(best)[::-1]
+def _unpack(packed: mx.array, layout: list[_Part]) -> dict[str, mx.array]:
+    parts = {}
+    start = 0
+    for key, shape, dtype in layout:
+        data = packed[start : start + math.prod(shape) * dtype.size]
+        parts[key] = data.reshape(*shape[:-1], shape[-1] * dtype.size).view(dtype)
+        start += _nbytes(shape, dtype)
+    return parts
 
 
 class TextModel(PipelineMixin, nn.Module):
@@ -843,21 +892,81 @@ class TextModel(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.args = args
 
-    def pipeline(self, group, split=None):
-        # A stage can only start where no shared state crosses from the stage
-        # before, because only the residual streams are sent between stages.
-        split = split or _pipeline_split(self.args, group.size())
-        starts = {sum(split[rank + 1 :]) for rank in range(len(split))}
-        unsafe = sorted(starts - set(_stage_starts(self.args)))
-        if unsafe:
-            raise ValueError(
-                f"Pipeline stages cannot start at layers {unsafe}; "
-                f"they can start at {_stage_starts(self.args)}."
-            )
+    def pipeline(
+        self, group: mx.distributed.Group, split: Optional[list[int]] = None
+    ) -> None:
         super().pipeline(group, split)
+        # Besides the streams, a stage receives and sends the shared state that
+        # crosses its boundaries.
+        self._shared_in = _crossing(self.args, self.start_idx)
+        self._shared_out = _crossing(self.args, self.end_idx)
 
     def make_cache(self) -> list[LayerCache]:
         return [LayerCache(self.args.sliding_window) for _ in self.pipeline_layers]
+
+    def _receive(
+        self,
+        like: mx.array,
+        start_pos: int,
+        cache: LayerCache,
+        shared: dict[str, Optional[mx.array]],
+    ) -> tuple[mx.array, mx.array]:
+        """Receive the streams and pre_mix, and put the shared state in `shared`."""
+        batch, length = like.shape[:2]
+        layout = _layout(
+            self.args, self._shared_in, batch, length, start_pos, like.dtype
+        )
+        size = sum(_nbytes(shape, dtype) for _, shape, dtype in layout)
+        packed = mx.distributed.recv((size,), mx.uint8, self.pipeline_rank + 1)
+        parts = _unpack(packed, layout)
+        streams = parts.pop("streams")
+        pre_mix = parts.pop("pre_mix")
+        for key, part in parts.items():
+            if key in _CACHE_FIELDS:
+                # The first layer never writes this field, so it keeps the
+                # entries of the source in the stage before.
+                if part.shape[1]:
+                    setattr(cache, key, _append(getattr(cache, key), part))
+                shared[key] = getattr(cache, key)
+            elif key == "candidates":
+                keys = _index_keys(self.args, self._shared_in[key], start_pos + length)
+                mask = mx.repeat(part, self.args.candidate_block_size, axis=-1)
+                shared[key] = mask[..., :keys] if keys else None
+            else:
+                shared[key] = part
+        return streams, pre_mix
+
+    def _send(
+        self,
+        streams: mx.array,
+        pre_mix: mx.array,
+        start_pos: int,
+        shared: dict[str, Optional[mx.array]],
+    ) -> mx.array:
+        """Send the streams, pre_mix and the shared state the next stages read."""
+        batch, length = streams.shape[:2]
+        layout = _layout(
+            self.args, self._shared_out, batch, length, start_pos, streams.dtype
+        )
+        state = {**shared, "streams": streams, "pre_mix": pre_mix}
+        parts = []
+        for key, shape, dtype in layout:
+            part = state.get(key)
+            if part is None:
+                # Not written yet, so the layout has no entries either.
+                part = mx.zeros(shape, dtype)
+            elif key in _CACHE_FIELDS:
+                # It holds all entries so far; send only the new ones.
+                part = part[:, part.shape[1] - shape[1] :]
+            elif key == "candidates":
+                part = part[..., :: self.args.candidate_block_size]
+            if part.shape != shape or part.dtype != dtype:
+                raise ValueError(
+                    f"The next pipeline stage expects {key} as {dtype} {shape}, "
+                    f"not {part.dtype} {part.shape}."
+                )
+            parts.append(part)
+        return mx.distributed.send(_pack(parts), self.pipeline_rank - 1)
 
     def __call__(
         self, inputs: mx.array, cache: Optional[list[LayerCache]] = None
@@ -879,11 +988,10 @@ class TextModel(PipelineMixin, nn.Module):
         pre_mix = mx.zeros((batch, length, self.args.hc_mult), dtype=mx.float32)
         pre_mix[..., 0] = 1.0
         rank, size = self.pipeline_rank, self.pipeline_size
-        if rank < size - 1:
-            packed = mx.distributed.recv_like(_pack(streams, pre_mix), rank + 1)
-            streams, pre_mix = _unpack(packed, streams)
-
         shared = {}
+        if rank < size - 1:
+            streams, pre_mix = self._receive(streams, start_pos, cache[0], shared)
+
         for layer, layer_cache in zip(layers, cache, strict=True):
             streams, pre_mix = layer(
                 streams,
@@ -895,11 +1003,10 @@ class TextModel(PipelineMixin, nn.Module):
             )
 
         if rank > 0:
-            sent = mx.distributed.send(_pack(streams, pre_mix), rank - 1)
+            sent = self._send(streams, pre_mix, start_pos, shared)
             streams, pre_mix = mx.depends([streams, pre_mix], sent)
-            if cache[-1] is not None:
-                # Prefill only evaluates the cache, which must still send.
-                cache[-1].window = mx.depends(cache[-1].window, sent)
+            # Prefill only evaluates the cache, which must still send.
+            cache[-1].window = mx.depends(cache[-1].window, sent)
         out = _collapse(streams, pre_mix)
         if size > 1:
             # Rank 0 runs the last layers, and every rank needs its output.
