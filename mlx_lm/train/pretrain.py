@@ -71,7 +71,8 @@ def main(config, save_dir):
     params = model.trainable_parameters()
     nparams = tree_reduce(lambda acc, p: acc + p.size, params, 0)
     mx.eval(params)
-    logging.info("Training %d parameters", nparams)
+    if mesh.is_master:
+        logging.info("Training %d parameters", nparams)
     z_loss_weight = config.get("z_loss_weight", 0.0)
 
     def loss_fn(params, sample):
