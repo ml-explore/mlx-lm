@@ -15,7 +15,7 @@ def model_config():
     config.num_hidden_layers = 32
     config.rms_norm_eps = 1e-6
     config.rope_theta = 10_000_000
-    config.tie_word_embeddings = True
+    config.tie_word_embeddings = False
     config.layer_norm = "pre"
 
     # Every fourth layer is quadratic; the other three are gated delta net.
