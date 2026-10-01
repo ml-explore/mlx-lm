@@ -685,14 +685,14 @@ class ArraysCache(_BaseCache):
             self.left_padding -= N
 
     def make_mask(self, N: int):
+        pos = mx.arange(N)
+        mask = None
         if self.left_padding is not None:
-            pos = mx.arange(N)
-            return pos >= self.left_padding[:, None]
-        elif self.lengths is not None:
-            pos = mx.arange(N)
-            return pos < self.lengths[:, None]
-        else:
-            return None
+            mask = pos >= self.left_padding[:, None]
+        if self.lengths is not None:
+            in_length = pos < self.lengths[:, None]
+            mask = in_length if mask is None else (mask & in_length)
+        return mask
 
     @classmethod
     def merge(cls, caches):

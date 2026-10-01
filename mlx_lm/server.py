@@ -150,7 +150,8 @@ def process_message_content(messages):
             for tool_call in tool_calls:
                 if func := tool_call.get("function"):
                     if args := func.get("arguments"):
-                        func["arguments"] = json.loads(args)
+                        if isinstance(args, str):
+                            func["arguments"] = json.loads(args)
 
 
 @dataclass
@@ -322,8 +323,12 @@ class ModelProvider:
                 "Loading with adapters or draft models not supported in distributed mode"
             )
 
-        # Remove the old model if it exists.
+        # Remove the old model if it exists. Dropping the refs returns the
+        # weights to MLX's buffer pool, not the OS; clear that pool so a
+        # later load of a different model does not keep every previous one.
         self.reset()
+        gc.collect()
+        mx.clear_cache()
 
         # Load the model and tokenizer
         if self.is_distributed:
@@ -435,8 +440,19 @@ class ResponseGenerator:
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
-        self._generation_thread = Thread(target=self._generate)
+        self._generation_failed = False
+        self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
+
+    def _run_generate(self):
+        try:
+            self._generate()
+        except Exception as e:
+            logging.exception(f"mlx_lm.server generation thread died: {e}")
+            self._generation_failed = True
+
+    def generation_available(self):
+        return self._generation_thread.is_alive() and not self._generation_failed
 
     def stop_and_join(self):
         self._stop = True
@@ -447,7 +463,7 @@ class ResponseGenerator:
 
     @property
     def is_healthy(self):
-        return self._generation_thread.is_alive()
+        return self.generation_available()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -994,6 +1010,16 @@ class ResponseGenerator:
         except Exception as e:
             rqueue.put(e)
 
+    def _await_response(self, response_queue):
+        # Wherever the request was when the thread died, nothing more will be
+        # put on its queue, so give up rather than block forever.
+        while True:
+            try:
+                return response_queue.get(timeout=1.0)
+            except QueueEmpty:
+                if not self.generation_available():
+                    raise RuntimeError("generation thread died") from None
+
     def generate(
         self,
         request: CompletionRequest,
@@ -1001,11 +1027,13 @@ class ResponseGenerator:
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ):
         response_queue = Queue()
+        if not self.generation_available():
+            raise RuntimeError("generation thread died")
         self.requests.put((response_queue, request, generation_args))
 
         def _inner():
             while True:
-                response = response_queue.get()
+                response = self._await_response(response_queue)
                 if response is None:
                     break
                 if isinstance(response, Exception):
@@ -1016,7 +1044,7 @@ class ResponseGenerator:
                     continue
                 yield response
 
-        ctx = response_queue.get()
+        ctx = self._await_response(response_queue)
         if isinstance(ctx, Exception):
             raise ctx
 

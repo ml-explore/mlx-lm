@@ -14,7 +14,7 @@ from .base import (
     scaled_dot_product_attention,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
 from .mla import MultiLinear
 from .switch_layers import SwitchGLU
 
@@ -350,12 +350,7 @@ class KimiDeltaAttention(nn.Module):
         k = k_conv.reshape(B, T, self.num_heads, self.head_dim)
         v = v_conv.reshape(B, T, self.num_heads, self.head_dim)
 
-        inv_scale = self.scale
-        # Match the reference l2norm: x / sqrt(sum(x^2) + 1e-6). rms_norm adds
-        # eps to mean(x^2), so the equivalent eps is 1e-6 / head_dim.
-        eps = 1e-6 / self.head_dim
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, eps)
-        k = inv_scale * mx.fast.rms_norm(k, None, eps)
+        q, k = normalize_qk(q, k, inv_scale=self.scale, eps=1e-6)
 
         a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
             B, T, self.num_heads, self.head_dim

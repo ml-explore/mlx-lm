@@ -179,17 +179,19 @@ class YarnRoPE(nn.Module):
         self.dims = dims
         self.traditional = traditional
 
-    def __call__(self, x, offset=0):
+    def __call__(self, x, offset=0, scale=1.0, inverse=False):
         if self.mscale != 1.0:
-            x = x.at[..., : self.dims].multiply(self.mscale)
+            input_scale = 1.0 / self.mscale if inverse else self.mscale
+            x = x.at[..., : self.dims].multiply(input_scale)
+        freqs = -self._freqs if inverse else self._freqs
         return mx.fast.rope(
             x,
             self.dims,
             traditional=self.traditional,
             base=None,
-            scale=1.0,
+            scale=scale,
             offset=offset,
-            freqs=self._freqs,
+            freqs=freqs,
         )
 
 
@@ -267,6 +269,23 @@ class DynamicNTKScalingRoPE(nn.Module):
             scale=1.0,
             offset=offset,
         )
+
+
+def apply_yarn_mscale(scale: float, scaling_config: Optional[dict]) -> float:
+    """Fold the yarn mscale into an attention scale.
+
+    ``initialize_rope`` puts the ``mscale / mscale_all_dim`` ratio on the rope;
+    this is the other half, ``mscale_all_dim`` squared.
+    """
+    if not scaling_config:
+        return scale
+    rope_type = scaling_config.get("type") or scaling_config.get("rope_type", "default")
+    mscale_all_dim = scaling_config.get("mscale_all_dim", 0)
+    factor = scaling_config.get("factor", 1)
+    if rope_type == "default" or not mscale_all_dim or factor <= 1:
+        return scale
+    s = 0.1 * mscale_all_dim * math.log(factor) + 1.0
+    return scale * s * s
 
 
 def initialize_rope(

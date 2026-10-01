@@ -39,16 +39,16 @@ class Model(nn.Module):
     def sanitize(self, weights):
         weights = tree_unflatten(list(weights.items()))
         weights.pop("visual", None)
-        weights = dict(
-            tree_flatten(
-                {
-                    "language_model": {
-                        "model": weights["language_model"]["model"],
-                        "lm_head": weights["language_model"]["lm_head"],
-                    }
-                }
-            )
-        )
+        # Newer HF checkpoints nest the language model under
+        # ``model.language_model.*`` and keep ``lm_head`` at the top level.
+        if language_model := weights.get("model", {}).get("language_model"):
+            lm_head = weights["lm_head"]
+        else:
+            language_model = weights["language_model"]["model"]
+            lm_head = weights["language_model"]["lm_head"]
+
+        weights = {"language_model": {"model": language_model, "lm_head": lm_head}}
+        weights = dict(tree_flatten(weights))
 
         for l in range(self.language_model.args.num_hidden_layers):
             prefix = f"language_model.model.layers.{l}.mlp"
