@@ -2594,6 +2594,10 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+        args.rope_scaling = None
+        model = phimoe.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, nn.RoPE)
+
     def test_recurrent_gemma(self):
         from mlx_lm.models import recurrent_gemma
 
