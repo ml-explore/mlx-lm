@@ -45,16 +45,20 @@ class Attention(nn.Module):
         self.v_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=True)
         self.o_proj = nn.Linear(n_heads * head_dim, dim, bias=True)
 
-        self.rope = SuScaledRoPE(
-            head_dim,
-            base=args.rope_theta,
-            max_position_embeddings=args.max_position_embeddings,
-            original_max_position_embeddings=args.original_max_position_embeddings,
-            short_factor=args.rope_scaling["short_factor"],
-            long_factor=args.rope_scaling["long_factor"],
-            short_mscale=args.rope_scaling["short_mscale"],
-            long_mscale=args.rope_scaling["long_mscale"],
-        )
+        # A null rope_scaling (e.g. Phi-mini-MoE) means plain RoPE.
+        if args.rope_scaling is None:
+            self.rope = nn.RoPE(head_dim, base=args.rope_theta)
+        else:
+            self.rope = SuScaledRoPE(
+                head_dim,
+                base=args.rope_theta,
+                max_position_embeddings=args.max_position_embeddings,
+                original_max_position_embeddings=args.original_max_position_embeddings,
+                short_factor=args.rope_scaling["short_factor"],
+                long_factor=args.rope_scaling["long_factor"],
+                short_mscale=args.rope_scaling["short_mscale"],
+                long_mscale=args.rope_scaling["long_mscale"],
+            )
 
     def __call__(
         self,
