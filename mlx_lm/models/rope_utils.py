@@ -179,17 +179,19 @@ class YarnRoPE(nn.Module):
         self.dims = dims
         self.traditional = traditional
 
-    def __call__(self, x, offset=0):
+    def __call__(self, x, offset=0, scale=1.0, inverse=False):
         if self.mscale != 1.0:
-            x = x.at[..., : self.dims].multiply(self.mscale)
+            input_scale = 1.0 / self.mscale if inverse else self.mscale
+            x = x.at[..., : self.dims].multiply(input_scale)
+        freqs = -self._freqs if inverse else self._freqs
         return mx.fast.rope(
             x,
             self.dims,
             traditional=self.traditional,
             base=None,
-            scale=1.0,
+            scale=scale,
             offset=offset,
-            freqs=self._freqs,
+            freqs=freqs,
         )
 
 

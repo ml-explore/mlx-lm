@@ -56,6 +56,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "deepseek_v41_text": "deepseek_v41",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -517,6 +518,22 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "mxfp8":
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif (
+            quant_method == "fp8"
+            and quantization_config.get("scale_fmt") == "ue8m0"
+            and list(quantization_config.get("weight_block_size", ())) == [32, 32]
+        ):
+            # Power-of-two scales over 32x32 blocks are mxfp8, so the weights
+            # stay packed. Other fp8 checkpoints dequantize in their sanitize.
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
         elif quant_method == "compressed-tensors":
             quantization = _compressed_tensors_quantization(quantization_config)
             config["quantization"] = quantization
@@ -828,8 +845,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -853,8 +869,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()

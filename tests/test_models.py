@@ -14,6 +14,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    BatchKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
@@ -406,6 +407,30 @@ class TestModels(unittest.TestCase):
 
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
+
+    def left_padding_test_runner(self, model):
+        # A prompt run on its own must produce the same logits as the same
+        # prompt run as a shorter, left-padded member of a batch, both for
+        # the prefill and for a subsequent decode step.
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        short = [5, 6, 7]
+        long = [11, 12, 13, 14, 15, 16]
+        pad = len(long) - len(short)
+
+        cache = make_prompt_cache(model)
+        single = model(mx.array([short]), cache=cache)[0, -1]
+        next_tok = mx.argmax(single)
+        single_next = model(next_tok.reshape(1, 1), cache=cache)[0, -1]
+
+        batch_cache = [BatchKVCache(left_padding=[pad, 0]) for _ in model.layers]
+        batch = mx.array([[0] * pad + short, long])
+        batched = model(batch, cache=batch_cache)[0, -1]
+        next_toks = mx.array([[next_tok.item()], [0]])
+        batched_next = model(next_toks, cache=batch_cache)[0, -1]
+
+        self.assertTrue(mx.allclose(single, batched, rtol=1e-4, atol=1e-4))
+        self.assertTrue(mx.allclose(single_next, batched_next, rtol=1e-4, atol=1e-4))
 
     def test_bailing_moe_v3(self):
         from dataclasses import replace
@@ -1643,6 +1668,55 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_minicpm3(self):
+        from mlx_lm.models import minicpm3
+
+        args = minicpm3.ModelArgs(
+            model_type="minicpm3",
+            hidden_size=64,
+            dim_model_base=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=100,
+            num_key_value_heads=4,
+            q_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            kv_lora_rank=32,
+            scale_depth=1.0,
+            scale_emb=1.0,
+            max_position_embeddings=64,
+            rope_scaling={
+                "original_max_position_embeddings": 64,
+                "short_factor": [1.0] * 4,
+                "long_factor": [1.0] * 4,
+            },
+        )
+        model = minicpm3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+        self.left_padding_test_runner(model)
+
+    def test_phixtral(self):
+        from mlx_lm.models import phixtral
+
+        args = phixtral.ModelArgs(
+            model_type="phixtral",
+            num_vocab=100,
+            model_dim=64,
+            num_heads=4,
+            num_layers=2,
+            rotary_dim=16,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+        )
+        model = phixtral.Model(args)
+        self.model_test_runner(model, args.model_type, args.num_vocab, args.num_layers)
+        self.left_padding_test_runner(model)
+
     def test_mamba(self):
         from mlx_lm.models import mamba
 
@@ -1710,6 +1784,43 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_falcon_h1_without_cache(self):
+        from mlx_lm.models import falcon_h1
+
+        mx.random.seed(0)
+        args = falcon_h1.ModelArgs(
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=3,
+            vocab_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=16,
+            mamba_d_ssm=32,
+            mamba_n_heads=2,
+            mamba_d_head=16,
+            mamba_d_state=8,
+        )
+        model = falcon_h1.Model(args)
+        inputs = mx.array([[0, 1, 2], [2, 1, 0]])
+        targets = mx.array([[1, 2, 3], [1, 0, 3]])
+
+        with self.subTest("logits"):
+            logits = model(inputs)
+            cached_logits = model(inputs, cache=model.make_cache())
+            self.assertTrue(mx.allclose(logits, cached_logits, atol=1e-5))
+
+        def loss_fn(model):
+            return nn.losses.cross_entropy(model(inputs), targets).mean()
+
+        loss, grads = nn.value_and_grad(model, loss_fn)(model)
+        self.assertTrue(mx.isfinite(loss).item())
+        for i, layer_grads in enumerate(grads["model"]["layers"]):
+            with self.subTest(layer=i):
+                grad = layer_grads["feed_forward"]["down_proj"]["weight"]
+                self.assertTrue(mx.all(mx.isfinite(grad)).item())
+                self.assertGreater(mx.max(mx.abs(grad)).item(), 0)
 
     def test_gpt2(self):
         from mlx_lm.models import gpt2
@@ -1948,6 +2059,39 @@ class TestModels(unittest.TestCase):
             },
         )
         model = deepseek_v3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_deepseek_v41(self):
+        from mlx_lm.models import deepseek_v41
+
+        args = deepseek_v41.ModelArgs(
+            model_type="deepseek_v41",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            head_dim=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=8,
+            o_groups=2,
+            o_lora_rank=16,
+            moe_intermediate_size=32,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            sliding_window=4,
+            compress_ratios=(0, 2, 2, 2, 1, 1),
+            kv_source_layer_ids=(1, 4),
+            index_source_layer_ids=(1, 2, 4, 5),
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=3,
+            candidate_source_layer_id=4,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+        )
+        model = deepseek_v41.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -3659,6 +3803,40 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
             },
             {
+                "model_type": "bailing_hybrid",
+                "hidden_size": 256,
+                "intermediate_size": 512,
+                "moe_intermediate_size": 256,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "num_shared_experts": 1,
+                "n_group": 2,
+                "topk_group": 1,
+                "first_k_dense_replace": 1,
+                "layer_group_size": 2,
+                "group_norm_size": 4,
+                "vocab_size": 1000,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 1000,
+                "max_position_embeddings": 1000,
+                "routed_scaling_factor": 2.5,
+                "head_dim": 64,
+                "kv_lora_rank": 64,
+                "q_lora_rank": 96,
+                "qk_rope_head_dim": 16,
+                "qk_nope_head_dim": 32,
+                "v_head_dim": 32,
+                "rope_interleave": True,
+                "partial_rotary_factor": 0.5,
+                "use_qk_norm": True,
+                "score_function": "sigmoid",
+                "norm_topk_prob": True,
+                "moe_router_enable_expert_bias": True,
+            },
+            {
                 "model_type": "qwen3_next",
                 "hidden_size": 128,
                 "num_hidden_layers": 4,
@@ -3939,6 +4117,30 @@ class TestModels(unittest.TestCase):
                 "max_position_embeddings": 1000,
             },
             {
+                "model_type": "minimax_m3_vl",
+                "vocab_size": 128,
+                "num_hidden_layers": 4,
+                "text_config": {
+                    "model_type": "minimax_m3_vl",
+                    "vocab_size": 128,
+                    "hidden_size": 64,
+                    "intermediate_size": 32,
+                    "dense_intermediate_size": 64,
+                    "shared_intermediate_size": 32,
+                    "num_hidden_layers": 4,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 2,
+                    "head_dim": 16,
+                    "rotary_dim": 8,
+                    "num_local_experts": 4,
+                    "num_experts_per_tok": 2,
+                    "moe_layer_freq": [0, 0, 1, 1],
+                    "rms_norm_eps": 1e-5,
+                    "rope_theta": 1000.0,
+                    "max_position_embeddings": 1000,
+                },
+            },
+            {
                 "model_type": "talkie",
                 "vocab_size": 1000,
                 "hidden_size": 128,
@@ -3983,6 +4185,83 @@ class TestModels(unittest.TestCase):
                     config["vocab_size"],
                     config["num_hidden_layers"],
                 )
+
+    def test_minimax_m3_vl(self):
+        from mlx_lm.generate import _merge_caches
+        from mlx_lm.models import minimax_m3_vl
+
+        blk, topk = 4, 2
+        budget = blk * topk
+        base = {
+            "model_type": "minimax_m3_vl",
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "intermediate_size": 32,
+            "dense_intermediate_size": 32,
+            "shared_intermediate_size": 32,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "rotary_dim": 8,
+            "num_local_experts": 4,
+            "num_experts_per_tok": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1000.0,
+            "max_position_embeddings": 512,
+            "mlp_layer_types": ["dense", "sparse"],
+            "layer_types": ["full_attention", "minimax_m3_sparse"],
+            "index_n_heads": 2,
+            "index_head_dim": 8,
+            "index_block_size": blk,
+            "index_topk_blocks": topk,
+            "index_local_blocks": 1,
+        }
+
+        def build(**overrides):
+            config = {
+                "model_type": "minimax_m3_vl",
+                "text_config": {**base, **overrides},
+            }
+            return minimax_m3_vl.Model(minimax_m3_vl.ModelArgs.from_dict(config))
+
+        model = build()
+        self.assertEqual([l.is_moe for l in model.layers], [False, True])
+        self.assertEqual(
+            [l.self_attn.is_sparse_attn for l in model.layers], [False, True]
+        )
+
+        # The published config nests the same values.
+        nested = build(
+            layer_types=None,
+            index_block_size=None,
+            sparse_attention_config={
+                "use_sparse_attention": True,
+                "sparse_num_index_heads": 2,
+                "sparse_index_dim": 8,
+                "sparse_block_size": blk,
+                "sparse_topk_blocks": topk,
+                "sparse_local_block": 1,
+                "sparse_attention_freq": [0, 1],
+            },
+        )
+        self.assertEqual(
+            [l.self_attn.is_sparse_attn for l in nested.layers], [False, True]
+        )
+
+        dense = build(index_block_size=None)
+        model.update(dense.parameters())
+        for n in (budget, budget + blk):
+            x = mx.arange(n)[None] % base["vocab_size"]
+            same = bool(mx.allclose(model(x), dense(x), atol=1e-5))
+            self.assertEqual(same, n <= budget, f"length {n}")
+
+        # A batched cache holds a per-row offset array and advances it in place.
+        n = budget * 5
+        ids = mx.arange(n)[None] % base["vocab_size"]
+        want = model(ids)
+        got = model(ids, cache=_merge_caches([model.make_cache()]))
+        self.assertTrue(mx.allclose(got, want, atol=1e-5))
 
     def test_llama4_chunked_kv_cache(self):
         # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on

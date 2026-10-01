@@ -220,6 +220,7 @@ def mistral4_expert_select(
         scores_for_choice = scores
 
     inds = mx.argpartition(-scores_for_choice, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
 
     selected_scores = mx.take_along_axis(scores, inds, axis=-1)
     if norm_topk_prob:
