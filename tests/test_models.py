@@ -2572,6 +2572,14 @@ class TestModels(unittest.TestCase):
     def test_phimoe(self):
         from mlx_lm.models import phimoe
 
+        # Near ties share the weight, other picks get 1.
+        gates = mx.array([[3.0, 1.0, 0.0, -1.0], [3.0, 2.99, 0.0, -1.0]])
+        inds, scores = phimoe.sparsemixer(gates, top_k=2, jitter_eps=0.01)
+        self.assertEqual(inds.tolist(), [[0, 1], [0, 1]])
+        self.assertTrue(mx.allclose(scores, mx.array([[1.0, 1.0], [0.5025, 1.0]])))
+        loss = lambda g: phimoe.sparsemixer(g, top_k=2, jitter_eps=0.01)[1].sum()
+        mx.eval(mx.grad(loss)(gates))
+
         args = phimoe.ModelArgs(
             model_type="phimoe",
             vocab_size=320,
