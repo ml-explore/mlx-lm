@@ -2562,12 +2562,17 @@ class TestModels(unittest.TestCase):
             num_attention_heads=4,
             num_key_value_heads=2,
             layer_norm_epsilon=1e-4,
-            vocab_size=1000,
+            vocab_size=100352,
         )
         model = phi3small.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+        # The dummy tokens are masked in the vocab axis
+        out = model(mx.array([[1, 2, 3]]))
+        dummy = out[..., model._dummy_tokenizer_ids]
+        self.assertTrue(mx.all(dummy == -float("inf")).item())
 
     def test_phimoe(self):
         from mlx_lm.models import phimoe
