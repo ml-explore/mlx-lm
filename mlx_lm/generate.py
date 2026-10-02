@@ -1568,13 +1568,23 @@ class BatchGenerator:
         return self._stream
 
     def close(self):
-        if self._old_wired_limit is not None:
+        if self._old_wired_limit is None:
+            return
+        old = self._old_wired_limit
+        self._old_wired_limit = None
+        try:
             mx.synchronize(self._stream)
-            mx.set_wired_limit(self._old_wired_limit)
-            self._old_wired_limit = None
+            mx.set_wired_limit(old)
+        except RuntimeError:
+            # GC / another thread does not own this GPU stream. Dropping the
+            # restore is better than raising from a finalizer.
+            pass
 
     def __del__(self):
-        self.close()
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @contextlib.contextmanager
     def stats(self):

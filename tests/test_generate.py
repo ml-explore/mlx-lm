@@ -1060,5 +1060,37 @@ class TestGenerate(unittest.TestCase):
         )
 
 
+class TestBatchGeneratorTeardown(unittest.TestCase):
+    def test_close_swallows_missing_stream(self):
+        from unittest.mock import patch
+
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._stream = object()
+        gen._old_wired_limit = 4096
+        with patch(
+            "mlx_lm.generate.mx.synchronize",
+            side_effect=RuntimeError(
+                "There is no Stream(gpu, 3) in current thread"
+            ),
+        ):
+            gen.close()
+        self.assertIsNone(gen._old_wired_limit)
+
+    def test_del_swallows_missing_stream(self):
+        from unittest.mock import patch
+
+        gen = BatchGenerator.__new__(BatchGenerator)
+        gen._stream = object()
+        gen._old_wired_limit = 4096
+        with patch(
+            "mlx_lm.generate.mx.synchronize",
+            side_effect=RuntimeError(
+                "There is no Stream(gpu, 3) in current thread"
+            ),
+        ):
+            gen.__del__()
+        self.assertIsNone(gen._old_wired_limit)
+
+
 if __name__ == "__main__":
     unittest.main()
