@@ -138,6 +138,17 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     return [c.trim(num_tokens) for c in cache][0]
 
 
+def checkpoint_prompt_cache(cache: List[Any]):
+    """Save a snapshot of the prompt cache state."""
+    return [c.checkpoint() for c in cache]
+
+
+def rollback_prompt_cache(cache: List[Any], checkpoint: List[Any]):
+    """Roll back the prompt cache to the last saved snapshot."""
+    for c, state in zip(cache, checkpoint):
+        c.rollback(state)
+
+
 def create_attention_mask(
     N: int, offset: int, return_array: bool, window_size: Optional[int]
 ):
@@ -160,6 +171,12 @@ class _BaseCache:
     def state(self, v):
         if v is not None and v:
             raise ValueError("This cache has no state but a state was set.")
+
+    def checkpoint(self):
+        return self.state
+
+    def rollback(self, checkpoint):
+        self.state = checkpoint
 
     def is_trimmable(self):
         return False
@@ -619,11 +636,12 @@ class ArraysCache(_BaseCache):
 
     @property
     def state(self):
-        return self.cache, self.left_padding, self.lengths
+        return tuple(self.cache), self.left_padding, self.lengths
 
     @state.setter
     def state(self, v):
-        self.cache, self.left_padding, self.lengths = v
+        cache, self.left_padding, self.lengths = v
+        self.cache = list(cache)
 
     def filter(self, batch_indices):
         """
@@ -814,6 +832,13 @@ class CacheList(_BaseCache):
         for c in self.caches:
             m = c.trim(n)
         return m
+
+    def checkpoint(self):
+        return [c.checkpoint() for c in self.caches]
+
+    def rollback(self, checkpoint):
+        for c, state in zip(self.caches, checkpoint):
+            c.rollback(state)
 
     @property
     def state(self):

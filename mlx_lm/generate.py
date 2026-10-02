@@ -21,8 +21,10 @@ from .models.cache import (
     QuantizedKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
+    checkpoint_prompt_cache,
     load_prompt_cache,
     make_prompt_cache,
+    rollback_prompt_cache,
     trim_prompt_cache,
 )
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
@@ -506,7 +508,7 @@ def speculative_generate_step(
           A list of functions that take tokens and logits and return the processed
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
-          provided, the cache will be updated in place. The cache must be trimmable.
+          provided, the cache will be updated in place.
         prefill_step_size (int): Step size for processing the prompt.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
@@ -530,11 +532,8 @@ def speculative_generate_step(
         model_cache = prompt_cache[: len(model.layers)]
         draft_cache = prompt_cache[len(model.layers) :]
 
-    if not can_trim_prompt_cache(model_cache):
-        types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
-        raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
-        )
+    model_trimmable = can_trim_prompt_cache(model_cache)
+    draft_trimmable = can_trim_prompt_cache(draft_cache)
 
     sampler = sampler or greedy_sampler
 
@@ -585,9 +584,47 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
-    def _rewind_cache(num_draft, num_accept):
-        trim_prompt_cache(model_cache, num_draft - num_accept)
-        trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+    def _rewind_cache(
+        num_draft,
+        num_accept,
+        model_checkpoint=None,
+        draft_checkpoint=None,
+        y=None,
+        draft_y=None,
+        draft_tokens=None,
+    ):
+        if num_draft == 0:
+            return
+
+        if model_trimmable:
+            trim_prompt_cache(model_cache, num_draft - num_accept)
+        elif num_accept < num_draft and model_checkpoint is not None and y is not None:
+            rollback_prompt_cache(model_cache, model_checkpoint)
+            # Replay input token and accepted draft tokens so target cache
+            # contains exactly the committed target prefix.
+            model(y[: num_accept + 1][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache])
+
+        if draft_trimmable:
+            trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
+        elif (
+            num_accept < num_draft
+            and draft_checkpoint is not None
+            and draft_y is not None
+        ):
+            rollback_prompt_cache(draft_cache, draft_checkpoint)
+            # Draft cache only requires tokens prior to the bonus token.
+            keep = (
+                mx.concatenate(
+                    [draft_y, mx.array(draft_tokens[:num_accept], mx.uint32)]
+                )
+                if num_accept > 0
+                else draft_y
+            )
+            draft_model(keep[None], cache=draft_cache)
+            quantize_cache_fn(draft_cache)
+            mx.eval([c.state for c in draft_cache])
 
     def _draft_generate(y, num_draft):
         if num_draft == 0:
@@ -604,12 +641,27 @@ def speculative_generate_step(
         y = _prefill(model, model_cache, y)
 
         ntoks = 0
-        # Set these so the finally block doesn't raise
         num_draft = 0
         n = 0
+        draft_tokens = []
+        model_checkpoint = None
+        draft_checkpoint = None
+        rewound = True
         try:
             while True:
                 num_draft = min(max_tokens - ntoks, num_draft_tokens)
+                model_checkpoint = (
+                    checkpoint_prompt_cache(model_cache)
+                    if not model_trimmable
+                    else None
+                )
+                draft_checkpoint = (
+                    checkpoint_prompt_cache(draft_cache)
+                    if not draft_trimmable
+                    else None
+                )
+
+                rewound = False
                 draft_tokens = _draft_generate(draft_y, num_draft)
                 if prev_tokens is not None:
                     prev_tokens = prev_tokens[
@@ -637,6 +689,20 @@ def speculative_generate_step(
                 if ntoks == max_tokens:
                     break
 
+                if prev_tokens is not None:
+                    prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
+
+                _rewind_cache(
+                    num_draft,
+                    n,
+                    model_checkpoint=model_checkpoint,
+                    draft_checkpoint=draft_checkpoint,
+                    y=y,
+                    draft_y=draft_y,
+                    draft_tokens=draft_tokens,
+                )
+                rewound = True
+
                 y = mx.array([tokens[n]], mx.uint32)
                 draft_y = y
 
@@ -647,12 +713,17 @@ def speculative_generate_step(
                     draft_y = mx.concatenate(
                         [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
                     )
-
-                if prev_tokens is not None:
-                    prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
-                _rewind_cache(num_draft, n)
         finally:
-            _rewind_cache(num_draft, n)
+            if not rewound:
+                _rewind_cache(
+                    num_draft,
+                    n,
+                    model_checkpoint=model_checkpoint,
+                    draft_checkpoint=draft_checkpoint,
+                    y=y,
+                    draft_y=draft_y,
+                    draft_tokens=draft_tokens,
+                )
 
 
 def stream_generate(
