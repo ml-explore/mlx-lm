@@ -240,6 +240,89 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_composed_param_schema(self):
+        branches = [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "new"},
+                    "idPrefix": {"type": "string"},
+                },
+                "required": ["kind", "idPrefix"],
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "existing"},
+                    "pluginId": {"type": "string"},
+                },
+                "required": ["kind", "pluginId"],
+            },
+        ]
+        test_case = (
+            "<function=f>"
+            '<parameter=plugin>{"kind": "new", "idPrefix": "abc"}</parameter>'
+            "</function>"
+        )
+        expected = {
+            "name": "f",
+            "arguments": {"plugin": {"kind": "new", "idPrefix": "abc"}},
+        }
+
+        for keyword in ("oneOf", "anyOf"):
+            with self.subTest(keyword=keyword):
+                tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "f",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"plugin": {keyword: branches}},
+                            },
+                        },
+                    }
+                ]
+                tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+                self.assertEqual(tool_call, expected)
+
+    def test_qwen3_coder_param_conversion(self):
+        schema = {"anyOf": [{"type": "array"}, {"type": "string"}]}
+        test_cases = [
+            (schema, '["fiction", "new"]', ["fiction", "new"]),
+            (schema, "plain text", "plain text"),
+            (schema, '["unfinished"', '["unfinished"'),
+            (schema, "123", "123"),
+            (schema, "true", "true"),
+            (schema, '"quoted"', '"quoted"'),
+            ({"enum": ["123", "true"]}, "123", "123"),
+            ({"enum": ["123", "true"]}, "true", "true"),
+            ({"type": "string"}, '{"kind": "new"}', '{"kind": "new"}'),
+            ({"type": "string"}, "123", "123"),
+            ({"type": "string"}, "true", "true"),
+        ]
+        for param_schema, value, expected in test_cases:
+            with self.subTest(schema=param_schema, value=value):
+                tools = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "f",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"value": param_schema},
+                            },
+                        },
+                    }
+                ]
+                test_case = (
+                    "<function=f>" f"<parameter=value>{value}</parameter>" "</function>"
+                )
+                tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+                self.assertEqual(
+                    tool_call, {"name": "f", "arguments": {"value": expected}}
+                )
+
     def test_pythonic_nested_args(self):
         # Containers are rendered with tojson, so they hold true/false/null.
         test_case = (
