@@ -6,10 +6,11 @@ import mlx.core as mx
 
 import mlx_lm.models.gated_delta as gated_delta
 from mlx_lm.models.gated_delta import (
+    gated_delta_chunkwise,
     gated_delta_kernel,
     gated_delta_kernel_unpacked,
     gated_delta_kernel_xtree,
-    gated_delta_ops,
+    gated_delta_sequential,
 )
 
 
@@ -90,7 +91,7 @@ class TestGatedDelta(unittest.TestCase):
 
         q, k, v, g, beta, state = self._inputs(1, 64, 16, 32, 128, 128, mx.bfloat16)
         y_p, s_p = gated_delta_kernel(q, k, v, g, beta, state, None)
-        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, None)
+        y_r, s_r = gated_delta_sequential(q, k, v, g, beta, state, None)
         mx.eval(y_p, s_p, y_r, s_r)
         self.assertLess(_rel_l2(y_p, y_r), 2e-3)
         self.assertLess(_rel_l2(s_p, s_r), 2e-3)
@@ -116,7 +117,7 @@ class TestGatedDelta(unittest.TestCase):
         q, k, v, g, beta, state = self._inputs(2, 33, 8, 16, 128, 128, mx.bfloat16)
         mask = mx.arange(33)[None] < mx.array([[29], [17]])
         y_k, s_k = gated_delta_kernel(q, k, v, g, beta, state, mask)
-        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, mask)
+        y_r, s_r = gated_delta_sequential(q, k, v, g, beta, state, mask)
         mx.eval(y_k, s_k, y_r, s_r)
         # Outputs at padded positions are unspecified (the kernel zeros
         # them, the ops reference does not); compare valid positions only.
@@ -133,7 +134,7 @@ class TestGatedDelta(unittest.TestCase):
         g = mx.exp(-mx.random.uniform(shape=(1, 65, 8, 128)) * 0.2).astype(mx.float32)
         mx.eval(g)
         y_k, s_k = gated_delta_kernel(q, k, v, g, beta, state, None)
-        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, None)
+        y_r, s_r = gated_delta_sequential(q, k, v, g, beta, state, None)
         mx.eval(y_k, s_k, y_r, s_r)
         self.assertLess(_rel_l2(y_k, y_r), 2e-3)
         self.assertLess(_rel_l2(s_k, s_r), 2e-3)
@@ -143,7 +144,7 @@ class TestGatedDelta(unittest.TestCase):
             raise unittest.SkipTest("gated delta kernels are GPU only")
         q, k, v, g, beta, state = self._inputs(1, 65, 4, 8, 64, 64, mx.bfloat16)
         y_k, s_k = gated_delta_kernel(q, k, v, g, beta, state, None)
-        y_r, s_r = gated_delta_ops(q, k, v, g, beta, state, None)
+        y_r, s_r = gated_delta_sequential(q, k, v, g, beta, state, None)
         mx.eval(y_k, s_k, y_r, s_r)
         self.assertLess(_rel_l2(y_k, y_r), 2e-3)
         self.assertLess(_rel_l2(s_k, s_r), 2e-3)
@@ -168,6 +169,61 @@ class TestGatedDelta(unittest.TestCase):
         mx.eval(y_p, s_p, y_u, s_u)
         self.assertTrue(mx.array_equal(y_p, y_u))
         self.assertTrue(mx.array_equal(s_p, s_u))
+
+
+class TestGatedDeltaChunkwise(unittest.TestCase):
+    """The chunkwise training path must agree with the sequential reference."""
+
+    def _inputs(self, B, T, Hk, Hv, Dk, Dv, decay, dtype=mx.float32):
+        mx.random.seed(7)
+        q = _normed((B, T, Hk, Dk), Dk, dtype)
+        k = _normed((B, T, Hk, Dk), Dk, dtype)
+        v = mx.random.normal((B, T, Hv, Dv)).astype(dtype)
+        g = mx.exp(-mx.random.uniform(shape=(B, T, Hv)) * decay).astype(mx.float32)
+        beta = mx.random.uniform(shape=(B, T, Hv)).astype(dtype)
+        state = (mx.random.normal((B, Hv, Dv, Dk)) * 0.3).astype(mx.float32)
+        mx.eval(q, k, v, g, beta, state)
+        return q, k, v, g, beta, state
+
+    def test_matches_ops(self):
+        # decay 0.2 is the mild regime the kernels are tested at; 4.0 drives the
+        # cumulative products small, where dividing by them would overflow.
+        for decay in (0.2, 4.0):
+            for T, chunk in ((128, 64), (96, 64), (64, 16)):  # 96 exercises padding
+                args = self._inputs(1, T, 8, 16, 64, 64, decay)
+                y_ref, s_ref = gated_delta_sequential(*args, None)
+                y, s = gated_delta_chunkwise(*args, None, chunk_size=chunk)
+                mx.eval(y_ref, s_ref, y, s)
+                self.assertLess(_rel_l2(y, y_ref), 1e-5, f"decay={decay} T={T}")
+                self.assertLess(_rel_l2(s, s_ref), 1e-5, f"decay={decay} T={T}")
+
+    def test_grouped_query_heads(self):
+        args = self._inputs(2, 64, 4, 16, 64, 64, 0.5)  # Hv // Hk == 4
+        y_ref, s_ref = gated_delta_sequential(*args, None)
+        y, s = gated_delta_chunkwise(*args, None, chunk_size=32)
+        mx.eval(y_ref, s_ref, y, s)
+        self.assertLess(_rel_l2(y, y_ref), 1e-5)
+        self.assertLess(_rel_l2(s, s_ref), 1e-5)
+
+    def test_gradients_match_ops(self):
+        q, k, v, g, beta, state = self._inputs(1, 64, 2, 4, 32, 32, 0.5)
+        w = mx.random.normal((1, 64, 4, 32))
+
+        def make(fn, **kwargs):
+            def loss(q, k, v, g, beta):
+                y, s = fn(q, k, v, g, beta, state, None, **kwargs)
+                return (y * w).sum() + (s * s).sum()
+
+            return loss
+
+        argnums = (0, 1, 2, 3, 4)
+        ref = mx.grad(make(gated_delta_sequential), argnums=argnums)(q, k, v, g, beta)
+        got = mx.grad(make(gated_delta_chunkwise, chunk_size=16), argnums=argnums)(
+            q, k, v, g, beta
+        )
+        mx.eval(ref, got)
+        for a, b in zip(ref, got):
+            self.assertLess(_rel_l2(b, a), 1e-4)
 
 
 if __name__ == "__main__":
