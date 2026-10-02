@@ -266,6 +266,12 @@ def build_parser():
         help="How often to log the training metrics. Overrides the experiment config",
     )
     parser.add_argument(
+        "--steps-per-checkpoint",
+        type=int,
+        default=None,
+        help="How often to save a checkpoint. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--wandb",
         action="store_true",
         help="Log the run to wandb. The run is named after the config, the "
@@ -293,6 +299,8 @@ def cli():
         config.all_reduce_size = args.all_reduce_size
     if args.steps_per_report is not None:
         config.steps_per_report = args.steps_per_report
+    if args.steps_per_checkpoint is not None:
+        config.steps_per_checkpoint = args.steps_per_checkpoint
     if args.init_from is not None:
         with config.ignore_type():
             config.init_from = args.init_from
