@@ -296,7 +296,7 @@ class Model(nn.Module):
         out = self.model.embed_tokens.as_linear(out)
         if self.mup_width_multiplier:
             out = out / self.mup_width_multiplier
-        out[self._dummy_tokenizer_ids] = -float("inf")
+        out[..., self._dummy_tokenizer_ids] = -float("inf")
         return out
 
     @property

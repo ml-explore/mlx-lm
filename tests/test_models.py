@@ -14,6 +14,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    BatchKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
@@ -406,6 +407,30 @@ class TestModels(unittest.TestCase):
 
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
+
+    def left_padding_test_runner(self, model):
+        # A prompt run on its own must produce the same logits as the same
+        # prompt run as a shorter, left-padded member of a batch, both for
+        # the prefill and for a subsequent decode step.
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        short = [5, 6, 7]
+        long = [11, 12, 13, 14, 15, 16]
+        pad = len(long) - len(short)
+
+        cache = make_prompt_cache(model)
+        single = model(mx.array([short]), cache=cache)[0, -1]
+        next_tok = mx.argmax(single)
+        single_next = model(next_tok.reshape(1, 1), cache=cache)[0, -1]
+
+        batch_cache = [BatchKVCache(left_padding=[pad, 0]) for _ in model.layers]
+        batch = mx.array([[0] * pad + short, long])
+        batched = model(batch, cache=batch_cache)[0, -1]
+        next_toks = mx.array([[next_tok.item()], [0]])
+        batched_next = model(next_toks, cache=batch_cache)[0, -1]
+
+        self.assertTrue(mx.allclose(single, batched, rtol=1e-4, atol=1e-4))
+        self.assertTrue(mx.allclose(single_next, batched_next, rtol=1e-4, atol=1e-4))
 
     def test_bailing_moe_v3(self):
         from dataclasses import replace
@@ -1643,6 +1668,55 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_minicpm3(self):
+        from mlx_lm.models import minicpm3
+
+        args = minicpm3.ModelArgs(
+            model_type="minicpm3",
+            hidden_size=64,
+            dim_model_base=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=100,
+            num_key_value_heads=4,
+            q_lora_rank=32,
+            qk_nope_head_dim=16,
+            qk_rope_head_dim=8,
+            kv_lora_rank=32,
+            scale_depth=1.0,
+            scale_emb=1.0,
+            max_position_embeddings=64,
+            rope_scaling={
+                "original_max_position_embeddings": 64,
+                "short_factor": [1.0] * 4,
+                "long_factor": [1.0] * 4,
+            },
+        )
+        model = minicpm3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+        self.left_padding_test_runner(model)
+
+    def test_phixtral(self):
+        from mlx_lm.models import phixtral
+
+        args = phixtral.ModelArgs(
+            model_type="phixtral",
+            num_vocab=100,
+            model_dim=64,
+            num_heads=4,
+            num_layers=2,
+            rotary_dim=16,
+            num_experts_per_tok=2,
+            num_local_experts=4,
+        )
+        model = phixtral.Model(args)
+        self.model_test_runner(model, args.model_type, args.num_vocab, args.num_layers)
+        self.left_padding_test_runner(model)
+
     def test_mamba(self):
         from mlx_lm.models import mamba
 
@@ -1985,6 +2059,39 @@ class TestModels(unittest.TestCase):
             },
         )
         model = deepseek_v3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_deepseek_v41(self):
+        from mlx_lm.models import deepseek_v41
+
+        args = deepseek_v41.ModelArgs(
+            model_type="deepseek_v41",
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            head_dim=32,
+            q_lora_rank=32,
+            qk_rope_head_dim=8,
+            o_groups=2,
+            o_lora_rank=16,
+            moe_intermediate_size=32,
+            n_routed_experts=8,
+            num_experts_per_tok=2,
+            sliding_window=4,
+            compress_ratios=(0, 2, 2, 2, 1, 1),
+            kv_source_layer_ids=(1, 4),
+            index_source_layer_ids=(1, 2, 4, 5),
+            index_n_heads=4,
+            index_head_dim=32,
+            index_topk=3,
+            candidate_source_layer_id=4,
+            candidate_topk_blocks=2,
+            candidate_block_size=2,
+        )
+        model = deepseek_v41.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
@@ -2455,15 +2562,28 @@ class TestModels(unittest.TestCase):
             num_attention_heads=4,
             num_key_value_heads=2,
             layer_norm_epsilon=1e-4,
-            vocab_size=1000,
+            vocab_size=100352,
         )
         model = phi3small.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+        # The dummy tokens are masked in the vocab axis
+        out = model(mx.array([[1, 2, 3]]))
+        dummy = out[..., model._dummy_tokenizer_ids]
+        self.assertTrue(mx.all(dummy == -float("inf")).item())
+
     def test_phimoe(self):
         from mlx_lm.models import phimoe
+
+        # Near ties share the weight, other picks get 1.
+        gates = mx.array([[3.0, 1.0, 0.0, -1.0], [3.0, 2.99, 0.0, -1.0]])
+        inds, scores = phimoe.sparsemixer(gates, top_k=2, jitter_eps=0.01)
+        self.assertEqual(inds.tolist(), [[0, 1], [0, 1]])
+        self.assertTrue(mx.allclose(scores, mx.array([[1.0, 1.0], [0.5025, 1.0]])))
+        loss = lambda g: phimoe.sparsemixer(g, top_k=2, jitter_eps=0.01)[1].sum()
+        mx.eval(mx.grad(loss)(gates))
 
         args = phimoe.ModelArgs(
             model_type="phimoe",
@@ -2486,6 +2606,10 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+        args.rope_scaling = None
+        model = phimoe.Model(args)
+        self.assertIsInstance(model.layers[0].self_attn.rope, nn.RoPE)
 
     def test_recurrent_gemma(self):
         from mlx_lm.models import recurrent_gemma
