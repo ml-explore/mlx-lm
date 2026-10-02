@@ -22,6 +22,7 @@ from .models.cache import (
     TokenBuffer,
     can_trim_prompt_cache,
     load_prompt_cache,
+    make_prealloc_prompt_cache,
     make_prompt_cache,
     trim_prompt_cache,
 )
@@ -1532,6 +1533,9 @@ class BatchGenerator:
         prefill_batch_size: int = 8,
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
+        kv_preallocate_size: Optional[int] = None,
         stream=None,
     ):
         self.model = model
@@ -1543,6 +1547,9 @@ class BatchGenerator:
         self.prefill_batch_size = prefill_batch_size
         self.completion_batch_size = max(completion_batch_size, prefill_batch_size)
         self.max_kv_size = max_kv_size
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
+        self.kv_preallocate_size = kv_preallocate_size
 
         self._stream = stream or generation_stream
 
@@ -1673,7 +1680,15 @@ class BatchGenerator:
                 seq.append(seq[-1][-1:])
                 seq[-2] = seq[-2][:-1]
             if c is None:
-                c = make_prompt_cache(self.model, self.max_kv_size)
+                if self.kv_preallocate_size is not None:
+                    c = make_prealloc_prompt_cache(
+                        self.model,
+                        max_size=self.kv_preallocate_size,
+                        kv_bits=self.kv_bits,
+                        kv_group_size=self.kv_group_size,
+                    )
+                else:
+                    c = make_prompt_cache(self.model, self.max_kv_size)
             pending.append((uid, seq, m, c, at, s, lp, sm))
 
         self._unprocessed_sequences.extend(pending)
