@@ -27,6 +27,7 @@ class ModelArgs(BaseModelArgs):
     num_local_experts: int = 16
     num_experts_per_tok: int = 2
     rope_theta: float = 10000.0
+    router_jitter_noise: float = 0.01
 
 
 class Attention(nn.Module):
@@ -90,6 +91,26 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
+def sparsemixer(
+    gates: mx.array, *, top_k: int, jitter_eps: float
+) -> tuple[mx.array, mx.array]:
+    # Inference path of HF's sparsemixer.
+    masked = gates
+    inds, scores = [], []
+    for _ in range(top_k):
+        top = masked.max(axis=-1, keepdims=True)
+        ind = mx.stop_gradient(mx.argmax(masked, axis=-1, keepdims=True))
+        factor = mx.maximum(mx.abs(gates), top)
+        band = mx.where((top - gates) / factor > 2 * jitter_eps, -mx.inf, masked)
+        band = mx.softmax(band, axis=-1, precise=True)
+        scores.append(mx.take_along_axis(band, ind, axis=-1))
+        inds.append(ind)
+        masked = mx.put_along_axis(
+            masked, ind, mx.array(-mx.inf, masked.dtype), axis=-1
+        )
+    return mx.concatenate(inds, axis=-1), mx.concatenate(scores, axis=-1)
+
+
 class PhiMoESparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -97,6 +118,12 @@ class PhiMoESparseMoeBlock(nn.Module):
         self.ffn_dim = args.intermediate_size
         self.num_experts = args.num_local_experts
         self.top_k = args.num_experts_per_tok
+        self.jitter_eps = args.router_jitter_noise
+        if self.top_k > self.num_experts:
+            raise ValueError(
+                f"num_experts_per_tok ({self.top_k}) is larger than "
+                f"num_local_experts ({self.num_experts})."
+            )
 
         self.gate = nn.Linear(self.hidden_dim, self.num_experts, bias=False)
         self.switch_mlp = SwitchGLU(self.hidden_dim, self.ffn_dim, self.num_experts)
@@ -104,10 +131,7 @@ class PhiMoESparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
 
-        k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = mx.softmax(scores, axis=-1, precise=True)
+        inds, scores = sparsemixer(gates, top_k=self.top_k, jitter_eps=self.jitter_eps)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
