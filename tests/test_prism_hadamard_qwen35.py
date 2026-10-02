@@ -170,7 +170,6 @@ def build_pack(schema, tied):
             }
         )
 
-    lm.update_modules({})
     for path, w in unfolded.items():
         named[path].weight = w
     dense = {
@@ -240,6 +239,9 @@ class TestHadamardModel(unittest.TestCase):
 
     def test_schema2_untied(self):
         self._check(2, tied=False)
+
+    def test_schema2_tied(self):
+        self._check(2, tied=True)
 
     def test_rejects_wrong_namespace(self):
         config, _, _ = build_pack(1, tied=False)
