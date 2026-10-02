@@ -240,6 +240,47 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
 
+    def test_qwen3_coder_untyped_composite_params(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "define",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "plugin": {
+                                "oneOf": [
+                                    {"type": "object"},
+                                    {"type": "array"},
+                                ]
+                            },
+                            "target": {
+                                "anyOf": [{"type": "string"}, {"type": "integer"}]
+                            },
+                            "note": {"description": "free text"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=define>"
+            '<parameter=plugin>{"kind": "new", "idPrefix": "abc"}</parameter>'
+            "<parameter=target>main</parameter>"
+            "<parameter=note>14</parameter>"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(
+            tool_call["arguments"],
+            {
+                "plugin": {"kind": "new", "idPrefix": "abc"},
+                "target": "main",
+                "note": "14",
+            },
+        )
+
     def test_pythonic_nested_args(self):
         # Containers are rendered with tojson, so they hold true/false/null.
         test_case = (
