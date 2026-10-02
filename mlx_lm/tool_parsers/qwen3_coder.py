@@ -44,6 +44,11 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
 
     if "type" in param:
         param_type = str(param["type"]).strip().lower()
+    elif any(k in param for k in ("oneOf", "anyOf", "allOf")):
+        try:
+            return json.loads(param_value, strict=False)
+        except json.JSONDecodeError:
+            return param_value
     else:
         param_type = "string"
     if param_type in _string_types:
