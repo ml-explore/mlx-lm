@@ -228,6 +228,13 @@ def build_parser():
         help="Number of gradient accumulation steps. Overrides the experiment config",
     )
     parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=None,
+        help="Number of training steps. Also sets the length of the learning "
+        "rate schedule. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--save-dir",
         default="checkpoints",
         help="Where to write the model and checkpoints",
@@ -295,6 +302,8 @@ def cli():
         config.context_size = args.context_size
     if args.grad_accum_steps is not None:
         config.grad_accum_steps = args.grad_accum_steps
+    if args.num_steps is not None:
+        config.num_steps = args.num_steps
     if args.all_reduce_size is not None:
         config.all_reduce_size = args.all_reduce_size
     if args.steps_per_report is not None:
