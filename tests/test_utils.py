@@ -255,6 +255,70 @@ class TestUtils(unittest.TestCase):
             mx.eval(logits)
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
+    def test_load_model_rejects_per_module_map_in_checkpoint_names(self):
+        # muse_glimmer's sanitize() renames language_model.model.* to model.*, so a map keyed with the checkpoint names matches nothing.
+        from mlx_lm.models import muse_glimmer
+
+        config_in = {
+            "model_type": "muse_glimmer",
+            "vocab_size": 64,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "sliding_window": 8,
+        }
+        args = muse_glimmer.ModelArgs.from_dict(config_in)
+        model = muse_glimmer.Model(args)
+        # quantize_model writes only the top-level default, so a quant_predicate supplies the two per-module entries.
+        per_module = {
+            "lm_head": {"group_size": 32, "bits": 8},
+            "model.layers.0.mlp.down_proj": {"group_size": 32, "bits": 8},
+        }
+        model, config = utils.quantize_model(
+            model,
+            config_in,
+            group_size=32,
+            bits=4,
+            quant_predicate=lambda p, _: per_module.get(p, True),
+        )
+        self.assertEqual(
+            config["quantization"]["model.layers.0.mlp.down_proj"],
+            per_module["model.layers.0.mlp.down_proj"],
+        )
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            # A map in the model's namespace must still load.
+            loaded, _ = utils.load_model(Path(mlx_path))
+
+        self.assertEqual(loaded.lm_head.bits, 8)
+        self.assertEqual(loaded.layers[0].mlp.down_proj.bits, 8)
+        self.assertEqual(loaded.layers[1].mlp.down_proj.bits, 4)
+
+        # Put the same entries back under the names the checkpoint uses.
+        in_checkpoint_names = {
+            (
+                "language_model.lm_head."
+                if k == "lm_head"
+                else "language_model.model." + k.removeprefix("model.")
+            ): v
+            for k, v in per_module.items()
+        }
+        config["quantization"].update(in_checkpoint_names)
+        for k in per_module:
+            del config["quantization"][k]
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            utils.save_model(mlx_path, model)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+            with self.assertRaises(ValueError) as cm:
+                utils.load_model(Path(mlx_path))
+            self.assertIn("language_model.", str(cm.exception))
+
     def test_infer_quant_config(self):
         from mlx_lm.models.mla import MultiLinear
 
