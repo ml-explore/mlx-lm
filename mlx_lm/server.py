@@ -1228,7 +1228,9 @@ class APIHandler(BaseHTTPRequestHandler):
     def validate_model_parameters(self):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        # -1 means "no limit" in stream_generate/batch_generate; 0 is rejected there,
+        # so accept the sentinel and require at least one token otherwise.
+        self._validate("max_tokens", int, min_val=1, whitelist=[-1])
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
