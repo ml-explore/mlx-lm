@@ -13,16 +13,21 @@ import io
 import json
 import logging
 import os
+import time
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import boto3
 import mlx.core as mx
 import zstandard
 from botocore.config import Config
+from botocore.exceptions import BotoCoreError
 
 from mlx_lm.train.data.batching import tokenized_data
 
 S3_MAX_ATTEMPTS = int(os.environ.get("S3_MAX_ATTEMPTS", 10))
+S3_PREFETCH = int(os.environ.get("S3_PREFETCH", 2))
 MANIFEST_NAME = "manifest.json"
 
 DOLMA = {
@@ -85,29 +90,41 @@ def _open_stream(key, body):
     return body
 
 
-def s3_lines(bucket, key, client, skip=0, attempts=5):
-    sent = 0
+def download(bucket, key, client, attempts=S3_MAX_ATTEMPTS):
     for attempt in range(attempts):
         try:
-            body = client.get_object(Bucket=bucket, Key=key)["Body"]
-            stream = io.BufferedReader(_open_stream(key, body), buffer_size=2**20)
-            for idx, line in enumerate(stream):
-                if idx < skip + sent:
-                    continue
-                sent += 1
-                yield idx, line
-            return
-        except Exception:
-            logging.exception(
-                "%s failed after %d lines (attempt %d/%d)",
-                key,
-                sent,
-                attempt + 1,
-                attempts,
-            )
-            if sent == 0 and skip == 0:
+            return client.get_object(Bucket=bucket, Key=key)["Body"].read()
+        except BotoCoreError as e:
+            if attempt + 1 == attempts:
                 raise
-    raise RuntimeError(f"giving up on {key} after {attempts} attempts and {sent} lines")
+            logging.warning(
+                "%s: download failed (attempt %d/%d): %s", key, attempt + 1, attempts, e
+            )
+            time.sleep(min(2**attempt, 30))
+
+
+def read_ahead(fn, items, depth):
+    """Yield ``(item, fn(item))`` in order, with up to ``depth`` calls running ahead."""
+    pool = ThreadPoolExecutor(max(depth, 1))
+    try:
+        pending = deque()
+        for item in items:
+            pending.append((item, pool.submit(fn, item)))
+            if len(pending) > depth:
+                item, future = pending.popleft()
+                yield item, future.result()
+        while pending:
+            item, future = pending.popleft()
+            yield item, future.result()
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def s3_lines(key, data, skip=0):
+    stream = io.BufferedReader(_open_stream(key, io.BytesIO(data)), buffer_size=2**20)
+    for idx, line in enumerate(stream):
+        if idx >= skip:
+            yield idx, line
 
 
 def s3_data(
@@ -156,12 +173,11 @@ def s3_data(
                 f"{start_file_name} is not among rank {rank}'s files under {uri}"
             )
         keys = keys[keys.index(start_file_name) :]
-    for first, key in enumerate(keys):
+    files = read_ahead(lambda key: download(bucket, key, client), keys, S3_PREFETCH)
+    for first, (key, body) in enumerate(files):
         logging.info("reading s3://%s/%s", bucket, key)
         yield {
-            "lines": s3_lines(
-                bucket, key, client, skip=start_sample_idx if first == 0 else 0
-            ),
+            "lines": s3_lines(key, body, skip=start_sample_idx if first == 0 else 0),
             "file_name": key,
         }
 
