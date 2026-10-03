@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import time
+import types
 import unittest
 from queue import Queue
 from unittest import mock
@@ -231,6 +232,73 @@ class TestToolCallFormatter(unittest.TestCase):
             json.loads(tool_calls[1]["function"]["arguments"]),
             {"items": [{"name": "noodles", "organic": True}]},
         )
+
+
+class TestValidateMaxTokens(unittest.TestCase):
+    """max_tokens validation has to agree with what the generators accept.
+
+    ``stream_generate`` rejects 0 ("Maximum number of tokens must be non-zero
+    (use -1 for no limit)") and ``batch_generate`` rejects anything <= 0, while
+    -1 is the documented sentinel for no limit. The request validation has to
+    match, so that a bad value is a 400 from the server rather than an exception
+    raised later from inside generation.
+    """
+
+    # Every other parameter validate_model_parameters() touches, at a valid value,
+    # so the test exercises the real rule in server.py rather than restating it.
+    _VALID = dict(
+        stream=False,
+        temperature=1.0,
+        top_p=1.0,
+        top_k=0,
+        min_p=0.0,
+        num_draft_tokens=0,
+        repetition_penalty=1.0,
+        repetition_context_size=20,
+        presence_penalty=0.0,
+        presence_context_size=0,
+        frequency_penalty=0.0,
+        frequency_context_size=0,
+        logprobs=False,
+        top_logprobs=0,
+        xtc_probability=0.0,
+        xtc_threshold=0.0,
+        requested_model="default_model",
+        adapter=None,
+        seed=None,
+        logit_bias=None,
+    )
+
+    class _Params(types.SimpleNamespace):
+        # validate_model_parameters() calls self._validate, so the stand-in needs it.
+        _validate = APIHandler._validate
+
+    def _validate(self, value):
+        params = self._Params(max_tokens=value, **self._VALID)
+        APIHandler.validate_model_parameters(params)
+
+    def test_zero_is_rejected(self):
+        # 0 would be accepted by the request and then raise inside the generator.
+        with self.assertRaises(ValueError):
+            self._validate(0)
+
+    def test_negative_one_is_accepted(self):
+        # -1 is "no limit" for both stream_generate and batch_generate.
+        self._validate(-1)
+
+    def test_other_negatives_are_rejected(self):
+        for value in (-2, -100):
+            with self.assertRaises(ValueError):
+                self._validate(value)
+
+    def test_positive_values_are_accepted(self):
+        for value in (1, 10, 4096):
+            self._validate(value)
+
+    def test_non_int_is_rejected(self):
+        for value in ("10", 1.5, None):
+            with self.assertRaises(ValueError):
+                self._validate(value)
 
 
 class TestServer(unittest.TestCase):
