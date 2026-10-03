@@ -1760,8 +1760,6 @@ class BatchGenerator:
                 continue
             tokens = keys.shape[0] * keys.shape[2]
             bytes_per_token += (keys.nbytes + values.nbytes) / tokens
-        if bytes_per_token == 0:
-            return total
         pending_tokens = sum(len(s) for p in self._unprocessed_sequences for s in p[1])
         return total + int(pending_tokens * bytes_per_token)
 
