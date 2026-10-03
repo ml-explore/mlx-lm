@@ -552,8 +552,9 @@ class ResponseGenerator:
             if think_start > think_end:
                 initial_state = "reasoning"
 
-        # It is not a user message so no segmentation needed.
-        if messages[-1]["role"] != "user":
+        # Only a prompt that ends with a user or tool message has a message end
+        # to save a cache at.
+        if messages[-1]["role"] not in ("user", "tool"):
             return prompt, [prompt], ["assistant"], initial_state
 
         segments = []
@@ -577,6 +578,10 @@ class ResponseGenerator:
                 if a != b:
                     sys_end = i
                     break
+            else:
+                # Without an end-of-message token, the system part is an exact
+                # prefix of the prompt.
+                sys_end = len(sys_tokens)
             if sys_end > 0 and sys_end < len(prompt):
                 segments.append(prompt[:sys_end])
                 segment_types.append("system")
@@ -1398,6 +1403,8 @@ class APIHandler(BaseHTTPRequestHandler):
         prev_state = ctx.initial_state
         finish_reason = "stop"
         reasoning_text = ""
+        all_reasoning = ""
+        has_text = False
         made_tool_call = False
         tool_text = ""
         tool_calls = []
@@ -1428,6 +1435,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Collect the clean text by state: reasoning, tool, or normal
                 if current_state == "reasoning":
                     reasoning_text += clean_text
+                    all_reasoning += clean_text
                 elif current_state == "tool":
                     tool_text += clean_text
                 elif current_state == "normal":
@@ -1436,6 +1444,7 @@ class APIHandler(BaseHTTPRequestHandler):
                         tool_text = ""
                         made_tool_call = True
                     text += clean_text
+                    has_text = has_text or bool(clean_text)
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1472,6 +1481,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
+
+            # A turn that ends while still reasoning has its answer in the
+            # reasoning text, so return that text as the answer.
+            if finish_reason == "stop" and not has_text and all_reasoning:
+                text = all_reasoning
+                reasoning_text = ""
 
             if self.stream:
                 resp = self.generate_response(

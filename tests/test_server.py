@@ -5,6 +5,7 @@ import io
 import json
 import threading
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 import requests
@@ -13,13 +14,15 @@ from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache
 from mlx_lm.server import (
     APIHandler,
+    CompletionRequest,
+    GenerationContext,
     LRUPromptCache,
     Response,
     ResponseGenerator,
     SamplingArguments,
     _make_sampler,
 )
-from mlx_lm.utils import load
+from mlx_lm.utils import load, load_tokenizer
 
 
 class DummyModelProvider:
@@ -759,6 +762,129 @@ class TestMakeSampler(unittest.TestCase):
         token = sampler(logits)
         mx.eval(token)
         self.assertEqual(token.shape, (1,))
+
+
+class TestPromptSegments(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tokenizer = load_tokenizer("mlx-community/Qwen1.5-0.5B-Chat-4bit")
+        cls.stub = SimpleNamespace(
+            model_provider=SimpleNamespace(
+                cli_args=SimpleNamespace(chat_template_args={})
+            )
+        )
+
+    def tokenize(self, messages):
+        request = CompletionRequest("chat", "", messages, None, None)
+        args = SimpleNamespace(chat_template_kwargs=None)
+        return ResponseGenerator._tokenize(self.stub, self.tokenizer, request, args)
+
+    def test_tool_result_ends_a_segment(self):
+        prompt, segments, types, _ = self.tokenize(
+            [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Let me look."},
+                {"role": "tool", "content": "result"},
+            ]
+        )
+        self.assertEqual(types, ["system", "user"])
+        self.assertEqual(sum(len(s) for s in segments), len(prompt))
+
+    def test_system_prompt_without_end_token(self):
+        template = self.tokenizer.chat_template
+        self.tokenizer.chat_template = (
+            "{% for m in messages %}<|im_start|>{{ m['role'] }}\n"
+            "{{ m['content'] }}{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}"
+        )
+        try:
+            system = [{"role": "system", "content": "You are helpful."}]
+            sys_tokens = self.tokenizer.apply_chat_template(
+                system + [{"role": "user", "content": ""}]
+            )
+            prompt, segments, types, _ = self.tokenize(
+                system + [{"role": "user", "content": "Hi"}]
+            )
+        finally:
+            self.tokenizer.chat_template = template
+        self.assertEqual(types, ["system", "user"])
+        self.assertEqual(segments[0], sys_tokens)
+
+
+class TestReasoningOnlyAnswer(unittest.TestCase):
+    def post(self, texts, stream):
+        """Run a chat request on a generator that starts in reasoning."""
+        ctx = GenerationContext(
+            has_tool_calling=False,
+            has_thinking=True,
+            tool_parser=None,
+            text_sm=TextStateMachine(
+                {
+                    "normal": [("<think>", "reasoning")],
+                    "reasoning": [("</think>", "normal")],
+                }
+            ),
+            initial_state="reasoning",
+            prompt=[1, 2, 3],
+        )
+        responses = [Response(t, i, 0.0, None, ()) for i, t in enumerate(texts)]
+        responses.append(Response("", len(texts), 0.0, "stop", ()))
+        cli_args = SimpleNamespace(
+            num_draft_tokens=3,
+            max_tokens=64,
+            temp=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            allowed_origins=["*"],
+        )
+        generator = SimpleNamespace(
+            cli_args=cli_args,
+            generate=lambda *args, **kwargs: (ctx, iter(responses)),
+        )
+        body = json.dumps(
+            {"messages": [{"role": "user", "content": "Hi"}], "stream": stream}
+        ).encode()
+        handler = APIHandler.__new__(APIHandler)
+        handler.response_generator = generator
+        handler.system_fingerprint = "test"
+        handler.created = 0
+        handler.path = "/v1/chat/completions"
+        handler.headers = {"Content-Length": str(len(body))}
+        handler.rfile = io.BytesIO(body)
+        handler.wfile = io.BytesIO()
+        handler.request_version = "HTTP/1.1"
+        handler.requestline = "POST /v1/chat/completions HTTP/1.1"
+        handler.command = "POST"
+        handler.client_address = ("127.0.0.1", 0)
+        handler.log_message = lambda *args: None
+        handler.do_POST()
+        return handler.wfile.getvalue().decode().split("\r\n\r\n", 1)[1]
+
+    def stream_deltas(self, texts):
+        lines = self.post(texts, stream=True).splitlines()
+        chunks = [json.loads(l[6:]) for l in lines if l.startswith("data: {")]
+        return [c["choices"][0]["delta"] for c in chunks if c["choices"]]
+
+    def test_answer_without_end_of_reasoning(self):
+        message = json.loads(self.post(["The", " answer."], stream=False))
+        message = message["choices"][0]["message"]
+        self.assertEqual(message["content"], "The answer.")
+        self.assertNotIn("reasoning", message)
+
+    def test_streamed_answer_without_end_of_reasoning(self):
+        deltas = self.stream_deltas(["The", " answer."])
+        reasoning = "".join(d.get("reasoning", "") for d in deltas)
+        self.assertEqual(reasoning, "The answer.")
+        self.assertEqual(deltas[-1]["content"], "The answer.")
+
+    def test_answer_after_reasoning_is_unchanged(self):
+        deltas = self.stream_deltas(["Hmm.", "</think>", "Hi", " there"])
+        content = "".join(d.get("content", "") for d in deltas)
+        reasoning = "".join(d.get("reasoning", "") for d in deltas)
+        self.assertEqual(content, "Hi there")
+        self.assertEqual(reasoning, "Hmm.")
 
 
 if __name__ == "__main__":
