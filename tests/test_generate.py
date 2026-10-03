@@ -14,11 +14,120 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
+
+
+class TestSpeculativeCheckpoints(unittest.TestCase):
+    def test_recurrent_cache_boundaries(self):
+        class TrimmableCache(KVCache):
+            def checkpoint(self):
+                raise AssertionError("Trimmable layers must not save checkpoints")
+
+            def rollback(self, checkpoint):
+                raise AssertionError("Trimmable layers must use trim")
+
+            def trim(self, n):
+                self.trim_calls += 1
+                return super().trim(n)
+
+            def __init__(self):
+                super().__init__()
+                self.trim_calls = 0
+
+        class RecurrentModel:
+            layers = [None, None]
+
+            def __init__(self, mode="target"):
+                self.mode = mode
+                self.calls = []
+
+            def __call__(self, inputs, cache):
+                self.calls.append(inputs.shape[1])
+                kv = inputs[:, None, :, None].astype(mx.float32)
+                cache[1].update_and_fetch(kv, kv)
+                state = cache[0][0]
+                if state is None:
+                    state = mx.zeros((1,), dtype=mx.int32)
+                states = mx.cumsum(inputs.astype(mx.int32), axis=1) + state[:, None]
+                cache[0][0] = states[:, -1]
+                cache[0][1] = inputs[:, -1]
+                predictions = (inputs + 1) % 16
+                if self.mode == "reject":
+                    predictions = (predictions + 1) % 16
+                elif self.mode == "partial":
+                    predictions = (predictions + inputs % 2) % 16
+                return mx.where(
+                    mx.arange(16)[None, None, :] == predictions[..., None],
+                    0.0,
+                    -100.0,
+                )
+
+        for mode in ("target", "reject", "partial"):
+            with self.subTest(mode=mode):
+                target = RecurrentModel()
+                draft = RecurrentModel(mode)
+                cache = [
+                    ArraysCache(2),
+                    TrimmableCache(),
+                    ArraysCache(2),
+                    TrimmableCache(),
+                ]
+                results = list(
+                    speculative_generate_step(
+                        mx.array([2], mx.uint32),
+                        target,
+                        draft,
+                        prompt_cache=cache,
+                        max_tokens=6,
+                        num_draft_tokens=4,
+                    )
+                )
+                self.assertEqual([r[0] for r in results], list(range(3, 9)))
+                last_cached = 8 if mode == "target" else 7
+                self.assertEqual(cache[0][0].item(), sum(range(2, last_cached + 1)))
+                self.assertEqual(cache[0][1].item(), last_cached)
+                self.assertEqual(cache[2][0].item(), sum(range(2, 8)))
+                self.assertEqual(cache[2][1].item(), 7)
+                self.assertEqual(cache[1].offset, last_cached - 1)
+                self.assertEqual(cache[3].offset, 6)
+                self.assertGreater(cache[1].trim_calls, 0)
+                self.assertGreater(cache[3].trim_calls, 0)
+                self.assertTrue(all(n == 1 for n in target.calls))
+                if mode == "partial":
+                    self.assertEqual([r[2] for r in results], [True, False] * 3)
+
+                target = RecurrentModel()
+                draft = RecurrentModel(mode)
+                cache = [
+                    ArraysCache(2),
+                    TrimmableCache(),
+                    ArraysCache(2),
+                    TrimmableCache(),
+                ]
+                generator = speculative_generate_step(
+                    mx.array([2], mx.uint32),
+                    target,
+                    draft,
+                    prompt_cache=cache,
+                    max_tokens=6,
+                    num_draft_tokens=4,
+                )
+                next(generator)
+                calls = (len(target.calls), len(draft.calls))
+                generator.close()
+                last_cached = 2 if mode == "reject" else 3
+                for c in cache[::2]:
+                    self.assertEqual(c[0].item(), sum(range(2, last_cached + 1)))
+                    self.assertEqual(c[1].item(), last_cached)
+                for c in cache[1::2]:
+                    self.assertEqual(c.offset, last_cached - 1)
+                    self.assertEqual(c.trim_calls, 1)
+                self.assertEqual(calls, (len(target.calls), len(draft.calls)))
 
 
 class TestGenerate(unittest.TestCase):
@@ -136,82 +245,6 @@ class TestGenerate(unittest.TestCase):
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
-
-    def test_stream_generate_speculative_non_trimmable(self):
-        class NonTrimmableKVCache(KVCache):
-            def is_trimmable(self):
-                return False
-
-        sampler = make_sampler(temp=0.0)
-        messages = [{"role": "user", "content": "hello"}]
-        prompt = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-        )
-
-        # Baseline generation text
-        expected = generate(
-            self.model,
-            self.tokenizer,
-            prompt=prompt,
-            max_tokens=5,
-            sampler=sampler,
-            verbose=False,
-        )
-
-        # Speculative generation when draft tokens are accepted
-        cache = [NonTrimmableKVCache() for _ in range(len(self.model.layers) * 2)]
-        responses = list(
-            stream_generate(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                prompt=prompt,
-                max_tokens=5,
-                draft_model=self.model,
-                num_draft_tokens=2,
-                sampler=sampler,
-                prompt_cache=cache,
-            )
-        )
-        self.assertEqual("".join(r.text for r in responses), expected)
-        self.assertEqual(
-            [r.from_draft for r in responses], [True, True, False, True, True]
-        )
-
-        # Speculative generation when draft tokens are rejected
-        cache = [NonTrimmableKVCache() for _ in range(len(self.model.layers) * 2)]
-        draft_model = lambda x, cache=None: mx.roll(
-            self.model(x, cache=cache), shift=1, axis=-1
-        )
-        responses = list(
-            stream_generate(
-                model=self.model,
-                tokenizer=self.tokenizer,
-                prompt=prompt,
-                max_tokens=5,
-                draft_model=draft_model,
-                num_draft_tokens=2,
-                sampler=sampler,
-                prompt_cache=cache,
-            )
-        )
-        self.assertEqual("".join(r.text for r in responses), expected)
-        self.assertEqual([r.from_draft for r in responses], [False] * 5)
-
-        # Early termination cleanup
-        cache = [NonTrimmableKVCache() for _ in range(len(self.model.layers) * 2)]
-        gen = stream_generate(
-            model=self.model,
-            tokenizer=self.tokenizer,
-            prompt=prompt,
-            max_tokens=5,
-            draft_model=draft_model,
-            num_draft_tokens=2,
-            sampler=sampler,
-            prompt_cache=cache,
-        )
-        next(gen)
-        gen.close()
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
