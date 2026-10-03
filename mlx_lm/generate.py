@@ -1746,6 +1746,25 @@ class BatchGenerator:
         total += sum(c.nbytes for c in self._generation_batch.prompt_cache)
         return total
 
+    @property
+    def estimated_prompt_cache_nbytes(self):
+        # Include the KV cost of pending prefills, which hold no arrays yet,
+        # projected from the per-token cost of the materialized batch caches.
+        total = self.prompt_cache_nbytes
+        caches = self._prompt_batch.prompt_cache + self._generation_batch.prompt_cache
+        bytes_per_token = 0
+        for cache in caches:
+            keys = getattr(cache, "keys", None)
+            values = getattr(cache, "values", None)
+            if keys is None or values is None:
+                continue
+            tokens = keys.shape[0] * keys.shape[2]
+            bytes_per_token += (keys.nbytes + values.nbytes) / tokens
+        if bytes_per_token == 0:
+            return total
+        pending_tokens = sum(len(s) for p in self._unprocessed_sequences for s in p[1])
+        return total + int(pending_tokens * bytes_per_token)
+
     def _make_batch(self, n: int):
         uids = []
         caches = []
