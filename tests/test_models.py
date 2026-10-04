@@ -790,6 +790,30 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_kolibri1(self):
+        from mlx_lm.models import kolibri1
+
+        args = kolibri1.ModelArgs(
+            model_type="kolibri1",
+            hidden_size=128,
+            num_hidden_layers=5,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            num_experts=8,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            sliding_window=4,
+            layer_types=["sliding_attention"] * 4 + ["full_attention"],
+        )
+        model = kolibri1.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def check_moe_sanitize(self, model, num_experts, moe_attr):
         """Expert stacking must not be gated on layer 0 being an MoE layer."""
         moe = [i for i, l in enumerate(model.model.layers) if hasattr(l.mlp, moe_attr)]
