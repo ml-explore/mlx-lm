@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import http
+import http.client
 import io
 import json
 import threading
