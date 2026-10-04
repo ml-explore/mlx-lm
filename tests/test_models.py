@@ -814,6 +814,47 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_kolibri1_sanitize_expert_names(self):
+        from mlx_lm.models import kolibri1
+
+        args = kolibri1.ModelArgs(
+            model_type="kolibri1",
+            hidden_size=128,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            rms_norm_eps=1e-6,
+            vocab_size=1000,
+            num_experts=4,
+            num_experts_per_tok=2,
+            moe_intermediate_size=64,
+            shared_expert_intermediate_size=64,
+            sliding_window=4,
+            layer_types=["sliding_attention", "full_attention"],
+        )
+        model = kolibri1.Model(args)
+        nn.quantize(model, group_size=64, bits=4)
+        weights = dict(tree_flatten(model.parameters()))
+        inputs = mx.array([[0, 1, 2]])
+        expected = model(inputs)
+
+        # Stacked experts named `experts`, and one entry per expert.
+        stacked = {k.replace("switch_mlp", "experts"): v for k, v in weights.items()}
+        per_expert = {}
+        for k, v in weights.items():
+            if "switch_mlp" in k:
+                for e in range(args.num_experts):
+                    per_expert[k.replace("switch_mlp", f"experts.{e}")] = v[e]
+            else:
+                per_expert[k] = v
+
+        for layout in [weights, stacked, per_expert]:
+            loaded = kolibri1.Model(args)
+            nn.quantize(loaded, group_size=64, bits=4)
+            loaded.load_weights(list(loaded.sanitize(dict(layout)).items()))
+            self.assertTrue(mx.array_equal(loaded(inputs), expected))
+
     def check_moe_sanitize(self, model, num_experts, moe_attr):
         """Expert stacking must not be gated on layer 0 being an MoE layer."""
         moe = [i for i, l in enumerate(model.model.layers) if hasattr(l.mlp, moe_attr)]

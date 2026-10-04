@@ -252,13 +252,18 @@ class Model(nn.Module):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}.mlp"
             for n in ["gate_proj", "down_proj", "up_proj"]:
-                if f"{prefix}.experts.0.{n}.weight" in weights:
-                    weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(
-                        [
-                            weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                            for e in range(self.args.num_experts)
-                        ]
-                    )
+                for s in ["weight", "scales", "biases"]:
+                    dst = f"{prefix}.switch_mlp.{n}.{s}"
+                    # Some converted checkpoints keep stacked experts as `experts`.
+                    if f"{prefix}.experts.{n}.{s}" in weights:
+                        weights[dst] = weights.pop(f"{prefix}.experts.{n}.{s}")
+                    elif f"{prefix}.experts.0.{n}.{s}" in weights:
+                        weights[dst] = mx.stack(
+                            [
+                                weights.pop(f"{prefix}.experts.{e}.{n}.{s}")
+                                for e in range(self.args.num_experts)
+                            ]
+                        )
         return weights
 
     @property
