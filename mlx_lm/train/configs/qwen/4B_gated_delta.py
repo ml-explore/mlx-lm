@@ -68,6 +68,6 @@ def get_config():
     config.steps_per_report = 10
     config.steps_per_checkpoint = 100_000
     config.fsdp_dim = 1
-    config.grad_checkpoint = True
+    config.grad_checkpoint = False
     config.tokenizer = "Qwen/Qwen3.5-4B-Base"
     return config
