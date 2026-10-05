@@ -9,7 +9,6 @@ from pathlib import Path
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.nn.utils import average_gradients
 from mlx.utils import tree_map, tree_reduce
 
 from mlx_lm.train import data, fsdp, optim, utils
@@ -28,10 +27,10 @@ def main(config, save_dir):
         if max_rec_size is not None:
             mx.set_wired_limit(max_rec_size)
 
-    fsdp_dim = config.get("fsdp_dim", 1)
-
     # Initialize distributed mesh and process groups
-    mesh = init_distributed(fsdp_dim)
+    mesh = init_distributed(config.get("fsdp_dim", 1))
+    # On jaccl the mesh can change the FSDP size, see init_distributed.
+    fsdp_dim = config.fsdp_dim = mesh.fsdp.size
 
     grad_accum_steps = config.get("grad_accum_steps", 1)
     max_grad_norm = config.get("max_grad_norm", None)
@@ -109,7 +108,7 @@ def main(config, save_dir):
             grads = tree_map(lambda x, y: x + y, grads, grad_accum)
         # update
         if do_update:
-            grads = average_gradients(
+            grads = mesh.ddp.average_gradients(
                 tree_map(lambda x: x / grad_accum_steps, grads),
                 all_reduce_size=config.get("all_reduce_size", 4e9),
             )
@@ -233,6 +232,13 @@ def build_parser():
         help="Number of gradient accumulation steps. Overrides the experiment config",
     )
     parser.add_argument(
+        "--fsdp-dim",
+        type=int,
+        default=None,
+        help="Number of ranks to shard the model over. With jaccl, any value "
+        "above 1 shards over all ranks. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--num-steps",
         type=int,
         default=None,
@@ -313,6 +319,8 @@ def cli():
         config.context_size = args.context_size
     if args.grad_accum_steps is not None:
         config.grad_accum_steps = args.grad_accum_steps
+    if args.fsdp_dim is not None:
+        config.fsdp_dim = args.fsdp_dim
     if args.num_steps is not None:
         config.num_steps = args.num_steps
     if args.grad_checkpoint is not None:
