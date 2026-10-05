@@ -108,10 +108,10 @@ def main(config, save_dir):
             grads = tree_map(lambda x, y: x + y, grads, grad_accum)
         # update
         if do_update:
-            grads = mesh.ddp.average_gradients(
-                tree_map(lambda x: x / grad_accum_steps, grads),
-                all_reduce_size=config.get("all_reduce_size", 4e9),
-            )
+            # grads = mesh.ddp.average_gradients(
+            #     tree_map(lambda x: x / grad_accum_steps, grads),
+            #     all_reduce_size=config.get("all_reduce_size", 4e9),
+            # )
             grad_norm = None
             if max_grad_norm is not None:
                 grads, grad_norm = utils.clip_grad_norm(
