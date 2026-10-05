@@ -379,6 +379,47 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.all(mx.isfinite(qout)).item())
         self.assertTrue(mx.allclose(out, qout, rtol=1e-2, atol=1e-2))
 
+    def _k2_horizon_args(self, **overrides):
+        from mlx_lm.models import k2_horizon
+
+        config = dict(
+            model_type="k2_horizon",
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=16,
+            vocab_size=1000,
+            rms_norm_eps=1e-6,
+            max_position_embeddings=512,
+            rope_theta=10000.0,
+            num_experts=0,
+            num_experts_per_tok=0,
+            moe_intermediate_size=0,
+            mlp_only_layers=[0, 1, 2, 3],
+            num_shared_experts=0,
+            mova_num_experts=0,
+            mova_num_experts_per_tok=0,
+            attention_bias=False,
+            query_key_norm=False,
+            layernorm_num_groups=1,
+            rope_parameters=None,
+            use_sliding_window=False,
+            tie_word_embeddings=False,
+        )
+        config.update(overrides)
+        return k2_horizon.ModelArgs(**config)
+
+    def test_k2_horizon(self):
+        from mlx_lm.models import k2_horizon
+
+        args = self._k2_horizon_args()
+        model = k2_horizon.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def model_test_runner(self, model, model_type, vocab_size, num_layers):
         self.assertEqual(len(model.layers), num_layers)
         self.assertEqual(model.model_type, model_type)
