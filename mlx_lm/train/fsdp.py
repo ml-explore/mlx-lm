@@ -30,8 +30,8 @@ def _make_gather_fn(group, full_shapes, shard_sizes, cast_dtype):
     @gather.vjp
     def gather_vjp(shards, cotangents, _):
         big_cot_full = mx.concatenate([c.reshape(S, -1) for c in cotangents], axis=1)
-        ## todo
         big_cot_shard = mx.distributed.all_sum(big_cot_full, group=group) / S
+        big_cot_shard = big_cot_shard[group.rank() : group.rank() + 1] / S
         parts = mx.split(big_cot_shard, split_indices, axis=1)
         return [p.reshape(shape) for p, shape in zip(parts, shard_shapes)]
 
