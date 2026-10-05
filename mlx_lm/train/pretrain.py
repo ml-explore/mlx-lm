@@ -235,6 +235,12 @@ def build_parser():
         "rate schedule. Overrides the experiment config",
     )
     parser.add_argument(
+        "--grad-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Turn gradient checkpointing on or off. Overrides the experiment config",
+    )
+    parser.add_argument(
         "--save-dir",
         default="checkpoints",
         help="Where to write the model and checkpoints",
@@ -304,6 +310,8 @@ def cli():
         config.grad_accum_steps = args.grad_accum_steps
     if args.num_steps is not None:
         config.num_steps = args.num_steps
+    if args.grad_checkpoint is not None:
+        config.grad_checkpoint = args.grad_checkpoint
     if args.all_reduce_size is not None:
         config.all_reduce_size = args.all_reduce_size
     if args.steps_per_report is not None:
