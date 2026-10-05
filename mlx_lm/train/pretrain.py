@@ -23,6 +23,11 @@ def main(config, save_dir):
     np.random.seed(config.seed)
     mx.random.seed(config.seed)
 
+    if mx.metal.is_available():
+        max_rec_size = mx.device_info().get("max_recommended_working_set_size")
+        if max_rec_size is not None:
+            mx.set_wired_limit(max_rec_size)
+
     fsdp_dim = config.get("fsdp_dim", 1)
 
     # Initialize distributed mesh and process groups
