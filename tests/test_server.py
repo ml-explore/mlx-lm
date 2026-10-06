@@ -17,6 +17,7 @@ from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
     LRUPromptCache,
+    Response,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
@@ -287,6 +288,32 @@ class TestServer(unittest.TestCase):
             first_text,
             json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
         )
+
+    def test_handle_completions_logprob_only_when_requested(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        post_data = {
+            "model": "default_model",
+            "prompt": "Once upon a time",
+            "max_tokens": 4,
+        }
+
+        # Without a seed the request is batched, with a seed it is not.
+        for extra in ({}, {"seed": 0}):
+            with mock.patch("mlx_lm.server.Response", wraps=Response) as response:
+                r = requests.post(url, json={**post_data, **extra})
+            self.assertEqual(r.status_code, 200)
+            logprobs = [c.args[2] for c in response.call_args_list]
+            self.assertTrue(logprobs)
+            self.assertTrue(all(lp is None for lp in logprobs))
+
+            with mock.patch("mlx_lm.server.Response", wraps=Response) as response:
+                r = requests.post(url, json={**post_data, **extra, "logprobs": True})
+            self.assertEqual(r.status_code, 200)
+            body = r.json()
+            logprobs = [c.args[2] for c in response.call_args_list]
+            self.assertTrue(logprobs)
+            self.assertTrue(all(isinstance(lp, float) for lp in logprobs))
+            self.assertIn("logprobs", body["choices"][0])
 
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
