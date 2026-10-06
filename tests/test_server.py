@@ -233,47 +233,6 @@ class TestToolCallFormatter(unittest.TestCase):
         )
 
 
-class TestValidateModelParameters(unittest.TestCase):
-    def _handler(self, **overrides):
-        handler = APIHandler.__new__(APIHandler)
-        params = {
-            "stream": False,
-            "max_tokens": 16,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": 0,
-            "min_p": 0.0,
-            "num_draft_tokens": 0,
-            "repetition_penalty": 0.0,
-            "repetition_context_size": 20,
-            "presence_penalty": 0.0,
-            "presence_context_size": 20,
-            "frequency_penalty": 0.0,
-            "frequency_context_size": 20,
-            "logprobs": False,
-            "top_logprobs": -1,
-            "xtc_probability": 0.0,
-            "xtc_threshold": 0.1,
-            "requested_model": "default_model",
-            "adapter": None,
-            "seed": None,
-            "logit_bias": None,
-        }
-        params.update(overrides)
-        for name, value in params.items():
-            setattr(handler, name, value)
-        return handler
-
-    def test_max_tokens_zero_is_rejected(self):
-        # The batch generator rejects max_tokens <= 0, so the request must
-        # fail validation instead of reaching the generation thread.
-        with self.assertRaises(ValueError):
-            self._handler(max_tokens=0).validate_model_parameters()
-
-    def test_max_tokens_one_is_accepted(self):
-        self._handler(max_tokens=1).validate_model_parameters()
-
-
 class TestServer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -296,6 +255,11 @@ class TestServer(unittest.TestCase):
         cls.httpd.server_close()
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
+
+    def test_max_tokens_zero_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
+        self.assertEqual(response.status_code, 400)
 
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
