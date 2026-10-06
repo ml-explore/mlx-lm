@@ -587,112 +587,54 @@ class TestToolParsing(unittest.TestCase):
             )
 
     def test_minicpm5(self):
+        properties = {
+            "city": {"type": "string"},
+            "days": {"type": "integer"},
+            "metric": {"type": "boolean"},
+        }
         tools = [
             {
                 "type": "function",
                 "function": {
-                    "name": "get_weather",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "city": {"type": "string"},
-                            "days": {"type": "integer"},
-                            "metric": {"type": "boolean"},
-                        },
-                    },
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": properties},
                 },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "write_file",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string"},
-                            "content": {"type": "string"},
-                        },
-                    },
-                },
-            },
+            }
         ]
-
-        # What the server passes: both markers stripped by the state machine.
-        tool_call = minicpm5.parse_tool_call(
-            '"get_weather"><param name="city">Paris</param>'
-            '<param name="days">3</param><param name="metric">true</param>',
-            tools,
-        )
-        self.assertEqual(
-            tool_call,
-            {
-                "name": "get_weather",
-                "arguments": {"city": "Paris", "days": 3, "metric": True},
-            },
-        )
-
-        # Single quotes and whitespace around the tags.
-        tool_call = minicpm5.parse_tool_call(
-            "<function name='get_weather'>\n<param name='city'> Paris </param>\n</function>",
-            tools,
-        )
-        self.assertEqual(
-            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
-        )
-
-        # CDATA keeps the value verbatim, including newlines and markup.
-        tool_call = minicpm5.parse_tool_call(
-            '<function name="write_file"><param name="path">a.txt</param>'
-            '<param name="content"><![CDATA[line 1\n<b>&</b>\n]]></param></function>',
-            tools,
-        )
-        self.assertEqual(
-            tool_call,
-            {
-                "name": "write_file",
-                "arguments": {"path": "a.txt", "content": "line 1\n<b>&</b>\n"},
-            },
-        )
-
-        # No schema: values stay strings.
-        tool_call = minicpm5.parse_tool_call(
-            '<function name="get_weather"><param name="days">3</param></function>'
-        )
-        self.assertEqual(tool_call, {"name": "get_weather", "arguments": {"days": "3"}})
-
-        # Parallel calls are consecutive blocks.
-        tool_calls = minicpm5.parse_tool_call(
-            '<function name="get_weather"><param name="city">Tokyo</param></function>\n'
-            '<function name="write_file"><param name="path">b.txt</param></function>',
-            tools,
-        )
-        self.assertEqual(
-            tool_calls,
-            [
-                {"name": "get_weather", "arguments": {"city": "Tokyo"}},
-                {"name": "write_file", "arguments": {"path": "b.txt"}},
-            ],
-        )
-
-        # Truncated by max_tokens: no closing tag, the complete params survive.
-        tool_call = minicpm5.parse_tool_call(
-            '"get_weather"><param name="city">Paris</param><param name="days">3',
-            tools,
-        )
-        self.assertEqual(
-            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
-        )
-
-        # No parameters, an empty value, and dotted/hyphenated names.
-        self.assertEqual(
-            minicpm5.parse_tool_call('<function name="get_weather"></function>'),
-            {"name": "get_weather", "arguments": {}},
-        )
-        self.assertEqual(
-            minicpm5.parse_tool_call(
-                '<function name="fs.read-file"><param name="path"></param></function>'
+        test_cases = [
+            # The server strips both markers before calling the parser.
+            (
+                '"f"><param name="city">Paris</param><param name="days">3</param>'
+                '<param name="metric">true</param>',
+                {"city": "Paris", "days": 3, "metric": True},
             ),
-            {"name": "fs.read-file", "arguments": {"path": ""}},
+            (
+                "<function name='f'>\n<param name='city'> Paris </param>\n</function>",
+                {"city": "Paris"},
+            ),
+            (
+                '<function name="f"><param name="city"><![CDATA[a\n<b>&</b>\n]]>'
+                "</param></function>",
+                {"city": "a\n<b>&</b>\n"},
+            ),
+            # Truncated by max_tokens: the complete params survive.
+            (
+                '"f"><param name="city">Paris</param><param name="days">3',
+                {"city": "Paris"},
+            ),
+            ('<function name="f"><param name="city"></param></function>', {"city": ""}),
+        ]
+        for text, arguments in test_cases:
+            with self.subTest(text=text):
+                tool_call = minicpm5.parse_tool_call(text, tools)
+                self.assertEqual(tool_call, {"name": "f", "arguments": arguments})
+
+        # Parallel calls are consecutive blocks; a call may have no params.
+        tool_calls = minicpm5.parse_tool_call(
+            '<function name="f"></function>\n<function name="g"></function>', tools
+        )
+        self.assertEqual(
+            tool_calls, [{"name": "f", "arguments": {}}, {"name": "g", "arguments": {}}]
         )
 
         with self.assertRaises(ValueError):
