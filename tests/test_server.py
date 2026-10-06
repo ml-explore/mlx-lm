@@ -261,6 +261,27 @@ class TestServer(unittest.TestCase):
         response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
         self.assertEqual(response.status_code, 400)
 
+    def test_xtc_threshold_above_half_is_rejected(self):
+        """The server's range must match the sampler's.
+
+        `apply_xtc` rejects anything above 0.5. While the server accepted up to
+        1.0, a value in between passed validation here and raised inside the
+        sampler instead -- which is a much worse place for it to fail.
+        """
+        url = f"http://localhost:{self.port}/v1/completions"
+
+        base = {"model": "default_model", "prompt": "hi", "max_tokens": 1}
+
+        response = requests.post(url, json={**base, "xtc_threshold": 0.7})
+        self.assertEqual(response.status_code, 400)
+
+        # 0.5 is the documented maximum and must still pass validation. Assert
+        # only that it is not rejected -- the shared generation thread may have
+        # been torn down by an earlier test in this class, so a 200 here is not
+        # something this test can rely on.
+        response = requests.post(url, json={**base, "xtc_threshold": 0.5})
+        self.assertNotEqual(response.status_code, 400, response.text[:200])
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 

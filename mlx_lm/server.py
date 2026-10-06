@@ -1249,7 +1249,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("logprobs", bool)
         self._validate("top_logprobs", int, min_val=0, max_val=11, whitelist=[-1])
         self._validate("xtc_probability", float, min_val=0, max_val=1)
-        self._validate("xtc_threshold", float, min_val=0, max_val=1)
+        # apply_xtc rejects anything above 0.5; keep the two ranges in step so a
+        # request is refused here rather than deeper in the sampler.
+        self._validate("xtc_threshold", float, min_val=0, max_val=0.5)
         self._validate("requested_model", str)
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
