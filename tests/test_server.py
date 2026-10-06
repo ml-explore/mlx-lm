@@ -256,6 +256,11 @@ class TestServer(unittest.TestCase):
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
 
+    def test_max_tokens_zero_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
+        self.assertEqual(response.status_code, 400)
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
