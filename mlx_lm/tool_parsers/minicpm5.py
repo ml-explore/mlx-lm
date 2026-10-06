@@ -67,7 +67,7 @@ def parse_tool_call(model_output: str, tools: Optional[Any] = None):
                 _param_value(param_match.group("value")),
                 _get_param_types_from_config(param_name, param_config),
             )
-        calls.append(dict(name=function_name, arguments=arguments))
+        calls.append({"name": function_name, "arguments": arguments})
 
     if len(calls) == 1:
         return calls[0]
