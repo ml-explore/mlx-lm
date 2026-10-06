@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -235,7 +235,6 @@ class Model(nn.Module):
     def sanitize(self, weights):
         # Split experts into sub matrices
         num_experts = self.args.ffn_config["moe_num_experts"]
-        dim = self.args.ffn_config["ffn_hidden_size"]
 
         pattern = "experts.mlp"
         new_weights = {k: v for k, v in weights.items() if pattern not in k}

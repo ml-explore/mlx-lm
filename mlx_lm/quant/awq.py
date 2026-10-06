@@ -3,9 +3,7 @@
 import argparse
 import copy
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Callable, Dict
-from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -143,6 +141,9 @@ deepseek_v2_awq = AWQConfig(
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
+    "ministral3": llama_awq,
+    "mistral3": update(llama_awq, lm_key="language_model"),
+    "llava": update(llama_awq, lm_key="language_model"),
     "qwen2": llama_awq,
     "qwen3": llama_awq,
     "gemma3_text": gemma3_text_awq,
@@ -449,7 +450,7 @@ def awq_quantize(
 
         return Catcher()
 
-    for e, block in enumerate(tqdm(model.layers)):
+    for block in tqdm(model.layers):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
         capture_leaves = tree_map(capture, orig_leaves, is_leaf=nn.Module.is_module)

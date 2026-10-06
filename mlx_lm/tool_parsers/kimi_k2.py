@@ -1,4 +1,5 @@
 # Copyright © 2026 Apple Inc.
+
 """
 Modified from:
 https://github.com/vllm-project/vllm/blob/main/vllm/tool_parsers/kimi_k2_tool_parser.py

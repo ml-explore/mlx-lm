@@ -103,6 +103,7 @@ def moe_gate_select(gates, router_bias, top_k, routed_scaling_factor, norm_topk_
     topk_indices = mx.argpartition(-corrected_scores, kth=top_k - 1, axis=-1)[
         ..., :top_k
     ]
+    topk_indices = mx.stop_gradient(topk_indices)
     topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
 
     if norm_topk_prob:

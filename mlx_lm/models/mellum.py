@@ -6,7 +6,6 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -122,6 +121,7 @@ class MellumSparseMoeBlock(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(gates, inds, axis=-1)
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)

@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 import unittest
 
 from mlx_lm.tool_parsers import (
@@ -154,6 +156,34 @@ class TestToolParsing(unittest.TestCase):
                 }
                 self.assertEqual(tool_call, expected)
 
+    def test_glm47_string_typed_args(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "postal_code": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+        # Laguna puts each pair on its own line. A string-typed argument stays a
+        # string even when it parses as a number.
+        test_case = (
+            "get_weather\n"
+            "<arg_key>postal_code</arg_key>\n<arg_value>123</arg_value>\n"
+            "<arg_key>days</arg_key>\n<arg_value>3</arg_value>"
+        )
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
+        )
+
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
         test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
@@ -209,6 +239,41 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+    def test_pythonic_nested_args(self):
+        # Containers are rendered with tojson, so they hold true/false/null.
+        test_case = (
+            "[grocery.orderIngredients("
+            'ingredientList=[{"name": "noodles", "organic": true, "unit": null}], '
+            'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
+        )
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            {
+                "name": "grocery.orderIngredients",
+                "arguments": {
+                    "ingredientList": [
+                        {"name": "noodles", "organic": True, "unit": None}
+                    ],
+                    "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+                },
+            },
+        )
+
+    def test_pythonic_parallel_calls(self):
+        test_case = '[get_time(location="Paris"), get_temperature(location="Tokyo")]'
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"location": "Paris"}},
+                {"name": "get_temperature", "arguments": {"location": "Tokyo"}},
+            ],
+        )
+
+    def test_pythonic_invalid_calls(self):
+        for test_case in ['[manim-video(mode="plan")]', 'get_time(location="Paris")']:
+            with self.assertRaises(ValueError):
+                pythonic.parse_tool_call(test_case, None)
 
     def test_gemma4(self):
         # Nested object
@@ -287,6 +352,90 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["name"], "skill_manage")
         self.assertEqual(tool_call["arguments"]["action"], "create")
         self.assertIn("{", tool_call["arguments"]["content"])
+
+    def test_mistral(self):
+        # Single call with trailing natural-language text.
+        test_case = 'get_weather[ARGS]{"city": "Paris"}\n\nLet me check that.'
+        tool_call = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
+        )
+
+        # Multiple (parallel) tool calls concatenated into one segment,
+        # separated by the "[TOOL_CALLS]" marker. These must all be returned as
+        # a list rather than dropped. Hyphens are legal in tool names.
+        test_case = (
+            'get-weather[ARGS]{"city": "Paris"}'
+            '[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
+        )
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(
+            tool_calls[0], {"name": "get-weather", "arguments": {"city": "Paris"}}
+        )
+        self.assertEqual(
+            tool_calls[1], {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+        )
+
+        # Multiple calls with no separator between them.
+        test_case = 'a[ARGS]{"x": 1}b[ARGS]{"y": 2}'
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "a", "arguments": {"x": 1}},
+                {"name": "b", "arguments": {"y": 2}},
+            ],
+        )
+
+        # Nested JSON and literal braces / "[ARGS]" inside a string must not
+        # confuse the parser.
+        test_case = (
+            'run[ARGS]{"cmd": "echo {x} [ARGS] }", '
+            '"opts": {"deep": [1, 2, {"k": "v"}]}}'
+        )
+        tool_call = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "run")
+        self.assertEqual(tool_call["arguments"]["cmd"], "echo {x} [ARGS] }")
+        self.assertEqual(tool_call["arguments"]["opts"], {"deep": [1, 2, {"k": "v"}]})
+
+        for test_case in (
+            "just some prose, no call here",
+            'a[ARGS]{"x": 1}b[ARGS]{"y":',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(test_case, None)
+
+    def test_mistral_json_list(self):
+        cases = [
+            (
+                '[{"name": "get_weather", "arguments": {"city": "Paris"}}]',
+                {"name": "get_weather", "arguments": {"city": "Paris"}},
+            ),
+            (
+                '[{"name": "c", "arguments": "{\\"e\\": \\"2+3\\"}", "id": "abcdefghi"}]',
+                {"name": "c", "arguments": {"e": "2+3"}, "id": "abcdefghi"},
+            ),
+            (
+                '[{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]',
+                [{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}],
+            ),
+            (
+                '[{"name": "shell", "arguments": {"cmd": "run[ARGS]{}"}}]',
+                {"name": "shell", "arguments": {"cmd": "run[ARGS]{}"}},
+            ),
+        ]
+        for text, expected in cases:
+            self.assertEqual(mistral.parse_tool_call(text, None), expected)
+
+        # A malformed entry raises instead of falling back to the header parser.
+        for text in (
+            '[{"name": 1}]',
+            '[{"name": 1, "arguments": {"cmd": "run[ARGS]{}"}}]',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(text, None)
 
     def test_kimi_k2(self):
         # Single tool call
@@ -525,6 +674,45 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["name"], "get_current_time")
         self.assertEqual(tool_call["arguments"], {})
+
+    def test_qwen3_coder_missing_parameter_tag_close(self):
+        """Recover the parameter name when the model drops the ">" after it."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        # Missing ">" after the parameter name
+        test_case = (
+            "<function=read_file>\n"
+            "<parameter=path\n"
+            "/etc/hosts\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "read_file")
+        self.assertEqual(tool_call["arguments"]["path"], "/etc/hosts")
+
+        # A ">" later in the value must not be mistaken for the name's
+        test_case = (
+            "<function=read_file>\n"
+            "<parameter=path\n"
+            "a>b\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"], {"path": "a>b"})
 
 
 if __name__ == "__main__":

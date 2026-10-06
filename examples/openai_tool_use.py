@@ -1,4 +1,5 @@
 # Copyright © 2025 Apple Inc.
+
 """
 This is an example of tool use with mlx_lm and the OpenAI client.
 
@@ -8,6 +9,7 @@ To run, first start the server:
 
 Then run this script.
 """
+
 import json
 
 from openai import OpenAI

@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import math
 from typing import List, Optional, Union
@@ -16,8 +16,8 @@ class SuScaledRoPE(nn.Module):
         original_max_position_embeddings: int = 4096,
         short_factor: Union[List[float], float] = 1.0,
         long_factor: Union[List[float], float] = 1.0,
-        short_mscale: float = None,
-        long_mscale: float = None,
+        short_mscale: Optional[float] = None,
+        long_mscale: Optional[float] = None,
     ):
         """
         Su Scaled Rotary Embedding layer.
@@ -58,10 +58,8 @@ class SuScaledRoPE(nn.Module):
         self._scale = long_mscale or (1.0 if factor <= 1.0 else default_scale(factor))
 
     def __call__(self, x, offset: Union[int, mx.array] = 0):
-        x = x[...]
-        x[..., : self.dim] = self._scale * x[..., : self.dim]
         return mx.fast.rope(
-            x,
+            x.at[..., : self.dim].multiply(self._scale),
             self.dim,
             traditional=False,
             base=None,
@@ -78,7 +76,7 @@ class Llama3RoPE(nn.Module):
         max_position_embeddings: int = 2048,
         traditional: bool = False,
         base: float = 10000,
-        scaling_config: dict = None,
+        scaling_config: Optional[dict] = None,
     ):
         super().__init__()
         self.dims = dims
@@ -181,18 +179,19 @@ class YarnRoPE(nn.Module):
         self.dims = dims
         self.traditional = traditional
 
-    def __call__(self, x, offset=0):
+    def __call__(self, x, offset=0, scale=1.0, inverse=False):
         if self.mscale != 1.0:
-            x = x[...]
-            x[..., : self.dims] = self.mscale * x[..., : self.dims]
+            input_scale = 1.0 / self.mscale if inverse else self.mscale
+            x = x.at[..., : self.dims].multiply(input_scale)
+        freqs = -self._freqs if inverse else self._freqs
         return mx.fast.rope(
             x,
             self.dims,
             traditional=self.traditional,
             base=None,
-            scale=1.0,
+            scale=scale,
             offset=offset,
-            freqs=self._freqs,
+            freqs=freqs,
         )
 
 
@@ -270,6 +269,23 @@ class DynamicNTKScalingRoPE(nn.Module):
             scale=1.0,
             offset=offset,
         )
+
+
+def apply_yarn_mscale(scale: float, scaling_config: Optional[dict]) -> float:
+    """Fold the yarn mscale into an attention scale.
+
+    ``initialize_rope`` puts the ``mscale / mscale_all_dim`` ratio on the rope;
+    this is the other half, ``mscale_all_dim`` squared.
+    """
+    if not scaling_config:
+        return scale
+    rope_type = scaling_config.get("type") or scaling_config.get("rope_type", "default")
+    mscale_all_dim = scaling_config.get("mscale_all_dim", 0)
+    factor = scaling_config.get("factor", 1)
+    if rope_type == "default" or not mscale_all_dim or factor <= 1:
+        return scale
+    s = 0.1 * mscale_all_dim * math.log(factor) + 1.0
+    return scale * s * s
 
 
 def initialize_rope(

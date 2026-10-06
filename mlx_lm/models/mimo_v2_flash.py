@@ -1,9 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -126,7 +124,10 @@ class Attention(nn.Module):
 
 class MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -170,6 +171,7 @@ def group_expert_select(
 
     k = top_k
     inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
     scores = mx.take_along_axis(orig_scores, inds, axis=-1)
     if top_k > 1 and norm_topk_prob:
         denominator = scores.sum(axis=-1, keepdims=True)
@@ -351,7 +353,7 @@ class Model(nn.Module):
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
