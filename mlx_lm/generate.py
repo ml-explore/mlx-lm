@@ -25,7 +25,14 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
+from .sample_utils import (
+    LogitsProcessor,
+    Sampler,
+    distributed_argmax,
+    gather_vocab,
+    greedy_sampler,
+    make_sampler,
+)
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
     does_model_support_input_embeddings,
@@ -348,6 +355,8 @@ def generate_step(
 
     Yields:
         Tuple[mx.array, mx.array]: One token and a vector of log probabilities.
+        If the model splits its vocabulary across ranks, a greedy step
+        without logits processors gives ``None`` log probabilities.
     """
     if input_embeddings is not None:
         if not does_model_support_input_embeddings(model):
@@ -382,6 +391,14 @@ def generate_step(
     )
 
     sampler = sampler or greedy_sampler
+    # A model that splits its output head by vocabulary rows across ranks sets
+    # vocab_group to the group, in rank order. Else it is None.
+    vocab_group = getattr(model, "vocab_group", None)
+    # With a split vocabulary, a greedy step without logits processors needs
+    # only the best token of each rank. Other steps gather the vocabulary.
+    split_greedy = (
+        vocab_group is not None and sampler is greedy_sampler and not logits_processors and vocab_group.size() > 1
+    )
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -403,6 +420,8 @@ def generate_step(
             )
 
             logits = logits[:, -1, :]
+            if vocab_group is not None and vocab_group.size() > 1 and not split_greedy:
+                logits = gather_vocab(logits, vocab_group)
 
             if logits_processors and len(input_tokens) > 0:
                 tokens = (
@@ -415,6 +434,8 @@ def generate_step(
 
             quantize_cache_fn(prompt_cache)
 
+            if split_greedy:
+                return distributed_argmax(logits, vocab_group), None
             logprobs = logits - mx.logsumexp(logits, keepdims=True)
             sampled = sampler(logprobs)
             return sampled, logprobs.squeeze(0)
