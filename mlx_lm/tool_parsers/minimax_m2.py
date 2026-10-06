@@ -95,7 +95,7 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
     normalized_types = [t.lower() for t in param_types]
 
     # Try null first if it's in the list
-    if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
+    if "null" in normalized_types and value.lower() in ("null", "none", "nil"):
         return None
 
     # Try each type in order of preference (most specific first, string as fallback)

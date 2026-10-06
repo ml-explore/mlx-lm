@@ -591,6 +591,7 @@ class TestToolParsing(unittest.TestCase):
             "city": {"type": "string"},
             "days": {"type": "integer"},
             "metric": {"type": "boolean"},
+            "note": {"type": ["string", "null"]},
         }
         tools = [
             {
@@ -623,6 +624,9 @@ class TestToolParsing(unittest.TestCase):
                 {"city": "Paris"},
             ),
             ('<function name="f"><param name="city"></param></function>', {"city": ""}),
+            # A nullable param keeps its value, and the string "None" stays a string.
+            ('"f"><param name="note">Paris</param>', {"note": "Paris"}),
+            ('"f"><param name="city">None</param>', {"city": "None"}),
         ]
         for text, arguments in test_cases:
             with self.subTest(text=text):
