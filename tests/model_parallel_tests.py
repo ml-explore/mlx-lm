@@ -5,8 +5,10 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.models import qwen2, qwen3_moe, qwen3_next
+from mlx_lm.generate import generate_step
+from mlx_lm.models import qwen2, qwen3_5, qwen3_moe, qwen3_next
 from mlx_lm.models.pipeline import PipelineMixin
+from mlx_lm.sample_utils import gather_vocab
 
 
 class Group:
@@ -385,6 +387,50 @@ class TestModelParallel(unittest.TestCase):
             model.model.pipeline(Group(rank, size))
             self.assertIsNone(model.model.ssm_idx)
             self.assertEqual(model.model.fa_idx, 0)
+
+    def test_shard_vocab(self):
+        group = mx.distributed.init()
+        vocab_size = 1024
+        config = {
+            "model_type": "qwen3_5",
+            "hidden_size": 128,
+            "num_hidden_layers": 4,
+            "intermediate_size": 128,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "head_dim": 64,
+            "vocab_size": vocab_size,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-5,
+            "tie_word_embeddings": False,
+        }
+        mx.random.seed(0)
+        model = qwen3_5.Model(qwen3_5.ModelArgs.from_dict(config))
+        x = mx.random.randint(0, vocab_size, shape=(2, 8))
+
+        def generate():
+            steps = generate_step(x[0], model, max_tokens=8)
+            tokens, logprobs = zip(*steps)
+            return list(tokens), mx.stack(logprobs)
+
+        expected = model(x)
+        expected_tokens, expected_logprobs = generate()
+
+        model.shard(group)
+        out = model(x)
+        if group.size() > 1:
+            self.assertIs(model.vocab_group, group)
+            self.assertEqual(out.shape[-1], vocab_size // group.size())
+            out = gather_vocab(out, group)
+        self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+
+        tokens, logprobs = generate()
+        self.assertEqual(tokens, expected_tokens)
+        self.assertTrue(mx.allclose(expected_logprobs, logprobs, rtol=1e-3, atol=1e-3))
 
 
 if __name__ == "__main__":

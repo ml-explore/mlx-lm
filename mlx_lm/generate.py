@@ -388,11 +388,9 @@ def generate_step(
     )
 
     sampler = sampler or greedy_sampler
-    # A model that splits its output head by vocabulary rows across ranks sets
-    # vocab_group to the group, in rank order. Else it is None.
+    # If lm_head is sharded across ranks, vocab_group is sharded group
+    # for gathering logits across ranks for sampling. Otherwise it is None.
     vocab_group = getattr(model, "vocab_group", None)
-    # With a split vocabulary, a greedy step without logits processors needs
-    # only the best token of each rank. Other steps gather the vocabulary.
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
