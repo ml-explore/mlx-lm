@@ -175,8 +175,11 @@ class Model(nn.Module):
         cache=None,
     ) -> mx.array:
 
+        if cache is None:
+            cache = [None] * len(self.transformer.h)
+
         if mask is None:
-            mask = create_attention_mask(x, cache)
+            mask = create_attention_mask(x, cache[0])
 
         y = self.transformer(x, mask, cache)
         return self.lm_head(y)

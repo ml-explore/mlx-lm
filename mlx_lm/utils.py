@@ -5,6 +5,7 @@ import glob
 import importlib
 import inspect
 import json
+import math
 import os
 import resource
 import shutil
@@ -55,6 +56,7 @@ MODEL_REMAPPING = {
     "iquestcoder": "llama",
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "deepseek_v41_text": "deepseek_v41",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -324,9 +326,42 @@ def _compressed_tensors_quantization(quantization_config: dict) -> dict:
     )
 
 
+# transformers tags non-finite floats so config.json stays valid JSON, e.g.
+# {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
+_FLOAT_TAG_KEY = "__float__"
+_FLOAT_TAGS = {
+    "Infinity": float("inf"),
+    "-Infinity": float("-inf"),
+    "NaN": float("nan"),
+}
+
+
+def _decode_tagged_floats(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        if set(obj) == {_FLOAT_TAG_KEY} and obj[_FLOAT_TAG_KEY] in _FLOAT_TAGS:
+            return _FLOAT_TAGS[obj[_FLOAT_TAG_KEY]]
+        return {k: _decode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_tagged_floats(v) for v in obj]
+    return obj
+
+
+def _encode_tagged_floats(obj: Any) -> Any:
+    """Tag non-finite floats again, so a saved config stays valid JSON."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        if math.isnan(obj):
+            return {_FLOAT_TAG_KEY: "NaN"}
+        return {_FLOAT_TAG_KEY: "Infinity" if obj > 0 else "-Infinity"}
+    if isinstance(obj, dict):
+        return {k: _encode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_encode_tagged_floats(v) for v in obj]
+    return obj
+
+
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
-        config = json.load(f)
+        config = _decode_tagged_floats(json.load(f))
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
@@ -341,6 +376,33 @@ def load_config(model_path: Path) -> dict:
             config["eos_token_id"] = eos_token_id
 
     return config
+
+
+def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """Recover the group_size, bits and mode a saved weight was packed with.
+
+    Use this for paths the per-tensor quantization map does not name, where the
+    top-level default can be wrong. ``module`` must still be unquantized.
+    """
+    scales = weights[f"{path}.scales"]
+    in_dims = module.weight.shape[-1]
+    group_size = in_dims // scales.shape[-1]
+    bits = (weights[f"{path}.weight"].shape[-1] * 32) // in_dims
+    # Only affine keeps the scales in the weight dtype. Each of the other modes
+    # allows exactly one (bits, group_size) pair.
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    if (bits, group_size) == (4, 16):
+        return {"group_size": group_size, "bits": bits, "mode": "nvfp4"}
+    if (bits, group_size) == (4, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp4"}
+    if (bits, group_size) == (8, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp8"}
+
+    raise ValueError(
+        f"Cannot infer the quantization mode of {path}: "
+        f"{bits} bits with group size {group_size}."
+    )
 
 
 def load_model(
@@ -415,6 +477,14 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
+    if "quantization_config" not in config:
+        # NVIDIA ModelOpt exports keep their quantization metadata in a separate
+        # file rather than in config.json.
+        hf_quant_config = model_path / "hf_quant_config.json"
+        if hf_quant_config.exists():
+            with open(hf_quant_config, "r") as fid:
+                config["quantization_config"] = json.load(fid)
+
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
@@ -429,7 +499,12 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            params = infer_quant_config(p, m, weights)
+            if f"{p}.global_scale" in weights and _takes_global_scale(m):
+                params["global_scale"] = True
+            return params
 
         nn.quantize(
             model,
@@ -454,8 +529,37 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "mxfp8":
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif (
+            quant_method == "fp8"
+            and quantization_config.get("scale_fmt") == "ue8m0"
+            and list(quantization_config.get("weight_block_size", ())) == [32, 32]
+        ):
+            # Power-of-two scales over 32x32 blocks are mxfp8, so the weights
+            # stay packed. Other fp8 checkpoints dequantize in their sanitize.
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
         elif quant_method == "compressed-tensors":
             quantization = _compressed_tensors_quantization(quantization_config)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method == "modelopt":
+            # NVIDIA ModelOpt.
+            algo = quantization_config["quantization"]["quant_algo"]
+            if algo != "NVFP4":
+                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+            quantization = {
+                "group_size": quantization_config["quantization"].get("group_size", 16),
+                "bits": 4,
+                "mode": "nvfp4",
+            }
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -765,8 +869,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -790,8 +893,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
@@ -864,12 +966,19 @@ def save_model(
         )
 
 
+def _takes_global_scale(module: nn.Module) -> bool:
+    """Only some layers hold an nvfp4 tensor scale."""
+    params = inspect.signature(module.to_quantized).parameters
+    return "global_scale" in params
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
     group_size: Optional[int],
     bits: Optional[int],
     mode: str = "affine",
+    global_scale: bool = False,
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -881,6 +990,8 @@ def quantize_model(
         group_size (Optional[int]): Group size for quantization.
         bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
+        global_scale (bool): Use one ``nvfp4`` tensor scale per expert on the
+          switch layers. Only these layers support it for now.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
@@ -911,7 +1022,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
@@ -921,6 +1032,12 @@ def quantize_model(
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        # The scale is a parameter of the layer, so the config must record it
+        # for the loader to rebuild the same shapes.
+        if global_scale and bool_or_params and _takes_global_scale(module):
+            if not isinstance(bool_or_params, dict):
+                bool_or_params = dict(quant_params)
+            bool_or_params["global_scale"] = True
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
@@ -1012,7 +1129,7 @@ def save_config(
 
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
-        json.dump(config, fid, indent=4)
+        json.dump(_encode_tagged_floats(config), fid, indent=4)
 
 
 def save(

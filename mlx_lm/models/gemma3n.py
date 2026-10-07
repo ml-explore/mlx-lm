@@ -120,6 +120,7 @@ class Gemma3nAttention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        offset: int = 0,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -127,15 +128,11 @@ class Gemma3nAttention(nn.Module):
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
 
-        offset = 0
         if self.is_kv_shared_layer and cache is not None:
             # For shared layers, retrieve KV from the designated cache layer
             keys, values = cache.keys_and_values()
-            offset = cache.offset
 
         else:
-            if cache is not None:
-                offset = cache.offset
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
             keys = self.k_norm(keys)
             keys = keys.transpose(0, 2, 1, 3)
@@ -328,6 +325,7 @@ class Gemma3nDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
+        offset: int = 0,
     ):
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -339,6 +337,7 @@ class Gemma3nDecoderLayer(nn.Module):
             active_prediction_normed,
             mask,
             cache,
+            offset=offset,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -491,6 +490,9 @@ class LanguageModel(nn.Module):
         h = mx.stack(h_list, axis=0)
         mags = mx.mean(h[1:] ** 2, axis=-1, keepdims=True) ** 0.5
         h[1:] = h[1:] * (target_magnitude / mx.maximum(mags, mx.finfo(h0.dtype).min))
+        # One position offset for the whole forward pass, so KV-shared layers
+        # do not read a cache their owner has already advanced.
+        offset = cache[0].offset if cache is not None and cache[0] is not None else 0
         for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
@@ -506,6 +508,7 @@ class LanguageModel(nn.Module):
                 mask,
                 cache[self.layer_idx_to_cache_idx[i]],
                 per_layer_input,
+                offset=offset,
             )
 
         # Per-layer inputs to single output

@@ -420,7 +420,7 @@ class FalconH1Model(nn.Module):
         h = self.embed_tokens(inputs)
 
         if cache is None:
-            cache = [(None, None) * len(self.layers)]
+            cache = [(None, None)] * len(self.layers)
 
         mamba_mask = create_ssm_mask(h, cache[0][0])
         attn_mask = create_attention_mask(h, cache[0][1])

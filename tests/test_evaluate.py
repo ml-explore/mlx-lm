@@ -104,6 +104,40 @@ class TestMLXLM(unittest.TestCase):
 
         self.assertEqual(result, ["answer"])
 
+    def test_loglikelihood_scores_only_continuation_after_context_truncation(self):
+        def mock_score_fn(inputs, cache=None):
+            targets = inputs[:, 1:]
+            return (
+                -targets.astype(mx.float32),
+                None,
+                mx.ones(targets.shape, dtype=mx.bool_),
+            )
+
+        request = MagicMock(args=("context", " continuation"))
+
+        for max_tokens, prefix in ((4, [1, 2, 3]), (3, [2, 3]), (2, [3])):
+            with self.subTest(max_tokens=max_tokens):
+                self.mlx_lm._max_tokens = max_tokens
+                self.mlx_lm._tokenize = MagicMock(
+                    side_effect=[
+                        [[1, 2, 3]],  # Context tokens.
+                        [[1, 2, 3, 4, 5]],  # Context + continuation tokens.
+                    ]
+                )
+                self.mlx_lm._process_prompt = MagicMock(
+                    return_value=(-mx.arange(6, dtype=mx.float32)[None, :], [])
+                )
+                self.mlx_lm._score_fn = MagicMock(side_effect=mock_score_fn)
+
+                result = self.mlx_lm.loglikelihood([request])
+
+                self.mlx_lm._process_prompt.assert_called_once_with(prefix)
+                self.mlx_lm._score_fn.assert_called_once()
+                inputs = self.mlx_lm._score_fn.call_args[0][0]
+                self.assertEqual(inputs.tolist(), [[4, 5]])
+                # The total also checks the first target scored from the prompt.
+                self.assertEqual(result, [(-9.0, False)])
+
     def test_loglikelihood_returns_negative_infinity_when_context_is_fully_truncated(
         self,
     ):
