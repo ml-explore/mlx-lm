@@ -23,7 +23,7 @@ def _scatter_unsort(x, inv_order, shape=None):
     return x
 
 
-def _quantize_experts(w, group_size, bits, mode):
+def _quantize_experts(w, *, group_size, bits, mode):
     """Quantize each expert with its own nvfp4 tensor scale."""
     if mode != "nvfp4":
         raise ValueError(f"A global scale needs 'nvfp4' mode, got '{mode}'.")
@@ -49,35 +49,34 @@ class QuantizedSwitchLinear(nn.Module):
     ):
         super().__init__()
 
+        self.group_size = group_size
+        self.bits = bits
+        self.mode = mode
+
         scale = math.sqrt(1 / input_dims)
         weight = mx.random.uniform(
             low=-scale,
             high=scale,
             shape=(num_experts, output_dims, input_dims),
         )
+        self._quantize(weight, global_scale)
+        if bias:
+            self.bias = mx.zeros((num_experts, output_dims))
+        # Freeze this model's parameters
+        self.freeze()
+
+    def _quantize(self, weight, global_scale=False):
         if global_scale:
             self.weight, self.scales, self.global_scale = _quantize_experts(
-                weight, group_size, bits, mode
+                weight, group_size=self.group_size, bits=self.bits, mode=self.mode
             )
             self.biases = None
         else:
             self.weight, self.scales, *biases = mx.quantize(
-                weight,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
+                weight, self.group_size, self.bits, mode=self.mode
             )
             self.biases = biases[0] if biases else None
-
-        if bias:
-            self.bias = mx.zeros((num_experts, output_dims))
-
-        self.group_size = group_size
-        self.bits = bits
-        self.mode = mode
-
-        # Freeze this model's parameters
-        self.freeze()
+            self.global_scale = None
 
     @property
     def input_dims(self):
@@ -102,7 +101,7 @@ class QuantizedSwitchLinear(nn.Module):
             group_size=self.group_size,
             bits=self.bits,
             mode=self.mode,
-            global_scale=self.get("global_scale"),
+            global_scale=self.global_scale,
             sorted_indices=sorted_indices,
         )
         if "bias" in self:
@@ -165,16 +164,7 @@ class SwitchLinear(nn.Module):
             bits,
             mode=mode,
         )
-        if global_scale:
-            ql.weight, ql.scales, ql.global_scale = _quantize_experts(
-                self.weight, group_size, bits, mode
-            )
-            ql.biases = None
-        else:
-            ql.weight, ql.scales, *biases = mx.quantize(
-                self.weight, group_size, bits, mode=mode
-            )
-            ql.biases = biases[0] if biases else None
+        ql._quantize(self.weight, global_scale)
 
         if "bias" in self:
             ql.bias = self.bias
