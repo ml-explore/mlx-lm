@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import ast
 import json
 from typing import Any
 
@@ -95,7 +96,7 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
     normalized_types = [t.lower() for t in param_types]
 
     # Try null first if it's in the list
-    if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
+    if "null" in normalized_types and value.lower() in ("null", "none", "nil"):
         return None
 
     # Try each type in order of preference (most specific first, string as fallback)
@@ -140,8 +141,12 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
             continue
         elif param_type in ["object", "array"]:
             try:
-                return json.loads(value)
+                return json.loads(value, strict=False)
             except json.JSONDecodeError:
+                pass
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 continue
 
     # Fallback: try JSON parse, then return as string
