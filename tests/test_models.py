@@ -445,7 +445,8 @@ class TestModels(unittest.TestCase):
 
         # Without it the layer keeps the plain nvfp4 parameters
         self.assertNotIn(
-            "global_scale", layer.to_quantized(group_size=16, bits=4, mode="nvfp4", global_scale=False)
+            "global_scale",
+            layer.to_quantized(group_size=16, bits=4, mode="nvfp4", global_scale=False),
         )
         with self.assertRaises(ValueError):
             layer.to_quantized(group_size=32, bits=4, mode="mxfp4", global_scale=True)
