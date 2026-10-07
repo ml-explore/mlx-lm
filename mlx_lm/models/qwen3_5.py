@@ -557,10 +557,10 @@ class Model(nn.Module):
                 )
 
         # Split the output head by vocabulary rows
-        lm = self.language_model
-        if N > 1 and lm.args.vocab_size % N == 0 and not lm.args.tie_word_embeddings:
-            lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
-            self.vocab_group = group
+        # lm = self.language_model
+        # if N > 1 and lm.args.vocab_size % N == 0 and not lm.args.tie_word_embeddings:
+        #     lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
+        #     self.vocab_group = group
 
     @property
     def layers(self):
