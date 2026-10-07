@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import ast
 import json
 from typing import Any
 
@@ -140,8 +141,12 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
             continue
         elif param_type in ["object", "array"]:
             try:
-                return json.loads(value)
+                return json.loads(value, strict=False)
             except json.JSONDecodeError:
+                pass
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 continue
 
     # Fallback: try JSON parse, then return as string

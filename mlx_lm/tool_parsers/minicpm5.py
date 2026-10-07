@@ -9,7 +9,6 @@ outer wrapper. Values containing ``<``, ``&`` or newlines are wrapped in a
 CDATA block, and parallel calls are consecutive ``<function>`` blocks.
 """
 
-import ast
 from typing import Any, Optional
 
 import regex as re
@@ -46,17 +45,6 @@ def _param_value(raw: str) -> str:
     return raw.strip()
 
 
-def _convert(value: str, param_types: list[str]) -> Any:
-    result = _convert_param_value_with_types(value, param_types)
-    if isinstance(result, str) and {"object", "array"} & set(param_types):
-        try:
-            literal = ast.literal_eval(value)
-            return literal if isinstance(literal, (dict, list)) else result
-        except (ValueError, SyntaxError):
-            return result
-    return result
-
-
 def parse_tool_call(model_output: str, tools: Optional[Any] = None):
     function_matches = list(_function_regex.finditer(model_output))
     if not function_matches:
@@ -75,7 +63,7 @@ def parse_tool_call(model_output: str, tools: Optional[Any] = None):
         arguments = {}
         for param_match in _param_regex.finditer(function_match.group("body")):
             param_name = _extract_name(param_match.group("name"))
-            arguments[param_name] = _convert(
+            arguments[param_name] = _convert_param_value_with_types(
                 _param_value(param_match.group("value")),
                 _get_param_types_from_config(param_name, param_config),
             )
