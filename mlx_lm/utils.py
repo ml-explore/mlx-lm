@@ -502,10 +502,6 @@ def load_model(
             if f"{p}.scales" not in weights:
                 return False
             params = infer_quant_config(p, m, weights)
-            # An nvfp4 tensor scale is a parameter of the layer, so the layer has
-            # to be built to hold one. Whether it needs one is a property of the
-            # checkpoint, so read it from the weights rather than the config:
-            # externally produced nvfp4 does not carry per-layer entries.
             if f"{p}.global_scale" in weights and _takes_global_scale(m):
                 params["global_scale"] = True
             return params
