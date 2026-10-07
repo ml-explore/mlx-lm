@@ -601,7 +601,17 @@ class TestToolParsing(unittest.TestCase):
                     "name": "f",
                     "parameters": {"type": "object", "properties": properties},
                 },
-            }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "g",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"nums": {"type": "array"}},
+                    },
+                },
+            },
         ]
         test_cases = [
             # Markers stripped, as the server passes it.
@@ -615,9 +625,9 @@ class TestToolParsing(unittest.TestCase):
                 {"city": "Paris"},
             ),
             (
-                '<function name="f"><param name="city"><![CDATA[a\n<b>&</b>\n]]>'
-                "</param></function>",
-                {"city": "a\n<b>&</b>\n"},
+                '<function name="f"><param name="days">3</param>'
+                '<param name="city"><![CDATA[a\n<b>&</b>\n]]></param></function>',
+                {"days": 3, "city": "a\n<b>&</b>\n"},
             ),
             # Truncated: complete params survive.
             (
@@ -640,10 +650,18 @@ class TestToolParsing(unittest.TestCase):
                 self.assertEqual(tool_call, {"name": "f", "arguments": arguments})
 
         tool_calls = minicpm5.parse_tool_call(
-            '<function name="f"></function>\n<function name="g"></function>', tools
+            '<function name="f"><param name="days">3</param></function>\n'
+            '<function name="g"><param name="nums">[1, 2]</param></function>\n'
+            '<function name="h"></function>',
+            tools,
         )
         self.assertEqual(
-            tool_calls, [{"name": "f", "arguments": {}}, {"name": "g", "arguments": {}}]
+            tool_calls,
+            [
+                {"name": "f", "arguments": {"days": 3}},
+                {"name": "g", "arguments": {"nums": [1, 2]}},
+                {"name": "h", "arguments": {}},
+            ],
         )
 
         with self.assertRaises(ValueError):
