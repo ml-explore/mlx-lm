@@ -556,6 +556,12 @@ class Model(nn.Module):
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 
+        # Split the output head by vocabulary rows
+        lm = self.language_model
+        if N > 1 and lm.args.vocab_size % N == 0 and not lm.args.tie_word_embeddings:
+            lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
+            self.vocab_group = group
+
     @property
     def layers(self):
         return self.language_model.model.pipeline_layers
