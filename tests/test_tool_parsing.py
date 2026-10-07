@@ -592,6 +592,7 @@ class TestToolParsing(unittest.TestCase):
             "days": {"type": "integer"},
             "metric": {"type": "boolean"},
             "note": {"type": ["string", "null"]},
+            "opts": {"type": "object"},
         }
         tools = [
             {
@@ -603,7 +604,7 @@ class TestToolParsing(unittest.TestCase):
             }
         ]
         test_cases = [
-            # The server strips both markers before calling the parser.
+            # Markers stripped, as the server passes it.
             (
                 '"f"><param name="city">Paris</param><param name="days">3</param>'
                 '<param name="metric">true</param>',
@@ -618,22 +619,26 @@ class TestToolParsing(unittest.TestCase):
                 "</param></function>",
                 {"city": "a\n<b>&</b>\n"},
             ),
-            # Truncated by max_tokens: the complete params survive.
+            # Truncated: complete params survive.
             (
                 '"f"><param name="city">Paris</param><param name="days">3',
                 {"city": "Paris"},
             ),
             ('<function name="f"><param name="city"></param></function>', {"city": ""}),
-            # A nullable param keeps its value, and the string "None" stays a string.
+            # Nullable keeps its value; "None" stays a string.
             ('"f"><param name="note">Paris</param>', {"note": "Paris"}),
             ('"f"><param name="city">None</param>', {"city": "None"}),
+            # History renders dicts in Python style.
+            (
+                '"f"><param name="opts">' "{'unit': 'c'}</param>",
+                {"opts": {"unit": "c"}},
+            ),
         ]
         for text, arguments in test_cases:
             with self.subTest(text=text):
                 tool_call = minicpm5.parse_tool_call(text, tools)
                 self.assertEqual(tool_call, {"name": "f", "arguments": arguments})
 
-        # Parallel calls are consecutive blocks; a call may have no params.
         tool_calls = minicpm5.parse_tool_call(
             '<function name="f"></function>\n<function name="g"></function>', tools
         )
