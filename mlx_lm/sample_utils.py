@@ -134,28 +134,14 @@ def greedy_sampler(logprobs: mx.array) -> mx.array:
     return mx.argmax(logprobs, axis=-1)
 
 
-def distributed_argmax(logits: mx.array, group: mx.distributed.Group) -> mx.array:
-    index = mx.argmax(logits, axis=-1)[..., None]
-    # [..., None] to keep the last dimension for take_along_axis
-    n, vocab = group.size(), logits.shape[-1]
-    value = mx.take_along_axis(logits, index, axis=-1)
-    # shift the index by the rank of the group to get the global index
-    index = index + group.rank() * vocab
-    # One fp32 (value, index) pair per row. Indices below 2**24 are exact in fp32.
-    pairs = mx.concatenate(
-        [value.astype(mx.float32), index.astype(mx.float32)], axis=-1
-    )
-    pairs = mx.distributed.all_gather(pairs.reshape(-1, 2), group=group)
-    pairs = pairs.reshape(n, -1, 2)
-    best = mx.argmax(pairs[..., 0], axis=0)
-    token = mx.take_along_axis(pairs[..., 1], best[None], axis=0)[0]
-    return token.astype(mx.uint32).reshape(logits.shape[:-1])
-
-
 def gather_vocab(logits: mx.array, group: mx.distributed.Group) -> mx.array:
     """
-    The logits of the whole vocabulary, from the vocabulary rows that each rank
-    of ``group`` holds (see ``distributed_argmax``).
+    Gather the logits of the whole vocabulary from all ranks in the group.
+    Used when the model's lm_head is split across ranks.
+
+    Args:
+        logits: The logits from the model's output.
+        group: The distributed group to gather the logits from.
     """
     n, vocab = group.size(), logits.shape[-1]
     parts = mx.distributed.all_gather(logits.reshape(-1, vocab), group=group)
