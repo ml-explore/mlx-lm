@@ -8,6 +8,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from mlx.utils import tree_map
 
+from ..sample_utils import gather_vocab
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -322,6 +323,7 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.vocab_group = None
 
     def __call__(
         self,
@@ -334,6 +336,8 @@ class TextModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+        if self.vocab_group is not None:
+            out = gather_vocab(out, self.vocab_group)
         return out
 
     @property
@@ -560,7 +564,7 @@ class Model(nn.Module):
         lm = self.language_model
         if N > 1 and lm.args.vocab_size % N == 0 and not lm.args.tie_word_embeddings:
             lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
-            self.vocab_group = group
+            lm.vocab_group = group
 
     @property
     def layers(self):

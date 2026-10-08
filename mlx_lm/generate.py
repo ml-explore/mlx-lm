@@ -25,13 +25,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .sample_utils import (
-    LogitsProcessor,
-    Sampler,
-    gather_vocab,
-    greedy_sampler,
-    make_sampler,
-)
+from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
     does_model_support_input_embeddings,
@@ -388,9 +382,6 @@ def generate_step(
     )
 
     sampler = sampler or greedy_sampler
-    # If lm_head is sharded across ranks, vocab_group is sharded group
-    # for gathering logits across ranks for sampling. Otherwise it is None.
-    vocab_group = getattr(model, "vocab_group", None)
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
         if input_embeddings is not None:
@@ -412,10 +403,6 @@ def generate_step(
             )
 
             logits = logits[:, -1, :]
-            # If vocabulary is split across ranks, gather the logits for
-            # the full vocabulary before sampling
-            if vocab_group is not None:
-                logits = gather_vocab(logits, vocab_group)
 
             if logits_processors and len(input_tokens) > 0:
                 tokens = (

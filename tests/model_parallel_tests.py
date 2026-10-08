@@ -8,7 +8,6 @@ import mlx.core as mx
 from mlx_lm.generate import generate_step
 from mlx_lm.models import qwen2, qwen3_5, qwen3_moe, qwen3_next
 from mlx_lm.models.pipeline import PipelineMixin
-from mlx_lm.sample_utils import gather_vocab
 
 
 class Group:
@@ -423,9 +422,8 @@ class TestModelParallel(unittest.TestCase):
         model.shard(group)
         out = model(x)
         if group.size() > 1:
-            self.assertIs(model.vocab_group, group)
-            self.assertEqual(out.shape[-1], vocab_size // group.size())
-            out = gather_vocab(out, group)
+            self.assertIs(model.language_model.vocab_group, group)
+        self.assertEqual(out.shape[-1], vocab_size)
         self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
 
         tokens, logprobs = generate()
