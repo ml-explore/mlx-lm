@@ -3152,6 +3152,57 @@ class TestModels(unittest.TestCase):
         sanitized = model.sanitize(weights)
         self.assertNotIn("lm_head.weight", sanitized)
 
+    def test_granitemoehybrid_padded_batch(self):
+        from mlx_lm.generate import BatchGenerator, generate_step
+        from mlx_lm.models import granitemoehybrid
+
+        # Regression for #1908: the SSM update must use cache.lengths.
+        mx.random.seed(0)
+        args = granitemoehybrid.ModelArgs(
+            model_type="granitemoehybrid",
+            vocab_size=100,
+            hidden_size=64,
+            intermediate_size=128,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            layer_types=["mamba", "attention"],
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            embedding_multiplier=1.0,
+            attention_multiplier=0.25,
+            logits_scaling=1.0,
+            residual_multiplier=1.0,
+            rms_norm_eps=1e-5,
+            position_embedding_type="nope",
+            mamba_n_heads=4,
+            mamba_d_head=32,
+            mamba_d_state=32,
+            mamba_d_conv=4,
+            mamba_n_groups=1,
+            mamba_proj_bias=False,
+            mamba_conv_bias=True,
+        )
+        model = granitemoehybrid.Model(args)
+        # Random init hides the SSM path; strengthen it so the bug shows.
+        mamba = model.layers[0].mamba
+        mamba.A_log = mx.full(mamba.A_log.shape, -4.0)
+        mamba.conv1d.weight = mamba.conv1d.weight * 30
+
+        _, alone = next(generate_step(mx.array([7, 8, 9]), model, max_tokens=1))
+
+        gen = BatchGenerator(model, max_tokens=1)
+        uids = gen.insert([list(range(1, 13)), [7, 8, 9]])
+        got = {}
+        while len(got) < 2:
+            for r in gen.next_generated():
+                got[r.uid] = r.logprobs
+        gen.close()
+
+        err = mx.abs(got[uids[1]] - alone).max().item()
+        self.assertLess(err, 1e-5)
+
     def test_laguna_sanitize(self):
         from mlx_lm.models import laguna
 
