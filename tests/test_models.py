@@ -2146,34 +2146,71 @@ class TestModels(unittest.TestCase):
             (args.qk_nope_head_dim + args.qk_rope_head_dim) ** -0.5 * s * s,
         )
 
-        # Real fp8 layout: rank-0 scales, [E, 1, 1] for expert stacks, no "weight_".
+        # fp8 checkpoint: e4m3 weights with rank-0 scales, [E, 1, 1] for the
+        # fused experts. mxfp8 needs inputs that are a multiple of 32.
+        args.q_lora_rank = args.kv_lora_rank = 32
+        H, nope, v = args.num_attention_heads, args.qk_nope_head_dim, args.v_head_dim
         e, mi, h = args.n_routed_experts, args.moe_intermediate_size, args.hidden_size
-        fp8 = lambda *s: mx.full(s, 0x38, dtype=mx.uint8)  # 0x38 is 1.0 in e4m3
-        scale = lambda v, *s: mx.full(s, v, dtype=mx.bfloat16)
-        p = "model.layers.0.mlp"
-        out = model.sanitize(
-            {
-                f"{p}.shared_experts.down_proj.weight": fp8(h, mi),
-                f"{p}.shared_experts.down_proj.weight_scale_inv": scale(2.0),
-                f"{p}.shared_experts.down_proj.activation_scale": scale(1.0),
-                f"{p}.experts.down_proj": fp8(e, h, mi),
-                f"{p}.experts.down_proj_scale_inv": scale(4.0, e, 1, 1),
-                f"{p}.experts.down_proj_activation_scale": scale(1.0, e, 1, 1),
-                f"{p}.experts.gate_up_proj": fp8(e, 2 * mi, h),
-                f"{p}.experts.gate_up_proj_scale_inv": scale(8.0, e, 1, 1),
-            }
-        )
-        self.assertFalse([k for k in out if "activation_scale" in k])
-        self.assertFalse([k for k, v in out.items() if v.dtype == mx.uint8])
-        for name, shape, value in (
-            ("shared_experts.down_proj", (h, mi), 2.0),
-            ("switch_mlp.down_proj", (e, h, mi), 4.0),
-            ("switch_mlp.gate_proj", (e, mi, h), 8.0),
-            ("switch_mlp.up_proj", (e, mi, h), 8.0),
-        ):
-            w = out[f"{p}.{name}.weight"]
-            self.assertEqual(w.shape, shape)
-            self.assertEqual(w.reshape(-1)[0].item(), value)
+        rope = args.qk_rope_head_dim
+        fp8_shapes = {
+            "self_attn.q_a_proj.weight": (32, h),
+            "self_attn.q_b_proj.weight": (H * (nope + rope), 32),
+            "self_attn.kv_a_proj_with_mqa.weight": (32 + rope, h),
+            "self_attn.kv_b_proj.weight": (H * (nope + v), 32),
+            "self_attn.o_proj.weight": (h, H * v),
+            "mlp.shared_experts.gate_proj.weight": (mi, h),
+            "mlp.shared_experts.up_proj.weight": (mi, h),
+            "mlp.shared_experts.down_proj.weight": (h, mi),
+            "mlp.experts.gate_up_proj": (e, 2 * mi, h),
+            "mlp.experts.down_proj": (e, h, mi),
+        }
+
+        # The reference gets the same weights dequantized in fp32, so the two
+        # models do the same math.
+        mx.random.seed(0)
+        ref = mistral4.Model(args)
+        plain = {
+            k: v
+            for k, v in tree_flatten(ref.parameters())
+            if not any(n in k for n in ("_proj", "embed_q", "unembed_out"))
+        }
+        fp8_weights, ref_weights = dict(plain), dict(plain)
+        for l in range(args.num_hidden_layers):
+            for name, shape in fp8_shapes.items():
+                k = f"model.layers.{l}.{name}"
+                fused = len(shape) == 3
+                s = mx.random.uniform(0.01, 0.05, (e, 1, 1) if fused else ())
+                s = s.astype(mx.bfloat16)
+                w = mx.to_fp8(mx.random.normal(shape))
+                # Fused experts have no ".weight": "experts.down_proj_scale_inv".
+                fp8_weights[k] = w
+                fp8_weights[k + "_scale_inv"] = s
+                if fused:
+                    fp8_weights[k + "_activation_scale"] = mx.ones_like(s)
+                else:
+                    fp8_weights[k.replace("weight", "activation_scale")] = s
+                ref_weights[k] = mx.from_fp8(w, dtype=mx.float32) * s
+
+        model = mistral4.Model(args)
+        model.load_weights(list(model.sanitize(fp8_weights).items()))
+        ref.load_weights(list(ref.sanitize(ref_weights).items()))
+        layer = model.layers[0]
+        self.assertIsInstance(layer.self_attn.o_proj, mistral4.Fp8Linear)
+        self.assertIsInstance(layer.self_attn.embed_q, mistral4.Fp8MultiLinear)
+        self.assertIsInstance(layer.mlp.shared_experts.up_proj, mistral4.Fp8Linear)
+        self.assertIsInstance(layer.mlp.switch_mlp, mistral4.Fp8SwitchGLU)
+        self.assertEqual(layer.mlp.switch_mlp.gate_up_proj.weight.dtype, mx.uint32)
+
+        # Decode (L == 1) and a prefill that sorts the experts (L * top_k >= 64).
+        for L in (1, 32):
+            x = mx.random.randint(0, args.vocab_size, (1, L))
+            out, expected = model(x), ref(x)
+            err = mx.abs(out - expected).max() / mx.abs(expected).max()
+            self.assertLess(err.item(), 1e-4)
+
+        # The output scale must not promote bf16 activations to fp32.
+        model.set_dtype(mx.bfloat16)
+        self.assertEqual(model(x).dtype, mx.bfloat16)
 
     def test_gemma2(self):
         from mlx_lm.models import gemma2

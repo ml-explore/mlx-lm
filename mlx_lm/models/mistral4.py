@@ -6,17 +6,24 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.utils import tree_unflatten
 
+from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .deepseek_v3 import (
     DeepseekV3MLP,
     DeepseekV3Model,
 )
 from .ministral3 import _get_llama_4_attn_scale
-from .mla import MultiLinear
+from .mla import MultiLinear, QuantizedMultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import apply_yarn_mscale, initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import (
+    QuantizedSwitchLinear,
+    SwitchGLU,
+    _gather_sort,
+    _scatter_unsort,
+)
 
 
 @dataclass
@@ -231,6 +238,74 @@ def mistral4_expert_select(
     return inds, selected_scores
 
 
+class Fp8Linear(nn.QuantizedLinear):
+    """Linear on e4m3 weights, run as mxfp8 with unit group scales.
+
+    The kernel has no slot for the per-tensor scale, so it scales the output.
+    """
+
+    def __init__(self, input_dims: int, output_dims: int):
+        super().__init__(input_dims, output_dims, False, 32, 8, "mxfp8")
+        self.output_scale = mx.array(1.0)
+        self.freeze()
+
+    def __call__(self, x):
+        y = super().__call__(x)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+class Fp8MultiLinear(QuantizedMultiLinear):
+    """MultiLinear on e4m3 weights, see Fp8Linear."""
+
+    def __init__(self, input_dims: int, output_dims: int, num_heads: int):
+        super().__init__(input_dims, output_dims, num_heads, 32, 8, "mxfp8")
+        self.output_scale = mx.array(1.0)
+        self.freeze()
+
+    def __call__(self, x, transpose=True):
+        y = super().__call__(x, transpose)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+class Fp8SwitchLinear(QuantizedSwitchLinear):
+    """Experts on e4m3 weights with one scale per expert, see Fp8Linear."""
+
+    def __init__(self, input_dims: int, output_dims: int, num_experts: int):
+        super().__init__(input_dims, output_dims, num_experts, False, 32, 8, "mxfp8")
+        self.output_scale = mx.ones((num_experts, 1, 1))
+        self.freeze()
+
+    def __call__(self, x, indices, sorted_indices=False):
+        y = super().__call__(x, indices, sorted_indices)
+        return (y * self.output_scale[indices]).astype(y.dtype)
+
+
+class Fp8SwitchGLU(nn.Module):
+    """SwitchGLU with the fused gate_up_proj of the fp8 checkpoint."""
+
+    def __init__(self, input_dims: int, hidden_dims: int, num_experts: int):
+        super().__init__()
+        self.gate_up_proj = Fp8SwitchLinear(input_dims, 2 * hidden_dims, num_experts)
+        self.down_proj = Fp8SwitchLinear(hidden_dims, input_dims, num_experts)
+
+    def __call__(self, x, indices) -> mx.array:
+        x = mx.expand_dims(x, (-2, -3))
+
+        indices = mx.stop_gradient(indices)
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        if do_sort:
+            x, idx, inv_order = _gather_sort(x, indices)
+        gate, up = mx.split(self.gate_up_proj(x, idx, sorted_indices=do_sort), 2, -1)
+        x = self.down_proj(swiglu(gate, up), idx, sorted_indices=do_sort)
+
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+
+        return x.squeeze(-2)
+
+
 class Mistral4MoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -387,30 +462,6 @@ class Model(nn.Module):
         return self.model.pipeline_layers
 
     def sanitize(self, weights):
-        def broadcasts(scale_shape, weight_shape):
-            if len(scale_shape) > len(weight_shape):
-                return False
-            pad = (1,) * (len(weight_shape) - len(scale_shape)) + tuple(scale_shape)
-            return all(s in (1, w) for s, w in zip(pad, weight_shape))
-
-        def dequant(weight, scale_inv):
-            dtype = mx.bfloat16
-            weight = mx.from_fp8(weight, dtype=dtype)
-            # Per-tensor (rank 0) and per-expert ([E, 1, 1]) scales broadcast.
-            if broadcasts(scale_inv.shape, weight.shape):
-                return (weight * scale_inv).astype(dtype)
-            bs = 128
-            m, n = weight.shape
-            pad_bottom = (-m) % bs
-            pad_side = (-n) % bs
-            weight = mx.pad(weight, ((0, pad_bottom), (0, pad_side)))
-            weight = weight.reshape(
-                ((m + pad_bottom) // bs, bs, (n + pad_side) // bs, bs)
-            )
-            weight = (weight * scale_inv[:, None, :, None]).reshape(
-                m + pad_bottom, n + pad_side
-            )
-            return weight[:m, :n].astype(dtype)
 
         # Remap for int4
         new_weights = {}
@@ -427,45 +478,47 @@ class Model(nn.Module):
                 new_weights[k] = v
         weights = new_weights
 
-        # Dequantize fp8
+        # fp8 layers keep the e4m3 bytes, and the scale moves to the layer.
         new_weights = {}
         for k, v in weights.items():
             # Static activation scales have no consumer here.
             if k.endswith("activation_scale"):
                 continue
-            # Expert scales are named "experts.down_proj_scale_inv", so match
-            # the suffix rather than a "weight_scale_inv" substring.
-            if k.endswith("_scale_inv"):
-                wk = k.replace("_scale_inv", "")
-                new_weights[wk] = dequant(weights[wk], v)
-            elif k not in new_weights:
-                new_weights[k] = v
+            new_weights[k.replace(".weight_scale_inv", ".output_scale")] = v
         weights = new_weights
 
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
+            experts = f"{prefix}.mlp.experts"
+            switch = f"{prefix}.mlp.switch_mlp"
+
+            # The fp8 experts keep gate_up_proj fused, see Fp8SwitchGLU.
+            if f"{experts}.gate_up_proj_scale_inv" in weights:
+                for m in ["gate_up_proj", "down_proj"]:
+                    weights[f"{switch}.{m}.weight"] = weights.pop(f"{experts}.{m}")
+                    weights[f"{switch}.{m}.output_scale"] = weights.pop(
+                        f"{experts}.{m}_scale_inv"
+                    )
 
             # Handle fused gate_up_proj format (Mistral4NaiveMoe)
-            gup_key = f"{prefix}.mlp.experts.gate_up_proj"
+            gup_key = f"{experts}.gate_up_proj"
             if gup_key in weights:
                 gate_up = weights.pop(gup_key)
                 gate, up = mx.split(gate_up, 2, axis=1)
-                weights[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
-                weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
-            down_key = f"{prefix}.mlp.experts.down_proj"
+                weights[f"{switch}.gate_proj.weight"] = gate
+                weights[f"{switch}.up_proj.weight"] = up
+            down_key = f"{experts}.down_proj"
             if down_key in weights:
-                weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = weights.pop(
-                    down_key
-                )
+                weights[f"{switch}.down_proj.weight"] = weights.pop(down_key)
 
             for m in ["gate_proj", "down_proj", "up_proj"]:
                 for k in ["weight", "scales", "biases"]:
-                    if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+                    if f"{experts}.0.{m}.{k}" in weights:
                         to_join = [
-                            weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
+                            weights.pop(f"{experts}.{e}.{m}.{k}")
                             for e in range(self.args.n_routed_experts)
                         ]
-                        weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+                        weights[f"{switch}.{m}.{k}"] = mx.stack(to_join)
 
             # Absorb kv_b_proj into embed_q / unembed_out.
             # TODO: affine only; non-affine modes have no biases key.
@@ -499,12 +552,47 @@ class Model(nn.Module):
                     weights[f"{attn}.embed_q.biases"] = wk_biases
                     weights[f"{attn}.unembed_out.scales"] = wv_scales
                     weights[f"{attn}.unembed_out.biases"] = wv_biases
+                s = weights.pop(f"{attn}.kv_b_proj.output_scale", None)
+                if s is not None:
+                    weights[f"{attn}.embed_q.output_scale"] = s
+                    weights[f"{attn}.unembed_out.output_scale"] = s
                 weights[f"{attn}.embed_q.weight"] = wk
                 weights[f"{attn}.unembed_out.weight"] = wv
+
+        # e4m3 bytes read as uint32 are mxfp8 with unit (2^0) group scales.
+        for k in [k for k in weights if k.endswith(".output_scale")]:
+            p = k.removesuffix(".output_scale")
+            w = weights[f"{p}.weight"]
+            if w.dtype == mx.uint8:
+                weights[f"{p}.weight"] = w.view(mx.uint32)
+                weights[f"{p}.scales"] = mx.full(
+                    (*w.shape[:-1], w.shape[-1] // 32), 127, mx.uint8
+                )
+
+        fp8_modules = []
+        for p, m in self.named_modules():
+            if isinstance(m, nn.Linear) and f"{p}.output_scale" in weights:
+                fp8_modules.append((p, Fp8Linear(m.weight.shape[1], m.weight.shape[0])))
+            elif isinstance(m, MultiLinear) and f"{p}.output_scale" in weights:
+                h, o, i = m.weight.shape
+                fp8_modules.append((p, Fp8MultiLinear(i, o, h)))
+            elif (
+                isinstance(m, SwitchGLU) and f"{p}.gate_up_proj.output_scale" in weights
+            ):
+                g = m.gate_proj
+                fp8_modules.append(
+                    (p, Fp8SwitchGLU(g.input_dims, g.output_dims, g.num_experts))
+                )
+        if fp8_modules:
+            self.update_modules(tree_unflatten(fp8_modules))
 
         return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
+        # shard_linear would drop the output scale of the fp8 layers.
+        if any(isinstance(m, Fp8Linear) for _, m in self.named_modules()):
+            raise ValueError("Sharding fp8 Mistral4 weights is not supported yet.")
+
         group = group or mx.distributed.init()
         N = group.size()
 

@@ -62,6 +62,9 @@ class Model(nn.Module):
         sanitized_lm = self.language_model.sanitize(lm_weights)
         return {"language_model." + k: v for k, v in sanitized_lm.items()}
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        self.language_model.shard(group)
+
     @property
     def layers(self):
         return self.language_model.model.layers
