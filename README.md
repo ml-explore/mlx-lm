@@ -84,9 +84,9 @@ To see a description of all the arguments you can do:
 ```
 
 Check out the [generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
+example](https://github.com/ml-explore/mlx-lm/tree/main/examples/generate_response.py)
 to see how to use the API in more detail. Check out the [batch generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
+example](https://github.com/ml-explore/mlx-lm/tree/main/examples/batch_generate_response.py)
 to see how to efficiently generate continuations for a batch of prompts.
 
 The `mlx-lm` package also comes with functionality to quantize and optionally
@@ -238,7 +238,7 @@ not be supplied explicitly.
 Prompt caching can also be used in the Python API in order to avoid
 recomputing the prompt. This is useful in multi-turn dialogues or across
 requests that use the same context. See the
-[example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
+[example](https://github.com/ml-explore/mlx-lm/blob/main/examples/chat.py)
 for more usage details.
 
 ### Supported Models

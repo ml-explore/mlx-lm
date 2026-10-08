@@ -150,7 +150,8 @@ def process_message_content(messages):
             for tool_call in tool_calls:
                 if func := tool_call.get("function"):
                     if args := func.get("arguments"):
-                        func["arguments"] = json.loads(args)
+                        if isinstance(args, str):
+                            func["arguments"] = json.loads(args)
 
 
 @dataclass
@@ -1188,7 +1189,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
-        self.validate_model_parameters()
+        try:
+            self.validate_model_parameters()
+        except ValueError as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
 
         # Get stop sequences
         stop_words = self.body.get("stop")
@@ -1224,10 +1231,10 @@ class APIHandler(BaseHTTPRequestHandler):
         if max_val is not None and value > max_val:
             raise ValueError(f"{name} must be at most {max_val}")
 
-    def validate_model_parameters(self):
+    def validate_model_parameters(self) -> None:
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
-        self._validate("max_tokens", int, min_val=0)
+        self._validate("max_tokens", int, min_val=1)
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
