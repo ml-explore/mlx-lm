@@ -27,6 +27,7 @@ from .rope_utils import apply_yarn_mscale, initialize_rope
 from .switch_layers import (
     QuantizedSwitchLinear,
     SwitchGLU,
+    SwitchLinear,
     _gather_sort,
     _scatter_unsort,
 )
@@ -149,13 +150,20 @@ class Mistral4Attention(nn.Module):
 
         if self.q_lora_rank is None:
             q = self.q_proj(x)
+            compressed_kv = self.kv_a_proj_with_mqa(x)
         else:
-            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(x)))
+            # sanitize fuses the two projections unless they are stored differently.
+            if "qkv_a_proj" in self:
+                q, compressed_kv = mx.split(
+                    self.qkv_a_proj(x), [self.q_lora_rank], axis=-1
+                )
+            else:
+                q, compressed_kv = self.q_a_proj(x), self.kv_a_proj_with_mqa(x)
+            q = self.q_b_proj(self.q_a_layernorm(q))
 
         q = q.reshape(B, L, self.num_heads, self.q_head_dim).transpose(0, 2, 1, 3)
         q_nope, q_rope = mx.split(q, [self.qk_nope_head_dim], axis=-1)
 
-        compressed_kv = self.kv_a_proj_with_mqa(x)
         k_latent, k_rope = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
         k_rope = k_rope.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
         kv_latent = mx.expand_dims(self.kv_a_layernorm(k_latent), axis=1)
@@ -257,11 +265,12 @@ class Fp8Linear(nn.QuantizedLinear):
     """Linear on e4m3 weights, run as mxfp8 with unit group scales.
 
     The kernel has no slot for the per-tensor scale, so it scales the output.
+    Fused layers have one scale per output row.
     """
 
-    def __init__(self, input_dims: int, output_dims: int):
+    def __init__(self, input_dims: int, output_dims: int, per_row: bool = False):
         super().__init__(input_dims, output_dims, False, 32, 8, "mxfp8")
-        self.output_scale = mx.array(1.0)
+        self.output_scale = mx.ones((output_dims,)) if per_row else mx.array(1.0)
         self.freeze()
 
     def __call__(self, x):
@@ -295,13 +304,15 @@ class Fp8SwitchLinear(QuantizedSwitchLinear):
         return (y * self.output_scale[indices]).astype(y.dtype)
 
 
-class Fp8SwitchGLU(nn.Module):
-    """SwitchGLU with the fused gate_up_proj of the fp8 checkpoint."""
+class FusedSwitchGLU(nn.Module):
+    """SwitchGLU with gate_proj and up_proj fused into one projection."""
 
     def __init__(self, input_dims: int, hidden_dims: int, num_experts: int):
         super().__init__()
-        self.gate_up_proj = Fp8SwitchLinear(input_dims, 2 * hidden_dims, num_experts)
-        self.down_proj = Fp8SwitchLinear(hidden_dims, input_dims, num_experts)
+        self.gate_up_proj = SwitchLinear(
+            input_dims, 2 * hidden_dims, num_experts, bias=False
+        )
+        self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias=False)
 
     def __call__(self, x, indices) -> mx.array:
         x = mx.expand_dims(x, (-2, -3))
@@ -319,6 +330,50 @@ class Fp8SwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+
+class FusedGLU(nn.Module):
+    """Gated MLP with gate_proj and up_proj fused into one projection."""
+
+    def __init__(self, input_dims: int, hidden_dims: int):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(input_dims, 2 * hidden_dims, bias=False)
+        self.down_proj = nn.Linear(hidden_dims, input_dims, bias=False)
+
+    def __call__(self, x):
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(swiglu(gate, up))
+
+
+def _fuse(weights, parts, fused):
+    """Join the output rows of layers that read the same input.
+
+    Returns False and changes nothing when the layers are stored differently,
+    for example quantized with different bits.
+    """
+    keys = [{k[len(p) + 1 :] for k in weights if k.startswith(p + ".")} for p in parts]
+    if "weight" not in keys[0] or any(k != keys[0] for k in keys):
+        return False
+    for k in keys[0]:
+        vs = [weights[f"{p}.{k}"] for p in parts]
+        if k == "output_scale" and vs[0].ndim > 0:
+            return False
+        if k not in ("output_scale", "bias") and any(
+            v.dtype != vs[0].dtype or v.shape[-1] != vs[0].shape[-1] for v in vs
+        ):
+            return False
+
+    rows = [weights[f"{p}.weight"].shape[-2] for p in parts]
+    for k in keys[0]:
+        vs = [weights.pop(f"{p}.{k}") for p in parts]
+        if k == "output_scale":
+            # Each fp8 layer has one scale. Fused, there is one per row.
+            vs = [mx.full((n,), s, dtype=s.dtype) for n, s in zip(rows, vs)]
+            weights[f"{fused}.{k}"] = mx.concatenate(vs)
+        else:
+            axis = -1 if k == "bias" else -2
+            weights[f"{fused}.{k}"] = mx.concatenate(vs, axis=axis)
+    return True
 
 
 class Fp8AllToShardedLinear(QuantizedAllToShardedLinear):
@@ -354,10 +409,18 @@ def _shard_linear(layer, sharding, group):
 
 
 def _shard_inplace(layer, sharding, group, segments=1):
-    scale = layer.pop("output_scale", None)
-    shard_inplace(layer, sharding, segments=segments, group=group)
-    if scale is not None:
-        layer.output_scale = scale
+    rows = sharding == "all-to-sharded"
+
+    def predicate(path, w):
+        # A scalar or per-expert fp8 scale is the same for every shard.
+        if path == "output_scale" and w.ndim != 1:
+            return None
+        # A bias or a per-row scale follows the output rows.
+        if path in ("bias", "output_scale"):
+            return (-1, segments) if rows else None
+        return (max(w.ndim - 2, 0), segments) if rows else (-1, segments)
+
+    shard_inplace(layer, predicate, group=group)
 
 
 class Mistral4MoE(nn.Module):
@@ -544,29 +607,24 @@ class Model(nn.Module):
             new_weights[k.replace(".weight_scale_inv", ".output_scale")] = v
         weights = new_weights
 
+        def fused(parts, name):
+            return f"{name}.weight" in weights or _fuse(weights, parts, name)
+
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
             experts = f"{prefix}.mlp.experts"
             switch = f"{prefix}.mlp.switch_mlp"
+            shared = f"{prefix}.mlp.shared_experts"
+            attn = f"{prefix}.self_attn"
 
-            # The fp8 experts keep gate_up_proj fused, see Fp8SwitchGLU.
-            if f"{experts}.gate_up_proj_scale_inv" in weights:
-                for m in ["gate_up_proj", "down_proj"]:
+            # HF stores the experts with gate_up_proj fused (Mistral4NaiveMoe).
+            for m in ["gate_up_proj", "down_proj"]:
+                if f"{experts}.{m}" in weights:
                     weights[f"{switch}.{m}.weight"] = weights.pop(f"{experts}.{m}")
+                if f"{experts}.{m}_scale_inv" in weights:
                     weights[f"{switch}.{m}.output_scale"] = weights.pop(
                         f"{experts}.{m}_scale_inv"
                     )
-
-            # Handle fused gate_up_proj format (Mistral4NaiveMoe)
-            gup_key = f"{experts}.gate_up_proj"
-            if gup_key in weights:
-                gate_up = weights.pop(gup_key)
-                gate, up = mx.split(gate_up, 2, axis=1)
-                weights[f"{switch}.gate_proj.weight"] = gate
-                weights[f"{switch}.up_proj.weight"] = up
-            down_key = f"{experts}.down_proj"
-            if down_key in weights:
-                weights[f"{switch}.down_proj.weight"] = weights.pop(down_key)
 
             for m in ["gate_proj", "down_proj", "up_proj"]:
                 for k in ["weight", "scales", "biases"]:
@@ -579,7 +637,6 @@ class Model(nn.Module):
 
             # Absorb kv_b_proj into embed_q / unembed_out.
             # TODO: affine only; non-affine modes have no biases key.
-            attn = f"{prefix}.self_attn"
             if f"{attn}.kv_b_proj.weight" in weights:
                 quantized = f"{attn}.kv_b_proj.scales" in weights
                 w = weights.pop(f"{attn}.kv_b_proj.weight")
@@ -616,6 +673,33 @@ class Model(nn.Module):
                 weights[f"{attn}.embed_q.weight"] = wk
                 weights[f"{attn}.unembed_out.weight"] = wv
 
+            # Projections that read the same input run as one matmul.
+            layer = self.model.layers[l]
+            a = layer.self_attn
+            if "q_a_proj" in a and fused(
+                [f"{attn}.q_a_proj", f"{attn}.kv_a_proj_with_mqa"], f"{attn}.qkv_a_proj"
+            ):
+                rows = a.q_lora_rank + a.kv_lora_rank + a.qk_rope_head_dim
+                a.qkv_a_proj = nn.Linear(
+                    a.hidden_size, rows, bias=self.args.attention_bias
+                )
+                del a.q_a_proj, a.kv_a_proj_with_mqa
+            mlp = layer.mlp
+            if not isinstance(mlp, Mistral4MoE):
+                continue
+            if isinstance(mlp.switch_mlp, SwitchGLU) and fused(
+                [f"{switch}.gate_proj", f"{switch}.up_proj"], f"{switch}.gate_up_proj"
+            ):
+                g = mlp.switch_mlp.gate_proj
+                mlp.switch_mlp = FusedSwitchGLU(
+                    g.input_dims, g.output_dims, g.num_experts
+                )
+            if isinstance(mlp.get("shared_experts"), DeepseekV3MLP) and fused(
+                [f"{shared}.gate_proj", f"{shared}.up_proj"], f"{shared}.gate_up_proj"
+            ):
+                out_dims, in_dims = mlp.shared_experts.gate_proj.weight.shape
+                mlp.shared_experts = FusedGLU(in_dims, out_dims)
+
         # e4m3 bytes read as uint32 are mxfp8 with unit (2^0) group scales.
         for k in [k for k in weights if k.endswith(".output_scale")]:
             p = k.removesuffix(".output_scale")
@@ -628,17 +712,18 @@ class Model(nn.Module):
 
         fp8_modules = []
         for p, m in self.named_modules():
-            if isinstance(m, nn.Linear) and f"{p}.output_scale" in weights:
-                fp8_modules.append((p, Fp8Linear(m.weight.shape[1], m.weight.shape[0])))
-            elif isinstance(m, MultiLinear) and f"{p}.output_scale" in weights:
+            if f"{p}.output_scale" not in weights:
+                continue
+            if isinstance(m, nn.Linear):
+                out_dims, in_dims = m.weight.shape
+                per_row = weights[f"{p}.output_scale"].ndim == 1
+                fp8_modules.append((p, Fp8Linear(in_dims, out_dims, per_row)))
+            elif isinstance(m, MultiLinear):
                 h, o, i = m.weight.shape
                 fp8_modules.append((p, Fp8MultiLinear(i, o, h)))
-            elif (
-                isinstance(m, SwitchGLU) and f"{p}.gate_up_proj.output_scale" in weights
-            ):
-                g = m.gate_proj
+            elif isinstance(m, SwitchLinear):
                 fp8_modules.append(
-                    (p, Fp8SwitchGLU(g.input_dims, g.output_dims, g.num_experts))
+                    (p, Fp8SwitchLinear(m.input_dims, m.output_dims, m.num_experts))
                 )
         if fp8_modules:
             self.update_modules(tree_unflatten(fp8_modules))
@@ -688,11 +773,16 @@ class Model(nn.Module):
                 mlp.sharding_group = group
                 if hasattr(mlp, "shared_experts"):
                     shared = mlp.shared_experts
-                    _shard_inplace(shared.gate_proj, "all-to-sharded", group)
+                    if isinstance(shared, FusedGLU):
+                        _shard_inplace(
+                            shared.gate_up_proj, "all-to-sharded", group, segments=2
+                        )
+                    else:
+                        _shard_inplace(shared.gate_proj, "all-to-sharded", group)
+                        _shard_inplace(shared.up_proj, "all-to-sharded", group)
                     _shard_inplace(shared.down_proj, "sharded-to-all", group)
-                    _shard_inplace(shared.up_proj, "all-to-sharded", group)
                 switch = mlp.switch_mlp
-                if isinstance(switch, Fp8SwitchGLU):
+                if isinstance(switch, FusedSwitchGLU):
                     # Each rank takes its part of both halves of gate_up_proj.
                     _shard_inplace(
                         switch.gate_up_proj, "all-to-sharded", group, segments=2
