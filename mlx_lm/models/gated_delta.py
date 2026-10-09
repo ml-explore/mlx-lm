@@ -636,12 +636,14 @@ def gated_delta_update(
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
 
-    if (
-        not use_kernel
-        or mx.default_device() != mx.gpu
-        or not mx.metal.is_available()
-        or k.shape[-1] < 32
-        or k.shape[-1] % 32 != 0
-    ):
+    if not use_kernel or mx.default_device() != mx.gpu:
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+    if not mx.metal.is_available():
+        # No Metal: the backend may implement the fused op itself.
+        if hasattr(mx.fast, "gated_delta_update"):
+            y, state = mx.fast.gated_delta_update(q, k, v, g, beta, state, mask)
+            return y, state
+        return gated_delta_ops(q, k, v, g, beta, state, mask)
+    if k.shape[-1] < 32 or k.shape[-1] % 32 != 0:
         return gated_delta_ops(q, k, v, g, beta, state, mask)
     return gated_delta_kernel(q, k, v, g, beta, state, mask)

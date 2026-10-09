@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 import unittest
+from unittest import mock
 
 import mlx.core as mx
 
@@ -168,6 +169,38 @@ class TestGatedDelta(unittest.TestCase):
         mx.eval(y_p, s_p, y_u, s_u)
         self.assertTrue(mx.array_equal(y_p, y_u))
         self.assertTrue(mx.array_equal(s_p, s_u))
+
+    def test_non_metal_gpu_uses_native_op(self):
+        if not hasattr(mx.fast, "gated_delta_update"):
+            raise unittest.SkipTest("mx.fast.gated_delta_update is missing")
+
+        B, T, Hk, Hv, Dk, Dv = 1, 16, 4, 8, 64, 64
+        q, k, v, _, _, state = self._inputs(B, T, Hk, Hv, Dk, Dv, mx.float32)
+        a = mx.random.normal((B, T, Hv))
+        b = mx.random.normal((B, T, Hv))
+        A_log = mx.random.normal((Hv,))
+        dt_bias = mx.random.normal((Hv,))
+        g = gated_delta.compute_g(A_log, a, dt_bias)
+        y_r, s_r = gated_delta_ops(q, k, v, g, mx.sigmoid(b), state, None)
+
+        native = mx.fast.gated_delta_update
+        calls = []
+
+        def spy(*args):
+            calls.append(1)
+            return native(*args)
+
+        # Pretend this is a GPU backend without Metal.
+        with mock.patch.object(mx, "default_device", return_value=mx.gpu):
+            with mock.patch.object(mx.metal, "is_available", return_value=False):
+                with mock.patch.object(mx.fast, "gated_delta_update", spy):
+                    y, s = gated_delta.gated_delta_update(
+                        q, k, v, a, b, A_log, dt_bias, state
+                    )
+        mx.eval(y, s, y_r, s_r)
+        self.assertEqual(len(calls), 1)
+        self.assertLess(_rel_l2(y, y_r), 1e-5)
+        self.assertLess(_rel_l2(s, s_r), 1e-5)
 
 
 if __name__ == "__main__":
