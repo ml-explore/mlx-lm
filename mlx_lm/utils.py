@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import resource
 import shutil
 from decimal import Decimal
@@ -744,19 +745,36 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
+        num_layers = len(model.model.layers)
         model.model.pipeline(pipeline_group)
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
-        local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if weight_index.get(k, None) is None:
+        names = [k for k, _ in tree_flatten(model.parameters())]
+        if all(k in weight_index for k in names):
+            local_files = {weight_index[k] for k in names}
+        else:
+            # sanitize renames the weights of unconverted checkpoints, so
+            # match the layer numbers of this stage instead.
+            layer_ids = {}
+            for k in weight_index:
+                if m := re.search(r"\.layers\.(\d+)\.", k):
+                    layer_ids[k] = int(m.group(1))
+            num_ckpt_layers = len(set(layer_ids.values()))
+            if num_ckpt_layers != num_layers:
                 raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
+                    f"The checkpoint has {num_ckpt_layers} layers but the model "
+                    f"has {num_layers}, so the weights of this pipeline stage "
+                    "cannot be matched by layer number. Convert the model with "
+                    "mlx_lm.convert first."
                 )
-            local_files.add(weight_index[k])
+            local = {i for i, l in enumerate(model.model.layers) if l is not None}
+            local_files = set()
+            for k, f in weight_index.items():
+                if k not in layer_ids or layer_ids[k] in local:
+                    local_files.add(f)
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
