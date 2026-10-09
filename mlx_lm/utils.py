@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import resource
 import shutil
 from decimal import Decimal
@@ -727,12 +728,17 @@ def sharded_load(
             weight_index = json.load(fid)["weight_map"]
 
         local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+        names = [k for k, _ in tree_flatten(model.parameters())]
+        if all(k in weight_index for k in names):
+            local_files = {weight_index[k] for k in names}
+        else:
+            # sanitize renames the weights of unconverted checkpoints, so
+            # match the layer numbers of this stage instead.
+            local = {i for i, l in enumerate(model.model.layers) if l is not None}
+            for k, f in weight_index.items():
+                m = re.search(r"\.layers\.(\d+)\.", k)
+                if m is None or int(m.group(1)) in local:
+                    local_files.add(f)
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)

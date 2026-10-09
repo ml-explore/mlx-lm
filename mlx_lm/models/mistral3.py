@@ -66,5 +66,10 @@ class Model(nn.Module):
         self.language_model.shard(group)
 
     @property
+    def model(self):
+        return self.language_model.model
+
+    @property
     def layers(self):
-        return self.language_model.model.layers
+        # Only the layers of this pipeline stage, so caches match them.
+        return self.language_model.layers
