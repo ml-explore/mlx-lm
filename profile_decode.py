@@ -30,7 +30,8 @@ def main():
 
     # Same seed on every rank, so all ranks see the same prompt.
     mx.random.seed(0)
-    prompt = mx.random.randint(0, model.args.vocab_size, (1, args.prompt_tokens))
+    vocab_size = getattr(model, "language_model", model).args.vocab_size
+    prompt = mx.random.randint(0, vocab_size, (1, args.prompt_tokens))
     cache = make_prompt_cache(model)
 
     tic = time.perf_counter()
