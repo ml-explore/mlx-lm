@@ -5,7 +5,13 @@ from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.nn.layers.distributed import (
+    QuantizedAllToShardedLinear,
+    QuantizedShardedToAllLinear,
+    shard_inplace,
+    shard_linear,
+    sum_gradients,
+)
 from mlx.utils import tree_unflatten
 
 from .activations import swiglu
@@ -202,6 +208,15 @@ class Mistral4Attention(nn.Module):
         return self.o_proj(output)
 
 
+def gather_last_axis(x: mx.array, group: mx.distributed.Group) -> mx.array:
+    """Gather the last axis of ``x``, which is split across ``group``."""
+    n, size = group.size(), x.shape[-1]
+    parts = mx.distributed.all_gather(x.reshape(-1, size), group=group)
+    # (ranks * rows, size) to (rows, ranks * size), in rank order.
+    parts = parts.reshape(n, -1, size).transpose(1, 0, 2)
+    return parts.reshape(*x.shape[:-1], n * size)
+
+
 @mx.compile
 def mistral4_expert_select(
     gates,
@@ -304,6 +319,45 @@ class Fp8SwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+
+class Fp8AllToShardedLinear(QuantizedAllToShardedLinear):
+    """Fp8Linear with the outputs sharded across the group."""
+
+    def __call__(self, x):
+        y = super().__call__(x)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+class Fp8ShardedToAllLinear(QuantizedShardedToAllLinear):
+    """Fp8Linear with the inputs sharded across the group."""
+
+    def __call__(self, x):
+        y = super().__call__(x)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+# The fp8 output scale applies to each shard and to each partial sum, so every
+# rank keeps all of it.
+def _shard_linear(layer, sharding, group):
+    if not isinstance(layer, Fp8Linear):
+        return shard_linear(layer, sharding, group=group)
+    if sharding == "all-to-sharded":
+        cls = Fp8AllToShardedLinear
+    else:
+        cls = Fp8ShardedToAllLinear
+    scale = layer.pop("output_scale")
+    sharded = cls.from_quantized_linear(layer, group=group)
+    sharded.output_scale = scale
+    sharded.freeze()
+    return sharded
+
+
+def _shard_inplace(layer, sharding, group, segments=1):
+    scale = layer.pop("output_scale", None)
+    shard_inplace(layer, sharding, segments=segments, group=group)
+    if scale is not None:
+        layer.output_scale = scale
 
 
 class Mistral4MoE(nn.Module):
@@ -443,6 +497,7 @@ class Model(nn.Module):
         self.model = Mistral4Model(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -455,6 +510,8 @@ class Model(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+            if self.sharding_group is not None:
+                out = gather_last_axis(out, self.sharding_group)
         return out
 
     @property
@@ -589,72 +646,58 @@ class Model(nn.Module):
         return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
-        # shard_linear would drop the output scale of the fp8 layers.
-        if any(isinstance(m, Fp8Linear) for _, m in self.named_modules()):
-            raise ValueError("Sharding fp8 Mistral4 weights is not supported yet.")
-
         group = group or mx.distributed.init()
         N = group.size()
 
-        for layer in self.model.layers:
-            if layer.self_attn.q_lora_rank is None:
-                layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", group=group
-                )
-            else:
-                layer.self_attn.q_b_proj = shard_linear(
-                    layer.self_attn.q_b_proj, "all-to-sharded", group=group
-                )
+        # Each rank computes a slice of the vocabulary
+        if not self.args.tie_word_embeddings:
+            vocab = self.args.vocab_size
+            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
+            self.lm_head = shard_linear(self.lm_head, "all-to-sharded", group=group)
+            self.sharding_group = group
 
-            layer.self_attn.num_heads //= N
-            num_heads = layer.self_attn.num_heads
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            if attn.q_lora_rank is None:
+                attn.q_proj = _shard_linear(attn.q_proj, "all-to-sharded", group)
+            else:
+                attn.q_b_proj = _shard_linear(attn.q_b_proj, "all-to-sharded", group)
+
+            attn.num_heads //= N
+            num_heads = attn.num_heads
             sh = group.rank() * num_heads
             eh = sh + num_heads
 
             def shard_heads(w):
-                return w[sh:eh]
+                # The fp8 output scale is one scalar for all heads.
+                return w[sh:eh] if w.ndim > 0 else w
 
-            layer.self_attn.embed_q.apply(shard_heads)
-            layer.self_attn.unembed_out.apply(shard_heads)
+            attn.embed_q.apply(shard_heads)
+            attn.unembed_out.apply(shard_heads)
 
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
+            attn.o_proj = _shard_linear(attn.o_proj, "sharded-to-all", group)
 
-            if isinstance(layer.mlp, DeepseekV3MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
-                )
-                layer.mlp.down_proj = shard_linear(
-                    layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
-                )
+            mlp = layer.mlp
+            if isinstance(mlp, DeepseekV3MLP):
+                mlp.gate_proj = _shard_linear(mlp.gate_proj, "all-to-sharded", group)
+                mlp.down_proj = _shard_linear(mlp.down_proj, "sharded-to-all", group)
+                mlp.up_proj = _shard_linear(mlp.up_proj, "all-to-sharded", group)
 
             else:
                 # Shard in place: the MoE aggregates the partial sums itself.
-                layer.mlp.sharding_group = group
-                if hasattr(layer.mlp, "shared_experts"):
-                    shard_inplace(
-                        layer.mlp.shared_experts.gate_proj,
-                        "all-to-sharded",
-                        group=group,
+                mlp.sharding_group = group
+                if hasattr(mlp, "shared_experts"):
+                    shared = mlp.shared_experts
+                    _shard_inplace(shared.gate_proj, "all-to-sharded", group)
+                    _shard_inplace(shared.down_proj, "sharded-to-all", group)
+                    _shard_inplace(shared.up_proj, "all-to-sharded", group)
+                switch = mlp.switch_mlp
+                if isinstance(switch, Fp8SwitchGLU):
+                    # Each rank takes its part of both halves of gate_up_proj.
+                    _shard_inplace(
+                        switch.gate_up_proj, "all-to-sharded", group, segments=2
                     )
-                    shard_inplace(
-                        layer.mlp.shared_experts.down_proj,
-                        "sharded-to-all",
-                        group=group,
-                    )
-                    shard_inplace(
-                        layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
-                    )
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                )
+                else:
+                    _shard_inplace(switch.gate_proj, "all-to-sharded", group)
+                    _shard_inplace(switch.up_proj, "all-to-sharded", group)
+                _shard_inplace(switch.down_proj, "sharded-to-all", group)
