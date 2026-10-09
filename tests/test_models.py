@@ -421,6 +421,7 @@ class TestModels(unittest.TestCase):
     )
     def test_switch_linear_global_scale(self):
         from mlx_lm.models.switch_layers import SwitchLinear
+        from mlx_lm.utils import dequantize_model
 
         mx.random.seed(0)
         E, N, K = 8, 128, 256
@@ -450,6 +451,12 @@ class TestModels(unittest.TestCase):
         )
         expected = x @ w_hat[indices].swapaxes(-1, -2)
         self.assertTrue(mx.allclose(ql(x, indices), expected, atol=1e-4))
+
+        # dequantize_model applies each expert's scale.
+        holder = nn.Module()
+        holder.layer = ql
+        weight = dequantize_model(holder).layer.weight.astype(mx.float32)
+        self.assertTrue(mx.allclose(weight, w_hat, rtol=1e-2, atol=1e-6))
 
         # Without it the layer keeps the plain nvfp4 parameters
         self.assertNotIn(
