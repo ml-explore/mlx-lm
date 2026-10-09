@@ -5,7 +5,12 @@ from typing import Any, Dict, List, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_linear
+from mlx.nn.layers.distributed import (
+    QuantizedAllToShardedLinear,
+    QuantizedShardedToAllLinear,
+    shard_linear,
+)
+from mlx.utils import tree_unflatten
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
@@ -52,6 +57,102 @@ def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: 
         return scaling[:, None]
 
 
+class Fp8Linear(nn.QuantizedLinear):
+    """Linear on e4m3 weights, run as mxfp8 with unit group scales.
+
+    The kernel has no slot for the per-tensor scale, so it scales the output.
+    Fused layers have one scale per output row.
+    """
+
+    def __init__(self, input_dims: int, output_dims: int, per_row: bool = False):
+        super().__init__(input_dims, output_dims, False, 32, 8, "mxfp8")
+        self.output_scale = mx.ones((output_dims,)) if per_row else mx.array(1.0)
+        self.freeze()
+
+    def __call__(self, x):
+        y = super().__call__(x)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+class Fp8AllToShardedLinear(QuantizedAllToShardedLinear):
+    """Fp8Linear with the outputs sharded across the group."""
+
+    def __call__(self, x):
+        y = super().__call__(x)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+class Fp8ShardedToAllLinear(QuantizedShardedToAllLinear):
+    """Fp8Linear with the inputs sharded across the group."""
+
+    def __call__(self, x):
+        y = super().__call__(x)
+        return (y * self.output_scale).astype(y.dtype)
+
+
+def _shard_linear(layer, sharding, group, segments=1):
+    if not isinstance(layer, Fp8Linear):
+        return shard_linear(layer, sharding, segments=segments, group=group)
+    if sharding == "all-to-sharded":
+        cls = Fp8AllToShardedLinear
+    else:
+        cls = Fp8ShardedToAllLinear
+    scale = layer.pop("output_scale")
+    sharded = cls.from_quantized_linear(layer, segments=segments, group=group)
+    # A per-row scale follows the output rows. A scalar scale applies to each
+    # shard and to each partial sum, so every rank keeps all of it.
+    if scale.ndim == 1:
+        N, r = group.size(), group.rank()
+        parts = mx.split(scale, segments)
+        scale = mx.concatenate([mx.split(p, N)[r] for p in parts])
+    sharded.output_scale = scale
+    sharded.freeze()
+    return sharded
+
+
+def _fuse(weights, parts, fused):
+    """Join the output rows of layers that read the same input.
+
+    Returns False and changes nothing when the layers are stored differently,
+    for example quantized with different bits.
+    """
+    keys = [{k[len(p) + 1 :] for k in weights if k.startswith(p + ".")} for p in parts]
+    if "weight" not in keys[0] or any(k != keys[0] for k in keys):
+        return False
+    for k in keys[0]:
+        vs = [weights[f"{p}.{k}"] for p in parts]
+        if k == "output_scale" and vs[0].ndim > 0:
+            return False
+        if k not in ("output_scale", "bias") and any(
+            v.dtype != vs[0].dtype or v.shape[-1] != vs[0].shape[-1] for v in vs
+        ):
+            return False
+
+    rows = [weights[f"{p}.weight"].shape[-2] for p in parts]
+    for k in keys[0]:
+        vs = [weights.pop(f"{p}.{k}") for p in parts]
+        if k == "output_scale":
+            # Each fp8 layer has one scale. Fused, there is one per row.
+            vs = [mx.full((n,), s, dtype=s.dtype) for n, s in zip(rows, vs)]
+            weights[f"{fused}.{k}"] = mx.concatenate(vs)
+        else:
+            axis = -1 if k == "bias" else -2
+            weights[f"{fused}.{k}"] = mx.concatenate(vs, axis=axis)
+    return True
+
+
+def _fp8_as_mxfp8(weights):
+    """Read the e4m3 weights of fp8 layers as mxfp8 with unit (2^0) group scales."""
+    for k in [k for k in weights if k.endswith(".output_scale")]:
+        p = k.removesuffix(".output_scale")
+        w = weights[f"{p}.weight"]
+        if w.dtype == mx.uint8:
+            weights[f"{p}.weight"] = w.view(mx.uint32)
+            weights[f"{p}.scales"] = mx.full(
+                (*w.shape[:-1], w.shape[-1] // 32), 127, mx.uint8
+            )
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -90,7 +191,12 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, D = x.shape
 
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        # sanitize fuses the three projections unless they are stored differently.
+        if "qkv_proj" in self:
+            q, kv = self.n_heads * self.head_dim, self.n_kv_heads * self.head_dim
+            queries, keys, values = mx.split(self.qkv_proj(x), [q, q + kv], axis=-1)
+        else:
+            queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
 
         # Prepare the queries, keys and values for the attention computation
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
@@ -134,6 +240,19 @@ class MLP(nn.Module):
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
+class FusedGLU(nn.Module):
+    """Gated MLP with gate_proj and up_proj fused into one projection."""
+
+    def __init__(self, input_dims: int, hidden_dims: int):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(input_dims, 2 * hidden_dims, bias=False)
+        self.down_proj = nn.Linear(hidden_dims, input_dims, bias=False)
+
+    def __call__(self, x):
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(swiglu(gate, up))
 
 
 class TransformerBlock(nn.Module):
@@ -283,18 +402,43 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
 
-        new_weights = {}
-        for k, v in weights.items():
-            if "weight_scale_inv" in k:
-                scale_inv = v
-                wk = k.replace("_scale_inv", "")
-                weight = weights[wk]
-                new_weights[wk] = weight * scale_inv
-            elif "activation_scale" in k:
-                continue
-            elif k not in new_weights:
-                new_weights[k] = v
-        weights = new_weights
+        # fp8 layers keep the e4m3 bytes, and the scale moves to the layer.
+        # Static activation scales have no consumer here.
+        weights = {
+            k.replace(".weight_scale_inv", ".output_scale"): v
+            for k, v in weights.items()
+            if "activation_scale" not in k
+        }
+
+        def fused(parts, name):
+            if f"{name}.weight" in weights:
+                return True
+            # Only fp8 layers are fused. AWQ and the mixed-bit recipes look up
+            # q_proj, v_proj and gate_proj by name.
+            fp8 = f"{parts[0]}.output_scale" in weights
+            return fp8 and _fuse(weights, parts, name)
+
+        # Projections that read the same input run as one matmul.
+        for l, layer in enumerate(self.model.layers):
+            attn, mlp = f"model.layers.{l}.self_attn", f"model.layers.{l}.mlp"
+            a = layer.self_attn
+            if fused([f"{attn}.{n}_proj" for n in "qkv"], f"{attn}.qkv_proj"):
+                rows = (a.n_heads + 2 * a.n_kv_heads) * a.head_dim
+                a.qkv_proj = nn.Linear(self.args.hidden_size, rows, bias=False)
+                del a.q_proj, a.k_proj, a.v_proj
+            if fused([f"{mlp}.gate_proj", f"{mlp}.up_proj"], f"{mlp}.gate_up_proj"):
+                out_dims, in_dims = layer.mlp.gate_proj.weight.shape
+                layer.mlp = FusedGLU(in_dims, out_dims)
+
+        _fp8_as_mxfp8(weights)
+        fp8_modules = []
+        for p, m in self.named_modules():
+            if isinstance(m, nn.Linear) and f"{p}.output_scale" in weights:
+                out_dims, in_dims = m.weight.shape
+                per_row = weights[f"{p}.output_scale"].ndim == 1
+                fp8_modules.append((p, Fp8Linear(in_dims, out_dims, per_row)))
+        if fp8_modules:
+            self.update_modules(tree_unflatten(fp8_modules))
 
         return weights
 
@@ -303,31 +447,32 @@ class Model(nn.Module):
         N = group.size()
         for layer in self.model.layers:
             # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
+            attn = layer.self_attn
+            if "qkv_proj" in attn:
+                # Each rank takes its heads of q, k and v.
+                q = attn.n_heads * attn.head_dim
+                kv = attn.n_kv_heads * attn.head_dim
+                attn.qkv_proj = _shard_linear(
+                    attn.qkv_proj, "all-to-sharded", group, segments=[q, q + kv]
+                )
+            else:
+                attn.q_proj = _shard_linear(attn.q_proj, "all-to-sharded", group)
+                attn.k_proj = _shard_linear(attn.k_proj, "all-to-sharded", group)
+                attn.v_proj = _shard_linear(attn.v_proj, "all-to-sharded", group)
+            attn.o_proj = _shard_linear(attn.o_proj, "sharded-to-all", group)
+            attn.n_heads //= N
+            attn.n_kv_heads //= N
 
             # Shard the MLP
-            layer.mlp.gate_proj = shard_linear(
-                layer.mlp.gate_proj, "all-to-sharded", group=group
-            )
-            layer.mlp.down_proj = shard_linear(
-                layer.mlp.down_proj, "sharded-to-all", group=group
-            )
-            layer.mlp.up_proj = shard_linear(
-                layer.mlp.up_proj, "all-to-sharded", group=group
-            )
+            mlp = layer.mlp
+            if isinstance(mlp, FusedGLU):
+                mlp.gate_up_proj = _shard_linear(
+                    mlp.gate_up_proj, "all-to-sharded", group, segments=2
+                )
+            else:
+                mlp.gate_proj = _shard_linear(mlp.gate_proj, "all-to-sharded", group)
+                mlp.up_proj = _shard_linear(mlp.up_proj, "all-to-sharded", group)
+            mlp.down_proj = _shard_linear(mlp.down_proj, "sharded-to-all", group)
 
     @property
     def layers(self):

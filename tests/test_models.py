@@ -2387,6 +2387,129 @@ class TestModels(unittest.TestCase):
             self.assertEqual(w.shape, shape)
             self.assertEqual(w.reshape(-1)[0].item(), value)
 
+    def test_ministral3(self):
+        from mlx_lm.models import ministral3, mistral3
+
+        h, H, KV, D, I = 64, 4, 2, 32, 128
+        text_config = {
+            "model_type": "ministral3",
+            "hidden_size": h,
+            "num_hidden_layers": 2,
+            "intermediate_size": I,
+            "num_attention_heads": H,
+            "num_key_value_heads": KV,
+            "head_dim": D,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 128,
+            "max_position_embeddings": 262144,
+            "tie_word_embeddings": False,
+            "rope_parameters": {
+                "rope_type": "yarn",
+                "factor": 64.0,
+                "mscale": 1.0,
+                "mscale_all_dim": 0.0,
+                "beta_fast": 4.0,
+                "beta_slow": 1.0,
+                "original_max_position_embeddings": 4096,
+                "rope_theta": 1000000.0,
+                "llama_4_scaling_beta": 0.1,
+            },
+        }
+        args = mistral3.ModelArgs(model_type="mistral3", text_config=text_config)
+        model = mistral3.Model(args)
+        self.model_test_runner(model, args.model_type, 128, 2)
+
+        # fp8 checkpoint: e4m3 weights with one rank-0 scale per layer. The
+        # reference gets the same weights dequantized in fp32.
+        fp8_shapes = {
+            "self_attn.q_proj": (H * D, h),
+            "self_attn.k_proj": (KV * D, h),
+            "self_attn.v_proj": (KV * D, h),
+            "self_attn.o_proj": (h, H * D),
+            "mlp.gate_proj": (I, h),
+            "mlp.up_proj": (I, h),
+            "mlp.down_proj": (h, I),
+        }
+        mx.random.seed(0)
+        ref = mistral3.Model(args)
+        plain = {k: v for k, v in tree_flatten(ref.parameters()) if "_proj" not in k}
+        fp8_weights, ref_weights = dict(plain), dict(plain)
+        for l in range(2):
+            for name, shape in fp8_shapes.items():
+                k = f"model.language_model.layers.{l}.{name}"
+                s = mx.random.uniform(0.01, 0.05, ()).astype(mx.bfloat16)
+                w = mx.to_fp8(mx.random.normal(shape))
+                fp8_weights[f"{k}.weight"] = w
+                fp8_weights[f"{k}.weight_scale_inv"] = s
+                fp8_weights[f"{k}.activation_scale"] = s
+                ref_weights[f"{k}.weight"] = mx.from_fp8(w, dtype=mx.float32) * s
+
+        model = mistral3.Model(args)
+        model.load_weights(list(model.sanitize(fp8_weights).items()))
+        ref.load_weights(list(ref.sanitize(ref_weights).items()))
+        # fp8 projections that read the same input are fused, others are not.
+        layer = model.layers[0]
+        self.assertIsInstance(layer.self_attn.qkv_proj, ministral3.Fp8Linear)
+        self.assertEqual(
+            layer.self_attn.qkv_proj.output_scale.shape, ((H + 2 * KV) * D,)
+        )
+        self.assertIsInstance(layer.mlp, ministral3.FusedGLU)
+        self.assertIsInstance(layer.mlp.gate_up_proj, ministral3.Fp8Linear)
+        self.assertIsInstance(layer.mlp.down_proj, ministral3.Fp8Linear)
+        self.assertIsInstance(model.language_model.lm_head, nn.Linear)
+        self.assertIn("q_proj", ref.layers[0].self_attn)
+        self.assertIsInstance(ref.layers[0].mlp, ministral3.MLP)
+
+        # Each rank of a fused projection gets its part of q, k and v, with
+        # the matching rows of the per-row scale.
+        class FakeGroup:
+            def __init__(self, rank):
+                self._rank = rank
+
+            def rank(self):
+                return self._rank
+
+            def size(self):
+                return 2
+
+        h_in = mx.random.normal((1, 3, h))
+        split = [H * D, (H + KV) * D]
+        full = mx.split(layer.self_attn.qkv_proj(h_in), split, axis=-1)
+        shards = [
+            mx.split(
+                ministral3._shard_linear(
+                    copy.deepcopy(layer.self_attn.qkv_proj),
+                    "all-to-sharded",
+                    FakeGroup(r),
+                    segments=split,
+                )(h_in),
+                [s // 2 for s in split],
+                axis=-1,
+            )
+            for r in range(2)
+        ]
+        for i, f in enumerate(full):
+            out = mx.concatenate([s[i] for s in shards], axis=-1)
+            self.assertTrue(mx.allclose(out, f, atol=1e-5).item())
+
+        x = mx.random.randint(0, 128, (1, 16))
+        expected = ref(x)
+        for shard in (False, True):
+            if shard:
+                # Each sharded fp8 layer keeps its output scale.
+                model.language_model.shard(mx.distributed.init())
+                self.assertIsInstance(
+                    model.layers[0].self_attn.o_proj, ministral3.Fp8ShardedToAllLinear
+                )
+            out = model(x)
+            # fp32 matmuls on M5 GPUs have ~3e-4 error. A wrong scale gives ~1.
+            err = mx.abs(out - expected).max() / mx.abs(expected).max()
+            self.assertLess(err.item(), 2e-3)
+
+        # The output scale must not promote bf16 activations to fp32.
+        model.set_dtype(mx.bfloat16)
+        self.assertEqual(model(x).dtype, mx.bfloat16)
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
