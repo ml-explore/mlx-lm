@@ -7,7 +7,6 @@ import mlx.core as mx
 
 # isort: split
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import distributed_argmax
 from mlx_lm.utils import sharded_load
 
 
@@ -46,7 +45,7 @@ def main():
     for j in range(args.passes + 1):
         tic = time.perf_counter()
         logits = model(token, cache=cache)
-        token = distributed_argmax(logits[:, -1:], model.vocab_group)
+        token = mx.argmax(logits, axis=-1, keepdims=True)
         mx.eval(token)
         times.append(time.perf_counter() - tic)
         log(f"pass {j}{' (warmup)' if j == 0 else ''}: {times[-1] * 1e3:.1f} ms")
