@@ -747,34 +747,33 @@ def sharded_load(
     if pipeline_group is not None:
         num_layers = len(model.model.layers)
         model.model.pipeline(pipeline_group)
+        start, end = model.model.start_idx, model.model.end_idx
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
-        names = [k for k, _ in tree_flatten(model.parameters())]
-        if all(k in weight_index for k in names):
-            local_files = {weight_index[k] for k in names}
-        else:
-            # sanitize renames the weights of unconverted checkpoints, so
-            # match the layer numbers of this stage instead.
-            layer_ids = {}
-            for k in weight_index:
-                if m := re.search(r"\.layers\.(\d+)\.", k):
-                    layer_ids[k] = int(m.group(1))
-            num_ckpt_layers = len(set(layer_ids.values()))
-            if num_ckpt_layers != num_layers:
-                raise ValueError(
-                    f"The checkpoint has {num_ckpt_layers} layers but the model "
-                    f"has {num_layers}, so the weights of this pipeline stage "
-                    "cannot be matched by layer number. Convert the model with "
-                    "mlx_lm.convert first."
-                )
-            local = {i for i, l in enumerate(model.model.layers) if l is not None}
-            local_files = set()
-            for k, f in weight_index.items():
-                if k not in layer_ids or layer_ids[k] in local:
+        # Match weights by layer number, since sanitize can rename them.
+        ckpt_layers = set()
+        local_files = set()
+        for k, f in weight_index.items():
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+            if m is None:
+                # Every stage keeps the embeddings, the final norm and the head.
+                local_files.add(f)
+            else:
+                layer = int(m.group(1))
+                ckpt_layers.add(layer)
+                if start <= layer < end:
                     local_files.add(f)
+
+        # Layers past the last model layer are MTP layers, which sanitize drops.
+        missing = set(range(num_layers)) - ckpt_layers
+        if missing:
+            raise ValueError(
+                f"The checkpoint has no weights for layers {sorted(missing)}. "
+                "Convert the model with mlx_lm.convert first."
+            )
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
