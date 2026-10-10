@@ -60,6 +60,8 @@ class ToolCallFormatter:
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
+        self.unparsed: List[str] = []
+        self.made_valid_call = False
 
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
@@ -87,11 +89,30 @@ class ToolCallFormatter:
                     f"Failed to parse tool call ({type(e).__name__}: {e}) — "
                     f"tool text was likely truncated mid-generation."
                 )
+                self.unparsed.append(tool_text)
                 continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
+            self.made_valid_call = True
             result.extend(self._format(tc) for tc in parsed)
         return result
+
+    def fold_unparsed(self, text, finish_reason):
+        """Fold tool text the parser rejected back into the response.
+
+        Generated text must never vanish from the response, and
+        ``finish_reason`` must not report ``tool_calls`` when no call
+        actually parsed. Unparsed tool text is appended to the message
+        content so the client still sees what the model produced, and the
+        finish reason is downgraded to ``stop`` unless at least one call
+        parsed successfully.
+        """
+        if self.unparsed:
+            text = text + "".join(self.unparsed)
+            self.unparsed = []
+        if finish_reason == "tool_calls" and not self.made_valid_call:
+            finish_reason = "stop"
+        return text, finish_reason
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -1505,10 +1526,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     and current_state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
+                    formatted_calls = tool_formatter(tool_calls)
+                    text, _ = tool_formatter.fold_unparsed(text, None)
                     resp = self.generate_response(
                         text,
                         None,
-                        tool_calls=tool_formatter(tool_calls),
+                        tool_calls=formatted_calls,
                         reasoning_text=reasoning_text,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -1530,10 +1553,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason = "tool_calls"
 
             if self.stream:
+                formatted_calls = tool_formatter(tool_calls)
+                text, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=formatted_calls,
                     reasoning_text=reasoning_text,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -1552,6 +1577,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
             else:
+                formatted_calls = tool_formatter(tool_calls)
+                text, finish_reason = tool_formatter.fold_unparsed(text, finish_reason)
                 resp = self.generate_response(
                     text,
                     finish_reason,
@@ -1562,7 +1589,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=formatted_calls,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
