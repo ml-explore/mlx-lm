@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import resource
 import shutil
 from decimal import Decimal
@@ -744,19 +745,35 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
+        num_layers = len(model.model.layers)
         model.model.pipeline(pipeline_group)
+        start, end = model.model.start_idx, model.model.end_idx
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
+        # Match weights by layer number, since sanitize can rename them.
+        ckpt_layers = set()
         local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+        for k, f in weight_index.items():
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+            if m is None:
+                # Every stage keeps the embeddings, the final norm and the head.
+                local_files.add(f)
+            else:
+                layer = int(m.group(1))
+                ckpt_layers.add(layer)
+                if start <= layer < end:
+                    local_files.add(f)
+
+        # Layers past the last model layer are MTP layers, which sanitize drops.
+        missing = set(range(num_layers)) - ckpt_layers
+        if missing:
+            raise ValueError(
+                f"The checkpoint has no weights for layers {sorted(missing)}. "
+                "Convert the model with mlx_lm.convert first."
+            )
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
