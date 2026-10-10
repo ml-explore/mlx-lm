@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import http
+import http.client
 import io
 import json
 import threading
@@ -59,6 +60,7 @@ class DummyModelProvider:
                 "prompt_cache_size": 10,
                 "prompt_cache_bytes": 1 << 63,
                 "prompt_cache_total_bytes": None,
+                "generation_stall_timeout": 120,
                 "allowed_origins": ["*"],
                 "kv_bits": kv_bits,
                 "kv_group_size": 64,
@@ -965,6 +967,169 @@ class TestGenerationThreadDeath(unittest.TestCase):
         # waiting on it must give up instead of blocking forever.
         with self.assertRaisesRegex(RuntimeError, "generation thread died"):
             rg._await_response(Queue())
+
+
+class BudgetModelProvider:
+    def __init__(self, prompt_cache_bytes):
+        self.cli_args = type(
+            "obj", (object,), {"prompt_cache_bytes": prompt_cache_bytes}
+        )
+
+    def load_default(self):
+        raise RuntimeError("no model needed")
+
+
+class IdleModelProvider:
+    def __init__(self):
+        self.cli_args = type("obj", (object,), {"generation_stall_timeout": 120})
+
+    def load_default(self):
+        pass
+
+    def reset(self):
+        pass
+
+
+class FakeBatchGenerator:
+    def __init__(self, estimated_prompt_cache_nbytes):
+        self.estimated_prompt_cache_nbytes = estimated_prompt_cache_nbytes
+
+
+class TestPromptCacheBudget(unittest.TestCase):
+    def _generator(self, budget):
+        rg = ResponseGenerator(BudgetModelProvider(budget), LRUPromptCache())
+        rg.join()
+        return rg
+
+    @staticmethod
+    def _populate(cache, n, size=100):
+        for i in range(n):
+            cache.insert_cache("model", [i], [MockCache("x" * size)])
+
+    def test_trim_accounts_for_active_cache_bytes(self):
+        rg = self._generator(500)
+        self._populate(rg.prompt_cache, 4)
+
+        # 400 cached bytes with 250 active leaves room for 250, so half the
+        # entries are evicted.
+        rg._trim_prompt_cache(FakeBatchGenerator(250))
+        self.assertEqual(len(rg.prompt_cache), 2)
+
+    def test_trim_skipped_without_byte_budget(self):
+        rg = self._generator(None)
+        self._populate(rg.prompt_cache, 4)
+
+        rg._trim_prompt_cache(FakeBatchGenerator(10**9))
+        self.assertEqual(len(rg.prompt_cache), 4)
+
+
+class TestServerResilience(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.response_generator = ResponseGenerator(
+            DummyModelProvider(), LRUPromptCache()
+        )
+        cls.server_address = ("localhost", 0)
+        cls.httpd = http.server.HTTPServer(
+            cls.server_address,
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    @staticmethod
+    def _post(connection, payload):
+        body = json.dumps(payload).encode()
+        connection.request(
+            "POST",
+            "/v1/completions",
+            body=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    def test_client_disconnect_mid_stream(self):
+        # Fixed local test server. Drop the connection before the generation
+        # finishes.
+        with self.assertLogs(level="INFO") as logs:
+            connection = http.client.HTTPConnection("localhost", self.port, timeout=10)
+            self._post(
+                connection,
+                {
+                    "model": "default_model",
+                    "prompt": "Once upon a time",
+                    "max_tokens": 512,
+                    "stream": True,
+                },
+            )
+            connection.close()
+
+            deadline = time.time() + 20
+            while not any(
+                record.getMessage() == "Client disconnected during generation."
+                for record in logs.records
+            ):
+                if time.time() > deadline:
+                    self.fail("server did not log the client disconnect")
+                time.sleep(0.05)
+
+        # The server keeps serving after the disconnect.
+        connection = http.client.HTTPConnection("localhost", self.port, timeout=10)
+        self._post(
+            connection,
+            {"model": "default_model", "prompt": "Hello", "max_tokens": 5},
+        )
+        self.assertEqual(connection.getresponse().status, 200)
+        connection.close()
+
+
+class TestGenerationStall(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.rg = ResponseGenerator(IdleModelProvider(), LRUPromptCache())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.rg.stop_and_join()
+
+    def setUp(self):
+        self.rg.cli_args.generation_stall_timeout = 120
+        self.rg._busy = False
+        self.rg._touch_progress()
+
+    def test_stalled_generation_is_unhealthy(self):
+        self.assertTrue(self.rg.is_healthy)
+        self.rg._busy = True
+        self.rg._last_progress = time.monotonic() - 10_000
+        self.assertFalse(self.rg.is_healthy)
+        self.rg._touch_progress()
+        self.assertTrue(self.rg.is_healthy)
+
+    def test_idle_generation_is_healthy(self):
+        # An idle server has no recent progress but is not busy.
+        self.rg._last_progress = time.monotonic() - 10_000
+        self.assertTrue(self.rg.is_healthy)
+
+    def test_stalled_generation_fails_pending_request(self):
+        self.rg.cli_args.generation_stall_timeout = 1
+        self.rg._busy = True
+        self.rg._last_progress = time.monotonic() - 10_000
+        with self.assertRaisesRegex(RuntimeError, "generation stalled"):
+            self.rg._await_response(Queue())
+
+    def test_stall_check_disabled(self):
+        self.rg.cli_args.generation_stall_timeout = 0
+        self.rg._busy = True
+        self.rg._last_progress = time.monotonic() - 10_000
+        self.assertTrue(self.rg.is_healthy)
 
 
 if __name__ == "__main__":

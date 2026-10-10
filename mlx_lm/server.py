@@ -441,6 +441,8 @@ class ResponseGenerator:
         self._rank = mx.distributed.init().rank()
         self._stop = False
         self._generation_failed = False
+        self._busy = False
+        self._last_progress = time.monotonic()
         self._generation_thread = Thread(target=self._run_generate)
         self._generation_thread.start()
 
@@ -454,6 +456,16 @@ class ResponseGenerator:
     def generation_available(self):
         return self._generation_thread.is_alive() and not self._generation_failed
 
+    def _touch_progress(self):
+        self._last_progress = time.monotonic()
+
+    def _is_stalled(self):
+        # The generation thread can stay alive while blocked in native code,
+        # so track the time since it last admitted or served a request.
+        timeout = self.cli_args.generation_stall_timeout
+        elapsed = time.monotonic() - self._last_progress
+        return timeout > 0 and self._busy and elapsed > timeout
+
     def stop_and_join(self):
         self._stop = True
         self._generation_thread.join()
@@ -463,7 +475,7 @@ class ResponseGenerator:
 
     @property
     def is_healthy(self):
-        return self.generation_available()
+        return self.generation_available() and not self._is_stalled()
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -475,6 +487,13 @@ class ResponseGenerator:
             logging.info(
                 f"- {cache_type}: {n_sequences} sequences, {n_bytes / 1e9:.2f} GB"
             )
+
+    def _trim_prompt_cache(self, batch_generator):
+        # Enforce the byte budget as caches grow, not only at insert time.
+        budget = self.cli_args.prompt_cache_bytes
+        if budget is not None:
+            active = batch_generator.estimated_prompt_cache_nbytes
+            self.prompt_cache.trim_to(n_bytes=budget - active)
 
     def _next_request(self, timeout=None):
         request = None
@@ -739,6 +758,7 @@ class ResponseGenerator:
                         prompt_cache_count=prompt_cache_count,
                     )
                     rqueue.put(ctx)
+                    self._touch_progress()
 
                     (uid,) = batch_generator.insert_segments(
                         segments=[segments],
@@ -759,10 +779,7 @@ class ResponseGenerator:
                     # just making sure we don't leave a reference around
                     del cache
 
-                    if self.model_provider.cli_args.prompt_cache_bytes is not None:
-                        total = self.model_provider.cli_args.prompt_cache_bytes
-                        active = batch_generator.prompt_cache_nbytes
-                        self.prompt_cache.trim_to(n_bytes=total - active)
+                    self._trim_prompt_cache(batch_generator)
                     continue
 
                 # No batch generator. Load the model and if it's not
@@ -804,6 +821,7 @@ class ResponseGenerator:
 
             # No request so serve from the current batch
             elif batch_generator is not None:
+                self._busy = len(batch_results) > 0
                 if len(batch_results) == 0:
                     if drain_batch:
                         current_model = None
@@ -817,6 +835,8 @@ class ResponseGenerator:
                 uids_to_remove = []
                 for _ in self._time_budget:
                     prompt_responses, gen_responses = batch_generator.next()
+                    self._touch_progress()
+                    self._trim_prompt_cache(batch_generator)
                     if not prompt_responses and not gen_responses:
                         break
 
@@ -903,9 +923,11 @@ class ResponseGenerator:
 
     def _serve_single(self, request, stream):
         rqueue, request, args = request
+        self._busy = True
 
         # Define the progress callback
         def progress(tokens_processed, tokens_total):
+            self._touch_progress()
             rqueue.put((tokens_processed, tokens_total))
 
         try:
@@ -990,6 +1012,7 @@ class ResponseGenerator:
                         ),
                     )
                 )
+                self._touch_progress()
                 cache_key.append(gen.token)
 
                 if ctx._should_stop:
@@ -1009,6 +1032,8 @@ class ResponseGenerator:
 
         except Exception as e:
             rqueue.put(e)
+        finally:
+            self._busy = False
 
     def _await_response(self, response_queue):
         # Wherever the request was when the thread died, nothing more will be
@@ -1019,6 +1044,8 @@ class ResponseGenerator:
             except QueueEmpty:
                 if not self.generation_available():
                     raise RuntimeError("generation thread died") from None
+                if self._is_stalled():
+                    raise RuntimeError("generation stalled") from None
 
     def generate(
         self,
@@ -1573,6 +1600,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            # The client is gone; the stop flag releases its cache sequence.
+            logging.info("Client disconnected during generation.")
         finally:
             ctx.stop()
 
@@ -1907,6 +1937,13 @@ def main():
         "--prompt-cache-bytes",
         type=_parse_size,
         help="Maximum size in bytes of the KV caches",
+    )
+    parser.add_argument(
+        "--generation-stall-timeout",
+        type=int,
+        default=120,
+        help="Seconds without generation progress before /health reports "
+        "unavailable. 0 disables the check (default: 120)",
     )
     parser.add_argument(
         "--kv-bits",
