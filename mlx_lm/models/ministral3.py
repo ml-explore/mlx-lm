@@ -13,7 +13,12 @@ from mlx.nn.layers.distributed import (
 from mlx.utils import tree_unflatten
 
 from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    gather_last_axis,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -380,6 +385,7 @@ class Model(nn.Module):
         self.model = LanguageModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -392,6 +398,8 @@ class Model(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+            if self.sharding_group is not None:
+                out = gather_last_axis(out, self.sharding_group)
         return out
 
     def sanitize(self, weights):
@@ -445,6 +453,13 @@ class Model(nn.Module):
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
+
+        if not self.args.tie_word_embeddings:
+            vocab = self.args.vocab_size
+            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
+            self.lm_head = _shard_linear(self.lm_head, "all-to-sharded", group)
+            self.sharding_group = group
+
         for layer in self.model.layers:
             # Shard the self attention
             attn = layer.self_attn

@@ -2501,6 +2501,10 @@ class TestModels(unittest.TestCase):
                 self.assertIsInstance(
                     model.layers[0].self_attn.o_proj, ministral3.Fp8ShardedToAllLinear
                 )
+                # Each rank computes a slice of the vocabulary.
+                lm = model.language_model
+                self.assertIsInstance(lm.lm_head, nn.AllToShardedLinear)
+                self.assertIsNotNone(lm.sharding_group)
             out = model(x)
             # fp32 matmuls on M5 GPUs have ~3e-4 error. A wrong scale gives ~1.
             err = mx.abs(out - expected).max() / mx.abs(expected).max()
