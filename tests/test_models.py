@@ -384,7 +384,15 @@ class TestModels(unittest.TestCase):
         self.assertEqual(model.model_type, model_type)
 
         for t in [mx.float32, mx.float16]:
-            model.update(tree_map(lambda p: p.astype(t), model.parameters()))
+            # Leave packed integer weights alone
+            model.update(
+                tree_map(
+                    lambda p: (
+                        p.astype(t) if mx.issubdtype(p.dtype, mx.floating) else p
+                    ),
+                    model.parameters(),
+                )
+            )
 
             inputs = mx.array([[0, 1]])
             outputs = model(inputs)
@@ -407,6 +415,49 @@ class TestModels(unittest.TestCase):
 
         # Make sure the model can be copied / pickled
         copy.deepcopy(model)
+
+    @unittest.skipIf(
+        not mx.metal.is_available(), "Global scale is only supported on Metal backend"
+    )
+    def test_switch_linear_global_scale(self):
+        from mlx_lm.models.switch_layers import SwitchLinear
+
+        mx.random.seed(0)
+        E, N, K = 8, 128, 256
+        layer = SwitchLinear(K, N, E, bias=False)
+        # Scale the experts apart so a mixed up scale shows in the output.
+        layer.weight = layer.weight * mx.array(
+            [[1, 2, 4, 8][e % 4] for e in range(E)], mx.float32
+        ).reshape((E, 1, 1))
+
+        ql = layer.to_quantized(group_size=16, bits=4, mode="nvfp4", global_scale=True)
+        self.assertEqual(ql.global_scale.shape, (E,))
+        self.assertEqual(ql.global_scale.dtype, mx.float32)
+
+        x = mx.random.normal((16, 1, K))
+        indices = mx.random.randint(0, E, (16,))
+        w_hat = mx.stack(
+            [
+                mx.dequantize(
+                    ql.weight[e],
+                    ql.scales[e],
+                    mode="nvfp4",
+                    global_scale=ql.global_scale[e],
+                    dtype=x.dtype,
+                )
+                for e in range(E)
+            ]
+        )
+        expected = x @ w_hat[indices].swapaxes(-1, -2)
+        self.assertTrue(mx.allclose(ql(x, indices), expected, atol=1e-4))
+
+        # Without it the layer keeps the plain nvfp4 parameters
+        self.assertNotIn(
+            "global_scale",
+            layer.to_quantized(group_size=16, bits=4, mode="nvfp4", global_scale=False),
+        )
+        with self.assertRaises(ValueError):
+            layer.to_quantized(group_size=32, bits=4, mode="mxfp4", global_scale=True)
 
     def left_padding_test_runner(self, model):
         # A prompt run on its own must produce the same logits as the same
@@ -1026,6 +1077,167 @@ class TestModels(unittest.TestCase):
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
+
+    def _prism_hadamard_packed(self, rows, width, seed):
+        # Random 2-bit affine weights that dequantize exactly, and the dense
+        # weights they hold once the folded Hadamard rotation is undone.
+        from mlx_lm.models import prism_hadamard_qwen35 as phq
+
+        k1, k2, k3 = mx.random.split(mx.random.key(seed), 3)
+        codes = mx.random.randint(0, 4, (rows, width // 16, 16), key=k1)
+        shifts = 2 * mx.arange(16, dtype=mx.uint32)
+        weight = (codes.astype(mx.uint32) << shifts).sum(axis=-1).astype(mx.uint32)
+        scales = mx.random.uniform(0.01, 0.05, (rows, width // 128), key=k2)
+        scales = scales.astype(mx.float16)
+        biases = -1.5 * scales
+        signs = mx.where(mx.random.bernoulli(0.5, (width,), key=k3), 1.0, -1.0)
+        dense = mx.dequantize(weight, scales, biases, group_size=128, bits=2)
+        dense = phq.hadamard_rotate(dense.astype(mx.float32), 512, signs, inverse=True)
+        packed = {"weight": weight, "scales": scales, "biases": biases, "signs": signs}
+        return packed, dense
+
+    def test_prism_hadamard_qwen35_layers(self):
+        from mlx_lm.models import prism_hadamard_qwen35 as phq
+
+        packed, dense = self._prism_hadamard_packed(192, 1024, 0)
+        layer = phq.HadamardQuantizedLinear(1024, 192, 512)
+        layer.update(packed)
+        x = mx.random.normal((3, 5, 1024), key=mx.random.key(1)).astype(mx.float16)
+        self.assertTrue(
+            mx.allclose(layer(x), x.astype(mx.float32) @ dense.T, atol=2e-2, rtol=2e-2)
+        )
+
+        packed, table = self._prism_hadamard_packed(64, 512, 2)
+        embed = phq.HadamardQuantizedEmbedding(512, 64, 512)
+        embed.update(packed)
+        ids = mx.array([[0, 5, 63], [7, 7, 1]])
+        self.assertTrue(mx.allclose(embed(ids), table[ids], atol=1e-2))
+        h = mx.random.normal((2, 512), key=mx.random.key(3)).astype(mx.float16)
+        self.assertTrue(
+            mx.allclose(
+                embed.as_linear(h), h.astype(mx.float32) @ table.T, atol=2e-2, rtol=2e-2
+            )
+        )
+
+        with self.assertRaises(ValueError):
+            phq.HadamardQuantizedLinear(1024, 64, 384)
+        with self.assertRaises(ValueError):
+            phq.HadamardQuantizedLinear(768, 64, 512)
+
+    def test_prism_hadamard_qwen35_matches_qwen3_5(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_lm.models import prism_hadamard_qwen35 as phq
+        from mlx_lm.models import qwen3_5
+        from mlx_lm.utils import load_model
+
+        text_config = {
+            "hidden_size": 512,
+            "num_hidden_layers": 4,
+            "intermediate_size": 512,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 4,
+            "vocab_size": 256,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 4,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 2,
+            "rms_norm_eps": 1e-6,
+            "head_dim": 64,
+            "rope_theta": 1000.0,
+            "partial_rotary_factor": 0.25,
+            "max_position_embeddings": 1000,
+        }
+        targets = (
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "linear_attn.in_proj_qkv",
+            "linear_attn.in_proj_z",
+            "linear_attn.out_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        )
+
+        def build(schema, tied):
+            # A packed checkpoint plus a stock qwen3_5 model holding the
+            # unfolded weights.
+            text = dict(text_config, tie_word_embeddings=tied)
+            ref = qwen3_5.Model(
+                qwen3_5.ModelArgs.from_dict(
+                    {"model_type": "qwen3_5", "text_config": text}
+                )
+            )
+            lm = ref.language_model
+            named = dict(lm.named_modules())
+            paths = [
+                p
+                for p in named
+                if p.endswith(targets) or p in ("model.embed_tokens", "lm_head")
+            ]
+            weights = dict(tree_flatten(lm.parameters()))
+            modules = []
+            for seed, path in enumerate(paths):
+                rows, width = named[path].weight.shape
+                packed, dense = self._prism_hadamard_packed(rows, width, 100 + seed)
+                weights.update({f"{path}.{k}": v for k, v in packed.items()})
+                named[path].weight = dense
+                modules.append(
+                    {
+                        "path": path,
+                        "block": 512,
+                        "embedding": path == "model.embed_tokens",
+                        "dtype": "float16",
+                    }
+                )
+            prefix = "" if schema == 1 else "language_model."
+            weights = {prefix + k: v for k, v in weights.items()}
+            if schema == 2:
+                weights["vision_tower.patch_embed.proj.weight"] = mx.zeros((4, 4))
+            config = {
+                "model_type": "prism_hadamard_qwen35",
+                "schema_version": schema,
+                "tensor_namespace": phq._NAMESPACES[schema],
+                "gdn_activation_layout": "grouped",
+                "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+                "modules": modules,
+                "text_config": text,
+            }
+            return config, weights, ref
+
+        ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        for schema, tied in [(1, False), (1, True), (2, False), (2, True)]:
+            with self.subTest(schema=schema, tied=tied):
+                config, weights, ref = build(schema, tied)
+                with tempfile.TemporaryDirectory() as d:
+                    mx.save_safetensors(str(Path(d) / "model.safetensors"), weights)
+                    (Path(d) / "config.json").write_text(json.dumps(config))
+                    model, _ = load_model(Path(d))
+                self.assertIsInstance(model, phq.Model)
+                n_packed = sum(
+                    isinstance(m, phq.HadamardQuantizedLinear)
+                    for _, m in model.named_modules()
+                )
+                self.assertEqual(n_packed, len(config["modules"]))
+                out = model(ids).astype(mx.float32)
+                expected = ref(ids).astype(mx.float32)
+                err = mx.abs(out - expected).max() / mx.abs(expected).max()
+                self.assertLess(err.item(), 2e-2)
+
+        config, weights, _ = build(1, tied=False)
+        with self.assertRaises(ValueError):
+            phq.ModelArgs.from_dict(dict(config, tensor_namespace="mlx-vlm-qwen3_5"))
+        key = next(k for k in weights if k.endswith(".signs"))
+        weights[key] = weights[key] * 2
+        model = phq.Model(phq.ModelArgs.from_dict(config))
+        with self.assertRaises(ValueError):
+            model.sanitize(weights)
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4
@@ -2940,6 +3152,57 @@ class TestModels(unittest.TestCase):
         sanitized = model.sanitize(weights)
         self.assertNotIn("lm_head.weight", sanitized)
 
+    def test_granitemoehybrid_padded_batch(self):
+        from mlx_lm.generate import BatchGenerator, generate_step
+        from mlx_lm.models import granitemoehybrid
+
+        # Regression for #1908: the SSM update must use cache.lengths.
+        mx.random.seed(0)
+        args = granitemoehybrid.ModelArgs(
+            model_type="granitemoehybrid",
+            vocab_size=100,
+            hidden_size=64,
+            intermediate_size=128,
+            shared_intermediate_size=128,
+            num_hidden_layers=2,
+            layer_types=["mamba", "attention"],
+            max_position_embeddings=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            attention_bias=False,
+            embedding_multiplier=1.0,
+            attention_multiplier=0.25,
+            logits_scaling=1.0,
+            residual_multiplier=1.0,
+            rms_norm_eps=1e-5,
+            position_embedding_type="nope",
+            mamba_n_heads=4,
+            mamba_d_head=32,
+            mamba_d_state=32,
+            mamba_d_conv=4,
+            mamba_n_groups=1,
+            mamba_proj_bias=False,
+            mamba_conv_bias=True,
+        )
+        model = granitemoehybrid.Model(args)
+        # Random init hides the SSM path; strengthen it so the bug shows.
+        mamba = model.layers[0].mamba
+        mamba.A_log = mx.full(mamba.A_log.shape, -4.0)
+        mamba.conv1d.weight = mamba.conv1d.weight * 30
+
+        _, alone = next(generate_step(mx.array([7, 8, 9]), model, max_tokens=1))
+
+        gen = BatchGenerator(model, max_tokens=1)
+        uids = gen.insert([list(range(1, 13)), [7, 8, 9]])
+        got = {}
+        while len(got) < 2:
+            for r in gen.next_generated():
+                got[r.uid] = r.logprobs
+        gen.close()
+
+        err = mx.abs(got[uids[1]] - alone).max().item()
+        self.assertLess(err, 1e-5)
+
     def test_laguna_sanitize(self):
         from mlx_lm.models import laguna
 
@@ -3918,6 +4181,48 @@ class TestModels(unittest.TestCase):
                 "rope_theta": 1000.0,
                 "partial_rotary_factor": 0.5,
                 "max_position_embeddings": 1000,
+            },
+            {
+                "model_type": "prism_hadamard_qwen35",
+                "vocab_size": 1000,
+                "num_hidden_layers": 4,
+                "schema_version": 1,
+                "tensor_namespace": "mlx-lm-text",
+                "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
+                "modules": [
+                    {
+                        "path": path,
+                        "block": block,
+                        "embedding": path == "model.embed_tokens",
+                        "dtype": "float16",
+                    }
+                    for path, block in [
+                        ("model.embed_tokens", 512),
+                        ("model.layers.0.linear_attn.in_proj_qkv", 512),
+                        ("model.layers.2.mlp.down_proj", 0),
+                        ("model.layers.3.self_attn.o_proj", 512),
+                        ("lm_head", 512),
+                    ]
+                ],
+                "text_config": {
+                    "hidden_size": 512,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 512,
+                    "num_attention_heads": 8,
+                    "num_key_value_heads": 4,
+                    "vocab_size": 1000,
+                    "linear_num_value_heads": 4,
+                    "linear_num_key_heads": 4,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 3,
+                    "rms_norm_eps": 1e-5,
+                    "head_dim": 64,
+                    "rope_theta": 1000.0,
+                    "partial_rotary_factor": 0.5,
+                    "max_position_embeddings": 1000,
+                    "tie_word_embeddings": False,
+                },
             },
             {
                 "model_type": "kimi_linear",
