@@ -34,9 +34,9 @@ class TestModels(unittest.TestCase):
 
     def _on_cpu(self):
         """The rest of the test on the CPU: these compare a whole prompt
-        with token by token (or two kernels) in float32, and on an M5 GPU
-        (mlx 0.32) a matmul of two or more rows is rounded like tf32 while
-        one row isn't -- ~1e-3 apart, past their 1e-4 tolerances."""
+        with token by token in float32, and on the GPU MLX runs a float32
+        matmul of two or more rows as tf32 by default (MLX_ENABLE_TF32; one
+        row isn't) -- ~1e-3 apart, past their 1e-4 tolerances."""
         device = mx.default_device()
         mx.set_default_device(mx.cpu)
         self.addCleanup(mx.set_default_device, device)
@@ -4250,7 +4250,10 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
 
     def test_ssm(self):
-        self._on_cpu()
+        # On the GPU, so the fused kernel is what's checked (on the CPU
+        # ssm_update is ssm_attn). The ops path's float32 matmuls run as
+        # tf32 there by default (MLX_ENABLE_TF32): ~1e-3 apart from the
+        # kernel, hence the tolerance below.
         for batch_size in [1, 2]:
             for n_group in [1, 4]:
                 num_heads = 48
@@ -4276,9 +4279,9 @@ class TestModels(unittest.TestCase):
                 out_c, out_state_c = ssm_update(
                     hidden_states, A_log, B, C, D, dt, dt_bias, state
                 )
-                self.assertTrue(mx.allclose(out, out_c, atol=1e-4, rtol=1e-4))
+                self.assertTrue(mx.allclose(out, out_c, atol=5e-3, rtol=5e-3))
                 self.assertTrue(
-                    mx.allclose(out_state, out_state_c, atol=1e-4, rtol=1e-4)
+                    mx.allclose(out_state, out_state_c, atol=5e-3, rtol=5e-3)
                 )
 
     def test_ssm_masked(self):
