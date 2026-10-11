@@ -68,6 +68,12 @@ MAX_IMAGE_BYTES = 20 * 1024 * 1024
 # larger is ever needed; decoded, 48 MP is about 1 GB at the peak.
 MAX_IMAGE_PIXELS = 16_000_000
 MAX_REQUEST_PIXELS = 48_000_000
+
+# Audio clips per request and their length together (Gemma 4 takes 30 s a
+# clip in training; a long one is many soft tokens).
+MAX_AUDIOS = 8
+MAX_AUDIO_SECONDS = 600
+AUDIO_RATE = 16_000
 URL_FETCH_SECONDS = 30
 # Formats whose Image.open reads only the header (ICO, for one, decodes its
 # embedded PNG right there -- the size check would come after the cost).
@@ -294,6 +300,96 @@ def _check_image(blob: bytes) -> int:
     return width * height
 
 
+def extract_media(messages: List[Any]) -> Tuple[List[bytes], List[np.ndarray]]:
+    """Images (``image_url`` parts) as extract_images, and audio clips
+    (OpenAI ``input_audio`` parts: base64 WAV) as 16 kHz mono float32,
+    each part rewritten in place to ``{"type": "image"}`` / ``{"type":
+    "audio"}`` for the chat template. ValueError (a 400) for anything
+    malformed."""
+    audios: List[np.ndarray] = []
+    seconds = 0.0
+    if isinstance(messages, list):
+        for message in messages:
+            content = message.get("content") if isinstance(message, dict) else None
+            if not isinstance(content, list):
+                continue
+            for i, part in enumerate(content):
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "audio":
+                    # Only this function makes those (see extract_images).
+                    raise ValueError("Send audio as input_audio parts.")
+                if part.get("type") != "input_audio":
+                    continue
+                if len(audios) >= MAX_AUDIOS:
+                    raise ValueError(f"At most {MAX_AUDIOS} audio clips per request.")
+                ref = part.get("input_audio")
+                data = ref.get("data") if isinstance(ref, dict) else None
+                fmt = (ref.get("format") or "wav").lower() if isinstance(ref, dict) else "wav"
+                if not isinstance(data, str):
+                    raise ValueError("input_audio part is missing its data.")
+                if fmt != "wav":
+                    raise ValueError("Only WAV audio is supported (input_audio format \"wav\").")
+                try:
+                    blob = base64.b64decode(data, validate=False)
+                except Exception as e:
+                    raise ValueError(f"input_audio data isn't base64: {e}") from e
+                wave_16k = decode_wav(blob)
+                seconds += len(wave_16k) / AUDIO_RATE
+                if seconds > MAX_AUDIO_SECONDS:
+                    raise ValueError(f"The audio adds up to more than {MAX_AUDIO_SECONDS} seconds.")
+                audios.append(wave_16k)
+                content[i] = {"type": "audio"}
+    return extract_images(messages), audios
+
+
+def decode_wav(blob: bytes) -> np.ndarray:
+    """A WAV file (PCM 8/16/24/32-bit) as 16 kHz mono float32 in [-1, 1]:
+    channels averaged, other rates resampled (windowed-sinc low-pass, then
+    linear interpolation)."""
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(blob)) as w:
+            channels, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            if rate <= 0 or w.getnframes() > rate * MAX_AUDIO_SECONDS:
+                raise ValueError(f"The audio is longer than {MAX_AUDIO_SECONDS} seconds.")
+            frames = w.readframes(w.getnframes())
+    except (wave.Error, EOFError) as e:
+        raise ValueError(f"Could not read the WAV audio: {e}") from e
+    if width == 1:
+        x = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128) / 128
+    elif width == 2:
+        x = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768
+    elif width == 3:
+        b = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3).astype(np.int32)
+        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        x = np.where(v >= 1 << 23, v - (1 << 24), v).astype(np.float32) / (1 << 23)
+    elif width == 4:
+        x = np.frombuffer(frames, dtype="<i4").astype(np.float32) / (1 << 31)
+    else:
+        raise ValueError(f"Unsupported WAV sample width: {width} bytes.")
+    if channels > 1:
+        x = x[: len(x) // channels * channels].reshape(-1, channels).mean(axis=1)
+    return resample(x, rate, AUDIO_RATE)
+
+
+def resample(x: np.ndarray, rate: int, target: int) -> np.ndarray:
+    """``x`` at ``rate`` Hz to ``target`` Hz: a windowed-sinc low-pass below
+    the lower Nyquist when going down, then linear interpolation."""
+    if rate == target or len(x) == 0:
+        return x.astype(np.float32)
+    if target < rate:
+        cutoff = 0.5 * target / rate  # cycles per sample
+        taps = 63
+        n = np.arange(taps) - (taps - 1) / 2
+        h = 2 * cutoff * np.sinc(2 * cutoff * n) * np.hamming(taps)
+        x = np.convolve(x, h / h.sum(), mode="same")
+    duration = len(x) / rate
+    t_out = np.arange(int(round(duration * target))) / target
+    return np.interp(t_out, np.arange(len(x)) / rate, x).astype(np.float32)
+
+
 def extract_images(messages: List[Any]) -> List[bytes]:
     """Collect image bytes from OpenAI-style `image_url` content parts (in
     order) and rewrite those parts in place to `{"type": "image"}`. Raises
@@ -315,9 +411,9 @@ def extract_images(messages: List[Any]) -> List[bytes]:
             # Only this function makes those: a client's would render an
             # image placeholder with no image behind it.
             raise ValueError("Send images as image_url parts.")
-        if "image_url" in types and not types <= {"text", "image_url"}:
+        if "image_url" in types and not types <= {"text", "image_url", "audio"}:
             # They'd reach the chat template as raw special tokens.
-            raise ValueError("Only text and image_url parts are supported together with images.")
+            raise ValueError("Only text, image_url and input_audio parts are supported together with images.")
         for i, part in enumerate(content):
             if part.get("type") != "image_url":
                 continue
@@ -423,30 +519,92 @@ class ImageInputs:
         self.image_token_id = args.image_token_id
         self.boi_token_id = args.boi_token_id
         self.eoi_token_id = args.eoi_token_id
+        # Audio (E2B/E4B's conformer tower, the 12B's waveform frames): HF's
+        # own feature extractor, so the features are exactly HF's.
+        self.audio_token_id = getattr(args, "audio_token_id", None)
+        self.boa_token_id = getattr(args, "boa_token_id", None)
+        self.eoa_token_id = getattr(args, "eoa_token_index", None)
+        self.unified = bool(getattr(model, "unified", False))
+        self.audio_extractor = None
+        fe = processor_config.get("feature_extractor")
+        if getattr(model, "embed_audio", None) is not None and isinstance(fe, dict):
+            fe = {k: v for k, v in fe.items() if k not in ("feature_extractor_type", "processor_class")}
+            if self.unified:
+                from transformers.models.gemma4_unified.feature_extraction_gemma4_unified import (
+                    Gemma4UnifiedAudioFeatureExtractor as Extractor,
+                )
+            else:
+                from transformers.models.gemma4.feature_extraction_gemma4 import (
+                    Gemma4AudioFeatureExtractor as Extractor,
+                )
+            self.audio_extractor = Extractor(**fe)
+
+    @property
+    def accepts_audio(self) -> bool:
+        return self.audio_extractor is not None and self.audio_token_id is not None
+
+    def audio_soft_tokens(self, mask) -> int:
+        """Soft tokens of one clip from its feature mask, as HF's processor
+        counts them: the conformer's two stride-2 convolutions (E2B/E4B),
+        or one per frame (the 12B, no downsampling)."""
+        mask = np.asarray(mask)
+        if not self.unified:
+            for _ in range(2):
+                t = len(mask)
+                mask = mask[::2][: (t + 2 - 3) // 2 + 1]
+        return int(mask.sum())
 
     def build(
-        self, prompt: List[int], images: List[bytes]
+        self, prompt: List[int], images: List[bytes], audios: Optional[List[np.ndarray]] = None
     ) -> Tuple[List[int], mx.array, List[int]]:
-        """Returns (expanded token ids, input embeddings [L, H], cache key)."""
+        """Returns (expanded token ids, input embeddings [L, H], cache key).
+        `audios`: 16 kHz mono clips (extract_media), one per audio placeholder."""
+        audios = audios or []
         n_placeholders = sum(1 for t in prompt if t == self.image_token_id)
         if n_placeholders != len(images):
             raise ValueError(
                 f"Chat template produced {n_placeholders} image placeholder(s) "
                 f"for {len(images)} image(s)."
             )
+        if audios and not self.accepts_audio:
+            raise ValueError("This model does not accept audio inputs (no audio tower / feature extractor).")
+        n_audio = sum(1 for t in prompt if self.audio_token_id is not None and t == self.audio_token_id)
+        if n_audio != len(audios):
+            raise ValueError(
+                f"Chat template produced {n_audio} audio placeholder(s) for {len(audios)} audio clip(s)."
+            )
 
-        pil_images = [_decode(b) for b in images]
-        feats = self.processor(images=pil_images, return_tensors="np")
-        n_soft = [int(n) for n in feats["num_soft_tokens_per_image"]]
+        feats = {}
+        n_soft = []
+        if images:
+            pil_images = [_decode(b) for b in images]
+            feats = self.processor(images=pil_images, return_tensors="np")
+            n_soft = [int(n) for n in feats["num_soft_tokens_per_image"]]
         keys = [
             _IMAGE_KEY_BASE + int.from_bytes(hashlib.sha256(b).digest()[:5], "big")
             for b in images
         ]
+        audio_feats = None
+        n_audio_soft = []
+        audio_keys = []
+        if audios:
+            audio_feats = self.audio_extractor(audios, sampling_rate=AUDIO_RATE, return_tensors="np")
+            n_audio_soft = [self.audio_soft_tokens(m) for m in audio_feats["input_features_mask"]]
+            audio_keys = [
+                _IMAGE_KEY_BASE + int.from_bytes(hashlib.sha256(a.tobytes()).digest()[:5], "big")
+                for a in audios
+            ]
 
         expanded, cache_key = [], []
         img = 0
+        aud = 0
         for t in prompt:
-            if t == self.image_token_id:
+            if self.audio_token_id is not None and t == self.audio_token_id:
+                span = [self.audio_token_id] * n_audio_soft[aud]
+                expanded += [self.boa_token_id] + span + [self.eoa_token_id]
+                cache_key += [self.boa_token_id] + [audio_keys[aud]] * n_audio_soft[aud] + [self.eoa_token_id]
+                aud += 1
+            elif t == self.image_token_id:
                 span = [self.image_token_id] * n_soft[img]
                 expanded += [self.boi_token_id] + span + [self.eoi_token_id]
                 cache_key += (
@@ -459,10 +617,10 @@ class ImageInputs:
 
         fused, _ = self.model._fuse_multimodal_inputs(
             mx.array(expanded)[None],
-            mx.array(feats["pixel_values"]),
-            mx.array(feats["image_position_ids"]),
-            None,
-            None,
+            mx.array(feats["pixel_values"]) if images else None,
+            mx.array(feats["image_position_ids"]) if images else None,
+            mx.array(audio_feats["input_features"]) if audios else None,
+            mx.array(audio_feats["input_features_mask"]) if audios else None,
         )
         embeddings = fused[0]
         mx.eval(embeddings)
@@ -475,7 +633,8 @@ class ImageInputs:
         # changed the output (last-token logits off by ~26) and the model
         # answered as if no image had been given.
         pad = self.model.language_model.model.config.pad_token_id
-        gen_ids = [pad if t == self.image_token_id else t for t in expanded]
+        soft = {self.image_token_id, self.audio_token_id} - {None}
+        gen_ids = [pad if t in soft else t for t in expanded]
         return gen_ids, embeddings, cache_key
 
 
@@ -799,7 +958,8 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
         return inputs
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
-    if getattr(model, "embed_vision", None) is None:
+    # Images, audio or both.
+    if getattr(model, "embed_vision", None) is None and getattr(model, "embed_audio", None) is None:
         return None
     from .utils import _download
 

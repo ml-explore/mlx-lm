@@ -581,3 +581,132 @@ class TestImageInputLimits(unittest.TestCase):
         buf = io.BytesIO()
         im.save(buf, format="JPEG", exif=exif.tobytes())
         self.assertEqual(multimodal._decode(buf.getvalue()).size, (20, 40))
+
+
+AUDIO, BOA, EOA = 258881, 256000, 258883
+AUDIO_CONFIG = {
+    **PROCESSOR_CONFIG,
+    "feature_extractor": {
+        "feature_extractor_type": "Gemma4AudioFeatureExtractor", "dither": 0.0, "feature_size": 128,
+        "fft_length": 512, "fft_overdrive": False, "frame_length": 320, "hop_length": 160,
+        "input_scale_factor": 1.0, "max_frequency": 8000.0, "mel_floor": 0.001, "min_frequency": 0.0,
+        "padding_side": "right", "padding_value": 0.0, "per_bin_mean": None, "per_bin_stddev": None,
+        "preemphasis": 0.0, "preemphasis_htk_flavor": True, "return_attention_mask": True,
+        "sampling_rate": 16000,
+    },
+}
+
+
+def _wav(seconds, rate=16000, channels=1, freq=440.0):
+    import wave
+
+    t = np.arange(int(seconds * rate)) / rate
+    x = (0.5 * np.sin(2 * np.pi * freq * t) * 32767).astype("<i2")
+    if channels > 1:
+        x = np.repeat(x[:, None], channels, axis=1).reshape(-1)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(x.tobytes())
+    return buf.getvalue()
+
+
+def _audio_part(blob):
+    return {"type": "input_audio", "input_audio": {"data": base64.b64encode(blob).decode(), "format": "wav"}}
+
+
+def _audio_model(unified=False):
+    model, captured = _stub_model()
+
+    def fuse(ids, pixel_values, position_ids, feats, mask):
+        captured["n"] = ids.shape[1]
+        captured["feats"] = None if feats is None else feats.shape
+        captured["pixels"] = pixel_values is not None
+        return mx.zeros((1, ids.shape[1], 8)), None
+
+    model._fuse_multimodal_inputs = fuse
+    model.args.audio_token_id = AUDIO
+    model.args.boa_token_id = BOA
+    model.args.eoa_token_index = EOA
+    model.embed_audio = object()
+    model.unified = unified
+    return model, captured
+
+
+@unittest.skipUnless(HAVE_DEPS, "needs pillow + transformers")
+class TestAudioInputs(unittest.TestCase):
+    def test_extract_media_decodes_and_rewrites(self):
+        from mlx_lm.multimodal import extract_media
+
+        messages = [{"role": "user", "content": [{"type": "text", "text": "what is this?"},
+                                                  _audio_part(_wav(1.5, rate=48000, channels=2))]}]
+        images, audios = extract_media(messages)
+        self.assertEqual(images, [])
+        self.assertEqual(len(audios), 1)
+        self.assertEqual(audios[0].dtype, np.float32)
+        self.assertAlmostEqual(len(audios[0]) / 16000, 1.5, places=2)  # 48 kHz stereo -> 16 kHz mono
+        self.assertLess(np.abs(audios[0]).max(), 0.6)
+        self.assertEqual(messages[0]["content"][1], {"type": "audio"})
+        process_message_content(messages)
+        self.assertEqual(messages[0]["content"][1], {"type": "audio"}, "left for the chat template")
+
+    def test_bad_audio_is_a_value_error(self):
+        from mlx_lm.multimodal import extract_media
+
+        bad = [
+            [{"type": "input_audio", "input_audio": {"data": base64.b64encode(b"not a wav").decode(), "format": "wav"}}],
+            [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}}],
+            [{"type": "input_audio", "input_audio": {}}],
+            [{"type": "audio"}],  # only extract_media makes those
+        ]
+        for content in bad:
+            with self.assertRaises(ValueError, msg=str(content)[:60]):
+                extract_media([{"role": "user", "content": content}])
+
+    def test_build_expands_audio_as_hf_counts(self):
+        from transformers.models.gemma4.feature_extraction_gemma4 import Gemma4AudioFeatureExtractor
+
+        model, captured = _audio_model()
+        ii = ImageInputs(model, AUDIO_CONFIG)
+        self.assertTrue(ii.accepts_audio)
+        clips = [np.random.default_rng(0).standard_normal(16000 * 3).astype(np.float32) * 0.1,
+                 np.zeros(16000 // 2, dtype=np.float32)]
+        ids, _, key = ii.build([2, AUDIO, 9, AUDIO, 11], [], clips)
+        # HF's processor: the mask through two stride-2 convolutions.
+        fe = Gemma4AudioFeatureExtractor(**{k: v for k, v in AUDIO_CONFIG["feature_extractor"].items()
+                                            if k != "feature_extractor_type"})
+        feats = fe(clips, sampling_rate=16000, return_tensors="np")
+        expected = []
+        for mask in feats["input_features_mask"]:
+            for _ in range(2):
+                t = len(mask)
+                mask = mask[::2][: (t + 2 - 3) // 2 + 1]
+            expected.append(int(mask.sum()))
+        self.assertEqual(ids.count(BOA), 2)
+        self.assertEqual(ids.count(EOA), 2)
+        self.assertEqual(len(ids), 3 + sum(expected) + 4)
+        self.assertNotIn(AUDIO, ids, "pad at the soft-token positions, as the fusion")
+        self.assertEqual(len(key), len(ids))
+        self.assertEqual(captured["feats"][0], 2)
+        self.assertFalse(captured["pixels"])
+        # 3 s is 75 soft tokens at 40 ms each (HF's audio_ms_per_token).
+        self.assertEqual(expected[0], 75)
+
+    def test_unified_counts_frames(self):
+        model, _ = _audio_model(unified=True)
+        cfg = {**PROCESSOR_CONFIG, "feature_extractor": {"feature_extractor_type": "Gemma4UnifiedAudioFeatureExtractor"}}
+        ii = ImageInputs(model, cfg)
+        self.assertEqual(ii.audio_soft_tokens(np.ones(50, dtype=bool)), 50)
+
+    def test_placeholders_must_match_and_a_model_without_audio_refuses(self):
+        model, _ = _audio_model()
+        ii = ImageInputs(model, AUDIO_CONFIG)
+        with self.assertRaises(ValueError):
+            ii.build([2, AUDIO, AUDIO], [], [np.zeros(16000, dtype=np.float32)])
+        plain, _ = _stub_model()
+        no_audio = ImageInputs(plain, PROCESSOR_CONFIG)
+        self.assertFalse(no_audio.accepts_audio)
+        with self.assertRaises(ValueError):
+            no_audio.build([2, 11], [], [np.zeros(16000, dtype=np.float32)])
