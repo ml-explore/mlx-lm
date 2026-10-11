@@ -782,17 +782,18 @@ class TestServerKVCacheQuantization(unittest.TestCase):
         cls.response_generator.stop_and_join()
 
     def test_exact_prompt_cache_hit_single_path(self):
-        # Quantized KV takes the single path: an exact hit used to hand
-        # stream_generate an empty prompt (an error for a valid request).
+        # An exact hit used to hand stream_generate an empty prompt (an
+        # error for a valid request); with quantized KV, batched too.
         status, first = _complete(self.port, "In a small village")
         self.assertEqual(status, 200)
         status, second = _complete(self.port, "In a small village" + first["choices"][0]["text"])
         self.assertEqual(status, 200)
         self.assertIn("choices", second)
 
-    def test_quantized_kv_disables_batching(self):
-        args = type("args", (object,), {"seed": None})
-        self.assertFalse(self.response_generator._is_batchable(args))
+    def test_quantized_kv_keeps_batching(self):
+        # The batch quantizes its KV cache too (BatchQuantizedKVCache).
+        args = type("args", (object,), {"seed": None, "num_draft_tokens": 0})
+        self.assertTrue(self.response_generator._is_batchable(args))
 
     def test_completion_quantizes_the_cache(self):
         url = f"http://localhost:{self.port}/v1/completions"

@@ -53,8 +53,10 @@ from .generate import (
 )
 from .models.cache import (
     LRUPromptCache,
+    can_trim_prompt_cache,
     make_prompt_cache,
     stays_trimmable,
+    trim_prompt_cache,
 )
 
 DEFAULT_PREFILL_MEMORY_MB = 512
@@ -69,6 +71,9 @@ SERVER_DEFAULTS = {
     "memory_headroom_fraction": 0.9,
     "oom_retry_step_divisor": 2,
     "junction_min_gap_tokens": 256,
+    # A speculative (MTP / draft model) single request moves into the batch
+    # when another request arrives (see Handoff).
+    "batch_handoff": True,
 }
 # Smallest valid value of the integer options above.
 _OPT_MIN = {
@@ -313,6 +318,35 @@ def _now() -> float:
     return time.monotonic()
 
 
+class _ResumedStopSequences:
+    """Stop sequences whose matcher starts where a handed-off request's
+    left off (BatchGenerator asks each sequence's for a matcher once)."""
+
+    def __init__(self, stop_sequences, tokens):
+        self._stop_sequences = stop_sequences
+        self._tokens = list(tokens)
+
+    def matcher(self):
+        m = self._stop_sequences.matcher()
+        for t in self._tokens:
+            m.advance(t)
+        return m
+
+
+@dataclass
+class Handoff:
+    """A speculative single request stopped for the batch (another request
+    arrived): what it needs to go on there. ``cache`` holds the model's
+    layers for ``tokens`` -- the prompt and every token already sent."""
+
+    rqueue: Any
+    args: Any
+    ctx: Any
+    cache: List[Any]
+    tokens: List[int]
+    remaining: int
+
+
 @dataclass
 class GenerationContext:
     has_tool_calling: bool
@@ -491,11 +525,10 @@ class ModelProvider:
                     "Speculative decoding may not work as expected."
                 )
 
-        # Compute batchability
-        is_batchable = draft_model is None
-        is_batchable = is_batchable and all(
-            hasattr(c, "merge") for c in make_prompt_cache(model)
-        )
+        # Compute batchability: of the model itself. A draft model doesn't
+        # stop it -- a request runs with the drafter while it's alone and in
+        # the batch without it otherwise (_is_batchable, Handoff).
+        is_batchable = all(hasattr(c, "merge") for c in make_prompt_cache(model))
         # A Nemotron-H MTP head only ever gets used via _serve_single's
         # stream_generate call, which auto-dispatches to it for a single
         # unbatched sequence -- BatchGenerator (the batchable path) is
@@ -850,17 +883,94 @@ class ResponseGenerator:
         sampler = _make_sampler(args, self.model_provider.tokenizer)
         return sampler is greedy_sampler and not _make_logits_processors(args)
 
-    def _is_batchable(self, args, request=None):
+    def _uses_speculation(self, args, request=None):
+        """Whether the single path would serve this request speculatively
+        (an MTP head or the draft model)."""
+        if getattr(request, "images", None):
+            return False
+        return self._uses_mtp(args) or getattr(self.model_provider, "draft_model", None) is not None
+
+    def _is_batchable(self, args, request=None, alone=True):
+        """Whether the request runs in the batch. A speculative one (MTP,
+        draft model) runs on its own while it's `alone` -- the fastest for
+        one stream -- and in the batch without speculation when others run
+        or wait."""
         # Image requests need their input embeddings built up front (see
         # _serve_single); BatchGenerator only takes token segments.
         has_images = bool(getattr(request, "images", None))
         return (
             self.model_provider.is_batchable
             and args.seed is None
-            and self.cli_args.kv_bits is None
             and not has_images
-            and not self._uses_mtp(args)
+            and not (alone and self._uses_speculation(args, request))
         )
+
+    def _others_waiting(self):
+        # Distributed: only rank 0 holds the queue, and every rank must take
+        # the same path -- no switching by load there.
+        if self._is_distributed:
+            return False
+        return not self.requests.empty()
+
+    def _main_slots(self, cache):
+        """A stored cache as the batch takes it: the model's layers only (a
+        speculative single request stores the draft model's beside them)."""
+        if cache is None:
+            return None
+        n_main = len(make_prompt_cache(self.model_provider.model))
+        return cache[:n_main] if len(cache) > n_main else cache
+
+    def _insert_handoff(self, batch_generator, batch_results, handoff, tokenizer):
+        """A handed-off request into the batch, without speculation. A cache
+        that can be trimmed gives back its last token, fed again to start
+        the batch's next step; one that can't (a recurrent layer) goes on
+        from the nearest stored entry, the rest fed again."""
+        model_key = self.model_provider.model_key
+        tokens = handoff.tokens
+        cache = handoff.cache
+        if can_trim_prompt_cache(cache):
+            trim_prompt_cache(cache, 1)
+            history, rest = tokens[:-1], tokens[-1:]
+        else:
+            # The entry the request's own prefill stored (system / user
+            # checkpoints), else from scratch.
+            self.prompt_cache.insert_cache(model_key, tokens[:], cache, cache_type="assistant")
+            cache, left = self.prompt_cache.fetch_nearest_cache(model_key, tokens[:-1])
+            cache = self._main_slots(cache)
+            n = len(tokens) - 1 - len(left) if cache is not None else 0
+            history, rest = tokens[:n], tokens[n:]
+        stop_sequences, _ = self._make_state_machine(model_key, tokenizer, handoff.args.stop_words)
+        sent = tokens[len(handoff.ctx.prompt):]
+        # Its stop sequences go on from what it sent: one split by the move
+        # still stops it.
+        stop_sequences = _ResumedStopSequences(stop_sequences, sent)
+        # What it sent is the detokenizer's history (only that: the single
+        # path's detokenizer saw no prompt): a word split at the move keeps
+        # its spacing.
+        detokenizer = tokenizer.detokenizer
+        for t in sent[-8:]:
+            detokenizer.add_token(t)
+        _ = detokenizer.last_segment
+        (uid,) = batch_generator.insert_segments(
+            segments=[[rest]],
+            max_tokens=[handoff.remaining],
+            caches=[cache],
+            all_tokens=[history],
+            samplers=[_make_sampler(handoff.args, tokenizer)],
+            logits_processors=[_make_logits_processors(handoff.args)],
+            stop_sequences=[stop_sequences],
+        )
+        # For tests: how many moved, and the text the last one had sent.
+        self.handoffs = getattr(self, "handoffs", 0) + 1
+        self.last_handoff_sent = tokenizer.decode(tokens[len(handoff.ctx.prompt):])
+        batch_results[uid] = {
+            "ctx": handoff.ctx,
+            "rqueue": handoff.rqueue,
+            "detokenizer": detokenizer,
+            "segment_types": [],
+            "top_logprobs": handoff.args.top_logprobs,
+            "handoff": True,
+        }
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -914,11 +1024,14 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
-                # Can it be added to the current batch?
+                # Can it be added to the current batch? A speculative one
+                # alone (the batch empty, nobody waiting) doesn't join: the
+                # batch drains and it runs on its own.
+                alone = len(batch_results) == 0 and not unprocessed_requests and not self._others_waiting()
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args, request)
+                    and self._is_batchable(args, request, alone=alone)
                 ):
                     try:
                         prompt, segments, segment_types, initial_state = self._tokenize(
@@ -938,6 +1051,9 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
+                    # Stored by a speculative single request: without the
+                    # draft model's slots.
+                    cache = self._main_slots(cache)
                     prompt_cache_count = len(prompt) - len(rest)
                     self._log_cache_reuse(prompt_cache_count, len(prompt))
                     segments, segment_types = self._junction_split(
@@ -998,9 +1114,12 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args, request):
-                        self._serve_single((rqueue, request, args), generation_stream)
-                        continue
+                    alone = not unprocessed_requests and not self._others_waiting()
+                    handoff = None
+                    if not self._is_batchable(args, request, alone=alone):
+                        handoff = self._serve_single((rqueue, request, args), generation_stream)
+                        if handoff is None:
+                            continue
 
                     current_model = args.model
                     current_tokenizer = tokenizer
@@ -1012,8 +1131,19 @@ class ResponseGenerator:
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
                         stream=generation_stream,
+                        # The batch quantizes its KV cache as the unbatched
+                        # path does (from the first token).
+                        kv_bits=self.cli_args.kv_bits,
+                        kv_group_size=self.cli_args.kv_group_size,
                     )
-                    unprocessed_requests.append((rqueue, request, args))
+                    if handoff is not None:
+                        # The speculative request goes on in the batch; the
+                        # one waiting joins it next. Its own cache isn't
+                        # kept past this (the batch has what it needs).
+                        self._insert_handoff(batch_generator, batch_results, handoff, tokenizer)
+                        handoff = None
+                    else:
+                        unprocessed_requests.append((rqueue, request, args))
                     continue
 
                 # We have a batch but this request cannot be added to the
@@ -1044,7 +1174,10 @@ class ResponseGenerator:
                     # Progress report for prompt processing
                     for r in prompt_responses:
                         result = batch_results[r.uid]
-                        result["rqueue"].put(r.progress)
+                        # A handed-off request is past its prompt: its
+                        # catching up isn't prompt progress to its client.
+                        if not result.get("handoff"):
+                            result["rqueue"].put(r.progress)
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
 
@@ -1302,8 +1435,20 @@ class ResponseGenerator:
             set_media_positions = getattr(model, "set_media_positions", None)
             if input_embeddings is not None and set_media_positions is not None:
                 set_media_positions(getattr(image_inputs, "media_positions", None))
+            # Moves into the batch when another request arrives (Handoff):
+            # only a speculative text request, which is why it's here alone.
+            handoff_ok = (
+                self._opt("batch_handoff")
+                and self.model_provider.is_batchable
+                and not self._is_distributed
+                and input_embeddings is None
+                and args.seed is None
+                and (use_draft or self._uses_mtp(args))
+            )
+            handoff = None
+            n_out = 0
             try:
-                for gen in stream_generate(
+                steps = stream_generate(
                     model=model,
                     stream=stream,
                     tokenizer=tokenizer,
@@ -1322,7 +1467,8 @@ class ResponseGenerator:
                     kv_bits=self.cli_args.kv_bits,
                     kv_group_size=self.cli_args.kv_group_size,
                     quantized_kv_start=self.cli_args.quantized_kv_start,
-                ):
+                )
+                for gen in steps:
                     finish_reason = gen.finish_reason
 
                     # Token-level stop word detection
@@ -1350,11 +1496,25 @@ class ResponseGenerator:
 
                     if finish_reason is not None:
                         break
+
+                    n_out += 1
+                    if handoff_ok and n_out < args.max_tokens and self._others_waiting():
+                        handoff = Handoff(rqueue, args, ctx, None, cache_key, args.max_tokens - n_out)
+                        break
             finally:
+                # Closed here, not when collected: the cache then holds the
+                # prompt and every token sent (what Handoff and the stored
+                # entry rely on).
+                if "steps" in locals():
+                    steps.close()
                 if set_vision_spans is not None:
                     set_vision_spans(None)
                 if set_media_positions is not None:
                     set_media_positions(None)
+
+            if handoff is not None:
+                handoff.cache = cache[:n_main]
+                return handoff
 
             rqueue.put(None)
 
@@ -2793,6 +2953,13 @@ def make_parser():
         type=json.loads,
         help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
         default="{}",
+    )
+    parser.add_argument(
+        "--no-batch-handoff",
+        dest="batch_handoff",
+        action="store_false",
+        help="Keep a speculative (MTP / draft model) request on its own until it "
+        "ends, instead of moving it into the batch when another request arrives",
     )
     parser.add_argument(
         "--decode-concurrency",
