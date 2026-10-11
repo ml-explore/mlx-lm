@@ -60,6 +60,8 @@ MODEL_REMAPPING = {
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
     "deepseek_v41_text": "deepseek_v41",
     "qwen3_5_moe": "qwen3_5",
+    "qwen3_5_text": "qwen3_5",
+    "qwen3_5_moe_text": "qwen3_5",
     "qwen3_vl_moe": "qwen3_vl",
     "solar_open": "glm4_moe",
     # Package names cannot have hyphens.
