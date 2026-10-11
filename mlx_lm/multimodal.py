@@ -789,10 +789,14 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
         ids = _special_token_ids(path)
         # Without its image tokens a prompt can't be expanded: no image
         # inputs (a clear "doesn't accept images"), not a KeyError later.
-        needed = ("<|image_start|>", "<|image_end|>", "<|img_thumbnail|>", "<|img_row_1_col_1|>")
+        inputs = Lfm2VlImageInputs(model, cfg, ids)
+        needed = {"<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"}
+        # A marker for every tile of every grid the settings allow.
+        for cols, rows in inputs.ratios:
+            needed |= {f"<|img_row_{r + 1}_col_{c + 1}|>" for r in range(rows) for c in range(cols)}
         if any(t not in ids for t in needed):
             return None
-        return Lfm2VlImageInputs(model, cfg, ids)
+        return inputs
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
     if getattr(model, "embed_vision", None) is None:

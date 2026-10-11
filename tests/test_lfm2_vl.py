@@ -201,11 +201,16 @@ class TestImageInputs(unittest.TestCase):
         from mlx_lm.multimodal import load_image_inputs
 
         model = _model()
-        tokens = ["<|image_start|>", "<|image_end|>", "<|img_thumbnail|>", "<|img_row_1_col_1|>"]
+        tokens = ["<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"]
+        tokens += [f"<|img_row_{r}_col_{c}|>" for r in (1, 2) for c in (1, 2)]
         with tempfile.TemporaryDirectory() as d:
             Path(d, "processor_config.json").write_text(json.dumps({"image_processor": {"max_tiles": 10}}))
             Path(d, "preprocessor_config.json").write_text(json.dumps({"max_tiles": 2, "resample": 2}))
             # Without the image tokens: no image inputs, not a KeyError later.
+            self.assertIsNone(load_image_inputs(model, d))
+            # A tile marker short of the grids max_tiles 2 allows: still none.
+            added = [{"content": t, "id": 100 + i} for i, t in enumerate(tokens[:-2])]
+            Path(d, "tokenizer.json").write_text(json.dumps({"added_tokens": added}))
             self.assertIsNone(load_image_inputs(model, d))
             added = [{"content": t, "id": 100 + i} for i, t in enumerate(tokens)]
             Path(d, "tokenizer.json").write_text(json.dumps({"added_tokens": added}))
