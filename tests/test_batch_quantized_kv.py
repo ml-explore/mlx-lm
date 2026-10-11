@@ -12,6 +12,7 @@ from mlx_lm.models.cache import (
     QuantizedKVCache,
     QuantizedRotatingKVCache,
     RotatingKVCache,
+    fit_group_size,
     make_prompt_cache,
 )
 from mlx_lm.utils import load
@@ -141,6 +142,40 @@ class TestBatchedGenerationWithQuantizedKV(unittest.TestCase):
         tokens = self._batched([prompts[0][-1:], prompts[1]], 4, caches=[cache, None])
         self.assertEqual(len(tokens[0]), 4)
         self.assertEqual(len(tokens[1]), 4)
+
+
+class TestGroupSizeFitsTheHeads(unittest.TestCase):
+    """Group size 128 on 64-wide heads (LFM2) quantizes in groups of 64."""
+
+    def test_fit(self):
+        self.assertEqual(fit_group_size(128, 64, 64), 64)
+        self.assertEqual(fit_group_size(128, 128, 128), 128)
+        self.assertEqual(fit_group_size(64, 192, 128), 64)
+        self.assertEqual(fit_group_size(128, 96), 32)
+        self.assertEqual(fit_group_size(32, 64), 32, "never above the one asked")
+        self.assertEqual(fit_group_size(64, 80), 64, "none fits: as asked")
+
+    def test_caches_fit_on_first_update(self):
+        k, v = mx.random.normal((1, 2, 5, 64)), mx.random.normal((1, 2, 5, 64))
+        for cache in (QuantizedKVCache(group_size=128), QuantizedRotatingKVCache(max_size=16, group_size=128),
+                      BatchQuantizedKVCache([0], group_size=128)):
+            cache.update_and_fetch(k, v)
+            self.assertEqual(cache.group_size, 64, type(cache).__name__)
+        self.assertEqual(_kv(5).to_quantized(group_size=128, bits=8).group_size, 64)
+        batch = BatchKVCache([0])
+        batch.update_and_fetch(k, v)
+        self.assertEqual(batch.to_quantized(group_size=128, bits=8).group_size, 64)
+
+    def test_empty_caches_join_fitted_ones(self):
+        k, v = mx.random.normal((1, 2, 5, 64)), mx.random.normal((1, 2, 5, 64))
+        filled = QuantizedKVCache(group_size=128, bits=8)
+        filled.update_and_fetch(k, v)
+        merged = BatchQuantizedKVCache.merge([QuantizedKVCache(group_size=128, bits=8), filled])
+        self.assertEqual(merged.group_size, 64)
+        empty = BatchQuantizedKVCache([0], group_size=128, bits=8)
+        empty.extend(merged)
+        self.assertEqual(empty.group_size, 64)
+        empty.update_and_fetch(mx.random.normal((3, 2, 1, 64)), mx.random.normal((3, 2, 1, 64)))
 
 
 if __name__ == "__main__":
