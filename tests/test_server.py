@@ -349,6 +349,104 @@ class TestServer(unittest.TestCase):
         first_call = next(i for i, e in enumerate(events) if "get_weather" in e)
         self.assertLess(events.index(": keepalive tool"), first_call)
 
+    def test_thinking_budget_closes_the_reasoning(self):
+        # At the budget the server closes the reasoning itself and the
+        # answer goes on as a new request of the prompt, the tokens so far
+        # and the close -- not a logits processor, which would turn off
+        # MTP and speculative decoding.
+        sm = TextStateMachine({"normal": [("<think>", "reasoning")], "reasoning": [("</think>", "normal")]})
+        def ctx(prompt):
+            return GenerationContext(has_tool_calling=False, has_thinking=True, tool_parser=None,
+                                     text_sm=sm, initial_state="reasoning", prompt=prompt,
+                                     model_key=self.response_generator.model_provider.model_key)
+        def gen(text, token, finish=None):
+            return types.SimpleNamespace(text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=())
+        thinking = [gen(" step", 10 + i) for i in range(50)]
+        answer = [gen("Answer", 40), gen("", 41, "stop")]
+        first = ctx([1, 2, 3])
+        calls = []
+        def fake_generate(request, args, progress_callback=None):
+            calls.append((request, args))
+            return (first, iter(thinking)) if len(calls) == 1 else (ctx(request.prompt_tokens), iter(answer))
+        tokenizer = types.SimpleNamespace(has_thinking=True, think_end="</think>",
+                                          encode=lambda s, add_special_tokens=False: [7, 8])
+        with mock.patch.object(self.response_generator, "generate", side_effect=fake_generate), \
+                mock.patch.object(self.response_generator.model_provider, "tokenizer", tokenizer):
+            response = requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}],
+                      "thinking_budget": 3, "max_tokens": 100},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        message = response.json()["choices"][0]["message"]
+        self.assertEqual(message["content"].strip(), "Answer")
+        self.assertEqual(message["reasoning"], " step step step\n\nI have to answer now.\n")
+        self.assertEqual(len(calls), 2)
+        carried, args = calls[1]
+        self.assertEqual(carried.prompt_tokens, [1, 2, 3, 10, 11, 12, 7, 8])
+        self.assertIsNone(args.thinking_budget)
+        self.assertEqual(args.max_tokens, 100 - 5)
+        # Usage counts the request's own prompt, not the carry-on's.
+        self.assertEqual(response.json()["usage"]["prompt_tokens"], 3)
+
+    def _budget_run(self, thinking, budget, max_tokens=100, answer=None):
+        sm = TextStateMachine({"normal": [("<think>", "reasoning")], "reasoning": [("</think>", "normal")]})
+        def ctx(prompt):
+            return GenerationContext(has_tool_calling=False, has_thinking=True, tool_parser=None,
+                                     text_sm=sm, initial_state="reasoning", prompt=prompt,
+                                     model_key=self.response_generator.model_provider.model_key)
+        def gen(text, token, finish=None):
+            return types.SimpleNamespace(text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=())
+        gens = [gen(t, 10 + i) if isinstance(t, str) else gen(t[0], 10 + i, t[1]) for i, t in enumerate(thinking)]
+        answer = answer or [gen("Answer", 40), gen("", 41, "stop")]
+        calls = []
+        def fake_generate(request, args, progress_callback=None):
+            calls.append((request, args))
+            return (ctx([1, 2, 3]), iter(gens)) if len(calls) == 1 else (ctx(request.prompt_tokens), iter(answer))
+        tokenizer = types.SimpleNamespace(has_thinking=True, think_end="</think>",
+                                          encode=lambda s, add_special_tokens=False: [7, 8])
+        with mock.patch.object(self.response_generator, "generate", side_effect=fake_generate), \
+                mock.patch.object(self.response_generator.model_provider, "tokenizer", tokenizer):
+            response = requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}],
+                      "thinking_budget": budget, "max_tokens": max_tokens},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json(), calls
+
+    def test_thinking_budget_edges(self):
+        # Zero: closed before any reasoning token.
+        out, calls = self._budget_run([" a", " b"], 0)
+        self.assertEqual(out["choices"][0]["message"]["reasoning"], "\n\nI have to answer now.\n")
+        self.assertEqual(calls[1][0].prompt_tokens, [1, 2, 3, 7, 8])
+        # The close uses what max_tokens leaves: the answer ends there.
+        out, calls = self._budget_run([" a", " b", " c"], 2, max_tokens=4)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["choices"][0]["finish_reason"], "length")
+        # No room for the close: ends at the limit, never past it.
+        out, calls = self._budget_run([" a", " b", " c"], 1, max_tokens=2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["choices"][0]["finish_reason"], "length")
+        self.assertLessEqual(out["usage"]["completion_tokens"], 2)
+        # The model ending at the boundary ends the response.
+        out, calls = self._budget_run([" a", ("", "stop")], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["choices"][0]["finish_reason"], "stop")
+        # Not in the middle of a close the model writes itself.
+        # (at three, "</th" is held as a partial close: the next token waits)
+        out, calls = self._budget_run([" a", " b", "</th", "ink>", " ok"], 3)
+        self.assertEqual(len(calls), 1, "the model closed it: no carry-on")
+        self.assertIn("ok", out["choices"][0]["message"]["content"])
+
+    def test_thinking_budget_is_checked(self):
+        for bad in (-1, "2", 1.5, True):
+            response = requests.post(
+                f"http://localhost:{self.port}/v1/chat/completions",
+                json={"model": "default_model", "messages": [{"role": "user", "content": "hi"}], "thinking_budget": bad},
+            )
+            self.assertEqual(response.status_code, 400, bad)
+
     def test_request_stats_line(self):
         # One log line per request: what a client needs for speed statistics.
         ctx = GenerationContext(

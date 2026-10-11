@@ -179,6 +179,12 @@ def to_chat_request(body: dict) -> dict:
             chat[key] = body[key]
     if body.get("stop_sequences"):
         chat["stop"] = body["stop_sequences"]
+    # Extended thinking's budget is the server's thinking budget.
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
+        budget = thinking.get("budget_tokens")
+        if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+            chat["thinking_budget"] = budget
 
     tools = body.get("tools") or []
     if any(not isinstance(t, dict) or not isinstance(t.get("name"), str) or not t["name"] for t in tools):

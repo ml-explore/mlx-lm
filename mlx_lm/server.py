@@ -11,7 +11,7 @@ import socket
 import time
 import uuid
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty as QueueEmpty
@@ -296,6 +296,9 @@ class GenerationArguments:
     top_logprobs: int
     seed: Optional[int]
     chat_template_kwargs: Optional[Dict[str, Any]]
+    # Reasoning tokens at most before the answer (see handle_completion);
+    # None: as long as the model takes.
+    thinking_budget: Optional[int] = None
 
 
 @dataclass
@@ -311,6 +314,14 @@ class CompletionRequest:
     # Raw bytes of any images attached to the chat messages, in order (see
     # mlx_lm/multimodal.py). None/empty for text-only requests.
     images: Optional[List[bytes]] = None
+    # The prompt as tokens, used as is (no template): a request carried on
+    # after its thinking budget ran out.
+    prompt_tokens: Optional[List[int]] = None
+
+
+# Put before the model's close of its reasoning when its thinking budget
+# is spent: a thought cut off mid-sentence otherwise reads on into the answer.
+THINKING_BUDGET_NOTE = "\n\nI have to answer now.\n"
 
 
 def _now() -> float:
@@ -765,6 +776,9 @@ class ResponseGenerator:
             state machine (normal or thinking depending on whether we have tail
             or not)
         """
+        if request.prompt_tokens is not None:
+            prompt = list(request.prompt_tokens)
+            return prompt, [prompt], ["assistant"], "normal"
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
@@ -2121,6 +2135,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
+        self.thinking_budget = self.body.get("thinking_budget", None)
         try:
             self.validate_model_parameters()
         except ValueError as e:
@@ -2175,6 +2190,9 @@ class APIHandler(BaseHTTPRequestHandler):
         """Validate that the passed model parameters have correct types and values."""
         self._validate("stream", bool)
         self._validate("max_tokens", int, min_val=0)
+        if self.thinking_budget is not None and (not isinstance(self.thinking_budget, int)
+                                                 or isinstance(self.thinking_budget, bool) or self.thinking_budget < 0):
+            raise ValueError("thinking_budget must be a non-negative integer")
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
@@ -2380,6 +2398,7 @@ class APIHandler(BaseHTTPRequestHandler):
             top_logprobs=self.top_logprobs,
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
+            thinking_budget=self.thinking_budget,
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -2419,6 +2438,10 @@ class APIHandler(BaseHTTPRequestHandler):
             self._set_completion_headers(200)
             logging.debug("Starting completion:")
 
+        # The request's own: its prompt and cache, for the usage and stats
+        # (a thinking budget's carry-on has a longer prompt of its own).
+        first_ctx = ctx
+
         # Tool call formatter
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
@@ -2452,77 +2475,153 @@ class APIHandler(BaseHTTPRequestHandler):
         n_tokens = n_drafted = 0
 
         try:
-            for gen in response:
-                logging.debug(gen.text)
-                last_token_at = getattr(gen, "made_at", None) or _now()
-                if first_token_at is None:
-                    first_token_at = last_token_at
-                n_tokens += 1
-                n_drafted += bool(getattr(gen, "from_draft", False))
+            # A thinking budget: the tokens in the reasoning state counted;
+            # at the budget the reasoning is closed by the server. Not for
+            # an image request (its prompt needs its images' features) or a
+            # model without thinking tokens.
+            # The model's tokenizer as the request started (the provider may
+            # load another model meanwhile: then no budget is applied).
+            provider = self.response_generator.model_provider
+            tokenizer = provider.tokenizer
+            budget = args.thinking_budget
+            if budget is not None and (request.images or not getattr(tokenizer, "has_thinking", False)
+                                       or ctx.model_key != provider.model_key):
+                budget = None
+            thought = 0
+            budget_spent = False
+            while True:
+                switched = False
+                for gen in response:
+                    # The budget spent before this token: it's dropped and
+                    # the reasoning closed (budget 0 closes it at once) --
+                    # not halfway through a close the model is writing
+                    # itself (a partial match held in the buffer).
+                    # (A token that ends the response -- EOS, a stop word --
+                    # ends it as it would.)
+                    if (budget is not None and not budget_spent and prev_state == "reasoning"
+                            and thought >= budget and not sm_state[3] and gen.finish_reason is None):
+                        budget_spent = True
+                        switched = True
+                        break
+                    logging.debug(gen.text)
+                    last_token_at = getattr(gen, "made_at", None) or _now()
+                    if first_token_at is None:
+                        first_token_at = last_token_at
+                    n_tokens += 1
+                    n_drafted += bool(getattr(gen, "from_draft", False))
 
-                # Advance the text state machine to strip control sequences
-                if gen.finish_reason == "stop":
-                    sm_state, current_state = TextStateMachine.discard(sm_state)
-                    clean_text = ""
-                elif gen.finish_reason == "length":
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
-                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                    clean_text += flushed
-                else:
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                    # Advance the text state machine to strip control sequences
+                    if gen.finish_reason == "stop":
+                        sm_state, current_state = TextStateMachine.discard(sm_state)
+                        clean_text = ""
+                    elif gen.finish_reason == "length":
+                        sm_state, clean_text, current_state = TextStateMachine.step(
+                            sm_state, gen.text
+                        )
+                        sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
+                        clean_text += flushed
+                    else:
+                        sm_state, clean_text, current_state = TextStateMachine.step(
+                            sm_state, gen.text
+                        )
 
-                # Collect the clean text by state: reasoning, tool, or normal
-                if current_state == "reasoning":
-                    reasoning_text += clean_text
-                    answer_reasoning += clean_text
-                elif current_state == "tool":
-                    tool_text += clean_text
-                elif current_state == "normal":
-                    if prev_state == "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    text += clean_text
-                    answer_text += clean_text
+                    # Collect the clean text by state: reasoning, tool, or normal
+                    if current_state == "reasoning":
+                        reasoning_text += clean_text
+                        answer_reasoning += clean_text
+                    elif current_state == "tool":
+                        tool_text += clean_text
+                    elif current_state == "normal":
+                        if prev_state == "tool":
+                            tool_calls.append(tool_text)
+                            tool_text = ""
+                            made_tool_call = True
+                        text += clean_text
+                        answer_text += clean_text
 
-                # Add the tokens and logprobs to the vars.
-                tokens.append(gen.token)
-                if args.logprobs:
-                    token_logprobs.append(gen.logprob)
-                if args.top_logprobs > 0:
-                    top_tokens.append(gen.top_tokens)
+                    # Add the tokens and logprobs to the vars.
+                    tokens.append(gen.token)
+                    if args.logprobs:
+                        token_logprobs.append(gen.logprob)
+                    if args.top_logprobs > 0:
+                        top_tokens.append(gen.top_tokens)
 
-                if (
-                    self.stream
-                    and current_state != "tool"
-                    and (text or tool_calls or reasoning_text)
-                ):
-                    resp = self.generate_response(
-                        text,
-                        None,
-                        tool_calls=send_calls(tool_calls),
-                        reasoning_text=reasoning_text,
-                    )
-                    self._write_chunk(resp)
-                    self.wfile.flush()
-                    reasoning_text = ""
-                    text = ""
-                    tool_calls = []
-                elif self.stream and current_state == "tool":
-                    now = time.monotonic()
-                    if now - tool_keepalive_at >= 5:
-                        tool_keepalive_at = now
-                        self.wfile.write(b": keepalive tool\n\n")
+                    if (
+                        self.stream
+                        and current_state != "tool"
+                        and (text or tool_calls or reasoning_text)
+                    ):
+                        resp = self.generate_response(
+                            text,
+                            None,
+                            tool_calls=send_calls(tool_calls),
+                            reasoning_text=reasoning_text,
+                        )
+                        self._write_chunk(resp)
                         self.wfile.flush()
+                        reasoning_text = ""
+                        text = ""
+                        tool_calls = []
+                    elif self.stream and current_state == "tool":
+                        now = time.monotonic()
+                        if now - tool_keepalive_at >= 5:
+                            tool_keepalive_at = now
+                            self.wfile.write(b": keepalive tool\n\n")
+                            self.wfile.flush()
 
-                if gen.finish_reason is not None:
-                    finish_reason = gen.finish_reason
+                    if gen.finish_reason is not None:
+                        finish_reason = gen.finish_reason
 
+                    # Reasoning tokens toward the thinking budget.
+                    if budget is not None and current_state == "reasoning":
+                        thought += 1
+
+                    prev_state = current_state
+                if not switched:
+                    break
+                ctx.stop()
+                close = THINKING_BUDGET_NOTE + tokenizer.think_end + "\n\n"
+                closing = tokenizer.encode(close, add_special_tokens=False)
+                # No room left for the close: the response ends at the limit.
+                if len(tokens) + len(closing) > args.max_tokens:
+                    finish_reason = "length"
+                    break
+                logging.info(f"Thinking budget of {args.thinking_budget} tokens spent: the answer goes on.")
+                # Through the state machine as if generated, the note and
+                # then the close: the reasoning ends for the client too.
+                for piece in (THINKING_BUDGET_NOTE, tokenizer.think_end + "\n\n"):
+                    sm_state, clean_text, current_state = TextStateMachine.step(sm_state, piece)
+                    if current_state == "reasoning":
+                        reasoning_text += clean_text
+                        answer_reasoning += clean_text
+                    elif current_state == "normal":
+                        text += clean_text
+                        answer_text += clean_text
                 prev_state = current_state
+                tokens.extend(closing)
+                # Not the model's: no logprobs of their own (the lists stay
+                # aligned with the tokens).
+                if args.logprobs:
+                    token_logprobs.extend([0.0] * len(closing))
+                if args.top_logprobs > 0:
+                    top_tokens.extend([()] * len(closing))
+                n_tokens += len(closing)
+                # The close used what was left: the answer ends there.
+                if len(tokens) == args.max_tokens:
+                    finish_reason = "length"
+                    break
+                carried = CompletionRequest(
+                    request_type=request.request_type, prompt=request.prompt, messages=request.messages,
+                    tools=request.tools, role_mapping=request.role_mapping,
+                    prompt_tokens=list(ctx.prompt) + tokens,
+                )
+                left = args.max_tokens - len(tokens)
+                # A seed goes on rather than repeating the first part's draws.
+                seed = None if args.seed is None else args.seed + 1
+                ctx, response = self.response_generator.generate(
+                    carried, replace(args, max_tokens=left, thinking_budget=None, seed=seed),
+                    progress_callback=keepalive_callback,
+                )
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
@@ -2551,9 +2650,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     and self.stream_options["include_usage"]
                 ):
                     resp = self.completion_usage_response(
-                        len(ctx.prompt),
+                        len(first_ctx.prompt),
                         len(tokens),
-                        ctx.prompt_cache_count,
+                        first_ctx.prompt_cache_count,
                     )
                     self._write_chunk(resp)
                     self.wfile.flush()
@@ -2564,9 +2663,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    len(ctx.prompt),
+                    len(first_ctx.prompt),
                     len(tokens),
-                    ctx.prompt_cache_count,
+                    first_ctx.prompt_cache_count,
                     token_logprobs=token_logprobs,
                     top_tokens=top_tokens,
                     tokens=tokens,
@@ -2611,8 +2710,8 @@ class APIHandler(BaseHTTPRequestHandler):
             # last token, not when the client has the response.
             if first_token_at is not None:
                 logging.info(
-                    f"Request stats: prompt={len(ctx.prompt)} "
-                    f"cached={max(ctx.prompt_cache_count, 0)} "
+                    f"Request stats: prompt={len(first_ctx.prompt)} "
+                    f"cached={max(first_ctx.prompt_cache_count, 0)} "
                     f"first_token_s={first_token_at - started:.3f} "
                     f"tokens={n_tokens} decode_s={last_token_at - first_token_at:.3f} "
                     f"drafted={n_drafted}"
