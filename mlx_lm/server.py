@@ -111,7 +111,7 @@ def _fraction(value):
             f"must be a number in (0, 1], got {value!r}"
         )
     return x
-from .multimodal import extract_images, load_image_inputs
+from .multimodal import extract_media, load_image_inputs
 from .multimodal import vision_spans as multimodal_vision_spans
 from .sample_utils import greedy_sampler, make_logits_processors, make_sampler
 from .utils import (
@@ -230,7 +230,7 @@ def process_message_content(messages):
     for message in messages:
         content = message.get("content")
         if isinstance(content, list) and any(
-            fragment.get("type") == "image" for fragment in content
+            fragment.get("type") in ("image", "audio") for fragment in content
         ):
             # Image request (image_url parts were already extracted and
             # rewritten to {"type": "image"} by multimodal.extract_images):
@@ -314,6 +314,8 @@ class CompletionRequest:
     # Raw bytes of any images attached to the chat messages, in order (see
     # mlx_lm/multimodal.py). None/empty for text-only requests.
     images: Optional[List[bytes]] = None
+    # Audio clips (16 kHz mono float32, multimodal.extract_media), in order.
+    audios: Optional[List[Any]] = None
     # The prompt as tokens, used as is (no template): a request carried on
     # after its thinking budget ran out.
     prompt_tokens: Optional[List[int]] = None
@@ -900,7 +902,7 @@ class ResponseGenerator:
     def _uses_speculation(self, args, request=None):
         """Whether the single path would serve this request speculatively
         (an MTP head or the draft model)."""
-        if getattr(request, "images", None):
+        if getattr(request, "images", None) or getattr(request, "audios", None):
             return False
         return self._uses_mtp(args) or getattr(self.model_provider, "draft_model", None) is not None
 
@@ -911,7 +913,7 @@ class ResponseGenerator:
         or wait."""
         # Image requests need their input embeddings built up front (see
         # _serve_single); BatchGenerator only takes token segments.
-        has_images = bool(getattr(request, "images", None))
+        has_images = bool(getattr(request, "images", None) or getattr(request, "audios", None))
         return (
             self.model_provider.is_batchable
             and args.seed is None
@@ -1292,13 +1294,18 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             image_inputs = None
-            if request.images:
+            if request.images or request.audios:
                 image_inputs = self.model_provider.image_inputs
-                if image_inputs is None:
+                if request.images and (image_inputs is None or not getattr(image_inputs, "accepts_images", True)):
                     raise ValueError(
                         "This model does not accept image inputs (no vision "
                         "tower / image processor). Use a vision-capable model "
                         "or remove the image."
+                    )
+                if request.audios and not getattr(image_inputs, "accepts_audio", False):
+                    raise ValueError(
+                        "This model does not accept audio inputs (no audio "
+                        "tower). Use a model that hears audio or remove the recording."
                     )
 
             # Prepare the prompt and state machine
@@ -1314,9 +1321,14 @@ class ResponseGenerator:
             input_embeddings = None
             cache_prompt = prompt
             if image_inputs is not None:
-                prompt, input_embeddings, cache_prompt = image_inputs.build(
-                    prompt, request.images
-                )
+                if request.audios:
+                    prompt, input_embeddings, cache_prompt = image_inputs.build(
+                        prompt, request.images or [], request.audios
+                    )
+                else:
+                    prompt, input_embeddings, cache_prompt = image_inputs.build(
+                        prompt, request.images
+                    )
             stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -1556,7 +1568,7 @@ class ResponseGenerator:
         options or tools."""
         if not getattr(self.cli_args, "warm_next_turn", True) or self._is_distributed:
             return
-        if request.request_type != "chat" or getattr(request, "images", None):
+        if request.request_type != "chat" or getattr(request, "images", None) or getattr(request, "audios", None):
             return
         message = self._answer_as_sent_back(request, content, tool_calls, reasoning, echoes_reasoning)
         self._warm_jobs.append((model_key, request, args, message))
@@ -2484,7 +2496,7 @@ class APIHandler(BaseHTTPRequestHandler):
             provider = self.response_generator.model_provider
             tokenizer = provider.tokenizer
             budget = args.thinking_budget
-            if budget is not None and (request.images or not getattr(tokenizer, "has_thinking", False)
+            if budget is not None and (request.images or request.audios or not getattr(tokenizer, "has_thinking", False)
                                        or ctx.model_key != provider.model_key):
                 budget = None
             thought = 0
@@ -2757,7 +2769,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
 
         messages = body["messages"]
-        images = extract_images(messages)
+        images, audios = extract_media(messages)
 
         return CompletionRequest(
             "chat",
@@ -2766,6 +2778,7 @@ class APIHandler(BaseHTTPRequestHandler):
             body.get("tools") or None,
             body.get("role_mapping"),
             images=images or None,
+            audios=audios or None,
         )
 
     def handle_text_completions(self) -> CompletionRequest:
