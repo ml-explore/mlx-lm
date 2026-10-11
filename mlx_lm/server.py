@@ -2496,8 +2496,10 @@ class APIHandler(BaseHTTPRequestHandler):
                     # the reasoning closed (budget 0 closes it at once) --
                     # not halfway through a close the model is writing
                     # itself (a partial match held in the buffer).
+                    # (A token that ends the response -- EOS, a stop word --
+                    # ends it as it would.)
                     if (budget is not None and not budget_spent and prev_state == "reasoning"
-                            and thought >= budget and not sm_state[3]):
+                            and thought >= budget and not sm_state[3] and gen.finish_reason is None):
                         budget_spent = True
                         switched = True
                         break
@@ -2580,6 +2582,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 ctx.stop()
                 close = THINKING_BUDGET_NOTE + tokenizer.think_end + "\n\n"
                 closing = tokenizer.encode(close, add_special_tokens=False)
+                # No room left for the close: the response ends at the limit.
+                if len(tokens) + len(closing) > args.max_tokens:
+                    finish_reason = "length"
+                    break
                 logging.info(f"Thinking budget of {args.thinking_budget} tokens spent: the answer goes on.")
                 # Through the state machine as if generated, the note and
                 # then the close: the reasoning ends for the client too.
@@ -2601,7 +2607,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens.extend([()] * len(closing))
                 n_tokens += len(closing)
                 # The close used what was left: the answer ends there.
-                if len(tokens) >= args.max_tokens:
+                if len(tokens) == args.max_tokens:
                     finish_reason = "length"
                     break
                 carried = CompletionRequest(

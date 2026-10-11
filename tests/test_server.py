@@ -397,7 +397,7 @@ class TestServer(unittest.TestCase):
                                      model_key=self.response_generator.model_provider.model_key)
         def gen(text, token, finish=None):
             return types.SimpleNamespace(text=text, token=token, logprob=0.0, finish_reason=finish, top_tokens=())
-        gens = [gen(t, 10 + i) for i, t in enumerate(thinking)]
+        gens = [gen(t, 10 + i) if isinstance(t, str) else gen(t[0], 10 + i, t[1]) for i, t in enumerate(thinking)]
         answer = answer or [gen("Answer", 40), gen("", 41, "stop")]
         calls = []
         def fake_generate(request, args, progress_callback=None):
@@ -424,6 +424,15 @@ class TestServer(unittest.TestCase):
         out, calls = self._budget_run([" a", " b", " c"], 2, max_tokens=4)
         self.assertEqual(len(calls), 1)
         self.assertEqual(out["choices"][0]["finish_reason"], "length")
+        # No room for the close: ends at the limit, never past it.
+        out, calls = self._budget_run([" a", " b", " c"], 1, max_tokens=2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["choices"][0]["finish_reason"], "length")
+        self.assertLessEqual(out["usage"]["completion_tokens"], 2)
+        # The model ending at the boundary ends the response.
+        out, calls = self._budget_run([" a", ("", "stop")], 1)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["choices"][0]["finish_reason"], "stop")
         # Not in the middle of a close the model writes itself.
         # (at three, "</th" is held as a partial close: the next token waits)
         out, calls = self._budget_run([" a", " b", "</th", "ink>", " ok"], 3)
