@@ -1631,9 +1631,9 @@ class BatchQuantizedKVCache(_BaseCache):
         """QuantizedKVCaches (one sequence each, the same quantization)
         into one batch, left-padded to the longest."""
         # Empty caches haven't fitted their group size to the heads yet.
-        filled = [c for c in caches if c.keys is not None] or caches
-        group_size, bits = filled[0].group_size, filled[0].bits
-        if any((c.group_size, c.bits) != (group_size, bits) for c in filled) or any(c.bits != bits for c in caches):
+        filled = [c for c in caches if c.keys is not None]
+        group_size, bits = (filled or caches)[0].group_size, caches[0].bits
+        if any(c.group_size != group_size for c in filled) or any(c.bits != bits for c in caches):
             raise ValueError("Can't merge QuantizedKVCaches with different quantization")
         lengths = [c.offset if c.keys is not None else 0 for c in caches]
         max_length = max(lengths)
