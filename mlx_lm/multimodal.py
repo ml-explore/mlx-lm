@@ -613,6 +613,9 @@ class Lfm2VlImageInputs:
         self.min_tokens = int(cfg.get("min_image_tokens", 64))
         self.max_tokens = int(cfg.get("max_image_tokens", 256))
         self.tolerance = float(cfg.get("max_pixels_tolerance", 2.0))
+        # PIL's filter number, as HF reads it (2 bilinear in older
+        # checkpoints, 3 bicubic).
+        self.resample = int(cfg.get("resample", 3))
         self.mean = np.array(cfg.get("image_mean", [0.5] * 3), dtype=np.float32)
         self.std = np.array(cfg.get("image_std", [0.5] * 3), dtype=np.float32)
         self.image_token_id = model.args.image_token_id
@@ -675,15 +678,15 @@ class Lfm2VlImageInputs:
         out = []
         if self._too_large(H, W) and not self.min_tiles == self.max_tiles == 1:
             cols, rows = self._grid(H, W)
-            big = image.resize((cols * self.tile, rows * self.tile), Image.BICUBIC)
+            big = image.resize((cols * self.tile, rows * self.tile), Image.Resampling(self.resample))
             for r in range(rows):
                 for c in range(cols):
                     box = (c * self.tile, r * self.tile, (c + 1) * self.tile, (r + 1) * self.tile)
                     out.append(self._patches(big.crop(box)))
             if self.thumbnail and rows * cols > 1:
-                out.append(self._patches(image.resize((new_w, new_h), Image.BICUBIC)))
+                out.append(self._patches(image.resize((new_w, new_h), Image.Resampling(self.resample))))
         else:
-            out.append(self._patches(image.resize((new_w, new_h), Image.BICUBIC)))
+            out.append(self._patches(image.resize((new_w, new_h), Image.Resampling(self.resample))))
         n = math.ceil(new_h // self.patch / self.factor) * math.ceil(new_w // self.patch / self.factor)
         return out, rows, cols, n
 
@@ -783,7 +786,17 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
             if (path / name).exists():
                 data = json.loads((path / name).read_text())
                 cfg.update(data.get("image_processor", data))
-        return Lfm2VlImageInputs(model, cfg, _special_token_ids(path))
+        ids = _special_token_ids(path)
+        # Without its image tokens a prompt can't be expanded: no image
+        # inputs (a clear "doesn't accept images"), not a KeyError later.
+        inputs = Lfm2VlImageInputs(model, cfg, ids)
+        needed = {"<|image_start|>", "<|image_end|>", "<|img_thumbnail|>"}
+        # A marker for every tile of every grid the settings allow.
+        for cols, rows in inputs.ratios:
+            needed |= {f"<|img_row_{r + 1}_col_{c + 1}|>" for r in range(rows) for c in range(cols)}
+        if any(t not in ids for t in needed):
+            return None
+        return inputs
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
     if getattr(model, "embed_vision", None) is None:
