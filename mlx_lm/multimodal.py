@@ -57,6 +57,9 @@ import numpy as np
 # Pseudo token ids for image positions in prompt-cache keys only. Far above
 # any real vocabulary so they can never collide with a real token.
 _IMAGE_KEY_BASE = 1 << 40
+# An audio clip's pseudo ids, apart from images' (5 hash bytes stay below
+# 1 << 40 above the base): vision_spans must not take audio for an image.
+_AUDIO_KEY_BASE = 1 << 41
 
 # Set by the server from --allow-image-urls.
 ALLOW_IMAGE_URLS = False
@@ -72,7 +75,10 @@ MAX_REQUEST_PIXELS = 48_000_000
 # Audio clips per request and their length together (Gemma 4 takes 30 s a
 # clip in training; a long one is many soft tokens).
 MAX_AUDIOS = 8
-MAX_AUDIO_SECONDS = 600
+# Gemma 4's extractor takes 30 s a clip (it would cut a longer one).
+MAX_CLIP_SECONDS = 30
+MAX_AUDIO_SECONDS = MAX_AUDIOS * MAX_CLIP_SECONDS
+MAX_AUDIO_BYTES = 20 * 1024 * 1024
 AUDIO_RATE = 16_000
 URL_FETCH_SECONDS = 30
 # Formats whose Image.open reads only the header (ICO, for one, decodes its
@@ -325,13 +331,15 @@ def extract_media(messages: List[Any]) -> Tuple[List[bytes], List[np.ndarray]]:
                     raise ValueError(f"At most {MAX_AUDIOS} audio clips per request.")
                 ref = part.get("input_audio")
                 data = ref.get("data") if isinstance(ref, dict) else None
-                fmt = (ref.get("format") or "wav").lower() if isinstance(ref, dict) else "wav"
+                fmt = ref.get("format", "wav") if isinstance(ref, dict) else "wav"
                 if not isinstance(data, str):
                     raise ValueError("input_audio part is missing its data.")
-                if fmt != "wav":
+                if not isinstance(fmt, str) or fmt.lower() != "wav":
                     raise ValueError("Only WAV audio is supported (input_audio format \"wav\").")
+                if len(data) > MAX_AUDIO_BYTES * 4 // 3 + 4:
+                    raise ValueError(f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB.")
                 try:
-                    blob = base64.b64decode(data, validate=False)
+                    blob = base64.b64decode(data, validate=True)
                 except Exception as e:
                     raise ValueError(f"input_audio data isn't base64: {e}") from e
                 wave_16k = decode_wav(blob)
@@ -349,13 +357,18 @@ def decode_wav(blob: bytes) -> np.ndarray:
     linear interpolation)."""
     import wave
 
+    # The header first: nothing is decoded for a clip out of bounds.
     try:
         with wave.open(io.BytesIO(blob)) as w:
             channels, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
-            if rate <= 0 or w.getnframes() > rate * MAX_AUDIO_SECONDS:
-                raise ValueError(f"The audio is longer than {MAX_AUDIO_SECONDS} seconds.")
+            if not 1 <= channels <= 8 or not 1 <= width <= 4 or not 8_000 <= rate <= 192_000:
+                raise ValueError(f"Unsupported WAV: {channels} channel(s), {width * 8}-bit, {rate} Hz.")
+            if w.getnframes() > rate * MAX_CLIP_SECONDS:
+                raise ValueError(f"An audio clip is longer than {MAX_CLIP_SECONDS} seconds.")
             frames = w.readframes(w.getnframes())
-    except (wave.Error, EOFError) as e:
+    except ValueError:
+        raise
+    except Exception as e:  # wave.Error, EOFError, RuntimeError on a bad chunk...
         raise ValueError(f"Could not read the WAV audio: {e}") from e
     if width == 1:
         x = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128) / 128
@@ -371,7 +384,10 @@ def decode_wav(blob: bytes) -> np.ndarray:
         raise ValueError(f"Unsupported WAV sample width: {width} bytes.")
     if channels > 1:
         x = x[: len(x) // channels * channels].reshape(-1, channels).mean(axis=1)
-    return resample(x, rate, AUDIO_RATE)
+    out = resample(x, rate, AUDIO_RATE)
+    if len(out) < AUDIO_RATE // 10:
+        raise ValueError("The audio clip is empty (under 0.1 s).")
+    return out
 
 
 def resample(x: np.ndarray, rate: int, target: int) -> np.ndarray:
@@ -541,7 +557,12 @@ class ImageInputs:
 
     @property
     def accepts_audio(self) -> bool:
-        return self.audio_extractor is not None and self.audio_token_id is not None
+        return (self.audio_extractor is not None
+                and None not in (self.audio_token_id, self.boa_token_id, self.eoa_token_id))
+
+    @property
+    def accepts_images(self) -> bool:
+        return getattr(self.model, "embed_vision", None) is not None
 
     def audio_soft_tokens(self, mask) -> int:
         """Soft tokens of one clip from its feature mask, as HF's processor
@@ -588,10 +609,13 @@ class ImageInputs:
         n_audio_soft = []
         audio_keys = []
         if audios:
-            audio_feats = self.audio_extractor(audios, sampling_rate=AUDIO_RATE, return_tensors="np")
+            # Whole clips (each at most MAX_CLIP_SECONDS, extract_media):
+            # never the extractor's own cut.
+            audio_feats = self.audio_extractor(audios, sampling_rate=AUDIO_RATE, return_tensors="np",
+                                               max_length=MAX_CLIP_SECONDS * AUDIO_RATE, truncation=False)
             n_audio_soft = [self.audio_soft_tokens(m) for m in audio_feats["input_features_mask"]]
             audio_keys = [
-                _IMAGE_KEY_BASE + int.from_bytes(hashlib.sha256(a.tobytes()).digest()[:5], "big")
+                _AUDIO_KEY_BASE + int.from_bytes(hashlib.sha256(a.tobytes()).digest()[:5], "big")
                 for a in audios
             ]
 
@@ -914,9 +938,10 @@ def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
     images are always separated by their begin / end tokens)."""
     spans, start = [], None
     for i, t in enumerate(list(cache_key) + [0]):
-        if t >= _IMAGE_KEY_BASE and start is None:
+        image = _IMAGE_KEY_BASE <= t < _AUDIO_KEY_BASE
+        if image and start is None:
             start = i
-        elif t < _IMAGE_KEY_BASE and start is not None:
+        elif not image and start is not None:
             spans.append((start, i))
             start = None
     return spans

@@ -1296,7 +1296,7 @@ class ResponseGenerator:
             image_inputs = None
             if request.images or request.audios:
                 image_inputs = self.model_provider.image_inputs
-                if image_inputs is None and request.images:
+                if request.images and (image_inputs is None or not getattr(image_inputs, "accepts_images", True)):
                     raise ValueError(
                         "This model does not accept image inputs (no vision "
                         "tower / image processor). Use a vision-capable model "

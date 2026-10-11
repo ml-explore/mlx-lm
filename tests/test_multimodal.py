@@ -660,6 +660,11 @@ class TestAudioInputs(unittest.TestCase):
             [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": "mp3"}}],
             [{"type": "input_audio", "input_audio": {}}],
             [{"type": "audio"}],  # only extract_media makes those
+            [_audio_part(_wav(31))],  # over 30 s a clip
+            [{"type": "input_audio", "input_audio": {"data": base64.b64encode(
+                bytes.fromhex("524946460c000000574156454a554e4bffffffff")).decode(), "format": "wav"}}],
+            [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": 123}}],
+            [_audio_part(_wav(0.05))],  # empty
         ]
         for content in bad:
             with self.assertRaises(ValueError, msg=str(content)[:60]):
@@ -710,3 +715,20 @@ class TestAudioInputs(unittest.TestCase):
         self.assertFalse(no_audio.accepts_audio)
         with self.assertRaises(ValueError):
             no_audio.build([2, 11], [], [np.zeros(16000, dtype=np.float32)])
+
+
+@unittest.skipUnless(HAVE_DEPS, "needs pillow + transformers")
+class TestAudioKeys(unittest.TestCase):
+    def test_audio_isnt_a_vision_span(self):
+        from mlx_lm.multimodal import _AUDIO_KEY_BASE, vision_spans
+
+        key = [1, BOI, _IMAGE_KEY_BASE + 5, _IMAGE_KEY_BASE + 5, EOI, BOA, _AUDIO_KEY_BASE + 7, EOA]
+        self.assertEqual(vision_spans(key), [(2, 4)])
+
+    def test_odd_wav_headers_are_refused(self):
+        from mlx_lm.multimodal import decode_wav
+
+        with self.assertRaises(ValueError):
+            decode_wav(_wav(1, rate=4000))
+        with self.assertRaises(ValueError):
+            decode_wav(_wav(1, rate=16000, channels=9))
