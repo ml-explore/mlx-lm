@@ -25,8 +25,10 @@ from .models.cache import (
     RotatingKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
+    fit_group_size,
     load_prompt_cache,
     make_prompt_cache,
+    quantized_head_dims,
     trim_prompt_cache,
 )
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
@@ -1875,7 +1877,9 @@ def _batch_layers(cache, kv_bits, kv_group_size):
         elif isinstance(layer, QuantizedKVCache):
             if kv_bits is None:
                 layer = layer.to_unquantized()
-            elif (layer.group_size, layer.bits) != (kv_group_size, kv_bits):
+            elif (layer.group_size, layer.bits) != (fit_group_size(kv_group_size, *quantized_head_dims(layer)), kv_bits):
+                # Not what the batch quantizes to (its size fitted to these
+                # heads, as the layer's was): quantized again.
                 layer = layer.to_unquantized().to_quantized(group_size=kv_group_size, bits=kv_bits)
         elif isinstance(layer, QuantizedRotatingKVCache):
             layer = layer.to_unquantized()
@@ -3097,7 +3101,7 @@ def main():
                 raise ValueError(
                     "--kv-bits does not match the kv cache loaded from --prompt-cache-file."
                 )
-            if args.kv_group_size != prompt_cache[0].group_size:
+            if fit_group_size(args.kv_group_size, *quantized_head_dims(prompt_cache[0])) != prompt_cache[0].group_size:
                 raise ValueError(
                     "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
                 )
