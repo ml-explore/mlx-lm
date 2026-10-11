@@ -318,6 +318,21 @@ def _now() -> float:
     return time.monotonic()
 
 
+class _ResumedStopSequences:
+    """Stop sequences whose matcher starts where a handed-off request's
+    left off (BatchGenerator asks each sequence's for a matcher once)."""
+
+    def __init__(self, stop_sequences, tokens):
+        self._stop_sequences = stop_sequences
+        self._tokens = list(tokens)
+
+    def matcher(self):
+        m = self._stop_sequences.matcher()
+        for t in self._tokens:
+            m.advance(t)
+        return m
+
+
 @dataclass
 class Handoff:
     """A speculative single request stopped for the batch (another request
@@ -891,7 +906,19 @@ class ResponseGenerator:
         )
 
     def _others_waiting(self):
+        # Distributed: only rank 0 holds the queue, and every rank must take
+        # the same path -- no switching by load there.
+        if self._is_distributed:
+            return False
         return not self.requests.empty()
+
+    def _main_slots(self, cache):
+        """A stored cache as the batch takes it: the model's layers only (a
+        speculative single request stores the draft model's beside them)."""
+        if cache is None:
+            return None
+        n_main = len(make_prompt_cache(self.model_provider.model))
+        return cache[:n_main] if len(cache) > n_main else cache
 
     def _insert_handoff(self, batch_generator, batch_results, handoff, tokenizer):
         """A handed-off request into the batch, without speculation. A cache
@@ -909,13 +936,19 @@ class ResponseGenerator:
             # checkpoints), else from scratch.
             self.prompt_cache.insert_cache(model_key, tokens[:], cache, cache_type="assistant")
             cache, left = self.prompt_cache.fetch_nearest_cache(model_key, tokens[:-1])
+            cache = self._main_slots(cache)
             n = len(tokens) - 1 - len(left) if cache is not None else 0
             history, rest = tokens[:n], tokens[n:]
         stop_sequences, _ = self._make_state_machine(model_key, tokenizer, handoff.args.stop_words)
-        # The text it sent is the detokenizer's history: a word split at
-        # the move keeps its spacing.
+        sent = tokens[len(handoff.ctx.prompt):]
+        # Its stop sequences go on from what it sent: one split by the move
+        # still stops it.
+        stop_sequences = _ResumedStopSequences(stop_sequences, sent)
+        # What it sent is the detokenizer's history (only that: the single
+        # path's detokenizer saw no prompt): a word split at the move keeps
+        # its spacing.
         detokenizer = tokenizer.detokenizer
-        for t in tokens[-8:]:
+        for t in sent[-8:]:
             detokenizer.add_token(t)
         _ = detokenizer.last_segment
         (uid,) = batch_generator.insert_segments(
@@ -1018,6 +1051,9 @@ class ResponseGenerator:
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
                         current_model_key, prompt
                     )
+                    # Stored by a speculative single request: without the
+                    # draft model's slots.
+                    cache = self._main_slots(cache)
                     prompt_cache_count = len(prompt) - len(rest)
                     self._log_cache_reuse(prompt_cache_count, len(prompt))
                     segments, segment_types = self._junction_split(
@@ -1102,8 +1138,10 @@ class ResponseGenerator:
                     )
                     if handoff is not None:
                         # The speculative request goes on in the batch; the
-                        # one waiting joins it next.
+                        # one waiting joins it next. Its own cache isn't
+                        # kept past this (the batch has what it needs).
                         self._insert_handoff(batch_generator, batch_results, handoff, tokenizer)
+                        handoff = None
                     else:
                         unprocessed_requests.append((rqueue, request, args))
                     continue
