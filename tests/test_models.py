@@ -31,6 +31,15 @@ from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
+
+    def _on_cpu(self):
+        """The rest of the test on the CPU: these compare a whole prompt
+        with token by token (or two kernels) in float32, and on an M5 GPU
+        (mlx 0.32) a matmul of two or more rows is rounded like tf32 while
+        one row isn't -- ~1e-3 apart, past their 1e-4 tolerances."""
+        device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        self.addCleanup(mx.set_default_device, device)
     def test_kv_cache(self):
         cache = KVCache()
 
@@ -4189,6 +4198,7 @@ class TestModels(unittest.TestCase):
                 )
 
     def test_llama4_chunked_kv_cache(self):
+        self._on_cpu()
         # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
         # the number of valid cached tokens, not on the padded buffer size.
         # When the chunk size is smaller than the cache allocation step, the old
@@ -4240,6 +4250,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(full, step, atol=1e-3, rtol=1e-3))
 
     def test_ssm(self):
+        self._on_cpu()
         for batch_size in [1, 2]:
             for n_group in [1, 4]:
                 num_heads = 48
@@ -4614,6 +4625,7 @@ class TestModels(unittest.TestCase):
             self.assertIsInstance(cache, expected)
 
     def test_spark2_5_chunked_vs_oneshot_prefill(self):
+        self._on_cpu()
         from mlx_lm.models import spark2_5
 
         # sliding_window=16 with 40 tokens makes the rotating cache wrap.

@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 
-from mlx_lm.evaluate import MLXLM
+try:
+    from mlx_lm.evaluate import MLXLM
+except ImportError as e:  # lm_eval is an optional dependency
+    raise unittest.SkipTest(f"mlx_lm.evaluate needs lm_eval: {e}")
 
 
 class TestMLXLM(unittest.TestCase):

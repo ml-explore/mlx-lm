@@ -975,14 +975,18 @@ class ArraysCache(_BaseCache):
             self.left_padding -= N
 
     def make_mask(self, N: int):
+        # Both at once: a batch merged from empty caches has a left padding
+        # of zeros AND, prompts right-padded to one length, `lengths`. Taking
+        # the left padding alone let the right padding into the recurrent
+        # state of every prompt shorter than the longest.
+        pos = mx.arange(N)
+        mask = None
         if self.left_padding is not None:
-            pos = mx.arange(N)
-            return pos >= self.left_padding[:, None]
-        elif self.lengths is not None:
-            pos = mx.arange(N)
-            return pos < self.lengths[:, None]
-        else:
-            return None
+            mask = pos >= self.left_padding[:, None]
+        if self.lengths is not None:
+            within = pos < self.lengths[:, None]
+            mask = within if mask is None else mask & within
+        return mask
 
     @classmethod
     def merge(cls, caches):
