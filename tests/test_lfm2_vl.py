@@ -119,6 +119,25 @@ class TestModel(unittest.TestCase):
         out = model.sanitize({"model.vision_tower.vision_model.x": mx.zeros(1)})
         self.assertEqual(out, {})
 
+    def test_older_config_names(self):
+        # model_type "lfm2-vl": image_token_index, vision_feature_layer -2
+        # (the layers up to it stored), projector_use_layernorm unset.
+        args = lfm2_vl.ModelArgs.from_dict(
+            {
+                "model_type": "lfm2-vl",
+                "text_config": dict(TEXT),
+                "vision_config": dict(VISION, num_hidden_layers=3),
+                "image_token_index": 7,
+                "vision_feature_layer": -2,
+                "projector_hidden_size": 24,
+                "projector_use_layernorm": None,
+            }
+        )
+        model = lfm2_vl.Model(args)
+        self.assertEqual(args.image_token_id, 7)
+        self.assertEqual(len(model.vision_tower.encoder.layers), 2)
+        self.assertIn("layer_norm", model.multi_modal_projector)
+
     def test_embed_with_images(self):
         model = _model()
         # Two 4x4-patch crops (2x2 tokens each) and one 2x4 (1x2 tokens).
@@ -173,6 +192,20 @@ class TestImageInputs(unittest.TestCase):
         self.assertEqual(ids[1], 200)  # row 1 col 1
         self.assertIn(102, ids)  # thumbnail
         self.assertEqual(ids.count(7), 256 * len(tiles) + (crops[-1][1] // 2) * (crops[-1][2] // 2))
+
+    def test_preprocessor_config_overrides(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_lm.multimodal import load_image_inputs
+
+        model = _model()
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "processor_config.json").write_text(json.dumps({"image_processor": {"max_tiles": 10}}))
+            Path(d, "preprocessor_config.json").write_text(json.dumps({"max_tiles": 2}))
+            inputs = load_image_inputs(model, d)
+        self.assertEqual(inputs.max_tiles, 2)
 
     def test_placeholder_count_checked(self):
         with self.assertRaises(ValueError):

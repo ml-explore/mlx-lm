@@ -770,14 +770,19 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
         cfg_path = Path(_download(str(model_path))) / "preprocessor_config.json"
         cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
         return Qwen35ImageInputs(model, cfg)
-    if getattr(model, "model_type", None) == "lfm2_vl":
+    if getattr(model, "model_type", None) in ("lfm2_vl", "lfm2-vl"):
         if getattr(model, "vision_tower", None) is None:
             return None
         from .utils import _download
 
         path = Path(_download(str(model_path)))
-        cfg_path = path / "processor_config.json"
-        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        # The image settings: processor_config.json's image_processor, with
+        # preprocessor_config.json over it (where older checkpoints keep them).
+        cfg = {}
+        for name in ("processor_config.json", "preprocessor_config.json"):
+            if (path / name).exists():
+                data = json.loads((path / name).read_text())
+                cfg.update(data.get("image_processor", data))
         return Lfm2VlImageInputs(model, cfg, _special_token_ids(path))
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None

@@ -1150,6 +1150,7 @@ def save_config(
         "qwen3_5",
         "qwen3_5_moe",
         "lfm2_vl",
+        "lfm2-vl",
     ):
         config.pop("vision_config", None)
     if "quantization" in config:

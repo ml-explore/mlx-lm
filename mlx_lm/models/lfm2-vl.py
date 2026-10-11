@@ -17,14 +17,21 @@ class ModelArgs(BaseModelArgs):
     text_config: dict
     vision_config: Optional[dict] = None
     image_token_id: Optional[int] = None
+    image_token_index: Optional[int] = None
+    vision_feature_layer: int = -1
     downsample_factor: int = 2
     projector_hidden_size: int = 2560
     projector_hidden_act: str = "gelu"
     projector_bias: bool = True
-    projector_use_layernorm: bool = True
+    projector_use_layernorm: Optional[bool] = True
 
     def __post_init__(self):
         self.text_config["tie_word_embeddings"] = False
+        # Older configs (model_type "lfm2-vl") name it image_token_index.
+        if self.image_token_id is None:
+            self.image_token_id = self.image_token_index
+        if self.projector_use_layernorm is None:
+            self.projector_use_layernorm = True
 
 
 class Model(nn.Module):
@@ -36,6 +43,10 @@ class Model(nn.Module):
         self.vision_tower = None
         if args.vision_config is not None and args.image_token_id is not None:
             vision = VisionConfig.from_dict(args.vision_config)
+            # Older checkpoints take the features of an earlier layer
+            # (vision_feature_layer -2) and store only the layers up to it.
+            if args.vision_feature_layer not in (None, -1):
+                vision.num_hidden_layers = args.vision_feature_layer % vision.num_hidden_layers + 1
             self.vision_tower = VisionModel(vision)
             self.multi_modal_projector = Projector(
                 vision.hidden_size,
