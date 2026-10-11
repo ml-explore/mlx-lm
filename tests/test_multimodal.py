@@ -665,6 +665,8 @@ class TestAudioInputs(unittest.TestCase):
                 bytes.fromhex("524946460c000000574156454a554e4bffffffff")).decode(), "format": "wav"}}],
             [{"type": "input_audio", "input_audio": {"data": "AAAA", "format": 123}}],
             [_audio_part(_wav(0.05))],  # empty
+            [_audio_part(_wav(1)[:44 + 6400])],  # cut off: 0.2 s of a 1 s header
+            [_audio_part(_wav(1)), {"type": "video"}],  # not for the template
         ]
         for content in bad:
             with self.assertRaises(ValueError, msg=str(content)[:60]):

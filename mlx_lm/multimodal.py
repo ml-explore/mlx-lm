@@ -336,19 +336,31 @@ def extract_media(messages: List[Any]) -> Tuple[List[bytes], List[np.ndarray]]:
                     raise ValueError("input_audio part is missing its data.")
                 if not isinstance(fmt, str) or fmt.lower() != "wav":
                     raise ValueError("Only WAV audio is supported (input_audio format \"wav\").")
+                # As an image's: whitespace in the base64 is fine, the size
+                # is the decoded clip's.
+                data = "".join(data.split())
                 if len(data) > MAX_AUDIO_BYTES * 4 // 3 + 4:
                     raise ValueError(f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB.")
                 try:
                     blob = base64.b64decode(data, validate=True)
                 except Exception as e:
                     raise ValueError(f"input_audio data isn't base64: {e}") from e
+                if len(blob) > MAX_AUDIO_BYTES:
+                    raise ValueError(f"An audio clip is over {MAX_AUDIO_BYTES // (1024 * 1024)} MB.")
                 wave_16k = decode_wav(blob)
                 seconds += len(wave_16k) / AUDIO_RATE
                 if seconds > MAX_AUDIO_SECONDS:
                     raise ValueError(f"The audio adds up to more than {MAX_AUDIO_SECONDS} seconds.")
                 audios.append(wave_16k)
                 content[i] = {"type": "audio"}
-    return extract_images(messages), audios
+    images = extract_images(messages)
+    # A list with audio holds only what the template is given for it.
+    for message in messages if isinstance(messages, list) else []:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "audio" for p in content):
+            if not all(isinstance(p, dict) and p.get("type") in ("text", "image", "audio") for p in content):
+                raise ValueError("Only text, image_url and input_audio parts are supported together with audio.")
+    return images, audios
 
 
 def decode_wav(blob: bytes) -> np.ndarray:
@@ -366,6 +378,9 @@ def decode_wav(blob: bytes) -> np.ndarray:
             if w.getnframes() > rate * MAX_CLIP_SECONDS:
                 raise ValueError(f"An audio clip is longer than {MAX_CLIP_SECONDS} seconds.")
             frames = w.readframes(w.getnframes())
+            # A file shorter than its header says: cut off, refused.
+            if len(frames) != w.getnframes() * channels * width:
+                raise ValueError("The WAV audio is cut off (shorter than its header says).")
     except ValueError:
         raise
     except Exception as e:  # wave.Error, EOFError, RuntimeError on a bad chunk...
