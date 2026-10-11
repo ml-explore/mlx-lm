@@ -13,7 +13,9 @@ from mlx_lm.models.cache import (
     QuantizedRotatingKVCache,
     RotatingKVCache,
     fit_group_size,
+    load_prompt_cache,
     make_prompt_cache,
+    save_prompt_cache,
 )
 from mlx_lm.utils import load
 
@@ -165,6 +167,24 @@ class TestGroupSizeFitsTheHeads(unittest.TestCase):
         batch = BatchKVCache([0])
         batch.update_and_fetch(k, v)
         self.assertEqual(batch.to_quantized(group_size=128, bits=8).group_size, 64)
+
+    def test_fitted_caches_join_a_batch_as_they_are(self):
+        layer = _kv(5).to_quantized(group_size=128, bits=8)
+        (joined,) = _batch_layers([layer], kv_bits=8, kv_group_size=128)
+        self.assertIs(joined, layer, "not quantized again")
+
+    def test_a_saved_batch_keeps_its_group_size(self):
+        import os, tempfile
+        k, v = mx.random.normal((2, 2, 5, 64)), mx.random.normal((2, 2, 5, 64))
+        batch = BatchQuantizedKVCache([0, 1], group_size=128, bits=8)
+        batch.update_and_fetch(k, v)
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.safetensors")
+            save_prompt_cache(path, [batch])
+            (loaded,) = load_prompt_cache(path)
+        self.assertEqual((loaded.group_size, loaded.bits), (64, 8))
+        for a, b in zip(loaded.keys, batch.keys):
+            self.assertTrue(mx.array_equal(a, b))
 
     def test_empty_caches_join_fitted_ones(self):
         k, v = mx.random.normal((1, 2, 5, 64)), mx.random.normal((1, 2, 5, 64))

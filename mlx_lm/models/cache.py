@@ -163,6 +163,14 @@ def create_attention_mask(
         return "causal"
 
 
+def quantized_head_dims(cache) -> tuple:
+    """The key and value head widths of a quantized cache's stored keys
+    and values (each ``(packed, scales, biases)``), () when it holds none."""
+    if cache.keys is None:
+        return ()
+    return (cache.keys[1].shape[-1] * cache.group_size, cache.values[1].shape[-1] * cache.group_size)
+
+
 def fit_group_size(group_size: int, *dims: int) -> int:
     """The KV quantization group size for heads of these widths: the one
     asked if it divides them, else the largest of 128, 64 and 32 below it
@@ -1524,11 +1532,15 @@ class BatchQuantizedKVCache(_BaseCache):
 
     @property
     def state(self):
-        return self.keys, self.values, self.offset, self.left_padding, self._idx
+        # The quantization rides along, as QuantizedKVCache's does: a saved
+        # cache keeps the size fitted to its heads.
+        return self.keys, self.values, self.offset, self.left_padding, self._idx, self.group_size, self.bits
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.left_padding, self._idx = v
+        self.keys, self.values, self.offset, self.left_padding, self._idx, self.group_size, self.bits = v
+        if not hasattr(self, "_right_padding"):
+            self._right_padding = None
 
     def is_trimmable(self):
         return True
