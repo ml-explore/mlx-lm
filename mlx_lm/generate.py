@@ -19,6 +19,7 @@ from transformers import PreTrainedTokenizer
 
 from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
 from .models.cache import (
+    KVCache,
     QuantizedKVCache,
     QuantizedRotatingKVCache,
     RotatingKVCache,
@@ -1859,6 +1860,29 @@ def _right_pad_prompts(prompts, max_length=None):
     return mx.array([p + [0] * (max_length - len(p)) for p in prompts])
 
 
+def _batch_layers(cache, kv_bits, kv_group_size):
+    """One sequence's cache made ready to join a batch: full-attention
+    layers quantized when the batch quantizes its KV cache (``kv_bits``),
+    full precision when it doesn't; a quantized sliding-window layer
+    (QuantizedRotatingKVCache, from the unbatched path) back to full
+    precision -- in a batch those stay unquantized, their size is the
+    window's. Other layers (recurrent state, lists) as they are."""
+    out = []
+    for layer in cache:
+        if type(layer) is KVCache:
+            if kv_bits is not None:
+                layer = layer.to_quantized(group_size=kv_group_size, bits=kv_bits)
+        elif isinstance(layer, QuantizedKVCache):
+            if kv_bits is None:
+                layer = layer.to_unquantized()
+            elif (layer.group_size, layer.bits) != (kv_group_size, kv_bits):
+                layer = layer.to_unquantized().to_quantized(group_size=kv_group_size, bits=kv_bits)
+        elif isinstance(layer, QuantizedRotatingKVCache):
+            layer = layer.to_unquantized()
+        out.append(layer)
+    return out
+
+
 def _merge_caches(caches):
     batch_cache = []
 
@@ -2580,9 +2604,16 @@ class BatchGenerator:
         prefill_step_size: int = 2048,
         max_kv_size: Optional[int] = None,
         stream=None,
+        kv_bits: Optional[int] = None,
+        kv_group_size: int = 64,
     ):
         self.model = model
         self.max_tokens = max_tokens
+        # Full-attention layers' KV cache quantized in the batch, as the
+        # unbatched path quantizes it (from the first token: a batch has
+        # no quantized_kv_start).
+        self.kv_bits = kv_bits
+        self.kv_group_size = kv_group_size
         self.sampler = sampler or greedy_sampler
         self.logits_processors = logits_processors or []
         self.uid_count = 0
@@ -2721,6 +2752,7 @@ class BatchGenerator:
                 seq[-2] = seq[-2][:-1]
             if c is None:
                 c = make_prompt_cache(self.model, self.max_kv_size)
+            c = _batch_layers(c, self.kv_bits, self.kv_group_size)
             pending.append((uid, seq, m, c, at, s, lp, sm))
 
         self._unprocessed_sequences.extend(pending)
