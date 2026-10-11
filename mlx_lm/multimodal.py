@@ -593,6 +593,159 @@ class Qwen35ImageInputs:
         return expanded, embeddings, cache_key
 
 
+class Lfm2VlImageInputs:
+    """LFM2-VL image preprocessing (as HF Lfm2VlImageProcessor): a large
+    image is cut into tile_size tiles on the grid closest to its aspect ratio,
+    plus a thumbnail; a small one is resized whole. Prompt expansion follows
+    Lfm2VlProcessor, with the image special tokens."""
+
+    def __init__(self, model, processor_config: dict, token_ids: dict):
+        cfg = processor_config.get("image_processor", processor_config)
+        self.model = model
+        self.patch = int(cfg.get("encoder_patch_size", 16))
+        self.factor = int(cfg.get("downsample_factor", 2))
+        self.tile = int(cfg.get("tile_size", 512))
+        self.min_tiles = int(cfg.get("min_tiles", 2))
+        self.max_tiles = int(cfg.get("max_tiles", 10))
+        if not cfg.get("do_image_splitting", True):
+            self.min_tiles = self.max_tiles = 1
+        self.thumbnail = bool(cfg.get("use_thumbnail", True))
+        self.min_tokens = int(cfg.get("min_image_tokens", 64))
+        self.max_tokens = int(cfg.get("max_image_tokens", 256))
+        self.tolerance = float(cfg.get("max_pixels_tolerance", 2.0))
+        self.mean = np.array(cfg.get("image_mean", [0.5] * 3), dtype=np.float32)
+        self.std = np.array(cfg.get("image_std", [0.5] * 3), dtype=np.float32)
+        self.image_token_id = model.args.image_token_id
+        self.ids = token_ids  # special token name -> id
+        self.ratios = sorted(
+            {
+                (w, h)
+                for n in range(self.min_tiles, self.max_tiles + 1)
+                for w in range(1, n + 1)
+                for h in range(1, n + 1)
+                if self.min_tiles <= w * h <= self.max_tiles
+            },
+            key=lambda r: r[0] * r[1],
+        )
+
+    def _smart_resize(self, h: int, w: int) -> Tuple[int, int]:
+        f = self.patch * self.factor
+        lo, hi = self.min_tokens * f * f, self.max_tokens * f * f
+        h_bar, w_bar = max(f, round(h / f) * f), max(f, round(w / f) * f)
+        if h_bar * w_bar > hi:
+            beta = math.sqrt(h * w / hi)
+            h_bar = max(f, math.floor(h / beta / f) * f)
+            w_bar = max(f, math.floor(w / beta / f) * f)
+        elif h_bar * w_bar < lo:
+            beta = math.sqrt(lo / (h * w))
+            h_bar, w_bar = math.ceil(h * beta / f) * f, math.ceil(w * beta / f) * f
+        return h_bar, w_bar
+
+    def _too_large(self, h: int, w: int) -> bool:
+        f = self.patch * self.factor
+        h_bar, w_bar = max(self.patch, round(h / f) * f), max(self.patch, round(w / f) * f)
+        return h_bar * w_bar > self.max_tokens * f * f * self.tolerance
+
+    def _grid(self, h: int, w: int) -> Tuple[int, int]:
+        """(columns, rows): HF find_closest_aspect_ratio."""
+        aspect, best, best_diff = w / h, (1, 1), float("inf")
+        for cols, rows in self.ratios:
+            diff = abs(aspect - cols / rows)
+            if diff < best_diff:
+                best, best_diff = (cols, rows), diff
+            elif diff == best_diff and h * w > 0.5 * self.tile * self.tile * cols * rows:
+                best = (cols, rows)
+        return best
+
+    def _patches(self, image) -> Tuple[np.ndarray, int, int]:
+        x = (np.asarray(image, dtype=np.float32) / 255.0 - self.mean) / self.std
+        p = self.patch
+        gh, gw = x.shape[0] // p, x.shape[1] // p
+        x = x.reshape(gh, p, gw, p, 3).transpose(0, 2, 1, 3, 4)
+        return x.reshape(gh * gw, p * p * 3), gh, gw
+
+    def crops(self, image) -> Tuple[list, int, int, int]:
+        """The crops [(patches, h, w)], the grid rows and columns, and the
+        image tokens of the whole-image crop (single or thumbnail)."""
+        from PIL import Image
+
+        H, W = image.height, image.width
+        new_h, new_w = self._smart_resize(H, W)
+        rows = cols = 1
+        out = []
+        if self._too_large(H, W) and not self.min_tiles == self.max_tiles == 1:
+            cols, rows = self._grid(H, W)
+            big = image.resize((cols * self.tile, rows * self.tile), Image.BICUBIC)
+            for r in range(rows):
+                for c in range(cols):
+                    box = (c * self.tile, r * self.tile, (c + 1) * self.tile, (r + 1) * self.tile)
+                    out.append(self._patches(big.crop(box)))
+            if self.thumbnail and rows * cols > 1:
+                out.append(self._patches(image.resize((new_w, new_h), Image.BICUBIC)))
+        else:
+            out.append(self._patches(image.resize((new_w, new_h), Image.BICUBIC)))
+        n = math.ceil(new_h // self.patch / self.factor) * math.ceil(new_w // self.patch / self.factor)
+        return out, rows, cols, n
+
+    def build(
+        self, prompt: List[int], images: List[bytes]
+    ) -> Tuple[List[int], mx.array, List[int]]:
+        n_placeholders = sum(1 for t in prompt if t == self.image_token_id)
+        if n_placeholders != len(images):
+            raise ValueError(
+                f"Chat template produced {n_placeholders} image placeholder(s) "
+                f"for {len(images)} image(s)."
+            )
+        keys = [
+            _IMAGE_KEY_BASE + int.from_bytes(hashlib.sha256(b).digest()[:5], "big")
+            for b in images
+        ]
+        per_tile = math.ceil(self.tile // self.patch / self.factor) ** 2
+        expanded, cache_key, crops, img = [], [], [], 0
+        for tok in prompt:
+            if tok != self.image_token_id:
+                expanded.append(tok)
+                cache_key.append(tok)
+                continue
+            image_crops, rows, cols, n_image = self.crops(_decode(images[img]))
+            crops += [(mx.array(p), h, w) for p, h, w in image_crops]
+            spans = []  # (marker token or None, image tokens)
+            if rows * cols > 1:
+                for r in range(rows):
+                    for c in range(cols):
+                        spans.append((self.ids[f"<|img_row_{r + 1}_col_{c + 1}|>"], per_tile))
+                if self.thumbnail:
+                    spans.append((self.ids["<|img_thumbnail|>"], n_image))
+            else:
+                spans.append((None, n_image))
+            seq = [self.ids["<|image_start|>"]]
+            key = list(seq)
+            for marker, n in spans:
+                if marker is not None:
+                    seq.append(marker)
+                    key.append(marker)
+                seq += [self.image_token_id] * n
+                key += [keys[img]] * n
+            seq.append(self.ids["<|image_end|>"])
+            key.append(self.ids["<|image_end|>"])
+            expanded += seq
+            cache_key += key
+            img += 1
+
+        embeddings = self.model.embed_with_images(mx.array(expanded)[None], crops)[0]
+        mx.eval(embeddings)
+        return expanded, embeddings, cache_key
+
+
+def _special_token_ids(model_path) -> dict:
+    """Added-token name -> id, from the model's tokenizer.json."""
+    path = Path(model_path) / "tokenizer.json"
+    if not path.exists():
+        return {}
+    added = json.loads(path.read_text()).get("added_tokens", [])
+    return {t["content"]: t["id"] for t in added}
+
+
 def vision_spans(cache_key: List[int]) -> List[Tuple[int, int]]:
     """[start, end) of each image's soft tokens, from a cache key built by
     ImageInputs.build (its image positions hold pseudo ids >= _IMAGE_KEY_BASE;
@@ -617,6 +770,15 @@ def load_image_inputs(model, model_path) -> Optional[ImageInputs]:
         cfg_path = Path(_download(str(model_path))) / "preprocessor_config.json"
         cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
         return Qwen35ImageInputs(model, cfg)
+    if getattr(model, "model_type", None) == "lfm2_vl":
+        if getattr(model, "vision_tower", None) is None:
+            return None
+        from .utils import _download
+
+        path = Path(_download(str(model_path)))
+        cfg_path = path / "processor_config.json"
+        cfg = json.loads(cfg_path.read_text()) if cfg_path.exists() else {}
+        return Lfm2VlImageInputs(model, cfg, _special_token_ids(path))
     if getattr(model, "model_type", None) not in ("gemma4", "gemma4_unified"):
         return None
     if getattr(model, "embed_vision", None) is None:

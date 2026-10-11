@@ -55,6 +55,7 @@ MODEL_REMAPPING = {
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
     "xverse": "llama",
+    "lfm2_vl": "lfm2-vl",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant (the 12B): gemma4.Model with its vision_embedder
 }
 
@@ -1148,6 +1149,7 @@ def save_config(
         "gemma4_unified",
         "qwen3_5",
         "qwen3_5_moe",
+        "lfm2_vl",
     ):
         config.pop("vision_config", None)
     if "quantization" in config:
