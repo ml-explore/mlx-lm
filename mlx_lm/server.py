@@ -2479,15 +2479,28 @@ class APIHandler(BaseHTTPRequestHandler):
             # at the budget the reasoning is closed by the server. Not for
             # an image request (its prompt needs its images' features) or a
             # model without thinking tokens.
-            tokenizer = self.response_generator.model_provider.tokenizer
+            # The model's tokenizer as the request started (the provider may
+            # load another model meanwhile: then no budget is applied).
+            provider = self.response_generator.model_provider
+            tokenizer = provider.tokenizer
             budget = args.thinking_budget
-            if budget is not None and (request.images or not getattr(tokenizer, "has_thinking", False)):
+            if budget is not None and (request.images or not getattr(tokenizer, "has_thinking", False)
+                                       or ctx.model_key != provider.model_key):
                 budget = None
             thought = 0
             budget_spent = False
             while True:
                 switched = False
                 for gen in response:
+                    # The budget spent before this token: it's dropped and
+                    # the reasoning closed (budget 0 closes it at once) --
+                    # not halfway through a close the model is writing
+                    # itself (a partial match held in the buffer).
+                    if (budget is not None and not budget_spent and prev_state == "reasoning"
+                            and thought >= budget and not sm_state[3]):
+                        budget_spent = True
+                        switched = True
+                        break
                     logging.debug(gen.text)
                     last_token_at = getattr(gen, "made_at", None) or _now()
                     if first_token_at is None:
@@ -2557,17 +2570,9 @@ class APIHandler(BaseHTTPRequestHandler):
                     if gen.finish_reason is not None:
                         finish_reason = gen.finish_reason
 
-                    # The thinking budget spent: the reasoning is closed
-                    # here and the answer goes on from it (a new request
-                    # of the prompt, the tokens so far and the close).
-                    if (budget is not None and current_state == "reasoning"
-                            and gen.finish_reason is None and not budget_spent):
+                    # Reasoning tokens toward the thinking budget.
+                    if budget is not None and current_state == "reasoning":
                         thought += 1
-                        if thought >= budget:
-                            budget_spent = True
-                            prev_state = current_state
-                            switched = True
-                            break
 
                     prev_state = current_state
                 if not switched:
@@ -2588,14 +2593,27 @@ class APIHandler(BaseHTTPRequestHandler):
                         answer_text += clean_text
                 prev_state = current_state
                 tokens.extend(closing)
+                # Not the model's: no logprobs of their own (the lists stay
+                # aligned with the tokens).
+                if args.logprobs:
+                    token_logprobs.extend([0.0] * len(closing))
+                if args.top_logprobs > 0:
+                    top_tokens.extend([()] * len(closing))
+                n_tokens += len(closing)
+                # The close used what was left: the answer ends there.
+                if len(tokens) >= args.max_tokens:
+                    finish_reason = "length"
+                    break
                 carried = CompletionRequest(
                     request_type=request.request_type, prompt=request.prompt, messages=request.messages,
                     tools=request.tools, role_mapping=request.role_mapping,
                     prompt_tokens=list(ctx.prompt) + tokens,
                 )
-                left = max(1, args.max_tokens - len(tokens))
+                left = args.max_tokens - len(tokens)
+                # A seed goes on rather than repeating the first part's draws.
+                seed = None if args.seed is None else args.seed + 1
                 ctx, response = self.response_generator.generate(
-                    carried, replace(args, max_tokens=left, thinking_budget=None),
+                    carried, replace(args, max_tokens=left, thinking_budget=None, seed=seed),
                     progress_callback=keepalive_callback,
                 )
 
