@@ -29,6 +29,33 @@ class TestGenerate(unittest.TestCase):
         cls.model, cls.tokenizer = load(cls.HF_MODEL_PATH)
         cls.model.set_dtype(mx.float32)
 
+
+    def assertLogprobsClose(self, a, b):
+        """Batched vs unbatched log-probabilities: the same top token, and
+        within a few float16 ulps of each other. A batch's matmuls have
+        another shape, so MLX sums in another order (also on the CPU): with
+        mlx 0.32 two identical prompts batched differ from one alone by up
+        to 8 ulps (0.03 at a log-prob of -20), which allclose's 1e-5 / 1e-4
+        never allowed."""
+        a32, b32 = a.astype(mx.float32), b.astype(mx.float32)
+        self.assertEqual(mx.argmax(a32).item(), mx.argmax(b32).item())
+        ulp = mx.power(2.0, mx.floor(mx.log2(mx.maximum(mx.abs(b32), 2.0**-14))) - 10)
+        self.assertLessEqual((mx.abs(a32 - b32) / ulp).max().item(), 16)
+
+    def _patch_make_cache(self, make_cache):
+        """Replaces the shared model's make_cache for this test only: the
+        model is loaded once for the class, and a sliding window of 4 left
+        behind broke every later test that makes a cache."""
+        own = self.model.__dict__.get("make_cache", None)
+
+        def restore():
+            if own is None:
+                self.model.__dict__.pop("make_cache", None)
+            else:
+                self.model.make_cache = own
+
+        self.addCleanup(restore)
+        self.model.make_cache = make_cache
     def test_generate(self):
         # Simple test that generation runs
         generate(self.model, self.tokenizer, "hello", max_tokens=5, verbose=False)
@@ -231,7 +258,7 @@ class TestGenerate(unittest.TestCase):
             ):
                 blp = batch_responses[uids[e]].logprobs
                 lp = response.logprobs
-                self.assertTrue(mx.allclose(blp, lp))
+                self.assertLogprobsClose(blp, lp)
                 break
 
     def test_many_batches(self):
@@ -282,7 +309,7 @@ class TestGenerate(unittest.TestCase):
             ):
                 blp = batch_responses[uids[e]].logprobs
                 lp = response.logprobs
-                self.assertTrue(mx.allclose(blp, lp))
+                self.assertLogprobsClose(blp, lp)
                 break
 
     def test_batch_unique_max_toks(self):
@@ -346,9 +373,9 @@ class TestGenerate(unittest.TestCase):
             for p in prompts
         ]
 
-        self.model.make_cache = lambda: [
+        self._patch_make_cache(lambda: [
             RotatingKVCache(max_size=4) for _ in self.model.layers
-        ]
+        ])
         batch_gen = BatchGenerator(
             self.model,
             stop_tokens=self.tokenizer.eos_token_ids,
@@ -374,9 +401,7 @@ class TestGenerate(unittest.TestCase):
             ):
                 batch_logprobs = batch_responses[uid][i]
                 logprobs = response.logprobs
-                self.assertTrue(
-                    mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
-                )
+                self.assertLogprobsClose(batch_logprobs, logprobs)
 
         del self.model.make_cache
 
@@ -554,9 +579,9 @@ class TestGenerate(unittest.TestCase):
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:
-                self.model.make_cache = lambda: [
+                self._patch_make_cache(lambda: [
                     RotatingKVCache(max_size=4) for _ in self.model.layers
-                ]
+                ])
 
             # Make the prompts
             prompts_a = [
@@ -624,14 +649,37 @@ class TestGenerate(unittest.TestCase):
                 ):
                     batch_logprobs = batch_responses[uid][i]
                     logprobs = response.logprobs
-                    self.assertTrue(
-                        mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
-                    )
+                    self.assertLogprobsClose(batch_logprobs, logprobs)
 
             if rotating:
                 del self.model.make_cache
 
+    def _on_cpu(self):
+        """Runs the rest of the test on the CPU: exact float32. On the GPU
+        (an M5, mlx 0.32) a matmul of two or more rows is rounded like tf32
+        (~1e-3 relative), one row isn't -- a batch never matches one sequence
+        exactly there, and a tiny random MoE model turns that into another
+        expert and another token."""
+        import sys
+        from unittest import mock
+
+        # The module, not the package's `generate` function of that name.
+        generate_module = sys.modules["mlx_lm.generate"]
+
+        cpu = mx.new_stream(mx.cpu)
+        device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        self.addCleanup(mx.set_default_device, device)
+        patch = mock.patch.object(generate_module, "generation_stream", cpu)
+        patch.start()
+        self.addCleanup(patch.stop)
+        # Functions took the GPU stream as a default at import: the caller
+        # passes this one (generate_step(..., stream=cpu), BatchGenerator).
+        return cpu
+
     def _continued_generation_test_helper(self, model):
+        cpu = self._on_cpu()
+
         def rand_prompt(n):
             return [random.randint(0, 1000) for _ in range(n)]
 
@@ -652,6 +700,7 @@ class TestGenerate(unittest.TestCase):
         # Generate once
         batch_gen = BatchGenerator(
             model,
+            stream=cpu,
             stop_tokens={},
             max_tokens=10,
             prefill_batch_size=4,
@@ -682,12 +731,11 @@ class TestGenerate(unittest.TestCase):
                     model,
                     max_tokens=10,
                     prompt_cache=caches[e],
+                    stream=cpu,
                 )
             ):
                 batch_logprobs = batch_responses[uid][i]
-                self.assertTrue(
-                    mx.allclose(batch_logprobs, logprobs, rtol=1e-4, atol=1e-4)
-                )
+                self.assertLogprobsClose(batch_logprobs, logprobs)
 
     def test_batch_continued_generation_ssm(self):
         from mlx_lm.models import mamba2
@@ -716,6 +764,34 @@ class TestGenerate(unittest.TestCase):
         )
         model = mamba2.Model(args)
         self._continued_generation_test_helper(model)
+
+    def test_batch_gated_delta_prompts_of_different_lengths(self):
+        # Prompts right-padded to one length in the prompt batch: the
+        # padding must not reach a shorter prompt's recurrent state
+        # (ArraysCache.make_mask took the merged zero left padding alone).
+        from mlx_lm.models import qwen3_next
+
+        cpu = self._on_cpu()
+        random.seed(1)
+        mx.random.seed(4)
+        model = qwen3_next.Model(qwen3_next.ModelArgs(
+            model_type="qwen3_next", hidden_size=128, num_hidden_layers=4, intermediate_size=128,
+            num_attention_heads=8, num_key_value_heads=4, vocab_size=1000, linear_num_value_heads=4,
+            linear_num_key_heads=4, linear_key_head_dim=32, linear_value_head_dim=32, linear_conv_kernel_dim=3,
+            num_experts=4, num_experts_per_tok=2, decoder_sparse_step=1, shared_expert_intermediate_size=128,
+            mlp_only_layers=[0], moe_intermediate_size=128, rms_norm_eps=1e-5, head_dim=64, rope_theta=1000.0,
+            partial_rotary_factor=0.5, max_position_embeddings=1000,
+        ))
+        prompts = [[random.randint(0, 999) for _ in range(n)] for n in (8, 2, 5)]
+        gen = BatchGenerator(model, stream=cpu, stop_tokens={}, max_tokens=1, prefill_batch_size=4, completion_batch_size=4)
+        uids = gen.insert(prompts)
+        got = {}
+        while responses := gen.next_generated():
+            for r in responses:
+                got[r.uid] = r.logprobs
+        for uid, prompt in zip(uids, prompts):
+            (_, single), = list(generate_step(mx.array(prompt), model, max_tokens=1, stream=cpu))
+            self.assertLess(mx.abs(got[uid] - single).max().item(), 1e-4)
 
     def test_batch_continued_generation_gated_delta(self):
         from mlx_lm.models import qwen3_next

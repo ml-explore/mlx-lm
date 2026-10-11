@@ -112,6 +112,11 @@ class TestDatasets(unittest.TestCase):
         self.assertTrue(isinstance(train, datasets.ChatDataset))
 
     def test_hf(self):
+        # Hugging Face `datasets` (optional) and the network.
+        try:
+            import datasets  # noqa: F401
+        except ImportError:
+            self.skipTest("needs the optional `datasets` package")
         hf_args = {
             "path": "FiscalNote/billsum",
             "prompt_feature": "text",
