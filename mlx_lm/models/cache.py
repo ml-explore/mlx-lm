@@ -1538,7 +1538,10 @@ class BatchQuantizedKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values, self.offset, self.left_padding, self._idx, self.group_size, self.bits = v
+        # Saved before the quantization rode along: the defaults.
+        self.keys, self.values, self.offset, self.left_padding, self._idx, self.group_size, self.bits = (
+            tuple(v) + (64, 8)[len(v) - 5:] if len(v) < 7 else v
+        )
         if not hasattr(self, "_right_padding"):
             self._right_padding = None
 
@@ -1572,14 +1575,13 @@ class BatchQuantizedKVCache(_BaseCache):
             self.left_padding -= min_left_pad
 
     def extend(self, other):
-        # An empty cache hasn't fitted its group size to the heads yet: it
-        # takes the other's.
+        # An empty cache hasn't fitted its group size to the heads yet: only
+        # two filled ones must agree on it; this one takes a filled other's.
+        both = self.keys is not None and other.keys is not None
+        if other.bits != self.bits or (both and other.group_size != self.group_size):
+            raise ValueError("Can't extend a BatchQuantizedKVCache with other quantization")
         if self.keys is None and other.keys is not None:
             self.group_size = other.group_size
-        elif other.keys is None:
-            other.group_size = self.group_size
-        if (other.group_size, other.bits) != (self.group_size, self.bits):
-            raise ValueError("Can't extend a BatchQuantizedKVCache with other quantization")
         if self.keys is None and other.keys is None:
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
             self.offset = mx.concatenate([self.offset, other.offset])

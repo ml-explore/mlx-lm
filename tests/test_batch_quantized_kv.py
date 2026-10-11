@@ -196,6 +196,12 @@ class TestGroupSizeFitsTheHeads(unittest.TestCase):
         empty.extend(merged)
         self.assertEqual(empty.group_size, 64)
         empty.update_and_fetch(mx.random.normal((3, 2, 1, 64)), mx.random.normal((3, 2, 1, 64)))
+        # The other side is never changed.
+        other = BatchQuantizedKVCache([0], group_size=32, bits=8)
+        merged.extend(other)
+        self.assertEqual(other.group_size, 32)
+        old = BatchQuantizedKVCache.from_state((None, None, mx.array([0]), mx.array([0]), 0))
+        self.assertEqual((old.group_size, old.bits), (64, 8))
 
 
 if __name__ == "__main__":
