@@ -447,6 +447,15 @@ class TestServer(unittest.TestCase):
             )
             self.assertEqual(response.status_code, 400, bad)
 
+    def test_unparsed_tool_call_is_logged_with_its_text(self):
+        # The log says what the model wrote, not only that it failed.
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, None, False)
+        with self.assertLogs(level="WARNING") as logs:
+            self.assertEqual(formatter(['{"name": "get_time"} and much more' + "x" * 400]), [])
+        line = logs.output[0]
+        self.assertIn('the model wrote: "{\\"name\\": \\"get_time\\"}', line)
+        self.assertIn(" … ", line, "a long one is cut in the middle")
+
     def test_request_stats_line(self):
         # One log line per request: what a client needs for speed statistics.
         ctx = GenerationContext(

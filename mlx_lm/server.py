@@ -176,9 +176,12 @@ class ToolCallFormatter:
             try:
                 parsed = self._tool_parser(tool_text, self._tools)
             except (ValueError, json.JSONDecodeError) as e:
+                # What the model wrote, so the log says why (another
+                # format, a cut-off call): its start and end, one line.
+                snippet = tool_text if len(tool_text) <= 300 else tool_text[:200] + " … " + tool_text[-100:]
                 logging.warning(
-                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
-                    f"tool text was likely truncated mid-generation."
+                    f"Failed to parse tool call ({type(e).__name__}: {e}); the model wrote: "
+                    f"{json.dumps(snippet, ensure_ascii=False)}"
                 )
                 continue
             if not isinstance(parsed, list):
