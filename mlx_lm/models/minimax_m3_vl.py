@@ -611,7 +611,10 @@ class Model(nn.Module):
     @property
     def cast_predicate(self) -> Callable[[str], bool]:
         def predicate(k):
-            return "e_score_correction_bias" not in k
+            # Keep the router in float32 as the original
+            return (
+                "e_score_correction_bias" not in k and "block_sparse_moe.gate." not in k
+            )
 
         return predicate
 
