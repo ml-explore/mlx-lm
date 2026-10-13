@@ -844,6 +844,16 @@ class TestPromptCache(unittest.TestCase):
         a.extend(c)
         self.assertEqual(a.left_padding.tolist(), [0, 0, 0, 2])
         check(a)
+
+        # extend with a cache that is longer than this one: its rows are
+        # padded on the left by the difference, even if they had no padding
+        s, l = BatchKVCache([0, 0]), BatchKVCache([0])
+        update(s, 2, 2)
+        update(l, 1, 6)
+        s.extend(l)
+        self.assertEqual(s.left_padding.tolist(), [4, 4, 0])
+        self.assertIsInstance(s.make_mask(1), mx.array)
+        check(s)
         e = BatchKVCache([0])
         a.extend(e)
         self.assertEqual(a.left_padding.tolist(), [0, 0, 0, 2, 4])
@@ -1039,6 +1049,22 @@ class TestPromptCache(unittest.TestCase):
         for _ in range(7):
             check(cache)
             update(cache, 3, 1)
+
+        # The host copy of the padding must survive until finalize() puts the
+        # right padding on the left, so replacing it in between is refused
+        cache = BatchRotatingKVCache(5, [0, 0])
+        cache.prepare(lengths=[2, 4], right_padding=[2, 0])
+        update(cache, 2, 4)
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        with self.assertRaises(RuntimeError):
+            cache.left_padding = mx.array([0, 0])
+        with self.assertRaises(RuntimeError):
+            cache.state = cache.state
+        cache.finalize()
+        self.assertEqual(cache.left_padding.tolist(), [2, 0])
+        check(cache)
+        cache.left_padding = mx.array([0, 0])
+        self.assertIsNone(cache.make_mask(1))
 
         # state round trip and copies
         cache = BatchRotatingKVCache(4, [2, 0])

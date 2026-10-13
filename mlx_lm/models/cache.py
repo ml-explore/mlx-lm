@@ -886,8 +886,9 @@ class _LeftPaddingMixin:
     ``make_mask`` decide whether any row is padded without synchronizing
     with the GPU, which would break ``mx.async_eval`` pipelining.
 
-    Assigning ``left_padding`` (e.g. through ``state``) drops the host copy;
-    it is rebuilt from the array on next use.
+    Assigning ``left_padding`` from outside (e.g. through ``state``) drops the
+    host copy; it is rebuilt from the array on next use. The cache's own
+    updates rebind ``_left_padding`` and keep the host copy in step instead.
     """
 
     @property
@@ -896,8 +897,12 @@ class _LeftPaddingMixin:
 
     @left_padding.setter
     def left_padding(self, v):
+        self._check_padding_assignable()
         self._left_padding = v
         self._padding = None
+
+    def _check_padding_assignable(self):
+        pass
 
     def _padding_list(self) -> List[int]:
         if self._padding is None:
@@ -905,10 +910,9 @@ class _LeftPaddingMixin:
         return self._padding
 
     def _shift_padding(self, n: int):
-        padding = self._padding
-        self.left_padding -= n
-        if padding is not None:
-            self._padding = [p - n for p in padding]
+        self._left_padding = self._left_padding - n
+        if self._padding is not None:
+            self._padding = [p - n for p in self._padding]
 
     def _filter_padding(self, padding, batch_indices):
         if padding is not None and isinstance(batch_indices, list):
@@ -1220,10 +1224,9 @@ class BatchRotatingKVCache(_LeftPaddingMixin, _BaseCache):
                 roll = mx.maximum(0, self.offset - self._lengths)
                 self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
                 self.values = dynamic_roll(self.values, roll[:, None], axis=2)
-                padding = self._padding
-                self.left_padding += roll
-                # Already counted in the host-side padding by prepare()
-                self._padding = padding
+                # The host copy already counts this padding: prepare() added
+                # it (see _check_padding_assignable for why it is still there)
+                self._left_padding = self._left_padding + roll
                 self.offset = self.offset - roll
 
             # The largest size is self.max_size + S - 1 to ensure
@@ -1324,20 +1327,30 @@ class BatchRotatingKVCache(_LeftPaddingMixin, _BaseCache):
         if right_padding is not None and max(right_padding) > 0:
             self._lengths = mx.array(lengths) + self.offset
             # finalize() rolls right padding into left padding by at most
-            # this much, so count it now to keep the host-side padding an
-            # upper bound at every step.
+            # this much. Count it now so the host copy is an upper bound at
+            # every step, which is only sound while the host copy stays in
+            # place until finalize() (_check_padding_assignable).
             self._padding = [
                 a + int(b) for a, b in zip(self._padding_list(), right_padding)
             ]
+
+    def _check_padding_assignable(self):
+        # Between prepare(right_padding=...) and finalize() the host copy
+        # includes padding that only the array gains later. Rebuilding it
+        # from the array in that window would leave it below the array once
+        # the roll lands, and make_mask would skip a mask it needs.
+        if getattr(self, "_lengths", None) is not None:
+            raise RuntimeError(
+                "left_padding can't be replaced between prepare() with right "
+                "padding and finalize() on a BatchRotatingKVCache"
+            )
 
     def finalize(self):
         if self._lengths is not None:
             roll = mx.maximum(0, self.offset - self._lengths)
             self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
             self.values = dynamic_roll(self.values, roll[:, None], axis=2)
-            padding = self._padding
-            self.left_padding += roll
-            self._padding = padding
+            self._left_padding = self._left_padding + roll
             self.offset = self.offset - roll
             self._lengths = None
 
