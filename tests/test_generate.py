@@ -4,6 +4,7 @@ import concurrent.futures
 import random
 import unittest
 from typing import List
+from unittest import mock
 
 import mlx.core as mx
 
@@ -329,6 +330,67 @@ class TestGenerate(unittest.TestCase):
 
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
+
+    def test_batch_attention_mask_skipped_without_padding(self):
+        prompts = [
+            "Write a story about Einstein",
+            "Hi there, how are you doing today?",
+            "What time is it right now?",
+            "How tall is Mt Everest?",
+        ]
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in prompts
+        ]
+        shortest = min(len(p) for p in prompts)
+        same_length = [p[:shortest] for p in prompts]
+
+        sdpa = mx.fast.scaled_dot_product_attention
+
+        def run(batch):
+            masks = []
+
+            def recording_sdpa(*args, mask=None, **kwargs):
+                masks.append(mask)
+                return sdpa(*args, mask=mask, **kwargs)
+
+            gen = BatchGenerator(
+                self.model,
+                stop_tokens=self.tokenizer.eos_token_ids,
+                max_tokens=4,
+                prefill_step_size=8,
+            )
+            uids = gen.insert(batch)
+            logprobs = {uid: [] for uid in uids}
+            with mock.patch.object(
+                mx.fast, "scaled_dot_product_attention", recording_sdpa
+            ):
+                while responses := gen.next_generated():
+                    for r in responses:
+                        logprobs[r.uid].append(r.logprobs)
+            for uid, prompt in zip(uids, batch):
+                for i, response in enumerate(
+                    stream_generate(self.model, self.tokenizer, prompt, max_tokens=4)
+                ):
+                    # Chunked prefill and batching change the quantized matmuls
+                    # slightly, a leaked padding token would change a lot more
+                    self.assertTrue(
+                        mx.allclose(logprobs[uid][i], response.logprobs, atol=5e-2)
+                    )
+            return [isinstance(m, mx.array) for m in masks]
+
+        # Prompts of equal length are not padded so attention needs no mask
+        # array, for the prompt chunks nor for the decoding steps.
+        is_array = run(same_length)
+        self.assertGreater(len(is_array), 0)
+        self.assertFalse(any(is_array))
+
+        # Different lengths are padded and keep their mask arrays
+        self.assertTrue(any(run(prompts)))
 
     def test_batch_sliding_window(self):
         prompts = [

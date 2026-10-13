@@ -877,7 +877,46 @@ def dynamic_roll(x, shifts, axis):
     return rolled
 
 
-class BatchKVCache(_BaseCache):
+class _LeftPaddingMixin:
+    """
+    Keep a host-side copy of a batch cache's ``left_padding``.
+
+    The padding of every row is only ever changed by Python integers, so the
+    host can follow it without reading the array back. That lets
+    ``make_mask`` decide whether any row is padded without synchronizing
+    with the GPU, which would break ``mx.async_eval`` pipelining.
+
+    Assigning ``left_padding`` (e.g. through ``state``) drops the host copy;
+    it is rebuilt from the array on next use.
+    """
+
+    @property
+    def left_padding(self):
+        return self._left_padding
+
+    @left_padding.setter
+    def left_padding(self, v):
+        self._left_padding = v
+        self._padding = None
+
+    def _padding_list(self) -> List[int]:
+        if self._padding is None:
+            self._padding = self._left_padding.tolist()
+        return self._padding
+
+    def _shift_padding(self, n: int):
+        padding = self._padding
+        self.left_padding -= n
+        if padding is not None:
+            self._padding = [p - n for p in padding]
+
+    def _filter_padding(self, padding, batch_indices):
+        if padding is not None and isinstance(batch_indices, list):
+            return [padding[i] for i in batch_indices]
+        return None
+
+
+class BatchKVCache(_LeftPaddingMixin, _BaseCache):
     step = 256
 
     def __init__(self, left_padding: List[int]):
@@ -902,10 +941,12 @@ class BatchKVCache(_BaseCache):
         self.keys = None
         self.values = None
         self.left_padding = mx.array(left_padding)
+        self._padding = [int(p) for p in left_padding]
         self.offset = mx.array([-l for l in left_padding])
         self._idx = 0
 
         self._right_padding = None
+        self._right_padding_list = None
 
     def update_and_fetch(self, keys, values):
         prev = self._idx
@@ -941,21 +982,29 @@ class BatchKVCache(_BaseCache):
                 raise ValueError(
                     "Left padding can only be added to an empty BatchKVCache"
                 )
+            padding = [a + int(b) for a, b in zip(self._padding_list(), left_padding)]
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
+            self._padding = padding
             self.offset = self.offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
+            self._right_padding_list = list(right_padding)
 
     def finalize(self):
         if self._right_padding is not None:
             padding = self._right_padding
+            new_padding = [
+                a + b for a, b in zip(self._padding_list(), self._right_padding_list)
+            ]
             self.keys = dynamic_roll(self.keys, padding[:, None], axis=2)
             self.values = dynamic_roll(self.values, padding[:, None], axis=2)
             self.offset = self.offset - padding
             self.left_padding += padding
+            self._padding = new_padding
             self._right_padding = None
+            self._right_padding_list = None
 
     @property
     def state(self):
@@ -974,36 +1023,49 @@ class BatchKVCache(_BaseCache):
         self.offset = self.offset - n
         return n
 
-    def make_mask(self, N: int, return_array: bool = False, **kwargs):
+    def make_mask(
+        self, N: int, return_array: bool = False, window_size: Optional[int] = None
+    ):
+        # Without padding this is the mask of a plain KVCache, which is
+        # None for a single token and "causal" for a prompt chunk. Those
+        # let mx.fast.scaled_dot_product_attention skip the mask entirely.
+        if max(self._padding_list(), default=0) <= 0:
+            return create_attention_mask(
+                N, self._idx, return_array=return_array, window_size=window_size
+            )
         return create_causal_mask(
-            N, offset=self._idx, left_padding=self.left_padding, **kwargs
+            N, offset=self._idx, left_padding=self.left_padding, window_size=window_size
         )
 
     def filter(self, batch_indices):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        padding = self._padding
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        self._padding = self._filter_padding(padding, batch_indices)
 
         # Shift left to reduce padding
-        min_left_pad = min(self.left_padding.tolist())
+        min_left_pad = min(self._padding_list())
         if min_left_pad > 0:
             if self.keys is not None:
                 self.keys = self.keys[..., min_left_pad:, :]
                 self.values = self.values[..., min_left_pad:, :]
             self._idx -= min_left_pad
-            self.left_padding -= min_left_pad
+            self._shift_padding(min_left_pad)
 
     def extend(self, other):
         """
         In-place extend this cache with the other cache.
         """
         if self.keys is None and other.keys is None:
+            padding = self._padding_list() + other._padding_list()
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self._padding = padding
             self.offset = mx.concatenate([self.offset, other.offset])
             return
 
@@ -1039,9 +1101,12 @@ class BatchKVCache(_BaseCache):
             left_padding = c.left_padding + left
             return k, v, c.offset, left_padding
 
+        padding = [p + max_idx - self._idx for p in self._padding_list()]
+        padding += [p + max_idx - other._idx for p in other._padding_list()]
         self.keys, self.values, self.offset, self.left_padding = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
+        self._padding = padding
         self._idx = max_idx
 
     def extract(self, idx):
@@ -1098,7 +1163,7 @@ class BatchKVCache(_BaseCache):
         return self.keys.nbytes + self.values.nbytes
 
 
-class BatchRotatingKVCache(_BaseCache):
+class BatchRotatingKVCache(_LeftPaddingMixin, _BaseCache):
     step = 256
 
     def __init__(self, max_size, left_padding: List[int]):
@@ -1106,6 +1171,7 @@ class BatchRotatingKVCache(_BaseCache):
         self.values = None
 
         self.left_padding = mx.array(left_padding)
+        self._padding = [int(p) for p in left_padding]
         self.offset = mx.array([-l for l in left_padding])
 
         self.max_size = max_size
@@ -1154,14 +1220,17 @@ class BatchRotatingKVCache(_BaseCache):
                 roll = mx.maximum(0, self.offset - self._lengths)
                 self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
                 self.values = dynamic_roll(self.values, roll[:, None], axis=2)
+                padding = self._padding
                 self.left_padding += roll
+                # Already counted in the host-side padding by prepare()
+                self._padding = padding
                 self.offset = self.offset - roll
 
             # The largest size is self.max_size + S - 1 to ensure
             # every token gets at least self.max_size context
             trim_size = self._idx - self.max_size + 1
             if trim_size > 0:
-                self.left_padding -= trim_size
+                self._shift_padding(trim_size)
             self.keys = self._trim(trim_size, self.keys, keys)
             self.values = self._trim(trim_size, self.values, values)
         self.offset = self.offset + keys.shape[2]
@@ -1205,14 +1274,14 @@ class BatchRotatingKVCache(_BaseCache):
             self.keys = self._trim(trim_size, self.keys)
             self.values = self._trim(trim_size, self.values)
             self._idx = self.max_size
-            self.left_padding -= trim_size
+            self._shift_padding(trim_size)
 
         # Rotate
         if self._idx == self.max_size:
             self.rotated = True
             self._idx = 0
         if self.rotated:
-            self.left_padding -= S
+            self._shift_padding(S)
 
         # Assign
         self.keys[..., self._idx : self._idx + S, :] = keys
@@ -1246,19 +1315,29 @@ class BatchRotatingKVCache(_BaseCache):
                 raise ValueError(
                     "Left padding can only be added to an empty BatchRotatingKVCache"
                 )
+            padding = [a + int(b) for a, b in zip(self._padding_list(), left_padding)]
             left_padding = mx.array(left_padding)
             self.left_padding += left_padding
+            self._padding = padding
             self.offset = self.offset - left_padding
 
         if right_padding is not None and max(right_padding) > 0:
             self._lengths = mx.array(lengths) + self.offset
+            # finalize() rolls right padding into left padding by at most
+            # this much, so count it now to keep the host-side padding an
+            # upper bound at every step.
+            self._padding = [
+                a + int(b) for a, b in zip(self._padding_list(), right_padding)
+            ]
 
     def finalize(self):
         if self._lengths is not None:
             roll = mx.maximum(0, self.offset - self._lengths)
             self.keys = dynamic_roll(self.keys, roll[:, None], axis=2)
             self.values = dynamic_roll(self.values, roll[:, None], axis=2)
+            padding = self._padding
             self.left_padding += roll
+            self._padding = padding
             self.offset = self.offset - roll
             self._lengths = None
 
@@ -1307,16 +1386,29 @@ class BatchRotatingKVCache(_BaseCache):
         left_padding = self.left_padding
         window_size = window_size or self.max_size
         offset = min(self.max_size - 1, self._offset)
+        trim_size = self._idx - self.max_size + int(N > 1)
+        rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
+
+        # No row has padding left in the window so the mask is the one of a
+        # RotatingKVCache, which lets mx.fast.scaled_dot_product_attention skip
+        # the mask when everything in the cache is visible.
+        if max(self._padding_list(), default=0) <= max(trim_size, 0) + int(rotated):
+            if N > 1:
+                if offset + N > window_size or return_array:
+                    return create_causal_mask(N, offset, window_size=window_size)
+                return "causal"
+            if offset < window_size:
+                return None
+
         rinds = mx.arange(offset + N)
         linds = mx.arange(offset, offset + N) if offset else rinds
         linds = linds[:, None]
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
-        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+        if trim_size > 0:
             left_padding = left_padding - trim_size
 
-        rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
         if rotated:
             left_padding = left_padding - 1
 
@@ -1334,18 +1426,22 @@ class BatchRotatingKVCache(_BaseCache):
         """
         In-place filter to keep just the given indices in the cache.
         """
+        padding = self._padding
         if self.keys is not None:
             self.keys = self.keys[batch_indices]
             self.values = self.values[batch_indices]
         self.offset = self.offset[batch_indices]
         self.left_padding = self.left_padding[batch_indices]
+        self._padding = self._filter_padding(padding, batch_indices)
 
     def extend(self, other):
         """
         In-place extend this cache with the other cache.
         """
         if self.keys is None and other.keys is None:
+            padding = self._padding_list() + other._padding_list()
             self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self._padding = padding
             self.offset = mx.concatenate([self.offset, other.offset])
             return
 
@@ -1383,9 +1479,12 @@ class BatchRotatingKVCache(_BaseCache):
             left_padding = c.left_padding + left
             return k, v, c.offset, left_padding
 
+        padding = [p + max_idx - self._idx for p in self._padding_list()]
+        padding += [p + max_idx - other._idx for p in other._padding_list()]
         self.keys, self.values, self.offset, self.left_padding = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
+        self._padding = padding
         self._idx = max_idx
         self._offset = max(self._offset, other._offset)
 

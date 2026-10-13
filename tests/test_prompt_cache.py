@@ -3,6 +3,7 @@
 import copy
 import io
 import os
+import random
 import tempfile
 import unittest
 
@@ -27,6 +28,52 @@ from mlx_lm.models.cache import (
 from mlx_lm.utils import load
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
+
+
+def _padded_mask(cache, N, window_size=None):
+    """The mask batch caches built before they skipped it without padding."""
+    if isinstance(cache, BatchKVCache):
+        return create_causal_mask(
+            N,
+            offset=cache._idx,
+            left_padding=cache.left_padding,
+            window_size=window_size,
+        )
+    left_padding = cache.left_padding
+    window_size = window_size or cache.max_size
+    offset = min(cache.max_size - 1, cache._offset)
+    rinds = mx.arange(offset + N)
+    linds = mx.arange(offset, offset + N) if offset else rinds
+    linds = linds[:, None]
+    rinds = rinds[None]
+    mask = linds >= rinds
+    mask &= linds < rinds + window_size
+    if (trim_size := cache._idx - cache.max_size + int(N > 1)) > 0:
+        left_padding = left_padding - trim_size
+    rotated = N == 1 and (cache.rotated or cache._idx >= cache.max_size)
+    if rotated:
+        left_padding = left_padding - 1
+    mask = mask & (rinds >= mx.expand_dims(left_padding, (1, 2, 3)))
+    if rotated:
+        idx = cache._idx
+        if idx >= cache.max_size:
+            idx = 0
+        mask = mx.roll(mask, shift=idx + 1, axis=-1)
+    return mask
+
+
+def _max_effective_padding(cache, N):
+    padding = max(cache.left_padding.tolist(), default=0)
+    if isinstance(cache, BatchRotatingKVCache):
+        padding -= max(cache._idx - cache.max_size + int(N > 1), 0)
+        padding -= int(N == 1 and (cache.rotated or cache._idx >= cache.max_size))
+    return padding
+
+
+def _valid_queries(cache, N):
+    """Queries that are not on top of left padding, shaped for (B, H, N, D)."""
+    pos = mx.arange(cache._idx - N, cache._idx)[None, None, :, None]
+    return pos >= cache.left_padding[:, None, None, None]
 
 
 class TestPromptCache(unittest.TestCase):
@@ -618,6 +665,391 @@ class TestPromptCache(unittest.TestCase):
             ]
         )
         self.assertTrue(mx.array_equal(mask.squeeze(), expected))
+
+    def _assert_batch_mask_matches_padded(self, cache, Ns=(1, 3), **kwargs):
+        """
+        The mask a batch cache hands to attention must select the same keys
+        as the full left-padding array mask, and must be None / "causal"
+        whenever no row is padded.
+        """
+        window_size = kwargs.get("window_size")
+        for N in Ns:
+            expected = _padded_mask(cache, N, window_size)
+            mask = cache.make_mask(N, **kwargs)
+            padded = _max_effective_padding(cache, N) > 0
+            if isinstance(mask, mx.array):
+                self.assertEqual(mask.dtype, mx.bool_)
+                got = mask
+            else:
+                self.assertFalse(padded, "padded rows must get an array mask")
+                self.assertIn(mask, (None, "causal"))
+                if mask is None:
+                    self.assertEqual(N, 1)
+                    got = mx.ones(expected.shape[-2:], dtype=mx.bool_)
+                else:
+                    K = expected.shape[-1]
+                    got = create_causal_mask(N, K - N)
+            got = mx.broadcast_to(got, expected.shape)
+            self.assertTrue(mx.array_equal(got, expected), (N, kwargs))
+
+    def test_batch_kv_cache_fast_mask(self):
+        # No padding: same masks as a KVCache so that attention can skip them
+        cache = BatchKVCache(left_padding=[0, 0, 0])
+        self.assertIsNone(cache.make_mask(1))
+        self.assertEqual(cache.make_mask(4), "causal")
+        self.assertTrue(
+            mx.array_equal(
+                cache.make_mask(4, return_array=True), create_causal_mask(4, 0)
+            )
+        )
+        cache.update_and_fetch(mx.zeros((3, 1, 4, 8)), mx.zeros((3, 1, 4, 8)))
+        self.assertIsNone(cache.make_mask(1))
+        self.assertEqual(cache.make_mask(4), "causal")
+        single = KVCache()
+        single.update_and_fetch(mx.zeros((1, 1, 4, 8)), mx.zeros((1, 1, 4, 8)))
+        for return_array, window_size in [(False, None), (True, None), (False, 3)]:
+            for N in (1, 4):
+                kwargs = dict(return_array=return_array, window_size=window_size)
+                expected = single.make_mask(N, **kwargs)
+                mask = cache.make_mask(N, **kwargs)
+                if isinstance(expected, mx.array):
+                    self.assertTrue(mx.array_equal(mask, expected))
+                else:
+                    self.assertEqual(mask, expected)
+
+        # Any padded row needs the array mask
+        cache = BatchKVCache(left_padding=[0, 2, 0])
+        cache.update_and_fetch(mx.zeros((3, 1, 4, 8)), mx.zeros((3, 1, 4, 8)))
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        self.assertIsInstance(cache.make_mask(4), mx.array)
+
+        # An empty batch has nothing to mask
+        self.assertIsNone(BatchKVCache(left_padding=[]).make_mask(1))
+
+    def test_batch_kv_cache_mask_does_not_read_left_padding(self):
+        # make_mask runs once per step, so it must not synchronize on the
+        # left_padding array to find out if rows are padded.
+        class Poison:
+            def __getattr__(self, name):
+                raise AssertionError("left_padding was read: " + name)
+
+        cache = BatchKVCache(left_padding=[0, 0])
+        cache.update_and_fetch(mx.zeros((2, 1, 4, 8)), mx.zeros((2, 1, 4, 8)))
+        cache._left_padding = Poison()
+        self.assertIsNone(cache.make_mask(1))
+        self.assertEqual(cache.make_mask(4), "causal")
+
+        cache = BatchKVCache(left_padding=[2, 0, 1])
+        cache.update_and_fetch(mx.zeros((3, 1, 4, 8)), mx.zeros((3, 1, 4, 8)))
+        cache.filter([0, 2])
+        self.assertEqual(cache._padding, [1, 0])
+
+    def test_batch_kv_cache_mask_matches_padded_mask(self):
+        mx.random.seed(0)
+        rng = random.Random(0)
+        for trial in range(40):
+            B = rng.randint(1, 4)
+            if trial % 4 == 0:
+                left_padding = [0] * B
+            else:
+                left_padding = [rng.randint(0, 5) for _ in range(B)]
+            window_size = rng.choice([None, None, 3, 6])
+            H, D = 2, 16
+            cache = BatchKVCache(left_padding)
+            steps = [max(left_padding) + rng.randint(1, 4)]  # prompt
+            steps += [rng.randint(2, 4)]  # a prompt continuation
+            steps += [1] * 4  # decoding
+            for N in steps:
+                q = mx.random.normal((B, H, N, D))
+                k = mx.random.normal((B, H, N, D))
+                v = mx.random.normal((B, H, N, D))
+                for kwargs in (
+                    {"window_size": window_size},
+                    {"return_array": True, "window_size": window_size},
+                ):
+                    self._assert_batch_mask_matches_padded(cache, (N,), **kwargs)
+                mask = cache.make_mask(N, window_size=window_size)
+                expected = _padded_mask(cache, N, window_size)
+                keys, values = cache.update_and_fetch(k, v)
+                out = mx.fast.scaled_dot_product_attention(
+                    q, keys, values, scale=D**-0.5, mask=mask
+                )
+                ref = mx.fast.scaled_dot_product_attention(
+                    q, keys, values, scale=D**-0.5, mask=expected
+                )
+                # Queries over padding attend to nothing, compare the rest
+                valid = _valid_queries(cache, N)
+                self.assertTrue(
+                    mx.allclose(
+                        mx.where(valid, out, 0), mx.where(valid, ref, 0), atol=1e-5
+                    )
+                )
+
+    def test_batch_kv_cache_padding_tracking(self):
+        def update(cache, B, N=4):
+            cache.update_and_fetch(mx.zeros((B, 1, N, 8)), mx.zeros((B, 1, N, 8)))
+
+        def check(cache):
+            self._assert_batch_mask_matches_padded(cache, (1, 3))
+            if cache._padding is not None:
+                self.assertEqual(cache._padding, cache.left_padding.tolist())
+
+        # filter shifts the rest of the padding left
+        cache = BatchKVCache([3, 1, 4])
+        update(cache, 3, 5)
+        check(cache)
+        cache.filter([0, 1])
+        self.assertEqual(cache.left_padding.tolist(), [2, 0])
+        check(cache)
+        cache.filter([1])
+        self.assertEqual(cache.left_padding.tolist(), [0])
+        self.assertIsNone(cache.make_mask(1))
+        check(cache)
+
+        # prepare and finalize
+        cache = BatchKVCache([0, 0])
+        cache.prepare(left_padding=[2, 0])
+        check(cache)
+        cache = BatchKVCache([0, 0, 0])
+        cache.prepare(lengths=[2, 4, 3], right_padding=[2, 0, 1])
+        update(cache, 3, 4)
+        # right padding is invisible until it is rolled to the left
+        self._assert_batch_mask_matches_padded(cache, (1, 3))
+        cache.finalize()
+        self.assertEqual(cache.left_padding.tolist(), [2, 0, 1])
+        check(cache)
+        cache = BatchKVCache([0, 0])
+        cache.prepare(lengths=[3, 3], right_padding=[0, 0])
+        update(cache, 2, 3)
+        cache.finalize()
+        self.assertIsNone(cache.make_mask(1))
+
+        # extend, with and without content
+        cache = BatchKVCache([0])
+        cache.extend(BatchKVCache([0, 0]))
+        self.assertIsNone(cache.make_mask(1))
+        cache.extend(BatchKVCache([2]))
+        self.assertEqual(cache.left_padding.tolist(), [0, 0, 0, 2])
+        check(cache)
+
+        a, b = BatchKVCache([0, 0]), BatchKVCache([0])
+        update(a, 2, 4)
+        update(b, 1, 4)
+        a.extend(b)
+        self.assertEqual(a.left_padding.tolist(), [0, 0, 0])
+        self.assertIsNone(a.make_mask(1))
+        check(a)
+        c = BatchKVCache([0])
+        update(c, 1, 2)
+        a.extend(c)
+        self.assertEqual(a.left_padding.tolist(), [0, 0, 0, 2])
+        check(a)
+        e = BatchKVCache([0])
+        a.extend(e)
+        self.assertEqual(a.left_padding.tolist(), [0, 0, 0, 2, 4])
+        check(a)
+
+        # merge
+        def kv(n):
+            c = KVCache()
+            c.update_and_fetch(mx.zeros((1, 1, n, 8)), mx.zeros((1, 1, n, 8)))
+            return c
+
+        cache = BatchKVCache.merge([kv(3), kv(5), kv(4)])
+        self.assertEqual(cache.left_padding.tolist(), [2, 0, 1])
+        check(cache)
+        cache = BatchKVCache.merge([kv(4), kv(4)])
+        self.assertIsNone(cache.make_mask(1))
+        check(cache)
+
+        # copies are independent
+        cache = BatchKVCache([2, 0, 1])
+        update(cache, 3)
+        for clone in (copy.deepcopy(cache), copy.copy(cache)):
+            clone.filter([1])
+            check(clone)
+            self.assertIsNone(clone.make_mask(1))
+            self.assertIsInstance(cache.make_mask(1), mx.array)
+            self.assertEqual(cache.left_padding.tolist(), [2, 0, 1])
+            check(cache)
+
+        # state is restored with its padding, and a new padding is picked up
+        restored = BatchKVCache.from_state(cache.state)
+        self.assertIsInstance(restored.make_mask(1), mx.array)
+        check(restored)
+        cache = BatchKVCache([0, 0])
+        update(cache, 2)
+        self.assertIsNone(cache.make_mask(1))
+        cache.left_padding = mx.array([0, 3])
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        check(cache)
+        cache.left_padding += 1
+        check(cache)
+
+        # trim keeps the padding
+        cache = BatchKVCache([2, 0])
+        update(cache, 2)
+        cache.trim(1)
+        check(cache)
+
+    def test_batch_rotating_kv_cache_fast_mask(self):
+        cache = BatchRotatingKVCache(max_size=8, left_padding=[0, 0])
+        self.assertIsNone(cache.make_mask(1))
+        self.assertEqual(cache.make_mask(4), "causal")
+        self.assertIsInstance(cache.make_mask(4, return_array=True), mx.array)
+        # A prompt chunk that does not fit in the window needs the array
+        self.assertIsInstance(cache.make_mask(9), mx.array)
+
+        cache = BatchRotatingKVCache(max_size=8, left_padding=[0, 1])
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        self.assertIsInstance(cache.make_mask(4), mx.array)
+
+        # Padding that has been rotated out of the window no longer matters
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
+        cache.update_and_fetch(mx.zeros((2, 1, 4, 8)), mx.zeros((2, 1, 4, 8)))
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        for _ in range(3):
+            cache.update_and_fetch(mx.zeros((2, 1, 1, 8)), mx.zeros((2, 1, 1, 8)))
+        self.assertIsNone(cache.make_mask(1))
+
+        # Padding that is evicted by the pending trim or rotation is gone too
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
+        cache.update_and_fetch(mx.zeros((2, 1, 6, 8)), mx.zeros((2, 1, 6, 8)))
+        self.assertIsNone(cache.make_mask(1))
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[1, 0])
+        cache.update_and_fetch(mx.zeros((2, 1, 4, 8)), mx.zeros((2, 1, 4, 8)))
+        self.assertIsNone(cache.make_mask(1))
+        cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
+        cache.update_and_fetch(mx.zeros((2, 1, 4, 8)), mx.zeros((2, 1, 4, 8)))
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+
+    def test_batch_rotating_kv_cache_mask_matches_padded_mask(self):
+        rng = random.Random(1)
+        for trial in range(60):
+            B = rng.randint(1, 4)
+            max_size = rng.randint(4, 9)
+            window_size = rng.choice([None, None, max_size - 2])
+            right_padded = trial % 3 == 0
+            if right_padded:
+                # Right padded prompts that finalize() turns into left padding
+                lengths = [rng.randint(3, 12) for _ in range(B)]
+                prompt = max(lengths)
+                cache = BatchRotatingKVCache(max_size, [0] * B)
+                cache.prepare(
+                    lengths=lengths, right_padding=[prompt - l for l in lengths]
+                )
+            else:
+                left_padding = [rng.randint(0, 6) for _ in range(B)]
+                if trial % 3 == 1:
+                    left_padding = [0] * B
+                prompt = max(left_padding) + rng.randint(1, 10)
+                cache = BatchRotatingKVCache(max_size, left_padding)
+
+            while prompt > 0:
+                # Single tokens are decoding steps and can't be right padded
+                N = min(prompt, rng.randint(2 if right_padded else 1, 6))
+                if right_padded and prompt - N == 1:
+                    N = prompt
+                for kwargs in ({}, {"return_array": True}):
+                    self._assert_batch_mask_matches_padded(
+                        cache, (N,), window_size=window_size, **kwargs
+                    )
+                cache.update_and_fetch(mx.zeros((B, 1, N, 8)), mx.zeros((B, 1, N, 8)))
+                prompt -= N
+            cache.finalize()
+            for _ in range(rng.randint(1, 3 * max_size)):
+                for kwargs in ({}, {"return_array": True}):
+                    self._assert_batch_mask_matches_padded(
+                        cache, (1, 2), window_size=window_size, **kwargs
+                    )
+                cache.update_and_fetch(mx.zeros((B, 1, 1, 8)), mx.zeros((B, 1, 1, 8)))
+
+    def test_batch_rotating_kv_cache_padding_tracking(self):
+        def update(cache, B, N):
+            k = mx.zeros((B, 1, N, 8))
+            cache.update_and_fetch(k, k)
+
+        def check(cache):
+            self._assert_batch_mask_matches_padded(cache, (1, 2))
+            self._assert_batch_mask_matches_padded(cache, (1, 2), window_size=3)
+
+        # filter
+        cache = BatchRotatingKVCache(6, [3, 0, 2])
+        update(cache, 3, 4)
+        cache.filter([1, 2])
+        check(cache)
+        cache.filter(mx.array([0]))
+        check(cache)
+        self.assertIsNone(cache.make_mask(1))
+        update(cache, 1, 1)
+        check(cache)
+
+        # extend with and without content, and with rotation
+        a = BatchRotatingKVCache(4, [0, 0])
+        a.extend(BatchRotatingKVCache(4, [1]))
+        check(a)
+        a = BatchRotatingKVCache(4, [0, 0])
+        b = BatchRotatingKVCache(4, [0])
+        update(a, 2, 6)
+        update(b, 1, 3)
+        for _ in range(3):
+            update(a, 2, 1)
+        a.extend(b)
+        check(a)
+        for _ in range(6):
+            update(a, 3, 1)
+            check(a)
+        a = BatchRotatingKVCache(4, [0, 0])
+        b = BatchRotatingKVCache(4, [0, 0])
+        update(a, 2, 3)
+        update(b, 2, 3)
+        a.extend(b)
+        self.assertIsNone(a.make_mask(1))
+        check(a)
+        a = BatchRotatingKVCache(8, [0, 0])
+        b = BatchRotatingKVCache(8, [0])
+        update(a, 2, 6)
+        update(b, 1, 3)
+        a.extend(b)
+        self.assertEqual(a.left_padding.tolist(), [0, 0, 3])
+        self.assertIsInstance(a.make_mask(1), mx.array)
+        check(a)
+
+        # merge
+        def rot(n):
+            c = RotatingKVCache(max_size=6)
+            c.update_and_fetch(mx.zeros((1, 1, n, 8)), mx.zeros((1, 1, n, 8)))
+            return c
+
+        cache = BatchRotatingKVCache.merge([rot(3), rot(5), rot(4)])
+        check(cache)
+        for _ in range(8):
+            update(cache, 3, 1)
+            check(cache)
+        cache = BatchRotatingKVCache.merge([rot(4), rot(4)])
+        self.assertIsNone(cache.make_mask(1))
+
+        # prepare / finalize with right padding, in chunks
+        cache = BatchRotatingKVCache(5, [0, 0, 0])
+        cache.prepare(lengths=[2, 6, 4], right_padding=[4, 0, 2])
+        for N in (3, 3):
+            check(cache)
+            update(cache, 3, N)
+        cache.finalize()
+        for _ in range(7):
+            check(cache)
+            update(cache, 3, 1)
+
+        # state round trip and copies
+        cache = BatchRotatingKVCache(4, [2, 0])
+        update(cache, 2, 3)
+        restored = BatchRotatingKVCache.from_state(cache.state)
+        check(restored)
+        clone = copy.deepcopy(cache)
+        clone.filter([1])
+        check(clone)
+        check(cache)
+        self.assertIsInstance(cache.make_mask(1), mx.array)
 
     def test_save_load_batch_caches(self):
         cache_file = os.path.join(self.test_dir, "prompt_cache.safetensors")
