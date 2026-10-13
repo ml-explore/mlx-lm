@@ -994,7 +994,7 @@ class BatchKVCache(_LeftPaddingMixin, _BaseCache):
 
         if right_padding is not None and max(right_padding) > 0:
             self._right_padding = mx.array(right_padding)
-            self._right_padding_list = list(right_padding)
+            self._right_padding_list = [int(p) for p in right_padding]
 
     def finalize(self):
         if self._right_padding is not None:

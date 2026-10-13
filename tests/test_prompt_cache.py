@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 import mlx.core as mx
+import numpy as np
 
 from mlx_lm.generate import generate_step
 from mlx_lm.models.base import create_attention_mask, create_causal_mask
@@ -824,6 +825,16 @@ class TestPromptCache(unittest.TestCase):
         cache.finalize()
         self.assertIsNone(cache.make_mask(1))
 
+        # right padding handed in as an array still leaves a host list of ints:
+        # a scalar array there would make every make_mask() sync with the GPU
+        for right_padding in (mx.array([2, 0]), np.array([2, 0]), (2, 0)):
+            cache = BatchKVCache([0, 0])
+            cache.prepare(lengths=[2, 4], right_padding=right_padding)
+            update(cache, 2, 4)
+            cache.finalize()
+            self.assertEqual(cache._padding_list(), [2, 0])
+            self.assertTrue(all(type(p) is int for p in cache._padding_list()))
+
         # extend, with and without content
         cache = BatchKVCache([0])
         cache.extend(BatchKVCache([0, 0]))
@@ -1049,6 +1060,19 @@ class TestPromptCache(unittest.TestCase):
         for _ in range(7):
             check(cache)
             update(cache, 3, 1)
+
+        # The padding stays a host list once the window has slid past it: the
+        # mask is then the cheap one again (no per-row padding left to read),
+        # which only holds if trimming shifts the host copy too
+        cache = BatchRotatingKVCache(4, [2, 0])
+        update(cache, 2, 3)
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        update(cache, 2, 1)
+        self.assertIsInstance(cache.make_mask(1), mx.array)
+        update(cache, 2, 1)
+        self.assertIsNone(cache.make_mask(1))
+        self.assertEqual(cache._padding_list(), [1, -1])
+        check(cache)
 
         # The host copy of the padding must survive until finalize() puts the
         # right padding on the left, so replacing it in between is refused
