@@ -3,6 +3,7 @@
 import unittest
 
 from mlx_lm.tokenizer_utils import (
+    _infer_tool_parser,
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
@@ -140,6 +141,27 @@ class TestTokenizers(unittest.TestCase):
         self.assertEqual(tokenizer.tool_call_start, "<|tool_call_start|>")
         self.assertEqual(tokenizer.tool_call_end, "<|tool_call_end|>")
         self.assertEqual(tokenizer.tool_parser, pythonic.parse_tool_call)
+
+    def test_infer_tool_parser_from_vocab(self):
+        class FakeTokenizer:
+            def __init__(self, vocab, chat_template=None):
+                self.chat_template = chat_template
+                self._vocab = vocab
+
+            def get_vocab(self):
+                return self._vocab
+
+        # A MistralCommonBackend (tekken checkpoints such as Devstral) has no
+        # jinja chat_template, so the parser comes from the [TOOL_CALLS] token.
+        mistral_vocab = {"[TOOL_CALLS]": 9, "[ARGS]": 32, "hello": 100}
+        self.assertEqual(_infer_tool_parser(FakeTokenizer(mistral_vocab)), "mistral")
+        # A template match still wins over the vocab fallback.
+        template = "<tool_call>\n<function="
+        self.assertEqual(
+            _infer_tool_parser(FakeTokenizer(mistral_vocab, template)), "qwen3_coder"
+        )
+        # No marker anywhere means no parser.
+        self.assertIsNone(_infer_tool_parser(FakeTokenizer({"hello": 1})))
 
     def test_thinking(self):
         tokenizer_repo = "mlx-community/Qwen3-4B-4bit"

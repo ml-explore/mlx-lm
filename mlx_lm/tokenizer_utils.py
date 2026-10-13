@@ -651,11 +651,16 @@ def _infer_tool_parser(tokenizer):
 
     # No template match, so fall back to the vocab. LFM2.5 conversions for
     # example have the tool-call tokens but do not name them in the template.
+    # Mistral tekken checkpoints (Devstral, Ministral 3) load as a
+    # MistralCommonBackend, which renders prompts itself and exposes no jinja
+    # `chat_template`, but their vocab still carries the [TOOL_CALLS] token.
     vocab = tokenizer.get_vocab()
     if _is_xtml_vocab(vocab):
         return "kimi_k3"
     elif "<|tool_call_start|>" in vocab and "<|tool_call_end|>" in vocab:
         return "pythonic"
+    elif "[TOOL_CALLS]" in vocab:
+        return "mistral"
 
     return None
 
