@@ -637,8 +637,8 @@ class ResponseGenerator:
         if rs is not None:
             return rs
 
-        stop_sequences = make_stop_sequences(tokenizer, stop_words)
-        text_sm = make_text_state_machine(tokenizer, stop_words)
+        stop_sequences = make_stop_sequences(tokenizer, stop_words=stop_words)
+        text_sm = make_text_state_machine(tokenizer, stop_words=stop_words)
 
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
@@ -1448,7 +1448,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
         # Initialize the text state machine
-        reader = ctx.text_sm.reader(ctx.initial_state)
+        reader = ctx.text_sm.reader(state=ctx.initial_state)
 
         # Variables to save the generated text, tokens, logprobs, tools etc
         prev_state = ctx.initial_state
@@ -1476,15 +1476,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Collect the clean text by state: reasoning, tool, or normal
                 for current_state, clean_text in segments:
+                    if prev_state == "tool" and current_state != "tool":
+                        tool_calls.append(tool_text)
+                        tool_text = ""
+                        made_tool_call = True
                     if current_state == "reasoning":
                         reasoning_text += clean_text
                     elif current_state == "tool":
                         tool_text += clean_text
                     elif current_state == "normal":
-                        if prev_state == "tool":
-                            tool_calls.append(tool_text)
-                            tool_text = ""
-                            made_tool_call = True
                         text += clean_text
                     prev_state = current_state
 

@@ -936,6 +936,8 @@ class TextStateMachine:
     tokens, or merged with the next byte, still matches. The machine does not
     change; each stream reads through its own :class:`TextStateMachine.Reader`.
 
+    A ``next_state`` of ``None`` returns to the state before the current one.
+
     Example:
 
         sm = TextStateMachine(
@@ -945,7 +947,7 @@ class TextStateMachine:
                 "tool": [("</tool_call>", "normal")],
             }
         )
-        reader = sm.reader("normal")
+        reader = sm.reader(state="normal")
         reader.feed("<think>Hmm.</think>Hi")
         # [("normal", ""), ("reasoning", "Hmm."), ("normal", "Hi")]
     """
@@ -953,12 +955,15 @@ class TextStateMachine:
     class Reader:
         """One stream's position in a :class:`TextStateMachine`."""
 
-        def __init__(self, states: dict[str, Tuple[dict, List[str]]], state: str):
+        def __init__(
+            self, states: dict[str, Tuple[dict, List[str | None]]], *, state: str
+        ):
             self._states = states
             self._held = ""
+            self._previous = state
             self._enter(state)
 
-        def _enter(self, state: str):
+        def _enter(self, state: str) -> None:
             self.state = state
             self._root, self._next = self._states.get(state, ({}, []))
             self._node = self._root
@@ -981,7 +986,12 @@ class TextStateMachine:
                 if match is not None:
                     segments.append((self.state, text[begin : i + 1 - len(match[0])]))
                     begin = i + 1
-                    self._enter(self._next[match[1]])
+                    state = self._next[match[1]]
+                    if state is None:
+                        state = self._previous
+                    elif state != self.state:
+                        self._previous = self.state
+                    self._enter(state)
             end = len(text) - self._node.get("__depth__", 0)
             segments.append((self.state, text[begin:end]))
             self._held = text[end:]
@@ -995,7 +1005,8 @@ class TextStateMachine:
             return [(self.state, held)]
 
     def __init__(
-        self, transitions: Optional[dict[str, Sequence[Tuple[str, str]]]] = None
+        self,
+        transitions: dict[str, Sequence[Tuple[str, str | None]]] | None = None,
     ):
         # Per state: a trie of its markers, and the state each marker leads to.
         self._states = {}
@@ -1003,12 +1014,12 @@ class TextStateMachine:
             markers = [marker for marker, _ in edges]
             self._states[state] = (_build_trie(markers), [dst for _, dst in edges])
 
-    def reader(self, state: str = "normal") -> "TextStateMachine.Reader":
+    def reader(self, *, state: str = "normal") -> "TextStateMachine.Reader":
         """A fresh reader that starts in ``state``."""
-        return self.Reader(self._states, state)
+        return self.Reader(self._states, state=state)
 
 
-def make_stop_sequences(tokenizer, stop_words=None):
+def make_stop_sequences(tokenizer, *, stop_words=None):
     """Build StopSequences from EOS tokens and stop words."""
     stop_sequences = [(t,) for t in tokenizer.eos_token_ids]
     for w in stop_words or []:
@@ -1016,7 +1027,7 @@ def make_stop_sequences(tokenizer, stop_words=None):
     return StopSequences(stop_sequences)
 
 
-def make_text_state_machine(tokenizer, stop_words=None):
+def make_text_state_machine(tokenizer, *, stop_words=None):
     """Build a TextStateMachine with reasoning/tool transitions and stop words.
 
     Stop words are added as self-transitions in every state so they are
@@ -1034,8 +1045,9 @@ def make_text_state_machine(tokenizer, stop_words=None):
         transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
         if tokenizer.has_thinking:
             transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
+        # Back to the state the tool call started in.
         transitions["tool"] = (
-            [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
+            [(tokenizer.tool_call_end, None)] if tokenizer.tool_call_end else []
         )
 
     if tokenizer.structural_markers:

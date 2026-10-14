@@ -7,12 +7,13 @@ import threading
 import time
 import unittest
 from queue import Queue
+from types import SimpleNamespace
 from unittest import mock
 
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine
+from mlx_lm.generate import TextStateMachine, make_text_state_machine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
@@ -171,7 +172,7 @@ class TestTextStateMachine(unittest.TestCase):
         # Text before a marker belongs to the state before it, also when it was
         # held from the previous chunk.
         sm = TextStateMachine({**TOOL_CALLS, "reasoning": [("</think>", "normal")]})
-        reader = sm.reader("reasoning")
+        reader = sm.reader(state="reasoning")
         self.assertEqual(
             reader.feed("hmm</think>Hi <"), [("reasoning", "hmm"), ("normal", "Hi ")]
         )
@@ -203,6 +204,35 @@ class TestTextStateMachine(unittest.TestCase):
         reader.feed("</tool>")
         self.assertEqual(reader.state, "normal")
 
+    def test_tool_call_inside_reasoning(self):
+        # The tool call returns to reasoning, also after a stop word in it, and
+        # a reasoning segment separates two tool calls.
+        tokenizer = SimpleNamespace(
+            has_thinking=True,
+            think_start="<think>",
+            think_end="</think>",
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            structural_markers=(),
+        )
+        sm = make_text_state_machine(tokenizer, stop_words=["STOP"])
+        reader = sm.reader(state="reasoning")
+        self.assertEqual(
+            reader.feed(
+                "a<tool_call>bSTOPc</tool_call><tool_call>d</tool_call>e</think>f"
+            ),
+            [
+                ("reasoning", "a"),
+                ("tool", "b"),
+                ("tool", "c"),
+                ("reasoning", ""),
+                ("tool", "d"),
+                ("reasoning", "e"),
+                ("normal", "f"),
+            ],
+        )
+
     def test_empty_end_marker_stays_in_tool(self):
         # Models with an empty tool_call_end (e.g. Mistral) never leave "tool".
         sm = TextStateMachine({"normal": [("[TOOL_CALLS]", "tool")], "tool": []})
@@ -217,7 +247,7 @@ class TestTextStateMachine(unittest.TestCase):
         sm = TextStateMachine(TOOL_CALLS)
         a = sm.reader()
         # A state without markers passes all text through.
-        b = sm.reader("header")
+        b = sm.reader(state="header")
         a.feed("<tool_call>")
         self.assertEqual(a.state, "tool")
         self.assertEqual(b.feed("<tool_call>x"), [("header", "<tool_call>x")])
