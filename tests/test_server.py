@@ -17,13 +17,15 @@ from mlx_lm.generate import TextStateMachine, make_text_state_machine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
+    GenerationContext,
     LRUPromptCache,
+    Response,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
 )
-from mlx_lm.tool_parsers import pythonic
+from mlx_lm.tool_parsers import json_tools, pythonic
 from mlx_lm.utils import load
 
 
@@ -233,6 +235,39 @@ class TestTextStateMachine(unittest.TestCase):
             reader.feed("x")
 
 
+class TestHandleCompletion(unittest.TestCase):
+    def test_stream_drops_tool_calls_that_do_not_parse(self):
+        ctx = GenerationContext(
+            has_tool_calling=True,
+            has_thinking=False,
+            tool_parser=json_tools.parse_tool_call,
+            text_sm=TextStateMachine(TOOL_CALLS),
+            initial_state="normal",
+            prompt=[0],
+        )
+        call = '<tool_call>{"name": "f", "arguments": {}}</tool_call>'
+        chunks = ["Hi.", "<tool_call>{oops}</tool_call>", call]
+        response = [Response(c, 0, 0.0, None, ()) for c in chunks]
+        response.append(Response("", 0, 0.0, "stop", ()))
+        handler = mock.MagicMock(
+            stream=True, logprobs=False, top_logprobs=0, stream_options=None
+        )
+        handler.response_generator.generate.return_value = (ctx, iter(response))
+        sent = []
+
+        def generate_response(text, finish_reason, *args, tool_calls=(), **kwargs):
+            names = [tc["function"]["name"] for tc in tool_calls]
+            sent.append((text, finish_reason, names))
+            return {}
+
+        handler.generate_response.side_effect = generate_response
+        with self.assertLogs(level="WARNING"):
+            APIHandler.handle_completion(handler, SimpleNamespace(tools=None), [])
+        self.assertEqual(
+            sent, [("Hi.", None, []), ("", None, ["f"]), ("", "tool_calls", [])]
+        )
+
+
 class TestToolCallFormatter(unittest.TestCase):
     def test_formats_parallel_tool_calls(self):
         formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
@@ -251,6 +286,15 @@ class TestToolCallFormatter(unittest.TestCase):
         self.assertEqual(
             json.loads(tool_calls[1]["function"]["arguments"]),
             {"items": [{"name": "noodles", "organic": True}]},
+        )
+
+    def test_drops_broken_tool_calls(self):
+        formatter = ToolCallFormatter(json_tools.parse_tool_call, None, True)
+        broken = ["{oops}", "null", '{"name": "f"}']
+        with self.assertLogs(level="WARNING"):
+            tool_calls = formatter([*broken, '{"name": "g", "arguments": {}}'])
+        self.assertEqual(
+            [(tc["function"]["name"], tc["index"]) for tc in tool_calls], [("g", 0)]
         )
 
 

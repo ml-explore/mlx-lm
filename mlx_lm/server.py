@@ -65,15 +65,11 @@ class ToolCallFormatter:
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
         tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-        out = {
+        return {
             "function": tc,
             "type": "function",
             "id": tc_id,
         }
-        if self._streaming:
-            out["index"] = self.count
-        self.count += 1
-        return out
 
     def __call__(self, tool_calls):
         if not tool_calls:
@@ -81,17 +77,23 @@ class ToolCallFormatter:
 
         result = []
         for tool_text in tool_calls:
+            # A broken tool call is dropped, whatever the parser raises.
             try:
                 parsed = self._tool_parser(tool_text, self._tools)
-            except (ValueError, json.JSONDecodeError) as e:
+                if not isinstance(parsed, list):
+                    parsed = [parsed]
+                formatted = [self._format(tc) for tc in parsed]
+            except Exception as e:
                 logging.warning(
                     f"Failed to parse tool call ({type(e).__name__}: {e}) — "
                     f"tool text was likely truncated mid-generation."
                 )
                 continue
-            if not isinstance(parsed, list):
-                parsed = [parsed]
-            result.extend(self._format(tc) for tc in parsed)
+            for out in formatted:
+                if self._streaming:
+                    out["index"] = self.count
+                self.count += 1
+                result.append(out)
         return result
 
 
@@ -1479,17 +1481,17 @@ class APIHandler(BaseHTTPRequestHandler):
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
 
-                if self.stream and (
-                    pending.content or pending.reasoning or pending.tool_calls
-                ):
-                    resp = self.generate_response(
-                        pending.content,
-                        None,
-                        tool_calls=tool_formatter(pending.tool_calls),
-                        reasoning_text=pending.reasoning,
-                    )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
-                    self.wfile.flush()
+                if self.stream:
+                    tool_calls = tool_formatter(pending.tool_calls)
+                    if pending.content or pending.reasoning or tool_calls:
+                        resp = self.generate_response(
+                            pending.content,
+                            None,
+                            tool_calls=tool_calls,
+                            reasoning_text=pending.reasoning,
+                        )
+                        self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                        self.wfile.flush()
                     pending = TextStateMachine.Delta()
 
                 if gen.finish_reason is not None:
