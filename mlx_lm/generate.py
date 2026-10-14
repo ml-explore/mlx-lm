@@ -1049,14 +1049,11 @@ class TextStateMachine:
             self._held = text[end:]
             return delta
 
-        def finish(
-            self, text: str = "", *, drop_held: bool = False
-        ) -> "TextStateMachine.Delta":
-            """Read the last chunk of the stream. The held text is released,
-            unless ``drop_held``, and an open tool call is closed."""
+        def finish(self, text: str = "") -> "TextStateMachine.Delta":
+            """Read the last chunk of the stream. The held text is released and
+            an open tool call is closed."""
             delta = self.feed(text)
-            if not drop_held:
-                delta = self._add(delta, self._held)
+            delta = self._add(delta, self._held)
             self._held = ""
             self._node = self._root
             if self._tool:

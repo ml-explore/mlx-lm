@@ -124,20 +124,21 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine.Delta(content="hi  bye", tool_calls=("a", "b")),
         )
 
-    def test_finish_releases_or_drops_held_text(self):
+    def test_finish_releases_held_text(self):
         # "</" can start "</tool_call>", so it is held until the end.
-        sm = TextStateMachine(TOOL_CALLS)
-        reader = sm.reader()
+        reader = TextStateMachine(TOOL_CALLS).reader()
         reader.feed("<tool_call>body</")
         self.assertEqual(
             reader.finish(), TextStateMachine.Delta(tool_calls=("body</",))
         )
-        reader = sm.reader()
-        reader.feed("<tool_call>body</")
+
+    def test_finish_strips_the_stop_word(self):
+        # The last chunk of a stop completes the stop word.
+        reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
         self.assertEqual(
-            reader.finish(drop_held=True),
-            TextStateMachine.Delta(tool_calls=("body",)),
+            reader.feed("hello ST"), TextStateMachine.Delta(content="hello ")
         )
+        self.assertEqual(reader.finish("OP"), TextStateMachine.Delta())
 
     def test_holds_only_what_can_start_a_marker(self):
         reader = TextStateMachine(TOOL_CALLS).reader()

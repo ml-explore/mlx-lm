@@ -848,17 +848,15 @@ class ResponseGenerator:
                     for r in gen_responses:
                         result = batch_results[r.uid]
 
-                        # Don't decode the final stop token
-                        if r.finish_reason == "stop":
-                            result["detokenizer"].finalize()
-                            text = result["detokenizer"].last_segment
-                        elif r.finish_reason == "length":
-                            result["detokenizer"].add_token(r.token)
-                            result["detokenizer"].finalize()
-                            text = result["detokenizer"].last_segment
-                        else:
-                            result["detokenizer"].add_token(r.token)
-                            text = result["detokenizer"].last_segment
+                        # Decode all but EOS, so that the text state machine
+                        # gets the whole stop word and strips it.
+                        detokenizer = result["detokenizer"]
+                        eos_token_ids = current_tokenizer.eos_token_ids
+                        if r.finish_reason != "stop" or r.token not in eos_token_ids:
+                            detokenizer.add_token(r.token)
+                        if r.finish_reason is not None:
+                            detokenizer.finalize()
+                        text = detokenizer.last_segment
 
                         result["rqueue"].put(
                             Response(
@@ -1464,14 +1462,11 @@ class APIHandler(BaseHTTPRequestHandler):
             for gen in response:
                 logging.debug(gen.text)
 
-                # Advance the text state machine to strip control sequences.
-                # On a stop, the held text is dropped.
-                if gen.finish_reason == "stop":
-                    delta = reader.finish(drop_held=True)
-                elif gen.finish_reason == "length":
-                    delta = reader.finish(gen.text)
-                else:
+                # Advance the text state machine to strip control sequences
+                if gen.finish_reason is None:
                     delta = reader.feed(gen.text)
+                else:
+                    delta = reader.finish(gen.text)
 
                 # Collect the clean text: reasoning, tool calls, or normal
                 reasoning_text += delta.reasoning
