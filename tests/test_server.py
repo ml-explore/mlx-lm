@@ -140,6 +140,14 @@ class TestTextStateMachine(unittest.TestCase):
         )
         self.assertEqual(reader.discard(), TextStateMachine.Delta())
 
+    def test_empty_tool_calls_are_dropped(self):
+        reader = TextStateMachine(TOOL_CALLS).reader()
+        self.assertEqual(
+            reader.feed("a<tool_call></tool_call>b<tool_call>\n"),
+            TextStateMachine.Delta(content="ab"),
+        )
+        self.assertEqual(reader.finish(), TextStateMachine.Delta())
+
     def test_holds_only_what_can_start_a_marker(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
         self.assertEqual(reader.feed("a <<"), TextStateMachine.Delta(content="a <"))

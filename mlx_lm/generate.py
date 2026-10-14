@@ -1014,7 +1014,9 @@ class TextStateMachine:
         def _close_tool_call(
             self, delta: "TextStateMachine.Delta"
         ) -> "TextStateMachine.Delta":
-            delta = delta.add_tool_call(self._tool)
+            tool_call = self._tool.strip()
+            if tool_call:
+                delta = delta.add_tool_call(tool_call)
             self._tool = ""
             return delta
 
@@ -1047,9 +1049,7 @@ class TextStateMachine:
             delta = self._add(delta, self._held)
             self._held = ""
             self._node = self._root
-            if self._tool:
-                delta = self._close_tool_call(delta)
-            return delta
+            return self._close_tool_call(delta)
 
         def discard(self) -> "TextStateMachine.Delta":
             """End on a stop. The held text starts the stop word, so drop it."""
