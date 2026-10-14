@@ -1056,13 +1056,10 @@ class TextStateMachine:
             self._held = ""
             return self.finish()
 
-    def __init__(
-        self,
-        transitions: dict[str, Sequence[Tuple[str, str | None]]] | None = None,
-    ):
+    def __init__(self, transitions: dict[str, Sequence[Tuple[str, str | None]]]):
         # Per state: the trie of its markers and their next states.
         self._states = {}
-        for state, edges in (transitions or {}).items():
+        for state, edges in transitions.items():
             markers = [marker for marker, _ in edges]
             self._states[state] = (_build_trie(markers), [dst for _, dst in edges])
 
@@ -1111,7 +1108,7 @@ def make_text_state_machine(tokenizer, *, stop_words=None):
             for w in stop_words:
                 transitions.setdefault(state_name, []).append((w, state_name))
 
-    return TextStateMachine(transitions or None)
+    return TextStateMachine(transitions)
 
 
 class PromptProcessingBatch:
