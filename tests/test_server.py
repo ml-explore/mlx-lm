@@ -152,7 +152,7 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(reader.feed("a <<"), TextStateMachine.Delta(content="a <"))
 
     def test_held_text_is_read_once(self):
-        # A stop word split over two chunks.
+        # A marker split over two chunks.
         reader = TextStateMachine({"normal": [("##", "normal")]}).reader()
         self.assertEqual(reader.feed("a #"), TextStateMachine.Delta(content="a "))
         self.assertEqual(reader.feed("# b"), TextStateMachine.Delta(content=" b"))
@@ -170,7 +170,6 @@ class TestTextStateMachine(unittest.TestCase):
         )
 
     def test_tool_call_inside_reasoning(self):
-        # Returns to reasoning, also after a stop word.
         tokenizer = SimpleNamespace(
             has_thinking=True,
             think_start="<think>",
@@ -180,12 +179,22 @@ class TestTextStateMachine(unittest.TestCase):
             tool_call_end="</tool_call>",
             structural_markers=(),
         )
-        sm = make_text_state_machine(tokenizer, stop_words=["STOP"])
-        reader = sm.reader(state="reasoning")
+        reader = make_text_state_machine(tokenizer).reader(state="reasoning")
         self.assertEqual(
-            reader.feed("a<tool_call>bSTOPc</tool_call>d</think>e"),
-            TextStateMachine.Delta(content="e", reasoning="ad", tool_calls=("bc",)),
+            reader.feed("a<tool_call>b</tool_call>c</think>d"),
+            TextStateMachine.Delta(content="d", reasoning="ac", tool_calls=("b",)),
         )
+
+    def test_stop_word_ends_the_text(self):
+        tokenizer = SimpleNamespace(
+            has_thinking=False, has_tool_calling=False, structural_markers=()
+        )
+        reader = make_text_state_machine(tokenizer, stop_words=["\n\n"]).reader()
+        self.assertEqual(
+            reader.feed("First.\n"), TextStateMachine.Delta(content="First.")
+        )
+        self.assertEqual(reader.feed("\nSecond."), TextStateMachine.Delta(stopped=True))
+        self.assertEqual(reader.feed("More."), TextStateMachine.Delta(stopped=True))
 
     def test_stop_word_does_not_hide_a_marker(self):
         tokenizer = SimpleNamespace(

@@ -936,7 +936,8 @@ class TextStateMachine:
     text, so a marker split over tokens still matches.
 
     ``normal`` text is the content, ``reasoning`` text the reasoning and each
-    visit to ``tool`` one tool call. ``header`` text is dropped.
+    visit to ``tool`` one tool call. ``header`` text is dropped. ``stop`` ends
+    the text: its deltas have ``stopped`` set.
 
     Example:
 
@@ -959,6 +960,7 @@ class TextStateMachine:
         content: str = ""
         reasoning: str = ""
         tool_calls: Tuple[str, ...] = ()
+        stopped: bool = False
 
         def add_content(self, text: str) -> "TextStateMachine.Delta":
             return replace(self, content=self.content + text)
@@ -997,7 +999,7 @@ class TextStateMachine:
                 return delta.add_reasoning(text)
             if self._state == "tool":
                 self._tool += text
-            elif self._state != "header":
+            elif self._state not in ("header", "stop"):
                 raise ValueError(f"Unknown state {self._state!r}.")
             return delta
 
@@ -1042,7 +1044,7 @@ class TextStateMachine:
             end = len(text) - self._node.get("__depth__", 0)
             delta = self._add(delta, text[begin:end])
             self._held = text[end:]
-            return delta
+            return replace(delta, stopped=self._state == "stop")
 
         def finish(self, text: str = "") -> "TextStateMachine.Delta":
             """Read the last chunk, release the held text and close a tool call."""
@@ -1080,8 +1082,7 @@ def make_stop_sequences(tokenizer, *, stop_words=None):
 def make_text_state_machine(tokenizer, *, stop_words=None):
     """Build a TextStateMachine with reasoning/tool transitions and stop words.
 
-    Stop words are added as self-transitions in every state so they are
-    stripped from the output without changing state.
+    A stop word leads from every state to ``stop``, which ends the text.
     """
     transitions = {}
 
@@ -1107,7 +1108,7 @@ def make_text_state_machine(tokenizer, *, stop_words=None):
     if stop_words:
         for state_name in set(transitions) | {"normal"}:
             for w in stop_words:
-                transitions.setdefault(state_name, []).append((w, state_name))
+                transitions.setdefault(state_name, []).append((w, "stop"))
 
     return TextStateMachine(transitions)
 

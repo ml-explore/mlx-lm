@@ -1502,6 +1502,9 @@ class APIHandler(BaseHTTPRequestHandler):
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
 
+                if delta.stopped:
+                    break
+
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
 
