@@ -855,8 +855,8 @@ def _normalize_logits_processors(logits_processors, *, n):
 def _build_trie(sequences: Sequence[Any]) -> dict:
     """Build an Aho-Corasick trie from the provided sequences
 
-    See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm . Each node keeps
-    in ``__depth__`` the length of the prefix it matches.
+    See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm . Nodes keep their
+    depth in ``__depth__``.
     """
     trie = {}
     for idx, seq in enumerate(sequences):
@@ -928,19 +928,14 @@ class StopSequences:
 
 
 class TextStateMachine:
-    """Split streamed text into content, reasoning and tool calls, and remove
-    the markers that change the state.
+    """Split streamed text into content, reasoning and tool calls.
 
-    ``transitions`` maps a state to its ``(marker, next_state)`` pairs. Markers
-    are matched on decoded text rather than token ids, so a marker split over
-    tokens, or merged with the next byte, still matches. The machine does not
-    change; each stream reads through its own :class:`TextStateMachine.Reader`.
+    ``transitions`` maps a state to its ``(marker, next_state)`` pairs, where a
+    ``next_state`` of ``None`` returns to the previous state. Markers match on
+    text, so a marker split over tokens still matches.
 
-    A ``next_state`` of ``None`` returns to the state before the current one.
-
-    The text of the ``normal`` state is the content, of ``reasoning`` the
-    reasoning, and each visit to ``tool`` one tool call. The text of ``header``
-    (message headers) is dropped. Other states raise a ``ValueError``.
+    ``normal`` text is the content, ``reasoning`` text the reasoning and each
+    visit to ``tool`` one tool call. ``header`` text is dropped.
 
     Example:
 
@@ -958,7 +953,7 @@ class TextStateMachine:
 
     @dataclass(frozen=True)
     class Delta:
-        """The new text of a response, as in a chat completion delta."""
+        """New response text, as in a chat completion delta."""
 
         content: str = ""
         reasoning: str = ""
@@ -993,7 +988,6 @@ class TextStateMachine:
         def _add(
             self, delta: "TextStateMachine.Delta", text: str
         ) -> "TextStateMachine.Delta":
-            """Return ``delta`` with the text of the current state added."""
             if self._state == "normal":
                 return delta.add_content(text)
             if self._state == "reasoning":
@@ -1007,8 +1001,7 @@ class TextStateMachine:
         def _move(
             self, delta: "TextStateMachine.Delta", state: str | None
         ) -> "TextStateMachine.Delta":
-            """Move to ``state``, where ``None`` is the state before the current
-            one. Leaving ``tool`` closes the tool call."""
+            """``None`` is the previous state. Leaving ``tool`` closes the call."""
             if state is None:
                 state = self._previous
             if state != self._state:
@@ -1026,8 +1019,7 @@ class TextStateMachine:
             return delta
 
         def feed(self, text: str) -> "TextStateMachine.Delta":
-            """Read a chunk of text. The end of the chunk that can still start
-            a marker is held back for the next chunk."""
+            """Read a chunk. Text that can still start a marker is held back."""
             delta = TextStateMachine.Delta()
             start = len(self._held)
             text = self._held + text
@@ -1050,8 +1042,7 @@ class TextStateMachine:
             return delta
 
         def finish(self, text: str = "") -> "TextStateMachine.Delta":
-            """Read the last chunk of the stream. The held text is released and
-            an open tool call is closed."""
+            """Read the last chunk, release the held text and close a tool call."""
             delta = self.feed(text)
             delta = self._add(delta, self._held)
             self._held = ""
@@ -1060,11 +1051,16 @@ class TextStateMachine:
                 delta = self._close_tool_call(delta)
             return delta
 
+        def discard(self) -> "TextStateMachine.Delta":
+            """End on a stop. The held text starts the stop word, so drop it."""
+            self._held = ""
+            return self.finish()
+
     def __init__(
         self,
         transitions: dict[str, Sequence[Tuple[str, str | None]]] | None = None,
     ):
-        # Per state: a trie of its markers, and the state each marker leads to.
+        # Per state: the trie of its markers and their next states.
         self._states = {}
         for state, edges in (transitions or {}).items():
             markers = [marker for marker, _ in edges]

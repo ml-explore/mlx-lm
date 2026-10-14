@@ -132,13 +132,13 @@ class TestTextStateMachine(unittest.TestCase):
             reader.finish(), TextStateMachine.Delta(tool_calls=("body</",))
         )
 
-    def test_finish_strips_the_stop_word(self):
-        # The last chunk of a stop completes the stop word.
+    def test_discard_drops_held_text(self):
+        # On a stop, the held text is the start of the stop word.
         reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
         self.assertEqual(
             reader.feed("hello ST"), TextStateMachine.Delta(content="hello ")
         )
-        self.assertEqual(reader.finish("OP"), TextStateMachine.Delta())
+        self.assertEqual(reader.discard(), TextStateMachine.Delta())
 
     def test_holds_only_what_can_start_a_marker(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
@@ -151,8 +151,7 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(reader.feed("# b"), TextStateMachine.Delta(content=" b"))
 
     def test_text_keeps_its_state(self):
-        # Text before a marker belongs to the state before it, also when it was
-        # held from the previous chunk.
+        # Held text before a marker keeps the state before the marker.
         sm = TextStateMachine({**TOOL_CALLS, "reasoning": [("</think>", "normal")]})
         reader = sm.reader(state="reasoning")
         self.assertEqual(
