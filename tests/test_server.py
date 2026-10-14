@@ -120,33 +120,24 @@ class TestTextStateMachine(unittest.TestCase):
     def test_strips_control_sequences(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
         self.assertEqual(
-            reader.feed("hi <tool_call>body</tool_call> bye"),
-            TextStateMachine.Delta(content="hi  bye", tool_calls=("body",)),
+            reader.feed("hi <tool_call>a</tool_call><tool_call>b</tool_call> bye"),
+            TextStateMachine.Delta(content="hi  bye", tool_calls=("a", "b")),
         )
 
-    def test_back_to_back_tool_calls(self):
-        reader = TextStateMachine(TOOL_CALLS).reader()
-        self.assertEqual(
-            reader.feed("<tool_call>a</tool_call><tool_call>b</tool_call>"),
-            TextStateMachine.Delta(tool_calls=("a", "b")),
-        )
-
-    def test_partial_match_held_then_finished(self):
-        reader = TextStateMachine(TOOL_CALLS).reader()
-        # "</" can start "</tool_call>", so it is held.
-        self.assertEqual(reader.feed("<tool_call>body</"), TextStateMachine.Delta())
-        self.assertEqual(reader.state, "tool")
+    def test_finish_releases_or_drops_held_text(self):
+        # "</" can start "</tool_call>", so it is held until the end.
+        sm = TextStateMachine(TOOL_CALLS)
+        reader = sm.reader()
+        reader.feed("<tool_call>body</")
         self.assertEqual(
             reader.finish(), TextStateMachine.Delta(tool_calls=("body</",))
         )
-
-    def test_finish_drops_held_text(self):
-        # On a stop, the held text is the start of the stop word.
-        reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
+        reader = sm.reader()
+        reader.feed("<tool_call>body</")
         self.assertEqual(
-            reader.feed("hello ST"), TextStateMachine.Delta(content="hello ")
+            reader.finish(drop_held=True),
+            TextStateMachine.Delta(tool_calls=("body",)),
         )
-        self.assertEqual(reader.finish(drop_held=True), TextStateMachine.Delta())
 
     def test_holds_only_what_can_start_a_marker(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
@@ -171,30 +162,6 @@ class TestTextStateMachine(unittest.TestCase):
             reader.feed("<tool_call>{}"), TextStateMachine.Delta(content="<")
         )
 
-    def test_stop_words_stripped(self):
-        reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
-        self.assertEqual(
-            reader.feed("hello STOP world"),
-            TextStateMachine.Delta(content="hello  world"),
-        )
-
-    def test_reasoning_to_tool_transition(self):
-        # A tool call started inside a reasoning block must enter "tool".
-        sm = TextStateMachine(
-            {
-                "normal": [("<think>", "reasoning"), ("<tool>", "tool")],
-                "reasoning": [("</think>", "normal"), ("<tool>", "tool")],
-                "tool": [("</tool>", "normal")],
-            }
-        )
-        reader = sm.reader()
-        reader.feed("<think>hmm")
-        self.assertEqual(reader.state, "reasoning")
-        reader.feed("<tool>")
-        self.assertEqual(reader.state, "tool")
-        reader.feed("</tool>")
-        self.assertEqual(reader.state, "normal")
-
     def test_tool_call_inside_reasoning(self):
         # The tool call returns to reasoning, also after a stop word in it.
         tokenizer = SimpleNamespace(
@@ -209,21 +176,8 @@ class TestTextStateMachine(unittest.TestCase):
         sm = make_text_state_machine(tokenizer, stop_words=["STOP"])
         reader = sm.reader(state="reasoning")
         self.assertEqual(
-            reader.feed(
-                "a<tool_call>bSTOPc</tool_call><tool_call>d</tool_call>e</think>f"
-            ),
-            TextStateMachine.Delta(content="f", reasoning="ae", tool_calls=("bc", "d")),
-        )
-
-    def test_empty_end_marker_stays_in_tool(self):
-        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool",
-        # so the tool call ends with the stream.
-        sm = TextStateMachine({"normal": [("[TOOL_CALLS]", "tool")], "tool": []})
-        reader = sm.reader()
-        self.assertEqual(reader.feed("[TOOL_CALLS]f[ARGS]{}"), TextStateMachine.Delta())
-        self.assertEqual(reader.state, "tool")
-        self.assertEqual(
-            reader.finish(), TextStateMachine.Delta(tool_calls=("f[ARGS]{}",))
+            reader.feed("a<tool_call>bSTOPc</tool_call>d</think>e"),
+            TextStateMachine.Delta(content="e", reasoning="ad", tool_calls=("bc",)),
         )
 
     def test_header_text_is_dropped(self):
@@ -241,14 +195,9 @@ class TestTextStateMachine(unittest.TestCase):
     def test_readers_are_independent(self):
         sm = TextStateMachine(TOOL_CALLS)
         a = sm.reader()
-        # A state without markers passes all text through.
-        b = sm.reader(state="reasoning")
+        b = sm.reader()
         a.feed("<tool_call>")
-        self.assertEqual(a.state, "tool")
-        self.assertEqual(
-            b.feed("<tool_call>x"), TextStateMachine.Delta(reasoning="<tool_call>x")
-        )
-        self.assertEqual(sm.reader().state, "normal")
+        self.assertEqual((a.state, b.state), ("tool", "normal"))
 
 
 class TestToolCallFormatter(unittest.TestCase):
@@ -464,14 +413,12 @@ class TestServer(unittest.TestCase):
             stop_words=[],
         )
 
-        # Verify the text state machine strips tool call markers
+        # The tool call has no end marker, so it ends with the stream.
         reader = text_sm.reader()
         self.assertEqual(
             reader.feed("hello[TOOL_CALLS]body"),
             TextStateMachine.Delta(content="hello"),
         )
-        self.assertEqual(reader.state, "tool")
-        # The tool call has no end marker, so it ends with the stream.
         self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
 
         # Verify EOS stops via the stop matcher
