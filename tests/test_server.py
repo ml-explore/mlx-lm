@@ -210,6 +210,16 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine.Delta(tool_calls=("x",)),
         )
 
+    def test_deltas_add(self):
+        a = TextStateMachine.Delta(content="a", tool_calls=("x",))
+        b = TextStateMachine.Delta(reasoning="r", tool_calls=("y",), stopped=True)
+        self.assertEqual(
+            a + b,
+            TextStateMachine.Delta(
+                content="a", reasoning="r", tool_calls=("x", "y"), stopped=True
+            ),
+        )
+
     def test_header_text_is_dropped(self):
         sm = TextStateMachine({"header": [("<|message|>", "normal")]})
         reader = sm.reader(state="header")

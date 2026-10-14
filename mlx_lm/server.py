@@ -1452,10 +1452,8 @@ class APIHandler(BaseHTTPRequestHandler):
 
         # Variables to save the generated text, tokens, logprobs, tools etc
         finish_reason = "stop"
-        reasoning_text = ""
+        pending = TextStateMachine.Delta()
         made_tool_call = False
-        tool_calls = []
-        text = ""
         tokens = []
         token_logprobs = []
         top_tokens = []
@@ -1473,10 +1471,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     delta = reader.feed(gen.text)
 
                 # Collect the clean text by state: reasoning, tool, or normal
-                reasoning_text += delta.reasoning
-                text += delta.content
+                pending += delta
                 if delta.tool_calls:
-                    tool_calls += delta.tool_calls
                     made_tool_call = True
 
                 # Add the tokens and logprobs to the vars.
@@ -1486,18 +1482,18 @@ class APIHandler(BaseHTTPRequestHandler):
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
 
-                if self.stream and (text or tool_calls or reasoning_text):
+                if self.stream and (
+                    pending.content or pending.reasoning or pending.tool_calls
+                ):
                     resp = self.generate_response(
-                        text,
+                        pending.content,
                         None,
-                        tool_calls=tool_formatter(tool_calls),
-                        reasoning_text=reasoning_text,
+                        tool_calls=tool_formatter(pending.tool_calls),
+                        reasoning_text=pending.reasoning,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                     self.wfile.flush()
-                    reasoning_text = ""
-                    text = ""
-                    tool_calls = []
+                    pending = TextStateMachine.Delta()
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
@@ -1510,10 +1506,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if self.stream:
                 resp = self.generate_response(
-                    text,
+                    pending.content,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
-                    reasoning_text=reasoning_text,
+                    tool_calls=tool_formatter(pending.tool_calls),
+                    reasoning_text=pending.reasoning,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
@@ -1532,7 +1528,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             else:
                 resp = self.generate_response(
-                    text,
+                    pending.content,
                     finish_reason,
                     len(ctx.prompt),
                     len(tokens),
@@ -1540,8 +1536,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     token_logprobs=token_logprobs,
                     top_tokens=top_tokens,
                     tokens=tokens,
-                    reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    reasoning_text=pending.reasoning,
+                    tool_calls=tool_formatter(pending.tool_calls),
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")

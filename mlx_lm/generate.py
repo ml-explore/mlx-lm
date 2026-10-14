@@ -973,6 +973,14 @@ class TextStateMachine:
                 return self
             return replace(self, tool_calls=self.tool_calls + (text,))
 
+        def __add__(self, other: "TextStateMachine.Delta") -> "TextStateMachine.Delta":
+            return TextStateMachine.Delta(
+                content=self.content + other.content,
+                reasoning=self.reasoning + other.reasoning,
+                tool_calls=self.tool_calls + other.tool_calls,
+                stopped=self.stopped or other.stopped,
+            )
+
     class Reader:
         """One stream's position in a :class:`TextStateMachine`."""
 
