@@ -56,7 +56,8 @@ def get_system_fingerprint():
 
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
-        self._idx = 0
+        # The number of tool calls formatted so far
+        self.count = 0
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
@@ -70,8 +71,8 @@ class ToolCallFormatter:
             "id": tc_id,
         }
         if self._streaming:
-            out["index"] = self._idx
-            self._idx += 1
+            out["index"] = self.count
+        self.count += 1
         return out
 
     def __call__(self, tool_calls):
@@ -1453,7 +1454,6 @@ class APIHandler(BaseHTTPRequestHandler):
         # Variables to save the generated text, tokens, logprobs, tools etc
         finish_reason = "stop"
         pending = TextStateMachine.Delta()
-        made_tool_call = False
         tokens = []
         token_logprobs = []
         top_tokens = []
@@ -1472,8 +1472,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Collect the clean text by state: reasoning, tool, or normal
                 pending += delta
-                if delta.tool_calls:
-                    made_tool_call = True
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1501,14 +1499,16 @@ class APIHandler(BaseHTTPRequestHandler):
                 if delta.stopped:
                     break
 
-            if finish_reason == "stop" and made_tool_call:
+            # Only tool calls that parse count for the finish reason.
+            tool_calls = tool_formatter(pending.tool_calls)
+            if finish_reason == "stop" and tool_formatter.count:
                 finish_reason = "tool_calls"
 
             if self.stream:
                 resp = self.generate_response(
                     pending.content,
                     finish_reason,
-                    tool_calls=tool_formatter(pending.tool_calls),
+                    tool_calls=tool_calls,
                     reasoning_text=pending.reasoning,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -1537,7 +1537,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=pending.reasoning,
-                    tool_calls=tool_formatter(pending.tool_calls),
+                    tool_calls=tool_calls,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
