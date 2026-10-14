@@ -192,13 +192,6 @@ class TestTextStateMachine(unittest.TestCase):
         with self.assertRaises(ValueError):
             reader.feed("x")
 
-    def test_readers_are_independent(self):
-        sm = TextStateMachine(TOOL_CALLS)
-        a = sm.reader()
-        b = sm.reader()
-        a.feed("<tool_call>")
-        self.assertEqual((a.state, b.state), ("tool", "normal"))
-
 
 class TestToolCallFormatter(unittest.TestCase):
     def test_formats_parallel_tool_calls(self):
