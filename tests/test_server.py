@@ -187,6 +187,20 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine.Delta(content="e", reasoning="ad", tool_calls=("bc",)),
         )
 
+    def test_stop_word_does_not_hide_a_marker(self):
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=True,
+            tool_call_start="<tool_call>",
+            tool_call_end="</tool_call>",
+            structural_markers=(),
+        )
+        sm = make_text_state_machine(tokenizer, stop_words=["<tool_call>"])
+        self.assertEqual(
+            sm.reader().feed("<tool_call>x</tool_call>"),
+            TextStateMachine.Delta(tool_calls=("x",)),
+        )
+
     def test_header_text_is_dropped(self):
         sm = TextStateMachine({"header": [("<|message|>", "normal")]})
         reader = sm.reader(state="header")
