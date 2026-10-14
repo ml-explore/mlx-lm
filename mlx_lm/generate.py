@@ -967,6 +967,8 @@ class TextStateMachine:
             return replace(self, reasoning=self.reasoning + text)
 
         def add_tool_call(self, text: str) -> "TextStateMachine.Delta":
+            if not text:
+                return self
             return replace(self, tool_calls=self.tool_calls + (text,))
 
     class Reader:
@@ -1015,9 +1017,7 @@ class TextStateMachine:
         def _close_tool_call(
             self, delta: "TextStateMachine.Delta"
         ) -> "TextStateMachine.Delta":
-            tool_call = self._tool.strip()
-            if tool_call:
-                delta = delta.add_tool_call(tool_call)
+            delta = delta.add_tool_call(self._tool.strip())
             self._tool = ""
             return delta
 
