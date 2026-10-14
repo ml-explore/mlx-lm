@@ -125,7 +125,7 @@ class TestTextStateMachine(unittest.TestCase):
         )
 
     def test_finish_releases_held_text(self):
-        # "</" can start "</tool_call>", so it is held until the end.
+        # "</" can start "</tool_call>".
         reader = TextStateMachine(TOOL_CALLS).reader()
         reader.feed("<tool_call>body</")
         self.assertEqual(
@@ -133,7 +133,6 @@ class TestTextStateMachine(unittest.TestCase):
         )
 
     def test_discard_drops_held_text(self):
-        # On a stop, the held text is the start of the stop word.
         reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
         self.assertEqual(
             reader.feed("hello ST"), TextStateMachine.Delta(content="hello ")
@@ -159,7 +158,7 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(reader.feed("# b"), TextStateMachine.Delta(content=" b"))
 
     def test_text_keeps_its_state(self):
-        # Held text before a marker keeps the state before the marker.
+        # Held text keeps the state it was read in.
         sm = TextStateMachine({**TOOL_CALLS, "reasoning": [("</think>", "normal")]})
         reader = sm.reader(state="reasoning")
         self.assertEqual(
@@ -171,7 +170,7 @@ class TestTextStateMachine(unittest.TestCase):
         )
 
     def test_tool_call_inside_reasoning(self):
-        # The tool call returns to reasoning, also after a stop word in it.
+        # Returns to reasoning, also after a stop word.
         tokenizer = SimpleNamespace(
             has_thinking=True,
             think_start="<think>",
@@ -414,7 +413,7 @@ class TestServer(unittest.TestCase):
             stop_words=[],
         )
 
-        # The tool call has no end marker, so it ends with the stream.
+        # No end marker: the call ends with the stream.
         reader = text_sm.reader()
         self.assertEqual(
             reader.feed("hello[TOOL_CALLS]body"),

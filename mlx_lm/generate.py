@@ -1057,7 +1057,7 @@ class TextStateMachine:
             return self.finish()
 
     def __init__(self, transitions: dict[str, Sequence[Tuple[str, str | None]]]):
-        # Per state: the trie of its markers and their next states.
+        # Per state: its marker trie and next states.
         self._states = {}
         for state, edges in transitions.items():
             markers = [marker for marker, _ in edges]
