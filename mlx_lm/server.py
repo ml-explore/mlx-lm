@@ -1470,7 +1470,6 @@ class APIHandler(BaseHTTPRequestHandler):
                 else:
                     delta = reader.feed(gen.text)
 
-                # Collect the clean text by state: reasoning, tool, or normal
                 pending += delta
 
                 # Add the tokens and logprobs to the vars.

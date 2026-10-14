@@ -972,7 +972,7 @@ class TextStateMachine:
 
         content: str = ""
         reasoning: str = ""
-        tool_calls: Tuple[str, ...] = ()
+        tool_calls: tuple[str, ...] = ()
         stopped: bool = False
 
         def add_content(self, text: str) -> "TextStateMachine.Delta":
@@ -997,13 +997,8 @@ class TextStateMachine:
     class Reader:
         """One stream's position in a :class:`TextStateMachine`."""
 
-        def __init__(
-            self,
-            states: dict[TextState, Tuple[dict, List[TextState | None]]],
-            *,
-            state: TextState,
-        ):
-            self._states = states
+        def __init__(self, machine: "TextStateMachine", *, state: TextState):
+            self._states = machine._states
             self._held = ""
             self._tool = ""
             self._previous = state
@@ -1084,7 +1079,7 @@ class TextStateMachine:
             return self.finish()
 
     def __init__(
-        self, transitions: dict[TextState, Sequence[Tuple[str, TextState | None]]]
+        self, transitions: dict[TextState, Sequence[tuple[str, TextState | None]]]
     ):
         # Per state: its marker trie and next states.
         self._states = {}
@@ -1094,7 +1089,7 @@ class TextStateMachine:
 
     def reader(self, *, state: TextState = "normal") -> "TextStateMachine.Reader":
         """A fresh reader that starts in ``state``."""
-        return self.Reader(self._states, state=state)
+        return self.Reader(self, state=state)
 
 
 def make_stop_sequences(tokenizer, *, stop_words=None):
