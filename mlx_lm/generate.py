@@ -9,7 +9,17 @@ import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass, replace
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -928,6 +938,9 @@ class StopSequences:
         return self.Matcher(self._root)
 
 
+TextState = Literal["normal", "reasoning", "tool", "header", "stop"]
+
+
 class TextStateMachine:
     """Split streamed text into content, reasoning and tool calls.
 
@@ -985,7 +998,10 @@ class TextStateMachine:
         """One stream's position in a :class:`TextStateMachine`."""
 
         def __init__(
-            self, states: dict[str, Tuple[dict, List[str | None]]], *, state: str
+            self,
+            states: dict[TextState, Tuple[dict, List[TextState | None]]],
+            *,
+            state: TextState,
         ):
             self._states = states
             self._held = ""
@@ -993,7 +1009,7 @@ class TextStateMachine:
             self._previous = state
             self._enter(state)
 
-        def _enter(self, state: str) -> None:
+        def _enter(self, state: TextState) -> None:
             self._state = state
             self._root, self._next = self._states.get(state, ({}, []))
             self._node = self._root
@@ -1012,7 +1028,7 @@ class TextStateMachine:
             return delta
 
         def _move(
-            self, delta: "TextStateMachine.Delta", state: str | None
+            self, delta: "TextStateMachine.Delta", state: TextState | None
         ) -> "TextStateMachine.Delta":
             """``None`` is the previous state. Leaving ``tool`` closes the call."""
             if state is None:
@@ -1067,14 +1083,16 @@ class TextStateMachine:
             self._held = ""
             return self.finish()
 
-    def __init__(self, transitions: dict[str, Sequence[Tuple[str, str | None]]]):
+    def __init__(
+        self, transitions: dict[TextState, Sequence[Tuple[str, TextState | None]]]
+    ):
         # Per state: its marker trie and next states.
         self._states = {}
         for state, edges in transitions.items():
             markers = [marker for marker, _ in edges]
             self._states[state] = (_build_trie(markers), [dst for _, dst in edges])
 
-    def reader(self, *, state: str = "normal") -> "TextStateMachine.Reader":
+    def reader(self, *, state: TextState = "normal") -> "TextStateMachine.Reader":
         """A fresh reader that starts in ``state``."""
         return self.Reader(self._states, state=state)
 
