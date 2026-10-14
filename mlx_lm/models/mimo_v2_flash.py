@@ -47,6 +47,7 @@ class ModelArgs(BaseModelArgs):
     swa_head_dim: int
     swa_v_head_dim: int
     partial_rotary_factor: int
+    attention_value_scale: Optional[float] = None
 
 
 class Attention(nn.Module):
@@ -71,6 +72,7 @@ class Attention(nn.Module):
             rope_theta = args.rope_theta
 
         self.scale = head_dim**-0.5
+        self.value_scale = args.attention_value_scale
 
         self.q_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
         self.k_proj = nn.Linear(dim, n_kv_heads * head_dim, bias=False)
@@ -100,6 +102,8 @@ class Attention(nn.Module):
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
+        if self.value_scale is not None:
+            values = values * self.value_scale
 
         if cache is not None:
             queries = self.rope(queries, offset=cache.offset)
