@@ -1451,11 +1451,9 @@ class APIHandler(BaseHTTPRequestHandler):
         reader = ctx.text_sm.reader(state=ctx.initial_state)
 
         # Variables to save the generated text, tokens, logprobs, tools etc
-        prev_state = ctx.initial_state
         finish_reason = "stop"
         reasoning_text = ""
         made_tool_call = False
-        tool_text = ""
         tool_calls = []
         text = ""
         tokens = []
@@ -1468,25 +1466,19 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 # Advance the text state machine to strip control sequences.
                 # On a stop, the held text is dropped.
-                segments = []
-                if gen.finish_reason != "stop":
-                    segments = reader.feed(gen.text)
-                if gen.finish_reason == "length":
-                    segments += reader.flush()
+                if gen.finish_reason == "stop":
+                    delta = reader.finish(drop_held=True)
+                elif gen.finish_reason == "length":
+                    delta = reader.finish(gen.text)
+                else:
+                    delta = reader.feed(gen.text)
 
-                # Collect the clean text by state: reasoning, tool, or normal
-                for current_state, clean_text in segments:
-                    if prev_state == "tool" and current_state != "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    if current_state == "reasoning":
-                        reasoning_text += clean_text
-                    elif current_state == "tool":
-                        tool_text += clean_text
-                    elif current_state == "normal":
-                        text += clean_text
-                    prev_state = current_state
+                # Collect the clean text: reasoning, tool calls, or normal
+                reasoning_text += delta.reasoning
+                text += delta.content
+                if delta.tool_calls:
+                    tool_calls += delta.tool_calls
+                    made_tool_call = True
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1514,10 +1506,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
-
-            if prev_state == "tool" and tool_text:
-                tool_calls.append(tool_text)
-                made_tool_call = True
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"

@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
@@ -928,8 +928,8 @@ class StopSequences:
 
 
 class TextStateMachine:
-    """Split streamed text by state (reasoning, tool call, ...) and remove the
-    markers that change the state.
+    """Split streamed text into content, reasoning and tool calls, and remove
+    the markers that change the state.
 
     ``transitions`` maps a state to its ``(marker, next_state)`` pairs. Markers
     are matched on decoded text rather than token ids, so a marker split over
@@ -937,6 +937,10 @@ class TextStateMachine:
     change; each stream reads through its own :class:`TextStateMachine.Reader`.
 
     A ``next_state`` of ``None`` returns to the state before the current one.
+
+    The text of the ``normal`` state is the content, of ``reasoning`` the
+    reasoning, and each visit to ``tool`` one tool call. The text of ``header``
+    (message headers) is dropped. Other states raise a ``ValueError``.
 
     Example:
 
@@ -948,9 +952,26 @@ class TextStateMachine:
             }
         )
         reader = sm.reader(state="normal")
-        reader.feed("<think>Hmm.</think>Hi")
-        # [("normal", ""), ("reasoning", "Hmm."), ("normal", "Hi")]
+        reader.feed("<think>Hmm.</think>Hi<tool_call>{}</tool_call>")
+        # Delta(content="Hi", reasoning="Hmm.", tool_calls=("{}",))
     """
+
+    @dataclass(frozen=True)
+    class Delta:
+        """The new text of a response, as in a chat completion delta."""
+
+        content: str = ""
+        reasoning: str = ""
+        tool_calls: Tuple[str, ...] = ()
+
+        def add_content(self, text: str) -> "TextStateMachine.Delta":
+            return replace(self, content=self.content + text)
+
+        def add_reasoning(self, text: str) -> "TextStateMachine.Delta":
+            return replace(self, reasoning=self.reasoning + text)
+
+        def add_tool_call(self, text: str) -> "TextStateMachine.Delta":
+            return replace(self, tool_calls=self.tool_calls + (text,))
 
     class Reader:
         """One stream's position in a :class:`TextStateMachine`."""
@@ -960,6 +981,7 @@ class TextStateMachine:
         ):
             self._states = states
             self._held = ""
+            self._tool = ""
             self._previous = state
             self._enter(state)
 
@@ -968,13 +990,47 @@ class TextStateMachine:
             self._root, self._next = self._states.get(state, ({}, []))
             self._node = self._root
 
-        def feed(self, text: str) -> List[Tuple[str, str]]:
-            """Read a chunk of text. Returns one ``(state, text)`` per state
-            passed, the last for the current state. The end of the chunk that
-            can still start a marker is held back for the next chunk."""
+        def _add(
+            self, delta: "TextStateMachine.Delta", text: str
+        ) -> "TextStateMachine.Delta":
+            """Return ``delta`` with the text of the current state added."""
+            if self.state == "normal":
+                return delta.add_content(text)
+            if self.state == "reasoning":
+                return delta.add_reasoning(text)
+            if self.state == "tool":
+                self._tool += text
+            elif self.state != "header":
+                raise ValueError(f"Unknown state {self.state!r}.")
+            return delta
+
+        def _move(
+            self, delta: "TextStateMachine.Delta", state: str | None
+        ) -> "TextStateMachine.Delta":
+            """Move to ``state``, where ``None`` is the state before the current
+            one. Leaving ``tool`` closes the tool call."""
+            if state is None:
+                state = self._previous
+            if state != self.state:
+                if self.state == "tool":
+                    delta = self._close_tool_call(delta)
+                self._previous = self.state
+            self._enter(state)
+            return delta
+
+        def _close_tool_call(
+            self, delta: "TextStateMachine.Delta"
+        ) -> "TextStateMachine.Delta":
+            delta = delta.add_tool_call(self._tool)
+            self._tool = ""
+            return delta
+
+        def feed(self, text: str) -> "TextStateMachine.Delta":
+            """Read a chunk of text. The end of the chunk that can still start
+            a marker is held back for the next chunk."""
+            delta = TextStateMachine.Delta()
             start = len(self._held)
             text = self._held + text
-            segments = []
             begin = 0
             for i in range(start, len(text)):
                 ch = text[i]
@@ -984,25 +1040,28 @@ class TextStateMachine:
                 self._node = node.get(ch, self._root)
                 match = self._node.get("__match__")
                 if match is not None:
-                    segments.append((self.state, text[begin : i + 1 - len(match[0])]))
+                    before = text[begin : i + 1 - len(match[0])]
+                    delta = self._add(delta, before)
+                    delta = self._move(delta, self._next[match[1]])
                     begin = i + 1
-                    state = self._next[match[1]]
-                    if state is None:
-                        state = self._previous
-                    elif state != self.state:
-                        self._previous = self.state
-                    self._enter(state)
             end = len(text) - self._node.get("__depth__", 0)
-            segments.append((self.state, text[begin:end]))
+            delta = self._add(delta, text[begin:end])
             self._held = text[end:]
-            return segments
+            return delta
 
-        def flush(self) -> List[Tuple[str, str]]:
-            """Release the held text, at the end of the stream."""
-            held = self._held
+        def finish(
+            self, text: str = "", *, drop_held: bool = False
+        ) -> "TextStateMachine.Delta":
+            """Read the last chunk of the stream. The held text is released,
+            unless ``drop_held``, and an open tool call is closed."""
+            delta = self.feed(text)
+            if not drop_held:
+                delta = self._add(delta, self._held)
             self._held = ""
             self._node = self._root
-            return [(self.state, held)]
+            if self._tool:
+                delta = self._close_tool_call(delta)
+            return delta
 
     def __init__(
         self,

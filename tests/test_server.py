@@ -114,59 +114,49 @@ TOOL_CALLS = {
 }
 
 
-def read(reader, *chunks):
-    """The segments with text, of the chunks and then of the flush."""
-    segments = []
-    for chunk in chunks:
-        segments += reader.feed(chunk)
-    segments += reader.flush()
-    return [(state, text) for state, text in segments if text]
-
-
 class TestTextStateMachine(unittest.TestCase):
     """Test the TextStateMachine buffering and stripping behavior."""
 
     def test_strips_control_sequences(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
         self.assertEqual(
-            read(reader, "hi <tool_call>body</tool_call> bye"),
-            [("normal", "hi "), ("tool", "body"), ("normal", " bye")],
+            reader.feed("hi <tool_call>body</tool_call> bye"),
+            TextStateMachine.Delta(content="hi  bye", tool_calls=("body",)),
         )
 
     def test_back_to_back_tool_calls(self):
-        # The normal segment between the calls separates them.
         reader = TextStateMachine(TOOL_CALLS).reader()
-        segments = reader.feed("<tool_call>a</tool_call><tool_call>b</tool_call>")
         self.assertEqual(
-            segments,
-            [
-                ("normal", ""),
-                ("tool", "a"),
-                ("normal", ""),
-                ("tool", "b"),
-                ("normal", ""),
-            ],
+            reader.feed("<tool_call>a</tool_call><tool_call>b</tool_call>"),
+            TextStateMachine.Delta(tool_calls=("a", "b")),
         )
 
-    def test_partial_match_held_then_flushed(self):
+    def test_partial_match_held_then_finished(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
         # "</" can start "</tool_call>", so it is held.
-        self.assertEqual(
-            reader.feed("<tool_call>body</"), [("normal", ""), ("tool", "body")]
-        )
+        self.assertEqual(reader.feed("<tool_call>body</"), TextStateMachine.Delta())
         self.assertEqual(reader.state, "tool")
-        self.assertEqual(reader.flush(), [("tool", "</")])
+        self.assertEqual(
+            reader.finish(), TextStateMachine.Delta(tool_calls=("body</",))
+        )
+
+    def test_finish_drops_held_text(self):
+        # On a stop, the held text is the start of the stop word.
+        reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
+        self.assertEqual(
+            reader.feed("hello ST"), TextStateMachine.Delta(content="hello ")
+        )
+        self.assertEqual(reader.finish(drop_held=True), TextStateMachine.Delta())
 
     def test_holds_only_what_can_start_a_marker(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
-        self.assertEqual(reader.feed("a <<"), [("normal", "a <")])
+        self.assertEqual(reader.feed("a <<"), TextStateMachine.Delta(content="a <"))
 
     def test_held_text_is_read_once(self):
         # A stop word split over two chunks.
         reader = TextStateMachine({"normal": [("##", "normal")]}).reader()
-        self.assertEqual(
-            read(reader, "a #", "# b"), [("normal", "a "), ("normal", " b")]
-        )
+        self.assertEqual(reader.feed("a #"), TextStateMachine.Delta(content="a "))
+        self.assertEqual(reader.feed("# b"), TextStateMachine.Delta(content=" b"))
 
     def test_text_keeps_its_state(self):
         # Text before a marker belongs to the state before it, also when it was
@@ -174,17 +164,18 @@ class TestTextStateMachine(unittest.TestCase):
         sm = TextStateMachine({**TOOL_CALLS, "reasoning": [("</think>", "normal")]})
         reader = sm.reader(state="reasoning")
         self.assertEqual(
-            reader.feed("hmm</think>Hi <"), [("reasoning", "hmm"), ("normal", "Hi ")]
+            reader.feed("hmm</think>Hi <"),
+            TextStateMachine.Delta(content="Hi ", reasoning="hmm"),
         )
         self.assertEqual(
-            reader.feed("<tool_call>{}"), [("normal", "<"), ("tool", "{}")]
+            reader.feed("<tool_call>{}"), TextStateMachine.Delta(content="<")
         )
 
     def test_stop_words_stripped(self):
         reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
         self.assertEqual(
-            read(reader, "hello STOP world"),
-            [("normal", "hello "), ("normal", " world")],
+            reader.feed("hello STOP world"),
+            TextStateMachine.Delta(content="hello  world"),
         )
 
     def test_reasoning_to_tool_transition(self):
@@ -205,8 +196,7 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(reader.state, "normal")
 
     def test_tool_call_inside_reasoning(self):
-        # The tool call returns to reasoning, also after a stop word in it, and
-        # a reasoning segment separates two tool calls.
+        # The tool call returns to reasoning, also after a stop word in it.
         tokenizer = SimpleNamespace(
             has_thinking=True,
             think_start="<think>",
@@ -222,35 +212,42 @@ class TestTextStateMachine(unittest.TestCase):
             reader.feed(
                 "a<tool_call>bSTOPc</tool_call><tool_call>d</tool_call>e</think>f"
             ),
-            [
-                ("reasoning", "a"),
-                ("tool", "b"),
-                ("tool", "c"),
-                ("reasoning", ""),
-                ("tool", "d"),
-                ("reasoning", "e"),
-                ("normal", "f"),
-            ],
+            TextStateMachine.Delta(content="f", reasoning="ae", tool_calls=("bc", "d")),
         )
 
     def test_empty_end_marker_stays_in_tool(self):
-        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool".
+        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool",
+        # so the tool call ends with the stream.
         sm = TextStateMachine({"normal": [("[TOOL_CALLS]", "tool")], "tool": []})
         reader = sm.reader()
-        self.assertEqual(
-            reader.feed("[TOOL_CALLS]f[ARGS]{}"),
-            [("normal", ""), ("tool", "f[ARGS]{}")],
-        )
+        self.assertEqual(reader.feed("[TOOL_CALLS]f[ARGS]{}"), TextStateMachine.Delta())
         self.assertEqual(reader.state, "tool")
+        self.assertEqual(
+            reader.finish(), TextStateMachine.Delta(tool_calls=("f[ARGS]{}",))
+        )
+
+    def test_header_text_is_dropped(self):
+        sm = TextStateMachine({"header": [("<|message|>", "normal")]})
+        reader = sm.reader(state="header")
+        self.assertEqual(
+            reader.feed("to=user<|message|>Hi"), TextStateMachine.Delta(content="Hi")
+        )
+
+    def test_unknown_state_raises(self):
+        reader = TextStateMachine({}).reader(state="other")
+        with self.assertRaises(ValueError):
+            reader.feed("x")
 
     def test_readers_are_independent(self):
         sm = TextStateMachine(TOOL_CALLS)
         a = sm.reader()
         # A state without markers passes all text through.
-        b = sm.reader(state="header")
+        b = sm.reader(state="reasoning")
         a.feed("<tool_call>")
         self.assertEqual(a.state, "tool")
-        self.assertEqual(b.feed("<tool_call>x"), [("header", "<tool_call>x")])
+        self.assertEqual(
+            b.feed("<tool_call>x"), TextStateMachine.Delta(reasoning="<tool_call>x")
+        )
         self.assertEqual(sm.reader().state, "normal")
 
 
@@ -469,10 +466,13 @@ class TestServer(unittest.TestCase):
 
         # Verify the text state machine strips tool call markers
         reader = text_sm.reader()
-        segments = reader.feed("hello[TOOL_CALLS]body")
+        self.assertEqual(
+            reader.feed("hello[TOOL_CALLS]body"),
+            TextStateMachine.Delta(content="hello"),
+        )
         self.assertEqual(reader.state, "tool")
-        # 'hello' is before the match, 'body' flows through (no tool_call_end)
-        self.assertEqual(segments, [("normal", "hello"), ("tool", "body")])
+        # The tool call has no end marker, so it ends with the stream.
+        self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
 
         # Verify EOS stops via the stop matcher
         self.assertTrue(stop_sequences.matcher().advance(2))
