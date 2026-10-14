@@ -1496,6 +1496,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     finish_reason = gen.finish_reason
 
                 if delta.stopped:
+                    finish_reason = "stop"
                     break
 
             # Only tool calls that parse count for the finish reason.
