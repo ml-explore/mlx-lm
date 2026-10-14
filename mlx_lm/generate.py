@@ -852,23 +852,24 @@ def _normalize_logits_processors(logits_processors, *, n):
     return [tuple(lp) if lp else () for lp in logits_processors]
 
 
-def _build_trie(sequences):
+def _build_trie(sequences: Sequence[Any]) -> dict:
     """Build an Aho-Corasick trie from the provided sequences
 
-    See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm .
+    See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm . Each node keeps
+    in ``__depth__`` the length of the prefix it matches.
     """
     trie = {}
     for idx, seq in enumerate(sequences):
         node = trie
         try:
-            for tok in seq:
-                node = node.setdefault(tok, {})
+            for depth, tok in enumerate(seq, 1):
+                node = node.setdefault(tok, {"__depth__": depth})
             if node is trie:
                 # An empty pattern would make the root match every token.
                 continue
             node["__match__"] = (tuple(seq), idx)
         except TypeError:
-            node = node.setdefault(seq, {})
+            node = node.setdefault(seq, {"__depth__": 1})
             node["__match__"] = ((seq,), idx)
 
     # BFS to set failure links and propagate matches.
@@ -881,7 +882,7 @@ def _build_trie(sequences):
     while queue:
         parent = queue.popleft()
         for key, child in parent.items():
-            if key in ("__fail__", "__match__"):
+            if key in ("__fail__", "__match__", "__depth__"):
                 continue
             queue.append(child)
             fail = parent["__fail__"]
@@ -927,94 +928,84 @@ class StopSequences:
 
 
 class TextStateMachine:
-    """A state machine that matches decoded text to track state transitions
-    (reasoning, tool calling) and strip the matched control sequences from the
-    output.
+    """Split streamed text by state (reasoning, tool call, ...) and remove the
+    markers that change the state.
 
-    Transitions are provided as state -> [(text, new_state)]. Matching on text
-    rather than token ids is robust to tokenization differences (e.g. a
-    marker's trailing ``>`` being merged with the following byte).
-
-    The runtime state carries a buffer holding text that might be part of a
-    control sequence. Text is only emitted once it is known not to be part of
-    any match.
+    ``transitions`` maps a state to its ``(marker, next_state)`` pairs. Markers
+    are matched on decoded text rather than token ids, so a marker split over
+    tokens, or merged with the next byte, still matches. The machine does not
+    change; each stream reads through its own :class:`TextStateMachine.Reader`.
 
     Example:
 
         sm = TextStateMachine(
-            transitions={
+            {
                 "normal": [("<think>", "reasoning"), ("<tool_call>", "tool")],
                 "reasoning": [("</think>", "normal")],
                 "tool": [("</tool_call>", "normal")],
-            },
+            }
         )
-        state = sm.make_state(initial="normal")
+        reader = sm.reader("normal")
+        reader.feed("<think>Hmm.</think>Hi")
+        # [("normal", ""), ("reasoning", "Hmm."), ("normal", "Hi")]
     """
 
-    def __init__(self, transitions=None):
+    class Reader:
+        """One stream's position in a :class:`TextStateMachine`."""
+
+        def __init__(self, states: dict[str, Tuple[dict, List[str]]], state: str):
+            self._states = states
+            self._held = ""
+            self._enter(state)
+
+        def _enter(self, state: str):
+            self.state = state
+            self._root, self._next = self._states.get(state, ({}, []))
+            self._node = self._root
+
+        def feed(self, text: str) -> List[Tuple[str, str]]:
+            """Read a chunk of text. Returns one ``(state, text)`` per state
+            passed, the last for the current state. The end of the chunk that
+            can still start a marker is held back for the next chunk."""
+            start = len(self._held)
+            text = self._held + text
+            segments = []
+            begin = 0
+            for i in range(start, len(text)):
+                ch = text[i]
+                node = self._node
+                while ch not in node and node is not self._root:
+                    node = node["__fail__"]
+                self._node = node.get(ch, self._root)
+                match = self._node.get("__match__")
+                if match is not None:
+                    segments.append((self.state, text[begin : i + 1 - len(match[0])]))
+                    begin = i + 1
+                    self._enter(self._next[match[1]])
+            end = len(text) - self._node.get("__depth__", 0)
+            segments.append((self.state, text[begin:end]))
+            self._held = text[end:]
+            return segments
+
+        def flush(self) -> List[Tuple[str, str]]:
+            """Release the held text, at the end of the stream."""
+            held = self._held
+            self._held = ""
+            self._node = self._root
+            return [(self.state, held)]
+
+    def __init__(
+        self, transitions: Optional[dict[str, Sequence[Tuple[str, str]]]] = None
+    ):
+        # Per state: a trie of its markers, and the state each marker leads to.
         self._states = {}
-        for src, edges in (transitions or {}).items():
-            strings, dst = zip(*edges) if edges else ([], [])
-            self._states[src] = (_build_trie(strings), dst)
+        for state, edges in (transitions or {}).items():
+            markers = [marker for marker, _ in edges]
+            self._states[state] = (_build_trie(markers), [dst for _, dst in edges])
 
-    def make_state(self, initial="normal"):
-        """Create a fresh runtime state (state_name, trie_node, states, buffer)."""
-        if initial not in self._states:
-            self._states[initial] = (_build_trie([]), [])
-        return (initial, self._states[initial][0], self._states, "")
-
-    @staticmethod
-    def step(state, text):
-        """Consume a chunk of decoded text.
-
-        Returns (new_state, emittable_text, current_state_name) where
-        emittable_text is the text safe to show (control sequences stripped,
-        possible partial matches held back in the buffer).
-        """
-        s, n, states, buf = state
-        buf += text
-        trie = states[s][0]
-        emittable = ""
-        # buf[:consumed] has been emitted or discarded; buf[consumed:] pending.
-        consumed = 0
-
-        for i in range(len(buf)):
-            ch = buf[i]
-            while ch not in n and n is not trie:
-                n = n["__fail__"]
-            if ch in n:
-                n = n[ch]
-
-            match = n.get("__match__")
-            if match is not None:
-                match_start = i + 1 - len(match[0])
-                emittable += buf[consumed:match_start]
-                consumed = i + 1
-                s = states[s][1][match[1]]
-                if s is None:
-                    return (s, None, states, buf[consumed:]), emittable, s
-                trie = states[s][0]
-                n = trie
-            elif n is trie:
-                # At the root: no partial match in progress, everything is safe.
-                emittable += buf[consumed : i + 1]
-                consumed = i + 1
-
-        return (s, n, states, buf[consumed:]), emittable, s
-
-    @staticmethod
-    def flush(state):
-        """Emit the remaining buffer (use on finish_reason="length")."""
-        s, _, states, buf = state
-        trie = states[s][0] if s is not None else None
-        return (s, trie, states, ""), buf, s
-
-    @staticmethod
-    def discard(state):
-        """Drop the remaining buffer (use on finish_reason="stop")."""
-        s, _, states, _ = state
-        trie = states[s][0] if s is not None else None
-        return (s, trie, states, ""), s
+    def reader(self, state: str = "normal") -> "TextStateMachine.Reader":
+        """A fresh reader that starts in ``state``."""
+        return self.Reader(self._states, state)
 
 
 def make_stop_sequences(tokenizer, stop_words=None):

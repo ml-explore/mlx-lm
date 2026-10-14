@@ -107,76 +107,84 @@ class MockCache:
         return n
 
 
+TOOL_CALLS = {
+    "normal": [("<tool_call>", "tool")],
+    "tool": [("</tool_call>", "normal")],
+}
+
+
+def read(reader, *chunks):
+    """The segments with text, of the chunks and then of the flush."""
+    segments = []
+    for chunk in chunks:
+        segments += reader.feed(chunk)
+    segments += reader.flush()
+    return [(state, text) for state, text in segments if text]
+
+
 class TestTextStateMachine(unittest.TestCase):
     """Test the TextStateMachine buffering and stripping behavior."""
 
     def test_strips_control_sequences(self):
-        sm = TextStateMachine(
-            {
-                "normal": [("<tool_call>", "tool")],
-                "tool": [("</tool_call>", "normal")],
-            }
+        reader = TextStateMachine(TOOL_CALLS).reader()
+        self.assertEqual(
+            read(reader, "hi <tool_call>body</tool_call> bye"),
+            [("normal", "hi "), ("tool", "body"), ("normal", " bye")],
         )
-        state = sm.make_state()
-        state, text, _ = sm.step(state, "hi <tool_call>body</tool_call> bye")
-        state, rest, _ = sm.flush(state)
-        full = text + rest
-        self.assertEqual(full, "hi body bye")
 
     def test_back_to_back_tool_calls(self):
-        sm = TextStateMachine(
-            {
-                "normal": [("<tool_call>", "tool")],
-                "tool": [("</tool_call>", "normal")],
-            }
+        # The normal segment between the calls separates them.
+        reader = TextStateMachine(TOOL_CALLS).reader()
+        segments = reader.feed("<tool_call>a</tool_call><tool_call>b</tool_call>")
+        self.assertEqual(
+            segments,
+            [
+                ("normal", ""),
+                ("tool", "a"),
+                ("normal", ""),
+                ("tool", "b"),
+                ("normal", ""),
+            ],
         )
-        state = sm.make_state()
-        state, t1, _ = sm.step(state, "<tool_call>call1</tool_call>")
-        state, t2, _ = sm.step(state, "<tool_call>call2</tool_call>")
-        state, rest, _ = sm.flush(state)
-        full = t1 + t2 + rest
-        self.assertEqual(full, "call1call2")
 
-    def test_partial_match_buffered_then_flushed(self):
-        sm = TextStateMachine(
-            {
-                "normal": [("<tool_call>", "tool")],
-                "tool": [("</tool_call>", "normal")],
-            }
+    def test_partial_match_held_then_flushed(self):
+        reader = TextStateMachine(TOOL_CALLS).reader()
+        # "</" can start "</tool_call>", so it is held.
+        self.assertEqual(
+            reader.feed("<tool_call>body</"), [("normal", ""), ("tool", "body")]
         )
-        # First enter tool state
-        state = sm.make_state()
-        state, text, s = sm.step(state, "<tool_call>body</")
-        self.assertEqual(s, "tool")
-        # 'body' is emitted, '</' is buffered (partial match of '</tool_call>')
-        self.assertEqual(text, "body")
-        # flush releases the buffered text
-        state, rest, s = sm.flush(state)
-        self.assertEqual(rest, "</")
+        self.assertEqual(reader.state, "tool")
+        self.assertEqual(reader.flush(), [("tool", "</")])
 
-    def test_discard_drops_buffer(self):
-        sm = TextStateMachine(
-            {
-                "normal": [("STOP", "normal")],
-            }
+    def test_holds_only_what_can_start_a_marker(self):
+        reader = TextStateMachine(TOOL_CALLS).reader()
+        self.assertEqual(reader.feed("a <<"), [("normal", "a <")])
+
+    def test_held_text_is_read_once(self):
+        # A stop word split over two chunks.
+        reader = TextStateMachine({"normal": [("##", "normal")]}).reader()
+        self.assertEqual(
+            read(reader, "a #", "# b"), [("normal", "a "), ("normal", " b")]
         )
-        state = sm.make_state()
-        state, text, s = sm.step(state, "hello ST")
-        self.assertEqual(text, "hello ")
-        # discard drops the buffered 'ST'
-        state, s = sm.discard(state)
-        self.assertEqual(s, "normal")
+
+    def test_text_keeps_its_state(self):
+        # Text before a marker belongs to the state before it, also when it was
+        # held from the previous chunk.
+        sm = TextStateMachine({**TOOL_CALLS, "reasoning": [("</think>", "normal")]})
+        reader = sm.reader("reasoning")
+        self.assertEqual(
+            reader.feed("hmm</think>Hi <"), [("reasoning", "hmm"), ("normal", "Hi ")]
+        )
+        self.assertEqual(
+            reader.feed("<tool_call>{}"), [("normal", "<"), ("tool", "{}")]
+        )
 
     def test_stop_words_stripped(self):
-        sm = TextStateMachine(
-            {
-                "normal": [("STOP", "normal")],
-            }
+        reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
+        self.assertEqual(
+            read(reader, "hello STOP world"),
+            [("normal", "hello "), ("normal", " world")],
         )
-        state = sm.make_state()
-        state, text, _ = sm.step(state, "hello STOP world")
-        state, rest, _ = sm.flush(state)
-        self.assertEqual(text + rest, "hello  world")
 
     def test_reasoning_to_tool_transition(self):
         # A tool call started inside a reasoning block must enter "tool".
@@ -187,29 +195,33 @@ class TestTextStateMachine(unittest.TestCase):
                 "tool": [("</tool>", "normal")],
             }
         )
-        state = sm.make_state()
-        state, _, s = sm.step(state, "<think>hmm")
-        self.assertEqual(s, "reasoning")
-        state, _, s = sm.step(state, "<tool>")
-        self.assertEqual(s, "tool")
-        state, _, s = sm.step(state, "</tool>")
-        self.assertEqual(s, "normal")
+        reader = sm.reader()
+        reader.feed("<think>hmm")
+        self.assertEqual(reader.state, "reasoning")
+        reader.feed("<tool>")
+        self.assertEqual(reader.state, "tool")
+        reader.feed("</tool>")
+        self.assertEqual(reader.state, "normal")
 
-    def test_empty_end_marker_stays_in_tool_on_discard(self):
-        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool";
-        # discard on stop must preserve the state so the tool call is flushed.
-        sm = TextStateMachine(
-            {
-                "normal": [("[TOOL_CALLS]", "tool")],
-                "tool": [],
-            }
+    def test_empty_end_marker_stays_in_tool(self):
+        # Models with an empty tool_call_end (e.g. Mistral) never leave "tool".
+        sm = TextStateMachine({"normal": [("[TOOL_CALLS]", "tool")], "tool": []})
+        reader = sm.reader()
+        self.assertEqual(
+            reader.feed("[TOOL_CALLS]f[ARGS]{}"),
+            [("normal", ""), ("tool", "f[ARGS]{}")],
         )
-        state = sm.make_state()
-        state, text, s = sm.step(state, "[TOOL_CALLS]f[ARGS]{}")
-        self.assertEqual(s, "tool")
-        self.assertEqual(text, "f[ARGS]{}")
-        state, s = sm.discard(state)
-        self.assertEqual(s, "tool")
+        self.assertEqual(reader.state, "tool")
+
+    def test_readers_are_independent(self):
+        sm = TextStateMachine(TOOL_CALLS)
+        a = sm.reader()
+        # A state without markers passes all text through.
+        b = sm.reader("header")
+        a.feed("<tool_call>")
+        self.assertEqual(a.state, "tool")
+        self.assertEqual(b.feed("<tool_call>x"), [("header", "<tool_call>x")])
+        self.assertEqual(sm.reader().state, "normal")
 
 
 class TestToolCallFormatter(unittest.TestCase):
@@ -426,11 +438,11 @@ class TestServer(unittest.TestCase):
         )
 
         # Verify the text state machine strips tool call markers
-        text_state = text_sm.make_state()
-        text_state, clean_text, s = text_sm.step(text_state, "hello[TOOL_CALLS]body")
-        self.assertEqual(s, "tool")
+        reader = text_sm.reader()
+        segments = reader.feed("hello[TOOL_CALLS]body")
+        self.assertEqual(reader.state, "tool")
         # 'hello' is before the match, 'body' flows through (no tool_call_end)
-        self.assertEqual(clean_text, "hellobody")
+        self.assertEqual(segments, [("normal", "hello"), ("tool", "body")])
 
         # Verify EOS stops via the stop matcher
         self.assertTrue(stop_sequences.matcher().advance(2))

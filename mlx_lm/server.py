@@ -1448,7 +1448,7 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
         # Initialize the text state machine
-        sm_state = ctx.text_sm.make_state(ctx.initial_state)
+        reader = ctx.text_sm.reader(ctx.initial_state)
 
         # Variables to save the generated text, tokens, logprobs, tools etc
         prev_state = ctx.initial_state
@@ -1466,32 +1466,27 @@ class APIHandler(BaseHTTPRequestHandler):
             for gen in response:
                 logging.debug(gen.text)
 
-                # Advance the text state machine to strip control sequences
-                if gen.finish_reason == "stop":
-                    sm_state, current_state = TextStateMachine.discard(sm_state)
-                    clean_text = ""
-                elif gen.finish_reason == "length":
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
-                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                    clean_text += flushed
-                else:
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                # Advance the text state machine to strip control sequences.
+                # On a stop, the held text is dropped.
+                segments = []
+                if gen.finish_reason != "stop":
+                    segments = reader.feed(gen.text)
+                if gen.finish_reason == "length":
+                    segments += reader.flush()
 
                 # Collect the clean text by state: reasoning, tool, or normal
-                if current_state == "reasoning":
-                    reasoning_text += clean_text
-                elif current_state == "tool":
-                    tool_text += clean_text
-                elif current_state == "normal":
-                    if prev_state == "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    text += clean_text
+                for current_state, clean_text in segments:
+                    if current_state == "reasoning":
+                        reasoning_text += clean_text
+                    elif current_state == "tool":
+                        tool_text += clean_text
+                    elif current_state == "normal":
+                        if prev_state == "tool":
+                            tool_calls.append(tool_text)
+                            tool_text = ""
+                            made_tool_call = True
+                        text += clean_text
+                    prev_state = current_state
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1502,7 +1497,7 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if (
                     self.stream
-                    and current_state != "tool"
+                    and reader.state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
                     resp = self.generate_response(
@@ -1519,8 +1514,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
-
-                prev_state = current_state
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
