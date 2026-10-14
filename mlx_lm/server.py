@@ -1482,11 +1482,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
 
-                if (
-                    self.stream
-                    and reader.state != "tool"
-                    and (text or tool_calls or reasoning_text)
-                ):
+                if self.stream and (text or tool_calls or reasoning_text):
                     resp = self.generate_response(
                         text,
                         None,

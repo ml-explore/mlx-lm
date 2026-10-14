@@ -986,7 +986,7 @@ class TextStateMachine:
             self._enter(state)
 
         def _enter(self, state: str) -> None:
-            self.state = state
+            self._state = state
             self._root, self._next = self._states.get(state, ({}, []))
             self._node = self._root
 
@@ -994,14 +994,14 @@ class TextStateMachine:
             self, delta: "TextStateMachine.Delta", text: str
         ) -> "TextStateMachine.Delta":
             """Return ``delta`` with the text of the current state added."""
-            if self.state == "normal":
+            if self._state == "normal":
                 return delta.add_content(text)
-            if self.state == "reasoning":
+            if self._state == "reasoning":
                 return delta.add_reasoning(text)
-            if self.state == "tool":
+            if self._state == "tool":
                 self._tool += text
-            elif self.state != "header":
-                raise ValueError(f"Unknown state {self.state!r}.")
+            elif self._state != "header":
+                raise ValueError(f"Unknown state {self._state!r}.")
             return delta
 
         def _move(
@@ -1011,10 +1011,10 @@ class TextStateMachine:
             one. Leaving ``tool`` closes the tool call."""
             if state is None:
                 state = self._previous
-            if state != self.state:
-                if self.state == "tool":
+            if state != self._state:
+                if self._state == "tool":
                     delta = self._close_tool_call(delta)
-                self._previous = self.state
+                self._previous = self._state
             self._enter(state)
             return delta
 
