@@ -3203,6 +3203,59 @@ class TestModels(unittest.TestCase):
         err = mx.abs(got[uids[1]] - alone).max().item()
         self.assertLess(err, 1e-5)
 
+    def test_muse_spark_hf_expert_weights_split_for_switch_glu(self):
+        from mlx_lm.models import muse_spark
+
+        args = muse_spark.ModelArgs.from_dict(
+            {
+                "model_type": "muse_spark",
+                "text_config": {
+                    "model_type": "muse_spark_text",
+                    "vocab_size": 32,
+                    "hidden_size": 16,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "head_dim": 8,
+                    "moe_hidden_size": 8,
+                    "moe_intermediate_size": 3,
+                    "num_local_experts": 2,
+                    "num_experts_per_tok": 1,
+                },
+            }
+        )
+        self.assertEqual(args.model_type, "muse_spark")
+        model = muse_spark.Model(args)
+
+        gate_up = mx.arange(2 * 6 * 8, dtype=mx.float32).reshape(2, 6, 8)
+        down = mx.arange(2 * 8 * 3, dtype=mx.float32).reshape(2, 8, 3)
+        prefix = "model.language_model.layers.0.mlp.experts."
+        converted = model.sanitize(
+            {
+                prefix + "gate_up_proj": gate_up,
+                prefix + "down_proj": down,
+                prefix + "post_expert_norm.weight": mx.zeros((8,)),
+                "model.vision_tower.weight": mx.zeros((1,)),
+                "model.audio_tower.weight": mx.zeros((1,)),
+            }
+        )
+
+        switch = "model.layers.0.mlp.switch_mlp."
+        self.assertEqual(
+            sorted(converted),
+            [
+                "model.layers.0.mlp.post_expert_norm.weight",
+                switch + "down_proj.weight",
+                switch + "gate_proj.weight",
+                switch + "up_proj.weight",
+            ],
+        )
+        gate = converted[switch + "gate_proj.weight"]
+        up = converted[switch + "up_proj.weight"]
+        self.assertTrue(mx.array_equal(gate, gate_up[:, :3]))
+        self.assertTrue(mx.array_equal(up, gate_up[:, 3:]))
+        self.assertTrue(mx.array_equal(converted[switch + "down_proj.weight"], down))
+
     def test_laguna_sanitize(self):
         from mlx_lm.models import laguna
 
@@ -4472,6 +4525,29 @@ class TestModels(unittest.TestCase):
                 "intermediate_size": 256,
                 "rope_theta": 1000.0,
                 "max_position_embeddings": 256,
+            },
+            {
+                "model_type": "muse_spark",
+                "vocab_size": 1000,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 8,
+                "sliding_window": 8,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "full_attention",
+                ],
+                "layer_rope_theta": [1000.0, 0, 1000.0, 0],
+                "mlp_layer_types": ["sparse", "sparse", "sparse", "dense"],
+                "moe_hidden_size": 32,
+                "moe_intermediate_size": 32,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
             },
             {
                 "model_type": "muse_glimmer",
