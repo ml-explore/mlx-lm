@@ -9,6 +9,12 @@ import mlx.nn as nn
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .mimo_v2_attention import (
+    decode_supported,
+    mimo_decode_attention,
+    mimo_prefill_attention,
+    prefill_supported,
+)
 from .switch_layers import SwitchGLU
 
 
@@ -109,15 +115,33 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.attention_sink_bias,
+        # Global layers (192-wide queries/keys, 128-wide values) have no fused SDPA
+        # kernel in MLX; use the dedicated kernels when the call fits them.
+        fused = (
+            not self.is_sliding_window
+            and self.attention_sink_bias is None
+            and not self.training
+            and not hasattr(cache, "bits")
         )
+        if fused and decode_supported(queries, keys, values, mask):
+            output = mimo_decode_attention(queries, keys, values, self.scale, mask)
+        elif (
+            fused
+            and isinstance(mask, str)
+            and mask == "causal"
+            and prefill_supported(queries, keys, values)
+        ):
+            output = mimo_prefill_attention(queries, keys, values, self.scale)
+        else:
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.attention_sink_bias,
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
