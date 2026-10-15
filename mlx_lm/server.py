@@ -1,7 +1,10 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+import base64
 import gc
+import hashlib
+import io
 import json
 import logging
 import pickle
@@ -20,14 +23,17 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
     Tuple,
     Union,
 )
+from urllib.request import urlopen
 
 import mlx.core as mx
+import numpy as np
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound
 
@@ -41,6 +47,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .processors import load_processor
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -119,7 +126,78 @@ def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
     return prompt.rstrip()
 
 
-def process_message_content(messages):
+def _image_url(part: Dict[str, Any]) -> Optional[str]:
+    """The URL of an image content part, or None for other parts."""
+    if part.get("type") not in ("image_url", "input_image", "image"):
+        return None
+    url = part.get("image_url", part.get("image"))
+    return url.get("url") if isinstance(url, dict) else url
+
+
+def _image_parts(messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            yield from (p for p in content if _image_url(p) is not None)
+
+
+def _inline_image_urls(messages: List[Dict[str, Any]]) -> None:
+    """Replace http(s) image URLs with data URLs: all ranks read the same bytes."""
+    for part in _image_parts(messages):
+        url = _image_url(part)
+        if not url.startswith(("http://", "https://")):
+            continue
+        with urlopen(url, timeout=30) as response:
+            mime = response.headers.get_content_type()
+            data = base64.b64encode(response.read()).decode()
+        part.clear()
+        part.update(type="image_url", image_url={"url": f"data:{mime};base64,{data}"})
+
+
+def _decode_image(url: str) -> np.ndarray:
+    """An RGB uint8 image from a data URL."""
+    from PIL import Image
+
+    if not url.startswith("data:"):
+        raise ValueError("Images must be data URLs or http(s) URLs.")
+    data = base64.b64decode(url.partition(",")[2])
+    return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+
+
+@dataclass
+class Vision:
+    """The images of a prompt."""
+
+    pixel_values: List[mx.array]
+    # The position of the first patch token of each image.
+    starts: List[int]
+    # The prompt with each patch token replaced by a negative id of its image,
+    # since two images of one size give the same tokens.
+    cache_key: List[int]
+
+
+def _make_vision(
+    prompt: List[int],
+    *,
+    urls: List[str],
+    pixel_values: List[mx.array],
+    token_id: int,
+) -> Vision:
+    ids = (-1 - int(hashlib.sha256(u.encode()).hexdigest()[:15], 16) for u in urls)
+    starts, cache_key = [], list(prompt)
+    for i, t in enumerate(prompt):
+        if t != token_id:
+            continue
+        if i == 0 or prompt[i - 1] != token_id:
+            starts.append(i)
+            image_id = next(ids)
+        cache_key[i] = image_id
+    return Vision(pixel_values=pixel_values, starts=starts, cache_key=cache_key)
+
+
+def process_message_content(
+    messages: List[Dict[str, Any]], *, keep_images: bool = False
+) -> List[str]:
     """
     Convert message content to a format suitable for `apply_chat_template`.
 
@@ -130,14 +208,25 @@ def process_message_content(messages):
         message_list (list): A list of dictionaries, where each dictionary may
           have a 'content' key containing a list of dictionaries with 'type' and
           'text' keys.
+        keep_images (bool): Keep the content lists with images, for the chat
+          template. Default: ``False``.
+
+    Returns:
+        The image URLs, in order.
 
     Raises:
         ValueError: If the 'content' type is not supported or if 'text' is missing.
 
     """
+    urls = []
     for message in messages:
         content = message.get("content")
-        if isinstance(content, list):
+        images = []
+        if keep_images and isinstance(content, list):
+            images = [u for p in content if (u := _image_url(p)) is not None]
+        if images:
+            urls.extend(images)
+        elif isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
             ]
@@ -153,6 +242,7 @@ def process_message_content(messages):
                     if args := func.get("arguments"):
                         if isinstance(args, str):
                             func["arguments"] = json.loads(args)
+    return urls
 
 
 @dataclass
@@ -284,6 +374,7 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.processor = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -313,6 +404,7 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.processor = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -333,18 +425,20 @@ class ModelProvider:
 
         # Load the model and tokenizer
         if self.is_distributed:
-            model, tokenizer = sharded_load(
+            model, tokenizer, config = sharded_load(
                 model_path,
                 pipeline_group=self.pipeline_group,
                 tensor_group=self.tensor_group,
+                return_config=True,
                 tokenizer_config=self._tokenizer_config,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
-            model, tokenizer = load(
+            model, tokenizer, config = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                return_config=True,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
 
@@ -373,6 +467,7 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
+        self.processor = load_processor(model, config)
         self.draft_model = draft_model
         self.is_batchable = is_batchable
 
@@ -534,14 +629,19 @@ class ResponseGenerator:
           * initial state - A string that contains the initial state of the
             state machine (normal or thinking depending on whether we have tail
             or not)
+          * vision - The images of the prompt, or None
         """
+        vision = None
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
             role_mapping = request.role_mapping
 
             if tokenizer.has_chat_template:
-                process_message_content(messages)
+                processor = self.model_provider.processor
+                urls = process_message_content(
+                    messages, keep_images=processor is not None
+                )
                 if tools and not tokenizer.has_tool_calling:
                     logging.warning(
                         "Received tools but model does not support tool calling. "
@@ -558,17 +658,34 @@ class ResponseGenerator:
                     tokenize=True,
                     **chat_template_args,
                 )
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    **template_kwargs,
-                )
+                if urls:
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        **{**template_kwargs, "tokenize": False},
+                    )
+                    text, pixel_values = processor(
+                        text, images=[_decode_image(u) for u in urls]
+                    )
+                    prompt = tokenizer.encode(text, add_special_tokens=False)
+                    vision = _make_vision(
+                        prompt,
+                        urls=urls,
+                        pixel_values=pixel_values,
+                        token_id=tokenizer.convert_tokens_to_ids(processor.image_token),
+                    )
+                else:
+                    prompt = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        **template_kwargs,
+                    )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], ["assistant"], "normal"
+                return prompt, [prompt], ["assistant"], "normal", None
         else:
             prompt = tokenizer.encode(request.prompt)
-            return prompt, [prompt], ["assistant"], "normal"
+            return prompt, [prompt], ["assistant"], "normal", None
 
         # If we are here it means we have a chat request so we need to search
         # for segments for better cache management.
@@ -580,10 +697,12 @@ class ResponseGenerator:
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
                 initial_state = "reasoning"
+        initial_state = tokenizer.response_initial_state or initial_state
 
-        # It is not a user message so no segmentation needed.
-        if messages[-1]["role"] != "user":
-            return prompt, [prompt], ["assistant"], initial_state
+        # It is not a user message, or it has images (served sequentially), so
+        # no segmentation needed.
+        if messages[-1]["role"] != "user" or vision is not None:
+            return prompt, [prompt], ["assistant"], initial_state, vision
 
         segments = []
         segment_types = []
@@ -629,7 +748,7 @@ class ResponseGenerator:
             segments = [prompt]
             segment_types = ["assistant"]
 
-        return prompt, segments, segment_types, initial_state
+        return prompt, segments, segment_types, initial_state, None
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
         """Make (and cache) a StopSequences and TextStateMachine."""
@@ -696,15 +815,20 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
+                # Requests with images are served sequentially.
+                batchable = self._is_batchable(args) and not any(
+                    _image_parts(request.messages)
+                )
+
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args)
+                    and batchable
                 ):
                     try:
-                        prompt, segments, segment_types, initial_state = self._tokenize(
-                            current_tokenizer, request, args
+                        prompt, segments, segment_types, initial_state, _ = (
+                            self._tokenize(current_tokenizer, request, args)
                         )
                     except Exception as e:
                         rqueue.put(e)
@@ -778,7 +902,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    if not batchable:
                         self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
@@ -916,7 +1040,9 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
+            prompt, _, _, initial_state, vision = self._tokenize(
+                tokenizer, request, args
+            )
             stop_sequences, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
@@ -944,15 +1070,27 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
+            cache_key = vision.cache_key if vision is not None else prompt[:]
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, cache_key
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
-            cache_key = prompt[:]
+            rest = prompt[ctx.prompt_cache_count :]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+
+            # The images after the cached tokens.
+            input_embeddings = None
+            if vision is not None:
+                n = sum(i < ctx.prompt_cache_count for i in vision.starts)
+                if pixel_values := vision.pixel_values[n:]:
+                    input_embeddings = model.embed_inputs(
+                        mx.array(rest), pixel_values=pixel_values
+                    )
+                    # The prefill runs on another stream: compute the vision rows first.
+                    mx.eval(input_embeddings)
 
             # Process the prompt and generate tokens
             # Own matcher: the automaton is cached across requests.
@@ -968,6 +1106,7 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                input_embeddings=input_embeddings,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 kv_bits=self.cli_args.kv_bits,
@@ -1204,7 +1343,13 @@ class APIHandler(BaseHTTPRequestHandler):
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        try:
+            request = request_factories[self.path]()
+        except Exception as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         self.handle_completion(request, stop_words)
 
     def _validate(
@@ -1470,29 +1615,27 @@ class APIHandler(BaseHTTPRequestHandler):
                 # Advance the text state machine to strip control sequences
                 if gen.finish_reason == "stop":
                     sm_state, current_state = TextStateMachine.discard(sm_state)
-                    clean_text = ""
+                    segments = [(current_state, "")]
                 elif gen.finish_reason == "length":
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                    sm_state, segments = TextStateMachine.split(sm_state, gen.text)
                     sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                    clean_text += flushed
+                    segments.append((current_state, flushed))
                 else:
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                    sm_state, segments = TextStateMachine.split(sm_state, gen.text)
 
                 # Collect the clean text by state: reasoning, tool, or normal
-                if current_state == "reasoning":
-                    reasoning_text += clean_text
-                elif current_state == "tool":
-                    tool_text += clean_text
-                elif current_state == "normal":
-                    if prev_state == "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    text += clean_text
+                for current_state, clean_text in segments:
+                    if current_state == "reasoning":
+                        reasoning_text += clean_text
+                    elif current_state == "tool":
+                        tool_text += clean_text
+                    elif current_state == "normal":
+                        if prev_state == "tool":
+                            tool_calls.append(tool_text)
+                            tool_text = ""
+                            made_tool_call = True
+                        text += clean_text
+                    prev_state = current_state
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1520,8 +1663,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
-
-                prev_state = current_state
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
@@ -1615,6 +1756,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
+        _inline_image_urls(body["messages"])
 
         return CompletionRequest(
             "chat",
