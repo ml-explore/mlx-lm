@@ -456,6 +456,17 @@ class TestTrustRemoteCode(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "float-quantized"):
             utils._compressed_tensors_quantization({"format": "float-quantized"})
 
+    def test_modelopt_quantization(self):
+        nvfp4 = {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        # config.json layout
+        config = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        self.assertEqual(utils._modelopt_quantization(config), nvfp4)
+        # hf_quant_config.json layout
+        config = {"quant_method": "modelopt", "quantization": {"quant_algo": "NVFP4"}}
+        self.assertEqual(utils._modelopt_quantization(config), nvfp4)
+        with self.assertRaisesRegex(ValueError, "FP8"):
+            utils._modelopt_quantization({"quant_algo": "FP8"})
+
 
 if __name__ == "__main__":
     unittest.main()
