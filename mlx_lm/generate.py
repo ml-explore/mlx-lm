@@ -878,11 +878,10 @@ def _build_trie(sequences: Sequence[Any]) -> dict:
             if node is trie:
                 # An empty pattern would make the root match every token.
                 continue
-            # The first of equal patterns wins.
-            node.setdefault("__match__", (tuple(seq), idx))
+            node["__match__"] = (tuple(seq), idx)
         except TypeError:
             node = node.setdefault(seq, {"__depth__": 1})
-            node.setdefault("__match__", ((seq,), idx))
+            node["__match__"] = ((seq,), idx)
 
     # BFS to set failure links and propagate matches.
     queue = deque()

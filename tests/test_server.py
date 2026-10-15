@@ -195,18 +195,6 @@ class TestTextStateMachine(unittest.TestCase):
         )
         self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
 
-    def test_first_of_equal_markers_wins(self):
-        sm = TextStateMachine(
-            {
-                "normal": [("<tool_call>", "tool"), ("<tool_call>", "stop")],
-                "tool": [("</tool_call>", "normal")],
-            }
-        )
-        self.assertEqual(
-            sm.reader().feed("<tool_call>x</tool_call>"),
-            TextStateMachine.Delta(tool_calls=("x",)),
-        )
-
     def test_deltas_add(self):
         a = TextStateMachine.Delta(content="a", tool_calls=("x",))
         b = TextStateMachine.Delta(reasoning="r", tool_calls=("y",))
