@@ -53,7 +53,9 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
-def _apply_stop_words(reader, text, *, finish_reason):
+def _apply_stop_words(
+    reader: TextStateMachine.Reader, text: str, *, finish_reason: str | None
+) -> tuple[str, str | None]:
     """Return the text of a chunk up to a stop word, and the finish reason."""
     if finish_reason is None:
         delta = reader.feed(text)
@@ -543,7 +545,7 @@ class ResponseGenerator:
           * segment_types - A string per segment indicating if the segment is a
             system prompt or a user prompt or nothing special.
           * initial state - A string that contains the initial state of the
-            state machine (normal or thinking depending on whether we have tail
+            state machine (normal or reasoning depending on whether we have tail
             or not)
         """
         if request.request_type == "chat":

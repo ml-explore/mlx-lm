@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from typing import (
     Any,
     Callable,
@@ -980,17 +980,6 @@ class TextStateMachine:
         reasoning: str = ""
         tool_calls: tuple[str, ...] = ()
 
-        def add_content(self, text: str) -> "TextStateMachine.Delta":
-            return replace(self, content=self.content + text)
-
-        def add_reasoning(self, text: str) -> "TextStateMachine.Delta":
-            return replace(self, reasoning=self.reasoning + text)
-
-        def add_tool_call(self, text: str) -> "TextStateMachine.Delta":
-            if not text:
-                return self
-            return replace(self, tool_calls=self.tool_calls + (text,))
-
         def __add__(self, other: "TextStateMachine.Delta") -> "TextStateMachine.Delta":
             return TextStateMachine.Delta(
                 content=self.content + other.content,
@@ -1022,9 +1011,9 @@ class TextStateMachine:
             self, delta: "TextStateMachine.Delta", text: str
         ) -> "TextStateMachine.Delta":
             if self._state == "normal":
-                return delta.add_content(text)
+                return delta + TextStateMachine.Delta(content=text)
             if self._state == "reasoning":
-                return delta.add_reasoning(text)
+                return delta + TextStateMachine.Delta(reasoning=text)
             if self._state == "tool":
                 self._tool += text
             # Text after a stop is dropped.
@@ -1046,8 +1035,10 @@ class TextStateMachine:
         def _close_tool_call(
             self, delta: "TextStateMachine.Delta"
         ) -> "TextStateMachine.Delta":
-            delta = delta.add_tool_call(self._tool.strip())
+            tool_call = self._tool.strip()
             self._tool = ""
+            if tool_call:
+                delta += TextStateMachine.Delta(tool_calls=(tool_call,))
             return delta
 
         def feed(self, text: str) -> "TextStateMachine.Delta":
