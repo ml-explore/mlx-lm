@@ -226,9 +226,10 @@ class TestTextStateMachine(unittest.TestCase):
         )
 
     def test_unknown_state_raises(self):
-        reader = TextStateMachine({}).reader(state="other")
         with self.assertRaises(ValueError):
-            reader.feed("x")
+            TextStateMachine({"normal": [("<x>", "other")]})
+        with self.assertRaises(ValueError):
+            TextStateMachine({}).reader(state="other")
 
 
 class TestApplyStopWords(unittest.TestCase):

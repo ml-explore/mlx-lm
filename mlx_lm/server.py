@@ -34,6 +34,7 @@ from ._version import __version__
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
+    TextState,
     TextStateMachine,
     stream_generate,
 )
@@ -229,7 +230,7 @@ class GenerationContext:
     tool_parser: Callable[[str, Any], Dict]
 
     text_sm: TextStateMachine
-    initial_state: str
+    initial_state: TextState
 
     prompt: List[int]
     prompt_cache_count: int = -1

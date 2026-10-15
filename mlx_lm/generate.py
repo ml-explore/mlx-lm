@@ -19,6 +19,7 @@ from typing import (
     Sequence,
     Tuple,
     Union,
+    get_args,
 )
 
 import mlx.core as mx
@@ -941,6 +942,11 @@ class StopSequences:
 TextState = Literal["normal", "reasoning", "tool", "stop"]
 
 
+def _check_state(state: str) -> None:
+    if state not in get_args(TextState):
+        raise ValueError(f"Unknown state {state!r}.")
+
+
 class TextStateMachine:
     """Split streamed text into content, reasoning and tool calls.
 
@@ -996,6 +1002,7 @@ class TextStateMachine:
         """One stream's position in a :class:`TextStateMachine`."""
 
         def __init__(self, machine: "TextStateMachine", *, state: TextState):
+            _check_state(state)
             self._states = machine._states
             self._held = ""
             self._tool = ""
@@ -1020,8 +1027,7 @@ class TextStateMachine:
                 return delta.add_reasoning(text)
             if self._state == "tool":
                 self._tool += text
-            elif self._state != "stop":
-                raise ValueError(f"Unknown state {self._state!r}.")
+            # Text after a stop is dropped.
             return delta
 
         def _move(
@@ -1081,6 +1087,10 @@ class TextStateMachine:
         # Per state: its marker trie and next states.
         self._states = {}
         for state, edges in transitions.items():
+            _check_state(state)
+            for _, next_state in edges:
+                if next_state is not None:
+                    _check_state(next_state)
             markers = [marker for marker, _ in edges]
             self._states[state] = (_build_trie(markers), [dst for _, dst in edges])
 
