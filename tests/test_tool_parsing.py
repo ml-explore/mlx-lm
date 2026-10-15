@@ -13,6 +13,7 @@ from mlx_lm.tool_parsers import (
     minicpm5,
     minimax_m2,
     mistral,
+    muse_spark_open,
     pythonic,
     qwen3_coder,
 )
@@ -63,6 +64,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
                 mistral,
+            ),
+            (
+                '<atem:invoke name="multiply">\n<atem:parameter name="a">12234585</atem:parameter><atem:parameter name="b">48838483920</atem:parameter>\n</atem:invoke>',
+                muse_spark_open,
             ),
         ]
 
@@ -137,6 +142,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'get_current_temperature[ARGS]{"location": "London"}',
                 mistral,
+            ),
+            (
+                '<atem:invoke name="get_current_temperature">\n<atem:parameter name="location">London</atem:parameter>\n</atem:invoke>',
+                muse_spark_open,
             ),
         ]
         tools = [
@@ -708,6 +717,64 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_muse_spark_open(self):
+        # The server strips the markers.
+        test_case = (
+            '\n<atem:invoke name="search">\n'
+            '<atem:parameter name="query">weather in Paris</atem:parameter>'
+            '<atem:parameter name="limit">5</atem:parameter>'
+            '<atem:parameter name="ratio">0.5</atem:parameter>'
+            '<atem:parameter name="safe">true</atem:parameter>'
+            '<atem:parameter name="tags">["a", "b"]</atem:parameter>'
+            '<atem:parameter name="filters">{"unit": "c"}</atem:parameter>\n'
+            "</atem:invoke>\n"
+        )
+        self.assertEqual(
+            muse_spark_open.parse_tool_call(test_case, None),
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "weather in Paris",
+                    "limit": 5,
+                    "ratio": 0.5,
+                    "safe": True,
+                    "tags": ["a", "b"],
+                    "filters": {"unit": "c"},
+                },
+            },
+        )
+
+        test_case = (
+            '<atem:invoke name="write">\n'
+            '<atem:parameter name="content">line 1\n  </atem:invoke>\n"quoted" line\n'
+            "</atem:parameter>\n</atem:invoke>"
+        )
+        tool_call = muse_spark_open.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "write",
+                "arguments": {"content": 'line 1\n  </atem:invoke>\n"quoted" line\n'},
+            },
+        )
+
+        test_case = (
+            '<atem:invoke name="get_time">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n'
+            "</atem:invoke>\n"
+            '<atem:invoke name="clock.now">\n</atem:invoke>\n'
+        )
+        self.assertEqual(
+            muse_spark_open.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"city": "Paris"}},
+                {"name": "clock.now", "arguments": {}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            muse_spark_open.parse_tool_call("no call here", None)
 
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""
