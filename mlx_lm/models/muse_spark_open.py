@@ -23,25 +23,22 @@ from ..kernels import (
     rms_norm_sigmoid_gate,
 )
 from .activations import precise_swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    gather_last_axis,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, RotatingKVCache
 from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 # For checkpoints without them. Stop on <|eot|>, not on <|eom|>.
 TOKENIZER_DEFAULTS = {
+    "chat_template_type": "muse_spark_open",
     "tool_parser_type": "muse_spark_open",
     "eos_token_ids": [200001, 200008],
 }
-
-
-def _gather_last_axis(x: mx.array, group: mx.distributed.Group) -> mx.array:
-    """Gather the last axis of ``x``, which is split across ``group``."""
-    n, size = group.size(), x.shape[-1]
-    parts = mx.distributed.all_gather(x.reshape(-1, size), group=group)
-    # (ranks * rows, size) to (rows, ranks * size), in rank order.
-    parts = parts.reshape(n, -1, size).transpose(1, 0, 2)
-    return parts.reshape(*x.shape[:-1], n * size)
 
 
 @dataclass
@@ -174,7 +171,7 @@ def row_parallel_linear(
     rows = linear.weight.shape[0] // group.size()
     r = group.rank()
     part = x @ linear.weight[r * rows : (r + 1) * rows].T
-    return _gather_last_axis(part, group)
+    return gather_last_axis(part, group)
 
 
 _UNUSED_QUANT_TENSORS = (
@@ -885,7 +882,7 @@ class Model(nn.Module):
         # The head weight is fp32 with use_fp32_for_output (see sanitize).
         out = self.lm_head(out.astype(self.lm_head.weight.dtype))
         if self.sharding_group is not None:
-            out = _gather_last_axis(out, self.sharding_group)
+            out = gather_last_axis(out, self.sharding_group)
         out = out.astype(mx.float32) * self.args.metap_multiplier
         cap = self.args.output_soft_cap_temp
         return mx.tanh(out / cap) * cap

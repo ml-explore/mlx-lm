@@ -1,12 +1,15 @@
 # Copyright © 2026 Apple Inc.
 
 import unittest
+from types import SimpleNamespace
 
 import mlx.core as mx
 import test_models
 from mlx.utils import tree_flatten, tree_map
 from model_parallel_tests import Group
 
+from mlx_lm.chat_templates.muse_spark_open import RESPONSE_FORMAT
+from mlx_lm.generate import TextStateMachine, make_text_state_machine
 from mlx_lm.models import muse_spark_open
 from mlx_lm.models.cache import RotatingKVCache
 
@@ -176,6 +179,49 @@ class TestMuseSparkOpen(unittest.TestCase):
         self.assertTrue(
             mx.allclose(mx.concatenate(steps, axis=1), one, rtol=1e-3, atol=1e-3)
         )
+
+
+class TestMuseSparkOpenResponseFormat(unittest.TestCase):
+    def split(self, text, step):
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=True,
+            tool_call_start="<atem:function_calls>",
+            tool_call_end="</atem:function_calls>",
+            structural_markers=(),
+            response_transitions=RESPONSE_FORMAT["transitions"],
+        )
+        sm = make_text_state_machine(tokenizer)
+        state = sm.make_state(RESPONSE_FORMAT["initial_state"])
+        out = {"reasoning": "", "tool": "", "normal": ""}
+        for i in range(0, len(text), step):
+            state, segments = TextStateMachine.split(state, text[i : i + step])
+            for name, chunk in segments:
+                if name in out:
+                    out[name] += chunk
+        return out
+
+    def test_message_headers(self):
+        call = (
+            '<atem:function_calls><atem:invoke name="grep">'
+            '<atem:parameter name="pattern">a</atem:parameter>'
+            "</atem:invoke></atem:function_calls>"
+        )
+        for start in ("<|start|>", ""):
+            text = (
+                " to=self<|message|>think<|eom|>"
+                f"{start}assistant to=commentary<|message|>one<|eom|>"
+                f"{start}assistant to=grep<|message|>{call}<|eom|>"
+                f"{start}assistant to=user<|message|>two"
+            )
+            for step in (1, 3, 7, len(text)):
+                out = self.split(text, step)
+                self.assertEqual(out["reasoning"], "think")
+                self.assertEqual(out["normal"], "onetwo")
+                self.assertEqual(
+                    out["tool"],
+                    call[len("<atem:function_calls>") : -len("</atem:function_calls>")],
+                )
 
 
 if __name__ == "__main__":
