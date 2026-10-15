@@ -1105,7 +1105,7 @@ class TextStateMachine:
 
     @classmethod
     def from_tokenizer(cls, tokenizer: TokenizerWrapper) -> "TextStateMachine":
-        """A TextStateMachine with the reasoning and tool markers of a tokenizer."""
+        """A TextStateMachine with the markers of a tokenizer."""
         transitions = {}
 
         if tokenizer.has_thinking:

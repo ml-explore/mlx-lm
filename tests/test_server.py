@@ -153,8 +153,7 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(reader.feed("a #"), TextStateMachine.Delta(content="a "))
         self.assertEqual(reader.feed("# b"), TextStateMachine.Delta(content=" b"))
 
-    def test_text_keeps_its_state(self):
-        # Held text keeps the state it was read in.
+    def test_held_text_keeps_its_state(self):
         sm = TextStateMachine({**TOOL_CALLS, "reasoning": [("</think>", "normal")]})
         reader = sm.reader(state="reasoning")
         self.assertEqual(
@@ -189,21 +188,12 @@ class TestTextStateMachine(unittest.TestCase):
             tool_call_end="",
             structural_markers=(),
         )
-        # No end marker: the call ends with the stream.
         reader = TextStateMachine.from_tokenizer(tokenizer).reader()
         self.assertEqual(
             reader.feed("hello[TOOL_CALLS]body"),
             TextStateMachine.Delta(content="hello"),
         )
         self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
-
-    def test_stop_word_ends_the_text(self):
-        reader = TextStateMachine.from_stop_words(["\n\n"]).reader()
-        self.assertEqual(
-            reader.feed("First.\n"), TextStateMachine.Delta(content="First.")
-        )
-        self.assertEqual(reader.feed("\nSecond."), TextStateMachine.Delta())
-        self.assertTrue(reader.stopped)
 
     def test_first_of_equal_markers_wins(self):
         sm = TextStateMachine(

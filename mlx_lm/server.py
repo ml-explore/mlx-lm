@@ -54,8 +54,7 @@ def get_system_fingerprint():
 
 
 def _apply_stop_words(reader, text, *, finish_reason):
-    """Return the text of a chunk without stop words, and the finish reason.
-    A stop word found in the text ends the generation."""
+    """Return the text of a chunk up to a stop word, and the finish reason."""
     if finish_reason is None:
         delta = reader.feed(text)
     else:
