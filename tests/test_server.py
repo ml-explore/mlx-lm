@@ -13,7 +13,7 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
-from mlx_lm.generate import TextStateMachine, make_text_state_machine
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
@@ -23,6 +23,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
+    _apply_stop_words,
     _make_sampler,
 )
 from mlx_lm.tool_parsers import json_tools, pythonic
@@ -181,32 +182,27 @@ class TestTextStateMachine(unittest.TestCase):
             tool_call_end="</tool_call>",
             structural_markers=(),
         )
-        reader = make_text_state_machine(tokenizer).reader(state="reasoning")
+        reader = TextStateMachine.from_tokenizer(tokenizer).reader(state="reasoning")
         self.assertEqual(
             reader.feed("a<tool_call>b</tool_call>c</think>d"),
             TextStateMachine.Delta(content="d", reasoning="ac", tool_calls=("b",)),
         )
 
     def test_stop_word_ends_the_text(self):
-        tokenizer = SimpleNamespace(
-            has_thinking=False, has_tool_calling=False, structural_markers=()
-        )
-        reader = make_text_state_machine(tokenizer, stop_words=["\n\n"]).reader()
+        reader = TextStateMachine.from_stop_words(["\n\n"]).reader()
         self.assertEqual(
             reader.feed("First.\n"), TextStateMachine.Delta(content="First.")
         )
-        self.assertEqual(reader.feed("\nSecond."), TextStateMachine.Delta(stopped=True))
-        self.assertEqual(reader.feed("More."), TextStateMachine.Delta(stopped=True))
+        self.assertEqual(reader.feed("\nSecond."), TextStateMachine.Delta())
+        self.assertTrue(reader.stopped)
 
-    def test_stop_word_does_not_hide_a_marker(self):
-        tokenizer = SimpleNamespace(
-            has_thinking=False,
-            has_tool_calling=True,
-            tool_call_start="<tool_call>",
-            tool_call_end="</tool_call>",
-            structural_markers=(),
+    def test_first_of_equal_markers_wins(self):
+        sm = TextStateMachine(
+            {
+                "normal": [("<tool_call>", "tool"), ("<tool_call>", "stop")],
+                "tool": [("</tool_call>", "normal")],
+            }
         )
-        sm = make_text_state_machine(tokenizer, stop_words=["<tool_call>"])
         self.assertEqual(
             sm.reader().feed("<tool_call>x</tool_call>"),
             TextStateMachine.Delta(tool_calls=("x",)),
@@ -214,12 +210,10 @@ class TestTextStateMachine(unittest.TestCase):
 
     def test_deltas_add(self):
         a = TextStateMachine.Delta(content="a", tool_calls=("x",))
-        b = TextStateMachine.Delta(reasoning="r", tool_calls=("y",), stopped=True)
+        b = TextStateMachine.Delta(reasoning="r", tool_calls=("y",))
         self.assertEqual(
             a + b,
-            TextStateMachine.Delta(
-                content="a", reasoning="r", tool_calls=("x", "y"), stopped=True
-            ),
+            TextStateMachine.Delta(content="a", reasoning="r", tool_calls=("x", "y")),
         )
 
     def test_header_text_is_dropped(self):
@@ -233,6 +227,33 @@ class TestTextStateMachine(unittest.TestCase):
         reader = TextStateMachine({}).reader(state="other")
         with self.assertRaises(ValueError):
             reader.feed("x")
+
+
+class TestApplyStopWords(unittest.TestCase):
+    def test_stop_words(self):
+        sm = TextStateMachine.from_stop_words(["\n\n"])
+        # The last chunk, its token and finish reason after "a\n".
+        cases = [
+            (("\nb", 1, None), ("", "stop")),  # found in the text
+            (("", 2, "stop"), ("", "stop")),  # matched as a stop sequence
+            (("", 0, "stop"), ("\n", "stop")),  # EOS: "\n" is part of the text
+            (("\nb", 1, "length"), ("", "stop")),
+        ]
+        for (text, token, finish_reason), expected in cases:
+            reader = sm.reader()
+            _apply_stop_words(
+                reader, "a\n", token=1, finish_reason=None, eos_token_ids={0}
+            )
+            self.assertEqual(
+                _apply_stop_words(
+                    reader,
+                    text,
+                    token=token,
+                    finish_reason=finish_reason,
+                    eos_token_ids={0},
+                ),
+                expected,
+            )
 
 
 class TestHandleCompletion(unittest.TestCase):
@@ -484,7 +505,7 @@ class TestServer(unittest.TestCase):
             def encode(self, text, add_special_tokens=False):
                 return []
 
-        stop_sequences, text_sm = self.response_generator._make_state_machine(
+        stop_sequences, _, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],

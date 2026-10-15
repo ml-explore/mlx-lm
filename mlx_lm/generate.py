@@ -950,7 +950,7 @@ class TextStateMachine:
 
     ``normal`` text is the content, ``reasoning`` text the reasoning and each
     visit to ``tool`` one tool call. ``header`` text is dropped. ``stop`` ends
-    the text: its deltas have ``stopped`` set.
+    the text: the reader is then ``stopped``.
 
     Example:
 
@@ -973,7 +973,6 @@ class TextStateMachine:
         content: str = ""
         reasoning: str = ""
         tool_calls: tuple[str, ...] = ()
-        stopped: bool = False
 
         def add_content(self, text: str) -> "TextStateMachine.Delta":
             return replace(self, content=self.content + text)
@@ -991,7 +990,6 @@ class TextStateMachine:
                 content=self.content + other.content,
                 reasoning=self.reasoning + other.reasoning,
                 tool_calls=self.tool_calls + other.tool_calls,
-                stopped=self.stopped or other.stopped,
             )
 
     class Reader:
@@ -1003,6 +1001,10 @@ class TextStateMachine:
             self._tool = ""
             self._previous = state
             self._enter(state)
+
+        @property
+        def stopped(self) -> bool:
+            return self._state == "stop"
 
         def _enter(self, state: TextState) -> None:
             self._state = state
@@ -1063,7 +1065,7 @@ class TextStateMachine:
             end = len(text) - self._node.get("__depth__", 0)
             delta = self._add(delta, text[begin:end])
             self._held = text[end:]
-            return replace(delta, stopped=self._state == "stop")
+            return delta
 
         def finish(self, text: str = "") -> "TextStateMachine.Delta":
             """Read the last chunk, release the held text and close a tool call."""
@@ -1091,6 +1093,39 @@ class TextStateMachine:
         """A fresh reader that starts in ``state``."""
         return self.Reader(self, state=state)
 
+    @classmethod
+    def from_stop_words(cls, stop_words: Sequence[str]) -> "TextStateMachine":
+        """A TextStateMachine whose stop words end the text."""
+        return cls({"normal": [(w, "stop") for w in stop_words]})
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer: TokenizerWrapper) -> "TextStateMachine":
+        """A TextStateMachine with the reasoning and tool markers of a tokenizer."""
+        transitions = {}
+
+        if tokenizer.has_thinking:
+            transitions.setdefault("normal", []).append(
+                (tokenizer.think_start, "reasoning")
+            )
+            transitions["reasoning"] = [(tokenizer.think_end, "normal")]
+
+        if tokenizer.has_tool_calling:
+            transitions.setdefault("normal", []).append(
+                (tokenizer.tool_call_start, "tool")
+            )
+            if tokenizer.has_thinking:
+                transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
+            # Back to the state the tool call started in.
+            transitions["tool"] = (
+                [(tokenizer.tool_call_end, None)] if tokenizer.tool_call_end else []
+            )
+
+        if tokenizer.structural_markers:
+            for w in tokenizer.structural_markers:
+                transitions.setdefault("normal", []).append((w, "normal"))
+
+        return cls(transitions)
+
 
 def make_stop_sequences(tokenizer, *, stop_words=None):
     """Build StopSequences from EOS tokens and stop words."""
@@ -1098,40 +1133,6 @@ def make_stop_sequences(tokenizer, *, stop_words=None):
     for w in stop_words or []:
         stop_sequences.append(tuple(tokenizer.encode(w, add_special_tokens=False)))
     return StopSequences(stop_sequences)
-
-
-def make_text_state_machine(tokenizer, *, stop_words=None):
-    """Build a TextStateMachine with reasoning/tool transitions and stop words.
-
-    A stop word leads from every state to ``stop``, which ends the text.
-    """
-    transitions = {}
-
-    if tokenizer.has_thinking:
-        transitions.setdefault("normal", []).append(
-            (tokenizer.think_start, "reasoning")
-        )
-        transitions["reasoning"] = [(tokenizer.think_end, "normal")]
-
-    if tokenizer.has_tool_calling:
-        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
-        if tokenizer.has_thinking:
-            transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
-        # Back to the state the tool call started in.
-        transitions["tool"] = (
-            [(tokenizer.tool_call_end, None)] if tokenizer.tool_call_end else []
-        )
-
-    if tokenizer.structural_markers:
-        for w in tokenizer.structural_markers:
-            transitions.setdefault("normal", []).append((w, "normal"))
-
-    if stop_words:
-        for state_name in set(transitions) | {"normal"}:
-            for w in stop_words:
-                transitions.setdefault(state_name, []).append((w, "stop"))
-
-    return TextStateMachine(transitions)
 
 
 class PromptProcessingBatch:

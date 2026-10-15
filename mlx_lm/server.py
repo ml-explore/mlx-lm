@@ -36,7 +36,6 @@ from .generate import (
     BatchGenerator,
     TextStateMachine,
     make_stop_sequences,
-    make_text_state_machine,
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
@@ -52,6 +51,21 @@ from .utils import (
 def get_system_fingerprint():
     gpu_arch = mx.device_info()["architecture"]
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
+
+
+def _apply_stop_words(reader, text, *, token, finish_reason, eos_token_ids):
+    """Return the text of a chunk without stop words, and the finish reason.
+    A stop word found in the text ends the generation."""
+    if finish_reason == "stop" and token not in eos_token_ids:
+        # A stop sequence matched, so the held text is its start.
+        delta = reader.discard()
+    elif finish_reason is not None:
+        delta = reader.finish(text)
+    else:
+        delta = reader.feed(text)
+    if reader.stopped:
+        finish_reason = "stop"
+    return delta.content, finish_reason
 
 
 class ToolCallFormatter:
@@ -634,20 +648,21 @@ class ResponseGenerator:
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) a StopSequences and TextStateMachine."""
+        """Make (and cache) the stop sequences and the two text state machines."""
         cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
         stop_sequences = make_stop_sequences(tokenizer, stop_words=stop_words)
-        text_sm = make_text_state_machine(tokenizer, stop_words=stop_words)
+        stop_sm = TextStateMachine.from_stop_words(stop_words)
+        text_sm = TextStateMachine.from_tokenizer(tokenizer)
 
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_sequences, text_sm)
+        self._state_machine_cache[cache_key] = (stop_sequences, stop_sm, text_sm)
 
-        return stop_sequences, text_sm
+        return stop_sequences, stop_sm, text_sm
 
     def _is_batchable(self, args):
         return (
@@ -712,7 +727,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_sequences, text_sm = self._make_state_machine(
+                    stop_sequences, stop_sm, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         current_tokenizer,
                         args.stop_words,
@@ -756,6 +771,7 @@ class ResponseGenerator:
                         "ctx": ctx,
                         "rqueue": rqueue,
                         "detokenizer": current_tokenizer.detokenizer,
+                        "stop_reader": stop_sm.reader(),
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                     }
@@ -848,6 +864,7 @@ class ResponseGenerator:
                         )
                     del caches
 
+                    uids_to_finish = []
                     for r in gen_responses:
                         result = batch_results[r.uid]
 
@@ -862,13 +879,20 @@ class ResponseGenerator:
                         else:
                             result["detokenizer"].add_token(r.token)
                             text = result["detokenizer"].last_segment
+                        text, finish_reason = _apply_stop_words(
+                            result["stop_reader"],
+                            text,
+                            token=r.token,
+                            finish_reason=r.finish_reason,
+                            eos_token_ids=current_tokenizer.eos_token_ids,
+                        )
 
                         result["rqueue"].put(
                             Response(
                                 text,
                                 r.token,
                                 r.logprobs[r.token].item(),
-                                r.finish_reason,
+                                finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
                                     result["top_logprobs"],
@@ -877,18 +901,34 @@ class ResponseGenerator:
                             )
                         )
 
-                        if r.finish_reason is not None:
+                        if finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key,
-                                r.all_tokens[:],
-                                r.prompt_cache,
-                                cache_type="assistant",
-                            )
+                            if r.finish_reason is not None:
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                )
+                            else:
+                                uids_to_finish.append(r.uid)
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
+
+                    # End text-stopped requests like finished ones (same on all ranks).
+                    if uids_to_finish:
+                        caches = batch_generator.remove(
+                            uids_to_finish, return_prompt_caches=True
+                        )
+                        for cache, tokens in caches.values():
+                            self.prompt_cache.insert_cache(
+                                current_model_key,
+                                tokens[:],
+                                cache,
+                                cache_type="assistant",
+                            )
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
@@ -919,7 +959,7 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_sequences, text_sm = self._make_state_machine(
+            stop_sequences, stop_sm, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
@@ -959,6 +999,7 @@ class ResponseGenerator:
             # Process the prompt and generate tokens
             # Own matcher: the automaton is cached across requests.
             stop_matcher = stop_sequences.matcher()
+            stop_reader = stop_sm.reader()
             for gen in stream_generate(
                 model=model,
                 stream=stream,
@@ -981,10 +1022,17 @@ class ResponseGenerator:
                 # Token-level stop word detection
                 if stop_matcher.advance(gen.token):
                     finish_reason = "stop"
+                text, finish_reason = _apply_stop_words(
+                    stop_reader,
+                    gen.text,
+                    token=gen.token,
+                    finish_reason=finish_reason,
+                    eos_token_ids=tokenizer.eos_token_ids,
+                )
 
                 rqueue.put(
                     Response(
-                        gen.text,
+                        text,
                         gen.token,
                         gen.logprobs[gen.token].item(),
                         finish_reason,
@@ -1465,12 +1513,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 logging.debug(gen.text)
 
                 # Advance the text state machine to strip control sequences
-                if gen.finish_reason == "stop":
-                    delta = reader.discard()
-                elif gen.finish_reason == "length":
-                    delta = reader.finish(gen.text)
-                else:
+                if gen.finish_reason is None:
                     delta = reader.feed(gen.text)
+                else:
+                    delta = reader.finish(gen.text)
 
                 pending += delta
 
@@ -1496,10 +1542,6 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
-
-                if delta.stopped:
-                    finish_reason = "stop"
-                    break
 
             # Only tool calls that parse count for the finish reason.
             tool_calls = tool_formatter(pending.tool_calls)
