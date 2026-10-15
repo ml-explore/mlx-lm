@@ -30,7 +30,6 @@ from .switch_layers import SwitchGLU
 
 # For checkpoints without them. Stop on <|eot|>, not on <|eom|>.
 TOKENIZER_DEFAULTS = {
-    "chat_template_type": "muse_spark_open",
     "tool_parser_type": "muse_spark_open",
     "eos_token_ids": [200001, 200008],
 }
