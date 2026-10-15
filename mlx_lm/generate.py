@@ -1075,11 +1075,6 @@ class TextStateMachine:
             self._node = self._root
             return self._close_tool_call(delta)
 
-        def discard(self) -> "TextStateMachine.Delta":
-            """End on a stop. The held text starts the stop word, so drop it."""
-            self._held = ""
-            return self.finish()
-
     def __init__(
         self, transitions: dict[TextState, Sequence[tuple[str, TextState | None]]]
     ):
@@ -1125,14 +1120,6 @@ class TextStateMachine:
                 transitions.setdefault("normal", []).append((w, "normal"))
 
         return cls(transitions)
-
-
-def make_stop_sequences(tokenizer, *, stop_words=None):
-    """Build StopSequences from EOS tokens and stop words."""
-    stop_sequences = [(t,) for t in tokenizer.eos_token_ids]
-    for w in stop_words or []:
-        stop_sequences.append(tuple(tokenizer.encode(w, add_special_tokens=False)))
-    return StopSequences(stop_sequences)
 
 
 class PromptProcessingBatch:

@@ -135,13 +135,6 @@ class TestTextStateMachine(unittest.TestCase):
             reader.finish(), TextStateMachine.Delta(tool_calls=("body</",))
         )
 
-    def test_discard_drops_held_text(self):
-        reader = TextStateMachine({"normal": [("STOP", "normal")]}).reader()
-        self.assertEqual(
-            reader.feed("hello ST"), TextStateMachine.Delta(content="hello ")
-        )
-        self.assertEqual(reader.discard(), TextStateMachine.Delta())
-
     def test_empty_tool_calls_are_dropped(self):
         reader = TextStateMachine(TOOL_CALLS).reader()
         self.assertEqual(
@@ -232,26 +225,17 @@ class TestTextStateMachine(unittest.TestCase):
 class TestApplyStopWords(unittest.TestCase):
     def test_stop_words(self):
         sm = TextStateMachine.from_stop_words(["\n\n"])
-        # The last chunk, its token and finish reason after "a\n".
+        # The last chunk and its finish reason after "a\n".
         cases = [
-            (("\nb", 1, None), ("", "stop")),  # found in the text
-            (("", 2, "stop"), ("", "stop")),  # matched as a stop sequence
-            (("", 0, "stop"), ("\n", "stop")),  # EOS: "\n" is part of the text
-            (("\nb", 1, "length"), ("", "stop")),
+            (("\nb", None), ("", "stop")),
+            (("", "stop"), ("\n", "stop")),  # EOS: "\n" is part of the text
+            (("\nb", "length"), ("", "stop")),
         ]
-        for (text, token, finish_reason), expected in cases:
+        for (text, finish_reason), expected in cases:
             reader = sm.reader()
-            _apply_stop_words(
-                reader, "a\n", token=1, finish_reason=None, eos_token_ids={0}
-            )
+            _apply_stop_words(reader, "a\n", finish_reason=None)
             self.assertEqual(
-                _apply_stop_words(
-                    reader,
-                    text,
-                    token=token,
-                    finish_reason=finish_reason,
-                    eos_token_ids={0},
-                ),
+                _apply_stop_words(reader, text, finish_reason=finish_reason),
                 expected,
             )
 
@@ -496,16 +480,12 @@ class TestServer(unittest.TestCase):
             tool_call_end = ""
             tool_call_start_tokens = (100,)
             tool_call_end_tokens = ()
-            eos_token_ids = [2]
             structural_markers = ()
 
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"
 
-            def encode(self, text, add_special_tokens=False):
-                return []
-
-        stop_sequences, _, text_sm = self.response_generator._make_state_machine(
+        _, text_sm = self.response_generator._make_state_machine(
             ("fake-empty-end", None, None),
             FakeTokenizer(),
             stop_words=[],
@@ -518,9 +498,6 @@ class TestServer(unittest.TestCase):
             TextStateMachine.Delta(content="hello"),
         )
         self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
-
-        # Verify EOS stops via the stop matcher
-        self.assertTrue(stop_sequences.matcher().advance(2))
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"

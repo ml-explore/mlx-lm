@@ -35,7 +35,6 @@ from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
     TextStateMachine,
-    make_stop_sequences,
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
@@ -53,16 +52,13 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
-def _apply_stop_words(reader, text, *, token, finish_reason, eos_token_ids):
+def _apply_stop_words(reader, text, *, finish_reason):
     """Return the text of a chunk without stop words, and the finish reason.
     A stop word found in the text ends the generation."""
-    if finish_reason == "stop" and token not in eos_token_ids:
-        # A stop sequence matched, so the held text is its start.
-        delta = reader.discard()
-    elif finish_reason is not None:
-        delta = reader.finish(text)
-    else:
+    if finish_reason is None:
         delta = reader.feed(text)
+    else:
+        delta = reader.finish(text)
     if reader.stopped:
         finish_reason = "stop"
     return delta.content, finish_reason
@@ -648,21 +644,20 @@ class ResponseGenerator:
         return prompt, segments, segment_types, initial_state
 
     def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) the stop sequences and the two text state machines."""
+        """Make (and cache) the stop word and the text state machines."""
         cache_key = (model_key, tuple(stop_words))
         rs = self._state_machine_cache.get(cache_key)
         if rs is not None:
             return rs
 
-        stop_sequences = make_stop_sequences(tokenizer, stop_words=stop_words)
         stop_sm = TextStateMachine.from_stop_words(stop_words)
         text_sm = TextStateMachine.from_tokenizer(tokenizer)
 
         if len(self._state_machine_cache) > 100:
             self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_sequences, stop_sm, text_sm)
+        self._state_machine_cache[cache_key] = (stop_sm, text_sm)
 
-        return stop_sequences, stop_sm, text_sm
+        return stop_sm, text_sm
 
     def _is_batchable(self, args):
         return (
@@ -727,7 +722,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_sequences, stop_sm, text_sm = self._make_state_machine(
+                    stop_sm, text_sm = self._make_state_machine(
                         self.model_provider.model_key,
                         current_tokenizer,
                         args.stop_words,
@@ -765,7 +760,6 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
@@ -806,6 +800,7 @@ class ResponseGenerator:
                     batch_results = {}
                     batch_generator = BatchGenerator(
                         model,
+                        stop_tokens=[[t] for t in tokenizer.eos_token_ids],
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
@@ -880,11 +875,7 @@ class ResponseGenerator:
                             result["detokenizer"].add_token(r.token)
                             text = result["detokenizer"].last_segment
                         text, finish_reason = _apply_stop_words(
-                            result["stop_reader"],
-                            text,
-                            token=r.token,
-                            finish_reason=r.finish_reason,
-                            eos_token_ids=current_tokenizer.eos_token_ids,
+                            result["stop_reader"], text, finish_reason=r.finish_reason
                         )
 
                         result["rqueue"].put(
@@ -959,7 +950,7 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_sequences, stop_sm, text_sm = self._make_state_machine(
+            stop_sm, text_sm = self._make_state_machine(
                 self.model_provider.model_key,
                 tokenizer,
                 args.stop_words,
@@ -997,8 +988,6 @@ class ResponseGenerator:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # Process the prompt and generate tokens
-            # Own matcher: the automaton is cached across requests.
-            stop_matcher = stop_sequences.matcher()
             stop_reader = stop_sm.reader()
             for gen in stream_generate(
                 model=model,
@@ -1017,17 +1006,8 @@ class ResponseGenerator:
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
-                finish_reason = gen.finish_reason
-
-                # Token-level stop word detection
-                if stop_matcher.advance(gen.token):
-                    finish_reason = "stop"
                 text, finish_reason = _apply_stop_words(
-                    stop_reader,
-                    gen.text,
-                    token=gen.token,
-                    finish_reason=finish_reason,
-                    eos_token_ids=tokenizer.eos_token_ids,
+                    stop_reader, gen.text, finish_reason=gen.finish_reason
                 )
 
                 rqueue.put(
