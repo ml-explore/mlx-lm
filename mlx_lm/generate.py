@@ -938,7 +938,7 @@ class StopSequences:
         return self.Matcher(self._root)
 
 
-TextState = Literal["normal", "reasoning", "tool", "header", "stop"]
+TextState = Literal["normal", "reasoning", "tool", "stop"]
 
 
 class TextStateMachine:
@@ -949,8 +949,8 @@ class TextStateMachine:
     text, so a marker split over tokens still matches.
 
     ``normal`` text is the content, ``reasoning`` text the reasoning and each
-    visit to ``tool`` one tool call. ``header`` text is dropped. ``stop`` ends
-    the text: the reader is then ``stopped``.
+    visit to ``tool`` one tool call. ``stop`` ends the text: the reader is
+    then ``stopped``.
 
     Example:
 
@@ -1020,7 +1020,7 @@ class TextStateMachine:
                 return delta.add_reasoning(text)
             if self._state == "tool":
                 self._tool += text
-            elif self._state not in ("header", "stop"):
+            elif self._state != "stop":
                 raise ValueError(f"Unknown state {self._state!r}.")
             return delta
 

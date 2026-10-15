@@ -209,13 +209,6 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine.Delta(content="a", reasoning="r", tool_calls=("x", "y")),
         )
 
-    def test_header_text_is_dropped(self):
-        sm = TextStateMachine({"header": [("<|message|>", "normal")]})
-        reader = sm.reader(state="header")
-        self.assertEqual(
-            reader.feed("to=user<|message|>Hi"), TextStateMachine.Delta(content="Hi")
-        )
-
     def test_unknown_state_raises(self):
         reader = TextStateMachine({}).reader(state="other")
         with self.assertRaises(ValueError):
