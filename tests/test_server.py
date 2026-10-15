@@ -181,6 +181,22 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine.Delta(content="d", reasoning="ac", tool_calls=("b",)),
         )
 
+    def test_tool_call_without_end_marker(self):
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=True,
+            tool_call_start="[TOOL_CALLS]",
+            tool_call_end="",
+            structural_markers=(),
+        )
+        # No end marker: the call ends with the stream.
+        reader = TextStateMachine.from_tokenizer(tokenizer).reader()
+        self.assertEqual(
+            reader.feed("hello[TOOL_CALLS]body"),
+            TextStateMachine.Delta(content="hello"),
+        )
+        self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
+
     def test_stop_word_ends_the_text(self):
         reader = TextStateMachine.from_stop_words(["\n\n"]).reader()
         self.assertEqual(
@@ -324,6 +340,12 @@ class TestServer(unittest.TestCase):
         response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})
         self.assertEqual(response.status_code, 400)
 
+    def test_malformed_stop_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        for stop in (5, [["a"]]):
+            response = requests.post(url, json={"prompt": "hi", "stop": stop})
+            self.assertEqual(response.status_code, 400)
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
@@ -464,33 +486,6 @@ class TestServer(unittest.TestCase):
         self.assertIsNone(provider.tokenizer)
         self.assertFalse(provider.is_batchable)
         self.assertIsNotNone(response_generator.cli_args.allowed_origins)
-
-    def test_make_state_machine_empty_tool_call_end(self):
-        class FakeTokenizer:
-            has_thinking = False
-            has_tool_calling = True
-            tool_call_start = "[TOOL_CALLS]"
-            tool_call_end = ""
-            tool_call_start_tokens = (100,)
-            tool_call_end_tokens = ()
-            structural_markers = ()
-
-            def convert_ids_to_tokens(self, t):
-                return f"<eos{t}>"
-
-        _, text_sm = self.response_generator._make_state_machine(
-            ("fake-empty-end", None, None),
-            FakeTokenizer(),
-            stop_words=[],
-        )
-
-        # No end marker: the call ends with the stream.
-        reader = text_sm.reader()
-        self.assertEqual(
-            reader.feed("hello[TOOL_CALLS]body"),
-            TextStateMachine.Delta(content="hello"),
-        )
-        self.assertEqual(reader.finish(), TextStateMachine.Delta(tool_calls=("body",)))
 
     def test_handle_models(self):
         url = f"http://localhost:{self.port}/v1/models"

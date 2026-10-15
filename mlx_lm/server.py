@@ -447,7 +447,6 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
-        self._state_machine_cache = {}
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -643,22 +642,6 @@ class ResponseGenerator:
 
         return prompt, segments, segment_types, initial_state
 
-    def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) the stop word and the text state machines."""
-        cache_key = (model_key, tuple(stop_words))
-        rs = self._state_machine_cache.get(cache_key)
-        if rs is not None:
-            return rs
-
-        stop_sm = TextStateMachine.from_stop_words(stop_words)
-        text_sm = TextStateMachine.from_tokenizer(tokenizer)
-
-        if len(self._state_machine_cache) > 100:
-            self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_sm, text_sm)
-
-        return stop_sm, text_sm
-
     def _is_batchable(self, args):
         return (
             self.model_provider.is_batchable
@@ -722,11 +705,8 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    stop_sm, text_sm = self._make_state_machine(
-                        self.model_provider.model_key,
-                        current_tokenizer,
-                        args.stop_words,
-                    )
+                    stop_sm = TextStateMachine.from_stop_words(args.stop_words)
+                    text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -950,11 +930,8 @@ class ResponseGenerator:
 
             # Prepare the prompt and state machine
             prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_sm, text_sm = self._make_state_machine(
-                self.model_provider.model_key,
-                tokenizer,
-                args.stop_words,
-            )
+            stop_sm = TextStateMachine.from_stop_words(args.stop_words)
+            text_sm = TextStateMachine.from_tokenizer(tokenizer)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -1219,6 +1196,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
+        self.stop = self.body.get("stop", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         try:
             self.validate_model_parameters()
@@ -1229,8 +1207,7 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Get stop sequences
-        stop_words = self.body.get("stop")
-        stop_words = stop_words or []
+        stop_words = self.stop or []
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
@@ -1285,12 +1262,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("stop", (str, list), optional=True)
 
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
             except ValueError as e:
                 raise ValueError("logit_bias must be a dict of int to float") from e
+
+        if isinstance(self.stop, list) and not all(
+            isinstance(w, str) for w in self.stop
+        ):
+            raise ValueError("stop must be a list of strings")
 
     def generate_response(
         self,
