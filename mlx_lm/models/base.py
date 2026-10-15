@@ -8,17 +8,53 @@ import mlx.core as mx
 from mlx.utils import tree_map
 
 
+def _flat_rope_config(rope_parameters) -> dict:
+    """Recover the flat RoPE config keys from transformers >= 5 ``rope_parameters``.
+
+    transformers 5 saves ``rope_theta``, ``rope_scaling`` and
+    ``partial_rotary_factor`` inside ``rope_parameters``, nested by layer type
+    when full and sliding attention layers use different RoPE settings.
+    """
+    if not isinstance(rope_parameters, dict):
+        return {}
+    config = {}
+    if "rope_theta" not in rope_parameters and "full_attention" in rope_parameters:
+        sliding = rope_parameters.get("sliding_attention") or {}
+        if "rope_theta" in sliding:
+            config["rope_local_base_freq"] = sliding["rope_theta"]
+        rope_parameters = rope_parameters["full_attention"] or {}
+    for key in (
+        "rope_theta",
+        "partial_rotary_factor",
+        "original_max_position_embeddings",
+    ):
+        if key in rope_parameters:
+            config[key] = rope_parameters[key]
+    rope_type = rope_parameters.get("rope_type") or rope_parameters.get(
+        "type", "default"
+    )
+    if rope_type == "default":
+        config["rope_scaling"] = None
+    else:
+        scaling = {
+            k: v
+            for k, v in rope_parameters.items()
+            if k not in ("rope_theta", "partial_rotary_factor")
+        }
+        scaling["type"] = scaling["rope_type"] = rope_type
+        config["rope_scaling"] = scaling
+    return config
+
+
 @dataclass
 class BaseModelArgs:
     @classmethod
     def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
+        fields = inspect.signature(cls).parameters
+        # Models that read rope_parameters themselves are left to do so.
+        if "rope_parameters" in params and "rope_parameters" not in fields:
+            params = {**_flat_rope_config(params["rope_parameters"]), **params}
+        return cls(**{k: v for k, v in params.items() if k in fields})
 
 
 def create_causal_mask(
