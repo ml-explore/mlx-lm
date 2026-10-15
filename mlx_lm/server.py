@@ -35,6 +35,7 @@ from urllib.request import urlopen
 import mlx.core as mx
 import numpy as np
 from huggingface_hub import scan_cache_dir
+from huggingface_hub.errors import CacheNotFound
 
 from ._version import __version__
 from .generate import (
@@ -1815,9 +1816,6 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Handle a GET request for the /v1/models endpoint.
         """
-        self._set_completion_headers(200)
-        self.end_headers()
-
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
         parts = self.path.split("/")
@@ -1835,11 +1833,17 @@ class APIHandler(BaseHTTPRequestHandler):
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
 
-        # Scan the cache directory for downloaded mlx models
-        hf_cache_info = scan_cache_dir()
-        downloaded_models = [
-            repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
-        ]
+        # Scan the cache directory for downloaded mlx models. A machine that only
+        # serves local paths may have no Hugging Face cache at all; that means no
+        # cached models, not a failed request.
+        try:
+            hf_cache_info = scan_cache_dir()
+        except CacheNotFound:
+            downloaded_models = []
+        else:
+            downloaded_models = [
+                repo for repo in hf_cache_info.repos if probably_mlx_lm(repo)
+            ]
 
         # Create a list of available models
         models = [
@@ -1864,8 +1868,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 )
 
         response = {"object": "list", "data": models}
-
         response_json = json.dumps(response).encode()
+
+        # The status goes out only once the body is known. It used to be sent
+        # first, so a scan failure left the client with a 200 and no body.
+        self._set_completion_headers(200)
+        self.end_headers()
         self.wfile.write(response_json)
         self.wfile.flush()
 
