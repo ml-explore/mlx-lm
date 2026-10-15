@@ -4778,6 +4778,7 @@ class TestModels(unittest.TestCase):
         dt_bias = mx.random.normal(shape=(num_heads,))
         A_log = mx.random.normal(shape=(num_heads,))
         D = mx.random.normal(shape=(num_heads,))
+        state = mx.random.normal(shape=(batch_size, num_heads, head_dim, state_dim))
         out, out_state = ssm_attn(
             hidden_states[:, :-pad],
             A_log,
@@ -4786,6 +4787,7 @@ class TestModels(unittest.TestCase):
             D,
             dt[:, :-pad],
             dt_bias,
+            state,
         )
         mask = mx.array([[True] * seq_len + [False] * pad])
         lengths = mx.array([seq_len])
@@ -4797,6 +4799,7 @@ class TestModels(unittest.TestCase):
             D,
             dt,
             dt_bias,
+            state,
             mask=mask,
             lengths=lengths,
         )
