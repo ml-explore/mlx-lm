@@ -553,11 +553,13 @@ def load_model(
             _quantize(quantization)
         elif quant_method == "modelopt":
             # NVIDIA ModelOpt.
-            algo = quantization_config["quantization"]["quant_algo"]
+            # hf_quant_config.json nests the settings, config.json does not.
+            settings = quantization_config.get("quantization", quantization_config)
+            algo = settings["quant_algo"]
             if algo != "NVFP4":
                 raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
             quantization = {
-                "group_size": quantization_config["quantization"].get("group_size", 16),
+                "group_size": settings.get("group_size", 16),
                 "bits": 4,
                 "mode": "nvfp4",
             }
@@ -1183,7 +1185,7 @@ def save(
 
     dst_path = Path(dst_path)
     # Models with a vision tower need vision_config to load it again.
-    keep_vision_config = getattr(model, "vision_model", False)
+    keep_vision_config = "vision_tower" in getattr(model, "model", {})
     save_model(dst_path, model, donate_model=donate_model)
     save_config(
         config,

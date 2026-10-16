@@ -5,14 +5,12 @@ import unittest
 import numpy as np
 from mlx import nn
 
-from mlx_lm.processors import load_processor, muse_spark_open
+from mlx_lm.processors import load_processor, muse_spark
 
 
-class TestMuseSparkOpenProcessor(unittest.TestCase):
+class TestMuseSparkProcessor(unittest.TestCase):
     def test_preprocess_image(self):
-        processor = muse_spark_open.Processor.from_config(
-            {"vision_config": {"navit_config": {"max_num_image_tokens": 16}}}
-        )
+        processor = muse_spark.Processor(max_num_image_tokens=16)
         # (height, width), pixel shape, number of tokens
         test_cases = [
             # A multiple of 28, no resize.
@@ -30,7 +28,7 @@ class TestMuseSparkOpenProcessor(unittest.TestCase):
                 self.assertEqual(n, num_tokens)
 
     def test_call(self):
-        processor = muse_spark_open.Processor()
+        processor = muse_spark.Processor()
         images = [
             np.zeros((56, 84, 3), dtype=np.uint8),
             np.zeros((10, 10, 3), dtype=np.uint8),
@@ -44,7 +42,7 @@ class TestMuseSparkOpenProcessor(unittest.TestCase):
         self.assertEqual([p.shape for p in pixel_values], [(3, 56, 84), (3, 28, 28)])
 
     def test_call_errors(self):
-        processor = muse_spark_open.Processor()
+        processor = muse_spark.Processor()
         image = np.zeros((28, 28, 3), dtype=np.uint8)
         with self.assertRaisesRegex(ValueError, "for 1 images"):
             processor("<image> <image>", images=[image])
@@ -55,11 +53,11 @@ class TestMuseSparkOpenProcessor(unittest.TestCase):
 
     def test_load_processor(self):
         model = nn.Module()
-        self.assertIsNone(load_processor(model, {"model_type": "muse_spark_open"}))
+        self.assertIsNone(load_processor(model, {"model_type": "muse_spark"}))
         self.assertIsNone(load_processor(model, {"vision_config": {}}))
         config = {
             "vision_config": {"patch_size": 16},
-            "processor_type": "muse_spark_open",
+            "processor_type": "muse_spark",
         }
         processor = load_processor(model, config)
         self.assertEqual(processor.patch_size, 16)

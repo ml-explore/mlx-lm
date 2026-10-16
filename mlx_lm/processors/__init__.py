@@ -4,15 +4,15 @@
 
 from mlx import nn
 
-from . import muse_spark_open
+from . import muse_spark
 
 # The processor of each model module.
 PROCESSORS = {
-    "muse_spark_open": muse_spark_open.Processor,
+    "muse_spark": muse_spark.Processor,
 }
 
 
-def load_processor(model: nn.Module, config: dict) -> muse_spark_open.Processor | None:
+def load_processor(model: nn.Module, config: dict) -> muse_spark.Processor | None:
     """The processor of a model, or None."""
     if not config.get("vision_config"):
         return None

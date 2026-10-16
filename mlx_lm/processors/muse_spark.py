@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Image processor of Muse Spark Open."""
+"""Image processor of Muse Spark."""
 
 import itertools
 import math
@@ -118,19 +118,10 @@ class Processor:
         vision = config.get("vision_config")
         if not vision:
             raise ValueError("The model config has no vision_config.")
-        navit = vision.get("navit_config", vision)
-        # The patch grid from vision_config, the rest from navit_config.
+        # The other settings are in processor_config.json; the defaults match it.
         return cls(
             patch_size=vision.get("patch_size", cls.patch_size),
-            downsample_factor=vision.get("downsample_factor", cls.downsample_factor),
-            min_num_image_tokens=navit.get(
-                "min_num_image_tokens", cls.min_num_image_tokens
-            ),
-            max_num_image_tokens=navit.get(
-                "max_num_image_tokens", cls.max_num_image_tokens
-            ),
-            image_mean=tuple(navit.get("image_mean", cls.image_mean)),
-            image_std=tuple(navit.get("image_std", cls.image_std)),
+            downsample_factor=vision.get("merge_size", cls.downsample_factor),
         )
 
     @property

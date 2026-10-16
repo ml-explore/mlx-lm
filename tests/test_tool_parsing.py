@@ -13,7 +13,7 @@ from mlx_lm.tool_parsers import (
     minicpm5,
     minimax_m2,
     mistral,
-    muse_spark_open,
+    muse_spark,
     pythonic,
     qwen3_coder,
 )
@@ -67,7 +67,7 @@ class TestToolParsing(unittest.TestCase):
             ),
             (
                 '<atem:invoke name="multiply">\n<atem:parameter name="a">12234585</atem:parameter><atem:parameter name="b">48838483920</atem:parameter>\n</atem:invoke>',
-                muse_spark_open,
+                muse_spark,
             ),
         ]
 
@@ -145,7 +145,7 @@ class TestToolParsing(unittest.TestCase):
             ),
             (
                 '<atem:invoke name="get_current_temperature">\n<atem:parameter name="location">London</atem:parameter>\n</atem:invoke>',
-                muse_spark_open,
+                muse_spark,
             ),
         ]
         tools = [
@@ -718,7 +718,7 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
 
-    def test_muse_spark_open(self):
+    def test_muse_spark(self):
         # The server strips the markers.
         test_case = (
             '\n<atem:invoke name="search">\n'
@@ -731,7 +731,7 @@ class TestToolParsing(unittest.TestCase):
             "</atem:invoke>\n"
         )
         self.assertEqual(
-            muse_spark_open.parse_tool_call(test_case, None),
+            muse_spark.parse_tool_call(test_case, None),
             {
                 "name": "search",
                 "arguments": {
@@ -750,7 +750,7 @@ class TestToolParsing(unittest.TestCase):
             '<atem:parameter name="content">line 1\n  </atem:invoke>\n"quoted" line\n'
             "</atem:parameter>\n</atem:invoke>"
         )
-        tool_call = muse_spark_open.parse_tool_call(test_case, None)
+        tool_call = muse_spark.parse_tool_call(test_case, None)
         self.assertEqual(
             tool_call,
             {
@@ -766,7 +766,7 @@ class TestToolParsing(unittest.TestCase):
             '<atem:invoke name="clock.now">\n</atem:invoke>\n'
         )
         self.assertEqual(
-            muse_spark_open.parse_tool_call(test_case, None),
+            muse_spark.parse_tool_call(test_case, None),
             [
                 {"name": "get_time", "arguments": {"city": "Paris"}},
                 {"name": "clock.now", "arguments": {}},
@@ -774,7 +774,7 @@ class TestToolParsing(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            muse_spark_open.parse_tool_call("no call here", None)
+            muse_spark.parse_tool_call("no call here", None)
 
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""

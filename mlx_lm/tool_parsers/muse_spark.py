@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Tool call parser for Muse Spark Open (XML_ATEM)."""
+"""Tool call parser for Muse Spark (XML_ATEM)."""
 
 import json
 from typing import Any, Optional
