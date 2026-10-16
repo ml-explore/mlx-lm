@@ -755,8 +755,20 @@ class TestToolParsing(unittest.TestCase):
             tool_call,
             {
                 "name": "write",
-                "arguments": {"content": 'line 1\n  </atem:invoke>\n"quoted" line\n'},
+                "arguments": {"content": 'line 1\n  </atem:invoke>\n"quoted" line'},
             },
+        )
+
+        # Any name without a double quote, also after another attribute.
+        test_case = (
+            '<atem:invoke name="f">\n'
+            '<atem:parameter name="a:b">1</atem:parameter>\n'
+            '<atem:parameter type="text" name="max tokens">two words</atem:parameter>\n'
+            "</atem:invoke>"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {"name": "f", "arguments": {"a:b": 1, "max tokens": "two words"}},
         )
 
         test_case = (

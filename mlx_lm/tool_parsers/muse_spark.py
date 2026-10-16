@@ -10,14 +10,15 @@ import regex as re
 tool_call_start = "<atem:function_calls>"
 tool_call_end = "</atem:function_calls>"
 
+# The names as response_template in tokenizer_config.json matches them.
 _invoke_regex = re.compile(
-    r"<atem:invoke\s+name=[\"']?(?P<name>[^\"'>]+)[\"']?\s*>"
+    r"<atem:invoke\b[^>]*?\bname=\"(?P<name>[^\"]+)\">"
     r"(?P<body>(?:<atem:parameter\b.*?</atem:parameter>|.)*?)"
     r"(?:</atem:invoke>|$)",
     re.DOTALL,
 )
 _param_regex = re.compile(
-    r"<atem:parameter\s+name=[\"']?(?P<name>[A-Za-z0-9_.-]+)[\"']?[^>]*>"
+    r"<atem:parameter\b[^>]*?\bname=\"(?P<name>[^\"]+)\"[^>]*?>"
     r"(?P<value>.*?)</atem:parameter>",
     re.DOTALL,
 )
@@ -27,7 +28,7 @@ def _param_value(raw: str) -> Any:
     try:
         return json.loads(raw)
     except ValueError:
-        return raw
+        return raw.strip()
 
 
 def parse_tool_call(
