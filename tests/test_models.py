@@ -3257,6 +3257,63 @@ class TestModels(unittest.TestCase):
                 original[k] = v
         check(original)
 
+    def test_mimo_v2_flash_attention_value_scale(self):
+        from mlx_lm.models import mimo_v2_flash
+
+        config = {
+            "model_type": "mimo_v2_flash",
+            "num_experts_per_tok": 2,
+            "hybrid_layer_pattern": [0, 1],
+            "moe_layer_freq": [0, 0],
+            "add_swa_attention_sink_bias": True,
+            "add_full_attention_sink_bias": False,
+            "sliding_window_size": 4,
+            "vocab_size": 32,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "moe_intermediate_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "n_shared_experts": None,
+            "n_routed_experts": 4,
+            "routed_scaling_factor": None,
+            "topk_method": "noaux_tc",
+            "scoring_func": "sigmoid",
+            "norm_topk_prob": True,
+            "n_group": 1,
+            "topk_group": 1,
+            "max_position_embeddings": 128,
+            "layernorm_epsilon": 1e-5,
+            "rope_theta": 1000.0,
+            "swa_rope_theta": 1000.0,
+            "swa_num_attention_heads": 4,
+            "swa_num_key_value_heads": 2,
+            "head_dim": 16,
+            "v_head_dim": 8,
+            "swa_head_dim": 16,
+            "swa_v_head_dim": 8,
+            "partial_rotary_factor": 0.5,
+        }
+        value_scale = 0.5
+        model = mimo_v2_flash.Model(mimo_v2_flash.ModelArgs.from_dict(config))
+        scaled = mimo_v2_flash.Model(
+            mimo_v2_flash.ModelArgs.from_dict(
+                {**config, "attention_value_scale": value_scale}
+            )
+        )
+
+        # A scale on the values is equal to the same scale on v_proj.
+        weights = tree_flatten(scaled.parameters())
+        model.load_weights(
+            [
+                (k, v * value_scale if k.endswith("v_proj.weight") else v)
+                for k, v in weights
+            ]
+        )
+        inputs = mx.array([[0, 1, 2, 3, 4, 5]])
+        self.assertTrue(mx.allclose(model(inputs), scaled(inputs)))
+
     def test_all_models(self):
         test_configs = [
             {
@@ -4373,6 +4430,7 @@ class TestModels(unittest.TestCase):
                 "swa_head_dim": 128,
                 "swa_v_head_dim": 64,
                 "partial_rotary_factor": 0.5,
+                "attention_value_scale": 0.707,
             },
             {
                 "model_type": "rwkv7",
@@ -4720,6 +4778,7 @@ class TestModels(unittest.TestCase):
         dt_bias = mx.random.normal(shape=(num_heads,))
         A_log = mx.random.normal(shape=(num_heads,))
         D = mx.random.normal(shape=(num_heads,))
+        state = mx.random.normal(shape=(batch_size, num_heads, head_dim, state_dim))
         out, out_state = ssm_attn(
             hidden_states[:, :-pad],
             A_log,
@@ -4728,6 +4787,7 @@ class TestModels(unittest.TestCase):
             D,
             dt[:, :-pad],
             dt_bias,
+            state,
         )
         mask = mx.array([[True] * seq_len + [False] * pad])
         lengths = mx.array([seq_len])
@@ -4739,6 +4799,7 @@ class TestModels(unittest.TestCase):
             D,
             dt,
             dt_bias,
+            state,
             mask=mask,
             lengths=lengths,
         )
