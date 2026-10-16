@@ -76,6 +76,13 @@ def image_prompt(
     return image, inputs
 
 
+def rotate_half_rows(w: mx.array, head_dim: int) -> mx.array:
+    """The q and k rows of each head in the Hugging Face order."""
+    shape = w.shape
+    w = w.reshape(-1, head_dim // 2, 2, *shape[1:])
+    return mx.swapaxes(w, 1, 2).reshape(shape)
+
+
 def hf_checkpoint(model: muse_spark.Model, weights: dict) -> dict:
     """The weights of model as a Hugging Face checkpoint stores them."""
     args = model.args.text
@@ -87,9 +94,13 @@ def hf_checkpoint(model: muse_spark.Model, weights: dict) -> dict:
             attn = k[: -len("qkvg_proj.weight")]
             parts = mx.split(v, [q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim])
             for name, part in zip(("q", "k", "v", "gate"), parts):
+                if name in "qk":
+                    part = rotate_half_rows(part, args.head_dim)
                 hf[f"{attn}{name}_proj.weight"] = part
         elif ".attn.qkv_proj." in k:
             for name, part in zip("qkv", mx.split(v, 3)):
+                if name in "qk":
+                    part = rotate_half_rows(part, model.args.vision.head_dim)
                 hf[k.replace("qkv_proj", f"{name}_proj")] = part
         elif k.endswith(("_alpha", "_beta")):
             # Zero gates give the default coefficients.
