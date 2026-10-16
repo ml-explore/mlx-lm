@@ -143,6 +143,29 @@ class TestSampleUtils(unittest.TestCase):
             actual_probs.tolist(), [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
         )
 
+    def test_apply_xtc_survives_an_invalid_argument(self):
+        """A rejected argument must not disable XTC for the rest of the process.
+
+        The validation used to run inside the `mx.compile`d body. Raising there
+        aborts the trace while `mx.random.state` is captured as an output, and
+        `_apply_xtc` is the only sampler that reads that state -- so every later
+        call failed with "[eval] Attempting to eval an array without a
+        primitive" until the process restarted.
+        """
+        logits = mx.log(mx.array([[0.1, 0.2, 0.3, 0.4]]))
+
+        mx.eval(apply_xtc(logits, 1.0, 0.1, []))
+
+        with self.assertRaises(ValueError):
+            mx.eval(apply_xtc(logits, 1.0, 0.9, []))
+        with self.assertRaises(ValueError):
+            mx.eval(apply_xtc(logits, 1.5, 0.1, []))
+
+        # the sampler still works afterwards
+        out = apply_xtc(logits, 1.0, 0.1, [])
+        mx.eval(out)
+        self.assertEqual(out.shape, logits.shape)
+
     def test_apply_xtc(self):
         # Test the threshold
         probs = mx.array([[0.4, 0.3, 0.15, 0.15]])
