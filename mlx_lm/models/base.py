@@ -61,6 +61,20 @@ def create_ssm_mask(h, cache=None):
     return None
 
 
+# Cap on the attention-scores allocation in :func:`quantized_scaled_dot_product_attention`,
+# in bytes. The scores are [B, n_kv, n_rep, T, K] in fp16 or fp32 (fp32 for any non-fp16
+# query — this model's bf16 weights, verified), so with a 4 GiB budget the query axis is
+# tiled to at most ~4 GiB / (n_q_heads * K * bytes) rows per pass — 4 GiB holds a 2048-row
+# pass to K ~ 14k at 24 q heads/fp32 and a 512-row pass to K ~ 57k, comfortably covering
+# the ~262k-token context ceiling. Verified at the actual crash shape (B=1, 24 q / 4 kv
+# heads, n_rep=6, T=2048, D=256, 4-bit KV, bf16 queries — the exact qwen3.8-27b geometry:
+# untiled scores 30,337,597,440 bytes ≈ 28.16 GiB at K = 154,305, vs the 28.08 GiB
+# Metal single-buffer cap -> metal::malloc abort): the tiled path completes in 7 x
+# ~291-row passes at 28.77 GiB peak in 1.6 s. Set to 0 to disable tiling (restore the
+# single-pass allocation).
+QDPA_SCORES_BUDGET_BYTES = 4_294_967_296
+
+
 def quantized_scaled_dot_product_attention(
     queries: mx.array,
     q_keys: tuple[mx.array, mx.array, mx.array],
@@ -73,38 +87,62 @@ def quantized_scaled_dot_product_attention(
     B, n_q_heads, L, D = queries.shape
     n_kv_heads = q_keys[0].shape[-3]
     n_repeats = n_q_heads // n_kv_heads
+    K = q_keys[0].shape[-2]
 
-    queries *= scale
-
+    # mx.quantized_matmul emits fp32 scores for non-fp16 queries (fp16 for fp16 queries),
+    # so the per-pass scores allocation is [B, n_kv, n_rep, T, K], growing linearly in the
+    # KV length K. On a long-context hybrid with quantized KV the 2048-row prefill chunk
+    # hit 28.16 GiB of fp32 scores at K = 154,305 — over the 28.08 GiB Metal
+    # single-buffer cap, which aborts the prefill with a metal::malloc error. Tile the
+    # QUERIES instead: the row reduction (mask + softmax over the full K) is per-row, so
+    # a partition of the query rows is an exact, embarrassingly-parallel split — verified
+    # bit-identical to the single pass (max|d| = 0) for the fp16- and bf16-scores paths,
+    # the 4D non-GQA branch, and the GQA n_rep>1 branch alike. The budget bounds peak
+    # memory for any context length; prompts short enough to fit take the identical
+    # single-tile path (tile = L).
+    budget = QDPA_SCORES_BUDGET_BYTES
+    tile = min(L, max(1, budget // (max(n_kv_heads, 1) * max(n_repeats, 1) * max(K, 1) * 4))) if budget > 0 else L
     if n_repeats > 1:
-        queries = mx.reshape(queries, (B, n_kv_heads, n_repeats, L, D))
         q_keys = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_keys)
         q_values = tree_map(lambda x: mx.expand_dims(x, axis=-3), q_values)
 
-    scores = mx.quantized_matmul(
-        queries, *q_keys, transpose=True, group_size=group_size, bits=bits
-    )
-    if mask is not None:
-        if isinstance(mask, str):
-            qL, kL = scores.shape[-2:]
-            q_indices = mx.arange(kL - qL, kL)
-            k_indices = mx.arange(kL)
-            mask = q_indices[:, None] >= k_indices[None]
-        if n_repeats > 1 and mask.ndim > 3:
-            mask = mx.expand_dims(mask, -3)
-        if mask.dtype == mx.bool_:
-            scores = mx.where(mask, scores, mx.finfo(scores.dtype).min)
-        else:
-            scores += mask
-    scores = mx.softmax(scores, axis=-1, precise=True)
-    out = mx.quantized_matmul(
-        scores, *q_values, transpose=False, group_size=group_size, bits=bits
-    )
+    def _align(m, t):
+        # Grow rank by inserting size-1 axes before (L, K) so 4D batch masks
+        # broadcast against 5D expanded GQA scores (mirrors mlx_vlm #1567 fix).
+        while m.ndim < t.ndim:
+            m = mx.expand_dims(m, axis=max(m.ndim - 2, 0))
+        return m
 
-    if n_repeats > 1:
-        out = mx.reshape(out, (B, n_q_heads, L, D))
-
-    return out
+    out = []
+    queries *= scale
+    for s in range(0, L, tile):
+        e = min(s + tile, L)
+        q = queries[..., s:e, :]
+        if n_repeats > 1:
+            q = mx.reshape(q, (B, n_kv_heads, n_repeats, e - s, D))
+        scores = mx.quantized_matmul(
+            q, *q_keys, transpose=True, group_size=group_size, bits=bits
+        )
+        if mask is not None:
+            if isinstance(mask, str):
+                k_indices = mx.arange(K)
+                q_indices = mx.arange(K - L + s, K - L + e)
+                tmask = (q_indices[:, None] >= k_indices[None])
+            else:
+                tmask = mask[..., s:e, :]
+            tmask = _align(tmask, scores)
+            if tmask.dtype == mx.bool_:
+                scores = mx.where(tmask, scores, mx.finfo(scores.dtype).min)
+            else:
+                scores += tmask
+        scores = mx.softmax(scores, axis=-1, precise=True)
+        o = mx.quantized_matmul(
+            scores, *q_values, transpose=False, group_size=group_size, bits=bits
+        )
+        if n_repeats > 1:
+            o = mx.reshape(o, (B, n_q_heads, e - s, D))
+        out.append(o)
+    return mx.concatenate(out, axis=-2) if len(out) > 1 else out[0]
 
 
 def scaled_dot_product_attention(
