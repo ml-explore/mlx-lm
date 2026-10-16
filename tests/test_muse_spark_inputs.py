@@ -33,7 +33,7 @@ class TestMuseSparkProcessor(unittest.TestCase):
             np.zeros((56, 84, 3), dtype=np.uint8),
             np.zeros((10, 10, 3), dtype=np.uint8),
         ]
-        text, pixel_values = processor("A <image> and B <image>.", images=images)
+        text, pixel_values = processor("A <|patch|> and B <|patch|>.", images=images)
         expected = (
             "A <|image_start|>" + "<|patch|>" * 6 + "<|image_end|>"
             " and B <|image_start|><|patch|><|image_end|>."
@@ -45,11 +45,9 @@ class TestMuseSparkProcessor(unittest.TestCase):
         processor = muse_spark.Processor()
         image = np.zeros((28, 28, 3), dtype=np.uint8)
         with self.assertRaisesRegex(ValueError, "for 1 images"):
-            processor("<image> <image>", images=[image])
+            processor("<|patch|> <|patch|>", images=[image])
         with self.assertRaisesRegex(ValueError, "for 1 images"):
             processor("No image", images=[image])
-        with self.assertRaisesRegex(ValueError, "already has"):
-            processor("<image><|patch|>", images=[image])
 
     def test_load_processor(self):
         model = nn.Module()
