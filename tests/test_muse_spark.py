@@ -258,6 +258,18 @@ class TestMuseSparkResponseFormat(unittest.TestCase):
                     call[len("<atem:function_calls>") : -len("</atem:function_calls>")],
                 )
 
+    def test_quoted_call(self):
+        # A call starts its own message; one in the answer is only text.
+        call = (
+            '<atem:function_calls><atem:invoke name="grep">'
+            "</atem:invoke></atem:function_calls>"
+        )
+        text = f" to=user<|message|>Write {call} to search."
+        for step in (1, 3, 7, len(text)):
+            out = self.split(text, step)
+            self.assertEqual(out["normal"], f"Write {call} to search.")
+            self.assertEqual(out["tool"], "")
+
 
 if __name__ == "__main__":
     unittest.main()
