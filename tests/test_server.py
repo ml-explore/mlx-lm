@@ -1198,6 +1198,36 @@ class TestServerSingleCheckpoints(unittest.TestCase):
                 self.assertEqual(stats["system"]["n_sequences"], n)
                 self.assertEqual(stats["assistant"]["n_sequences"], n)
 
+    def test_cache_store_false_reads_but_adds_nothing(self):
+        # A client's background request (cache_store: false) reuses what's
+        # cached and stores nothing -- no checkpoint, no entry, no warmed
+        # turn -- in the single path and with batching on (it isn't batched).
+        for batchable in (False, True):
+            with self.subTest(batchable=batchable):
+                provider, prompt_cache, url = self._serve(batchable=batchable)
+                first = [
+                    {"role": "system", "content": self.SYSTEM},
+                    {"role": "user", "content": "Hello!"},
+                ]
+                self._chat(url, first)
+                time.sleep(0.5)   # a warmed next turn lands meanwhile
+                before = {k: v["n_sequences"] for k, v in prompt_cache.stats_by_type().items()}
+                n_bytes = prompt_cache.nbytes
+                other = [first[0], {"role": "user", "content": "Read these notes."}]
+                cached = self._chat(url, other, cache_store=False)
+                time.sleep(0.5)
+                self.assertGreater(cached, 0)   # the system checkpoint served it
+                after = {k: v["n_sequences"] for k, v in prompt_cache.stats_by_type().items()}
+                self.assertEqual(after, before)
+                self.assertEqual(prompt_cache.nbytes, n_bytes)
+
+    def test_cache_store_must_be_a_bool(self):
+        provider, prompt_cache, url = self._serve()
+        response = requests.post(f"{url}/v1/chat/completions",
+                                 json={"model": "chat_model", "max_tokens": 2,
+                                       "messages": [{"role": "user", "content": "hi"}], "cache_store": "no"})
+        self.assertEqual(response.status_code, 400)
+
     def test_prompt_cache_bytes_batched(self):
         # The batched path trims after its checkpoint and final inserts too.
         provider, prompt_cache, url = self._serve(prompt_cache_bytes=1, batchable=True)

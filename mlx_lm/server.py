@@ -302,6 +302,11 @@ class GenerationArguments:
     # Reasoning tokens at most before the answer (see handle_completion);
     # None: as long as the model takes.
     thinking_budget: Optional[int] = None
+    # False: the request reads the prompt cache but adds nothing to it --
+    # no checkpoints, no stored entry, no next turn warmed. A client's
+    # background work (LLMTray's memory) then never pushes a chat's cached
+    # prompt out. Served on its own (not batched, no handoff).
+    cache_store: bool = True
 
 
 @dataclass
@@ -920,6 +925,7 @@ class ResponseGenerator:
         return (
             self.model_provider.is_batchable
             and args.seed is None
+            and getattr(args, "cache_store", True)
             and not has_images
             and not (alone and self._uses_speculation(args, request))
         )
@@ -1410,7 +1416,7 @@ class ResponseGenerator:
                 # from the whole sequence when the next turn diverges in the
                 # last answer.
                 n_prefilled = 0
-                if input_embeddings is None:
+                if input_embeddings is None and getattr(args, "cache_store", True):
                     seg, seg_types = self._junction_split(
                         seg, seg_types, ctx.prompt_cache_count, len(prompt)
                     )
@@ -1472,6 +1478,7 @@ class ResponseGenerator:
                 and not self._is_distributed
                 and input_embeddings is None
                 and args.seed is None
+                and getattr(args, "cache_store", True)
                 and (use_draft or self._uses_mtp(args))
             )
             handoff = None
@@ -1547,13 +1554,14 @@ class ResponseGenerator:
 
             rqueue.put(None)
 
-            # Save the KV cache again
-            self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
-            )
-            cap = getattr(self.cli_args, "prompt_cache_bytes", None)
-            if cap is not None:
-                self.prompt_cache.trim_to(n_bytes=cap)
+            # Save the KV cache again (not for a request that only reads it)
+            if getattr(args, "cache_store", True):
+                self.prompt_cache.insert_cache(
+                    self.model_provider.model_key, cache_key, cache
+                )
+                cap = getattr(self.cli_args, "prompt_cache_bytes", None)
+                if cap is not None:
+                    self.prompt_cache.trim_to(n_bytes=cap)
 
         except Exception as e:
             rqueue.put(e)
@@ -2151,6 +2159,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.seed = self.body.get("seed", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         self.thinking_budget = self.body.get("thinking_budget", None)
+        self.cache_store = self.body.get("cache_store", True)
         try:
             self.validate_model_parameters()
         except ValueError as e:
@@ -2208,6 +2217,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if self.thinking_budget is not None and (not isinstance(self.thinking_budget, int)
                                                  or isinstance(self.thinking_budget, bool) or self.thinking_budget < 0):
             raise ValueError("thinking_budget must be a non-negative integer")
+        if not isinstance(self.cache_store, bool):
+            raise ValueError("cache_store must be true or false")
         self._validate("temperature", (float, int), min_val=0)
         self._validate("top_p", (float, int), min_val=0, max_val=1)
         self._validate("top_k", int, min_val=0)
@@ -2414,6 +2425,7 @@ class APIHandler(BaseHTTPRequestHandler):
             seed=self.seed,
             chat_template_kwargs=self.chat_template_kwargs,
             thinking_budget=self.thinking_budget,
+            cache_store=self.cache_store,
         )
 
         # Keep connection allive during long prompt processing (and also log
@@ -2702,7 +2714,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(response_json)
                 self.wfile.flush()
-            if finish_reason in ("stop", "tool_calls"):
+            if finish_reason in ("stop", "tool_calls") and getattr(args, "cache_store", True):
                 self.response_generator.warm_next_turn(
                     ctx.model_key,
                     request,
