@@ -17,7 +17,14 @@ from tqdm import tqdm
 from .cli_ui import make_console, print_lora_run_header, rprint
 from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
-from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
+from .tuner.trainer import (
+    TrainingArgs,
+    TrainingCallback,
+    default_loss,
+    evaluate,
+    get_chunked_loss,
+    train,
+)
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
@@ -73,6 +80,7 @@ CONFIG_DEFAULTS = {
     "grad_checkpoint": False,
     "grad_accumulation_steps": 1,
     "clear_cache_threshold": 0,
+    "loss_chunk_size": 0,
     "lr_schedule": None,
     "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
@@ -202,6 +210,15 @@ def build_parser():
         help="Clear the allocator cache between steps if it grows too large.",
     )
     parser.add_argument(
+        "--loss-chunk-size",
+        type=int,
+        default=None,
+        help=(
+            "Compute the loss in chunks of this many tokens to reduce memory "
+            "use with large vocabularies. 0 disables it."
+        ),
+    )
+    parser.add_argument(
         "--report-to",
         type=str,
         default=None,
@@ -280,6 +297,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        loss_chunk_size=args.loss_chunk_size,
     )
 
     # Initialize the selected optimizer
@@ -319,9 +337,13 @@ def evaluate_model(args, model: nn.Module, test_set):
     if args.test_batches != -1:
         n_batches = min(n_batches, args.test_batches)
     pbar = tqdm(total=n_batches, desc="Calculating loss...") if rank == 0 else None
+    loss = default_loss
+    if args.loss_chunk_size > 0:
+        loss = get_chunked_loss(model, args.loss_chunk_size)
     test_loss = evaluate(
         model=model,
         dataset=CacheDataset(test_set),
+        loss=loss,
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,

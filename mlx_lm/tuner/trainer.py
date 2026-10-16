@@ -83,6 +83,12 @@ class TrainingArgs:
             "help": "Clear the allocator cache between steps if it grows too large."
         },
     )
+    loss_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Compute the loss in chunks of this many tokens to reduce memory use. 0 disables it."
+        },
+    )
 
 
 def default_loss(model, batch, lengths):
@@ -99,6 +105,70 @@ def default_loss(model, batch, lengths):
     ce = ce.astype(mx.float32).sum() / ntoks
 
     return ce, ntoks
+
+
+def chunked_loss(model, batch, lengths, tied, chunk_size):
+    """
+    Same loss as `default_loss`, but the logits are made `chunk_size` tokens
+    at a time and recomputed in the backward pass. The full
+    [batch, sequence, vocabulary] logits array is never stored.
+    """
+    inputs = batch[:, :-1]
+    targets = batch[:, 1:]
+
+    hidden = model.model(inputs)
+
+    steps = mx.arange(1, targets.shape[1] + 1)
+    mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
+    ntoks = mask.sum()
+
+    hidden = hidden.reshape(-1, hidden.shape[-1])
+    targets = targets.reshape(-1)
+    mask = mask.reshape(-1)
+
+    head = model.model.embed_tokens if tied else model.lm_head
+    head_fn = getattr(head, "as_linear", head)
+
+    def checkpointed_ce(t, m):
+        def chunk_ce(params, h):
+            head.update(params)
+            ce = nn.losses.cross_entropy(head_fn(h), t) * m
+            return ce.astype(mx.float32).sum()
+
+        return mx.checkpoint(chunk_ce)
+
+    params = head.trainable_parameters()
+    ce = 0
+    for i in range(0, targets.size, chunk_size):
+        s = slice(i, i + chunk_size)
+        ce += checkpointed_ce(targets[s], mask[s])(params, hidden[s])
+    # The chunks swap the head parameters for the arrays they were called with.
+    head.update(params)
+    return ce / ntoks, ntoks
+
+
+def get_chunked_loss(model, chunk_size):
+    """
+    Return `chunked_loss` for this model, or `default_loss` if the model does
+    not compute its logits as `lm_head(model.model(inputs))`.
+    """
+    x = mx.zeros((1, 8), dtype=mx.int32)
+    was_training = model.training
+    model.eval()
+    try:
+        expected = model(x)
+        for tied in (False, True):
+            try:
+                head = model.model.embed_tokens if tied else model.lm_head
+                logits = getattr(head, "as_linear", head)(model.model(x))
+                if mx.array_equal(expected, logits).item():
+                    return partial(chunked_loss, tied=tied, chunk_size=chunk_size)
+            except (AttributeError, ValueError, TypeError):
+                pass
+    finally:
+        model.train(was_training)
+    rprint("[WARNING] This model does not support loss_chunk_size, ignoring it.")
+    return default_loss
 
 
 def iterate_batches(
@@ -235,6 +305,9 @@ def train(
 
     if args.grad_checkpoint:
         grad_checkpoint(model.layers[0])
+
+    if args.loss_chunk_size > 0 and loss is default_loss:
+        loss = get_chunked_loss(model, args.loss_chunk_size)
 
     loss_value_and_grad = nn.value_and_grad(model, loss)
 
