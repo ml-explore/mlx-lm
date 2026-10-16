@@ -942,6 +942,99 @@ class TestModels(unittest.TestCase):
         )
         self.check_moe_sanitize(Klear.Model(args), args.num_experts, "experts")
 
+    def ernie4_5_moe_model(self):
+        from mlx_lm.models import ernie4_5_moe
+
+        args = ernie4_5_moe.ModelArgs(
+            hidden_size=8,
+            intermediate_size=8,
+            moe_intermediate_size=8,
+            model_type="ernie4_5_moe",
+            max_position_embeddings=64,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=16,
+            rope_theta=1000.0,
+            use_bias=False,
+            tie_word_embeddings=True,
+            moe_num_experts=4,
+            moe_k=2,
+            moe_layer_start_index=1,
+        )
+        return ernie4_5_moe.Model(args)
+
+    def test_ernie4_5_moe_sanitize_correction_bias(self):
+        model = self.ernie4_5_moe_model()
+        gate = "model.layers.1.mlp.gate.weight"
+        key = "model.layers.1.mlp.moe_statics.e_score_correction_bias"
+        gate_weight = mx.zeros((4, 8))
+
+        # The checkpoint stores the bias as [1, E]. The model expects [E].
+        bias = mx.arange(4, dtype=mx.float32)
+        weights = model.sanitize({gate: gate_weight, key: bias[None]})
+        self.assertEqual(weights[key].shape, (4,))
+        self.assertTrue(mx.array_equal(weights[key], bias))
+        weights = model.sanitize(weights)
+        self.assertTrue(mx.array_equal(weights[key], bias))
+
+        # A MoE layer without a bias gets zeros.
+        weights = model.sanitize({gate: gate_weight})
+        self.assertTrue(mx.array_equal(weights[key], mx.zeros((4,))))
+
+        # Pipeline loading can pass only some layers, or none.
+        self.assertEqual(model.sanitize({}), {})
+        dense = {"model.layers.0.mlp.gate_proj.weight": mx.zeros((8, 8))}
+        self.assertEqual(list(model.sanitize(dense)), list(dense))
+
+        self.assertFalse(model.cast_predicate(key))
+        self.assertTrue(model.cast_predicate(gate))
+
+    def test_ernie4_5_moe_correction_bias_routing(self):
+        model = self.ernie4_5_moe_model()
+        moe = model.layers[1].mlp
+
+        # With x = ones, the logit of expert e is the sum of its gate row.
+        logits = mx.array([2.0, 1.0, 0.99, -3.0])
+        bias = mx.array([0.0, 0.0, 0.05, 0.0])
+        weights = dict(tree_flatten(model.parameters()))
+        weights["model.layers.1.mlp.gate.weight"] = mx.broadcast_to(
+            logits[:, None] / 8, (4, 8)
+        )
+        weights["model.layers.1.mlp.moe_statics.e_score_correction_bias"] = bias[
+            None
+        ].astype(mx.bfloat16)
+        model.load_weights(list(model.sanitize(weights).items()), strict=True)
+        self.assertEqual(moe.moe_statics.e_score_correction_bias.dtype, mx.bfloat16)
+
+        probs = mx.softmax(logits)
+        unbiased = set(mx.argsort(-probs)[:2].tolist())
+        expected = set(mx.argsort(-(probs + bias))[:2].tolist())
+        # The bias must flip a near-tie, otherwise the test checks nothing.
+        self.assertNotEqual(unbiased, expected)
+
+        # Replace the experts with one-hot outputs to read the routing weights.
+        selected = {}
+
+        def switch_mlp(x, inds):
+            selected["inds"] = inds
+            one_hot = (inds[..., None] == mx.arange(4)).astype(mx.float32)
+            return mx.pad(one_hot, [(0, 0), (0, 0), (0, 0), (0, 4)])
+
+        moe.switch_mlp = switch_mlp
+        with mock.patch.object(mx, "argpartition", wraps=mx.argpartition) as argpart:
+            out = moe(mx.ones((1, 1, 8)))
+
+        # A bf16 bias must not lower the precision of the selection scores.
+        self.assertEqual(argpart.call_args.args[0].dtype, mx.float32)
+        self.assertEqual(set(selected["inds"].flatten().tolist()), expected)
+
+        expected_weights = mx.zeros(4)
+        for i in expected:
+            expected_weights[i] = probs[i] / sum(probs[j] for j in expected)
+        self.assertTrue(mx.allclose(out[0, 0, :4], expected_weights, atol=1e-5))
+
     def test_qwen3(self):
         from mlx_lm.models import qwen3
 
