@@ -8,90 +8,139 @@ import test_models
 from mlx.utils import tree_flatten, tree_map
 from model_parallel_tests import Group
 
-from mlx_lm.chat_templates.muse_spark_open import RESPONSE_FORMAT
+from mlx_lm.chat_templates.muse_spark import RESPONSE_FORMAT
 from mlx_lm.generate import TextStateMachine, make_text_state_machine
-from mlx_lm.models import muse_spark_open
+from mlx_lm.models import muse_spark
 from mlx_lm.models.cache import RotatingKVCache
 
 # Layers 0-2 are sliding (window 8) with RoPE, layer 3 is full and NoPE.
 CONFIG = {
-    "model_type": "muse_spark_open",
-    "vocab_size": 256,
-    "hidden_size": 64,
-    "num_hidden_layers": 4,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "head_dim": 16,
-    "rms_norm_eps": 1e-5,
-    "rms_post_norm_eps": 1e-8,
-    "rope_theta": 10000.0,
-    "every_n_layers_nope": 4,
-    "global_attn_cfg": [8, 8, 8, 0],
-    "output_soft_cap_temp": 20.0,
-    "use_fp32_for_output": True,
+    "model_type": "muse_spark",
     # The default id is not in this vocab.
-    "patch_token_id": 255,
-    "moe": {
-        "is_enabled": True,
-        "num_experts": 4,
-        "topk": 2,
-        "compression_factor": 2,
-        "override_routed_hidden_dim": 32,
-        "router_in_fp32": True,
-        "router_score_division_eps": 1e-15,
-        "route_scale": 1.5,
-    },
-    "metap": {
-        "use_metap": True,
-        "base_width": 32,
-        "router_has_one_inf_dim": True,
-        "m_emb": 2.0,
+    "image_token_id": 255,
+    "text_config": {
+        "vocab_size": 256,
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rms_norm_eps": 1e-5,
+        "post_norm_eps": 1e-8,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+        "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+        "sliding_window": 8,
+        "final_logit_softcapping": 20.0,
+        "output_multiplier": 2**-0.5,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_hidden_size": 32,
+        "moe_intermediate_size": 32,
+        "routed_scaling_factor": 1.5,
     },
 }
 
 # Tiles of 4 x 4 patches; layer 0 attends in tiles, layer 1 to all patches.
 VISION_CONFIG = {
-    "navit_config": {
-        "vision_output_dim": 128,
-        "num_hidden_layers": 2,
-        "num_attention_heads": 2,
-        "intermediate_size": 64,
-        "image_size": 8,
-        "patch_size": 2,
-        "sparse_attention_factor": 2,
-    },
-    "projector_input_dim": 48,
+    "hidden_size": 32,
+    "intermediate_size": 64,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 2,
+    "patch_size": 2,
+    "merge_size": 2,
+    "pos_emb_height": 4,
+    "pos_emb_width": 4,
+    "layer_types": ["window_attention", "full_attention"],
 }
 
 
-def create_model(vision: bool = False) -> muse_spark_open.Model:
+def create_model(vision: bool = False) -> muse_spark.Model:
     mx.random.seed(0)
-    config = {**CONFIG, "vision_config": VISION_CONFIG} if vision else CONFIG
-    args = muse_spark_open.ModelArgs.from_dict(config)
-    return muse_spark_open.Model(args)
+    config = CONFIG
+    if vision:
+        config = {**CONFIG, "vision_config": VISION_CONFIG, "projector_hidden_size": 48}
+    args = muse_spark.ModelArgs.from_dict(config)
+    return muse_spark.Model(args)
 
 
 def image_prompt(
-    model: muse_spark_open.Model, *, h: int, w: int
+    model: muse_spark.Model, *, h: int, w: int
 ) -> tuple[mx.array, mx.array]:
     """An h x w image and a prompt with a patch token for each of its rows."""
     vision = model.args.vision
-    side = vision.patch_size * vision.downsample_factor
+    side = vision.patch_size * vision.merge_size
     rows = (h // side) * (w // side)
     image = mx.random.uniform(shape=(3, h, w))
-    inputs = mx.array([1, 2] + [model.args.patch_token_id] * rows + [3, 4])
+    inputs = mx.array([1, 2] + [model.args.image_token_id] * rows + [3, 4])
     return image, inputs
 
 
-class TestMuseSparkOpen(unittest.TestCase):
+def rotate_half_rows(w: mx.array, head_dim: int) -> mx.array:
+    """The q and k rows of each head in the Hugging Face order."""
+    shape = w.shape
+    w = w.reshape(-1, head_dim // 2, 2, *shape[1:])
+    return mx.swapaxes(w, 1, 2).reshape(shape)
+
+
+def hf_checkpoint(model: muse_spark.Model, weights: dict) -> dict:
+    """The weights of model as a Hugging Face checkpoint stores them."""
+    args = model.args.text
+    q_dim = args.num_attention_heads * args.head_dim
+    kv_dim = args.num_key_value_heads * args.head_dim
+    hf = {}
+    for k, v in weights.items():
+        if k.endswith("self_attn.qkvg_proj.weight"):
+            attn = k[: -len("qkvg_proj.weight")]
+            parts = mx.split(v, [q_dim, q_dim + kv_dim, q_dim + 2 * kv_dim])
+            for name, part in zip(("q", "k", "v", "gate"), parts):
+                if name in "qk":
+                    part = rotate_half_rows(part, args.head_dim)
+                hf[f"{attn}{name}_proj.weight"] = part
+        elif ".attn.qkv_proj." in k:
+            for name, part in zip("qkv", mx.split(v, 3)):
+                if name in "qk":
+                    part = rotate_half_rows(part, model.args.vision.head_dim)
+                hf[k.replace("qkv_proj", f"{name}_proj")] = part
+        elif k.endswith(("_alpha", "_beta")):
+            # Zero gates give the default coefficients.
+            name = "post_attention" if ".add_attn_" in k else "post_feedforward"
+            prefix = k.rsplit(".", 1)[0]
+            hf[f"{prefix}.{name}_residual_gate.gate"] = mx.zeros(v.shape)
+        elif k.endswith(muse_spark._ZERO_CENTERED_NORMS):
+            hf[k] = v - 1
+        elif k.endswith("mlp.experts.gate_proj.weight"):
+            up = weights[k.replace("gate_proj", "up_proj")]
+            hf[k.replace("gate_proj.weight", "gate_up_proj")] = mx.concatenate(
+                [v, up], axis=1
+            )
+        elif k.endswith("mlp.experts.up_proj.weight"):
+            continue
+        elif k.endswith("mlp.experts.down_proj.weight"):
+            hf[k.replace("down_proj.weight", "down_proj")] = v
+        else:
+            hf[k] = v
+    return hf
+
+
+class TestMuseSpark(unittest.TestCase):
     def test_forward(self):
         model = create_model()
         for t in [mx.float32, mx.bfloat16]:
             model.update(tree_map(lambda p: p.astype(t), model.parameters()))
             # The soft-capped logits are fp32 for all weight dtypes.
             outputs = model(mx.array([[0, 1]]))
-            self.assertEqual(outputs.shape, (1, 2, model.args.vocab_size))
+            self.assertEqual(outputs.shape, (1, 2, model.args.text.vocab_size))
             self.assertEqual(outputs.dtype, mx.float32)
+
+    def test_vision_layer_types(self):
+        # As transformers: full attention in every 4th and the last layer.
+        vision = {**VISION_CONFIG, "num_hidden_layers": 6, "layer_types": None}
+        window, full = "window_attention", "full_attention"
+        self.assertEqual(
+            muse_spark.VisionArgs.from_dict(vision).layer_types,
+            [window, window, window, full, window, full],
+        )
 
     def test_left_padding(self):
         # Its prompts fit in the sliding window.
@@ -99,7 +148,7 @@ class TestMuseSparkOpen(unittest.TestCase):
 
     def test_cached_matches_forward(self):
         model = create_model()
-        tokens = mx.random.randint(0, model.args.vocab_size, (2, 16))
+        tokens = mx.random.randint(0, model.args.text.vocab_size, (2, 16))
         full = model(tokens)
 
         # Prefill in two chunks, then decode past the sliding window.
@@ -121,33 +170,28 @@ class TestMuseSparkOpen(unittest.TestCase):
             self.assertTrue(mx.array_equal(sanitized[k], v), k)
 
         # Checkpoint norms are centered at zero.
-        norm = "model.layers.0.pre_ffn_norm.weight"
+        norm = "model.language_model.layers.0.pre_feedforward_layernorm.weight"
         raw = {norm: mx.zeros((64,)), "lm_head.weight": weights["lm_head.weight"]}
         self.assertTrue(mx.array_equal(model.sanitize(raw)[norm], mx.ones((64,))))
 
-    def test_sanitize_muse_spark_weights(self):
-        # Muse Spark moves the vision prefix and adds an audio tower.
-        vision = "modalities.vision_perception.encoder."
-        names = [
-            "lm_head.weight",
-            vision + "vision_projection.weight",
-            vision + "vision_model.ln_pre.weight",
-            vision + "vision_module.wqkv.bias",
-            "modalities.soft_audio_perception.interaction_encoder.norm.weight",
-        ]
+    def test_sanitize_hf_weights(self):
         model = create_model(vision=True)
-        sanitized = model.sanitize({k: mx.zeros((1,)) for k in names})
-        self.assertEqual(
-            sanitized.keys(), {"lm_head.weight", "vision_projection.weight"}
-        )
+        weights = dict(tree_flatten(model.parameters()))
+        hf = hf_checkpoint(model, weights)
+        hf["model.audio_tower.norm.weight"] = mx.zeros((1,))
+        sanitized = model.sanitize(hf)
+        self.assertEqual(sanitized.keys(), weights.keys())
+        for k, v in weights.items():
+            self.assertTrue(mx.allclose(sanitized[k], v), k)
 
     def test_pipeline_layer_indices(self):
         # Rank 1 has layers 0-1 (sliding), rank 0 has 2 (sliding) and 3 (full).
         for rank, fa_idx, sliding in ((0, 1, [True, False]), (1, 0, [True, True])):
             model = create_model()
             model.model.pipeline(Group(rank, 2))
-            self.assertEqual(model.model.fa_idx, fa_idx)
-            self.assertEqual(model.model.swa_idx, 0)
+            text = model.model.language_model
+            self.assertEqual(text.fa_idx, fa_idx)
+            self.assertEqual(text.swa_idx, 0)
             caches = model.make_cache()
             self.assertEqual([isinstance(c, RotatingKVCache) for c in caches], sliding)
 
@@ -156,9 +200,9 @@ class TestMuseSparkOpen(unittest.TestCase):
         # 6 x 8 patches, more than one tile, give 3 x 4 rows.
         image, inputs = image_prompt(model, h=12, w=16)
         rows = model.encode_image(image)
-        self.assertEqual(rows.shape, (12, model.args.hidden_size))
+        self.assertEqual(rows.shape, (12, model.args.text.hidden_size))
         h = model.embed_inputs(inputs, pixel_values=[image])
-        text = model.model.embed(inputs)
+        text = model.model.language_model.embed(inputs)
         self.assertTrue(mx.array_equal(h[2:14], rows))
         self.assertTrue(mx.array_equal(h[:2], text[:2]))
         self.assertTrue(mx.array_equal(h[14:], text[14:]))
@@ -181,7 +225,7 @@ class TestMuseSparkOpen(unittest.TestCase):
         )
 
 
-class TestMuseSparkOpenResponseFormat(unittest.TestCase):
+class TestMuseSparkResponseFormat(unittest.TestCase):
     def split(self, text, step):
         tokenizer = SimpleNamespace(
             has_thinking=False,
@@ -222,6 +266,18 @@ class TestMuseSparkOpenResponseFormat(unittest.TestCase):
                     out["tool"],
                     call[len("<atem:function_calls>") : -len("</atem:function_calls>")],
                 )
+
+    def test_quoted_call(self):
+        # A call starts its own message; one in the answer is only text.
+        call = (
+            '<atem:function_calls><atem:invoke name="grep">'
+            "</atem:invoke></atem:function_calls>"
+        )
+        text = f" to=user<|message|>Write {call} to search."
+        for step in (1, 3, 7, len(text)):
+            out = self.split(text, step)
+            self.assertEqual(out["normal"], f"Write {call} to search.")
+            self.assertEqual(out["tool"], "")
 
 
 if __name__ == "__main__":

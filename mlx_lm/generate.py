@@ -1059,7 +1059,14 @@ def make_text_state_machine(tokenizer, stop_words=None):
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
 
     if tokenizer.has_tool_calling:
-        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
+        # A response format that goes to "tool" decides where calls start.
+        targets = set()
+        for edges in tokenizer.response_transitions.values():
+            targets.update(dst for _, dst in edges)
+        if "tool" not in targets:
+            transitions.setdefault("normal", []).append(
+                (tokenizer.tool_call_start, "tool")
+            )
         if tokenizer.has_thinking:
             transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
         transitions["tool"] = (
