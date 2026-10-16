@@ -42,7 +42,7 @@ Note, in the following the `--model` argument can be any compatible Hugging
 Face repo or a local path to a converted model.
 
 You can also specify a YAML config with `-c`/`--config`. For more on the format see the
-[example YAML](examples/lora_config.yaml). For example:
+[example YAML](../examples/lora_config.yaml). For example:
 
 ```shell
 mlx_lm.lora --config /path/to/config.yaml

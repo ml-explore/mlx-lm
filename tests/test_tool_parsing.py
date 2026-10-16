@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 import unittest
 
 from mlx_lm.tool_parsers import (
@@ -6,9 +8,12 @@ from mlx_lm.tool_parsers import (
     glm47,
     json_tools,
     kimi_k2,
+    kimi_k3,
     longcat,
+    minicpm5,
     minimax_m2,
     mistral,
+    muse_spark,
     pythonic,
     qwen3_coder,
 )
@@ -37,6 +42,10 @@ class TestToolParsing(unittest.TestCase):
                 minimax_m2,
             ),
             (
+                '<function name="multiply"><param name="a">12234585</param><param name="b">48838483920</param></function>',
+                minicpm5,
+            ),
+            (
                 "<function=multiply>\n<parameter=a>\n12234585\n</parameter>\n<parameter=b>\n48838483920\n</parameter>\n</function>",
                 qwen3_coder,
             ),
@@ -55,6 +64,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'multiply[ARGS]{"a": 12234585, "b": 48838483920}',
                 mistral,
+            ),
+            (
+                '<atem:invoke name="multiply">\n<atem:parameter name="a">12234585</atem:parameter><atem:parameter name="b">48838483920</atem:parameter>\n</atem:invoke>',
+                muse_spark,
             ),
         ]
 
@@ -107,6 +120,10 @@ class TestToolParsing(unittest.TestCase):
                 minimax_m2,
             ),
             (
+                '<function name="get_current_temperature"><param name="location">London</param></function>',
+                minicpm5,
+            ),
+            (
                 "<function=get_current_temperature>\n<parameter=location>\nLondon\n</parameter>\n</function>",
                 qwen3_coder,
             ),
@@ -125,6 +142,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 'get_current_temperature[ARGS]{"location": "London"}',
                 mistral,
+            ),
+            (
+                '<atem:invoke name="get_current_temperature">\n<atem:parameter name="location">London</atem:parameter>\n</atem:invoke>',
+                muse_spark,
             ),
         ]
         tools = [
@@ -152,6 +173,34 @@ class TestToolParsing(unittest.TestCase):
                     "arguments": {"location": "London"},
                 }
                 self.assertEqual(tool_call, expected)
+
+    def test_glm47_string_typed_args(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "postal_code": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+        # Laguna puts each pair on its own line. A string-typed argument stays a
+        # string even when it parses as a number.
+        test_case = (
+            "get_weather\n"
+            "<arg_key>postal_code</arg_key>\n<arg_value>123</arg_value>\n"
+            "<arg_key>days</arg_key>\n<arg_value>3</arg_value>"
+        )
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
+        )
 
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
@@ -208,6 +257,67 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"]["filters"], {"category": "books"})
         self.assertEqual(tool_call["arguments"]["tags"], ["fiction", "new"])
+
+    def test_qwen3_coder_untyped_param(self):
+        # Without a top-level "type", only JSON objects and arrays are parsed.
+        schema = {"anyOf": [{"type": "object"}, {"type": "array"}, {"type": "string"}]}
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {"value": schema}},
+                },
+            }
+        ]
+        test_cases = [
+            ('{"kind": "new"}', {"kind": "new"}),
+            ('["a", "b"]', ["a", "b"]),
+            ("plain text", "plain text"),
+            ('["unfinished"', '["unfinished"'),
+            ("123", "123"),
+            ('"quoted"', '"quoted"'),
+        ]
+        for value, expected in test_cases:
+            with self.subTest(value=value):
+                call = f"<function=f><parameter=value>{value}</parameter></function>"
+                tool_call = qwen3_coder.parse_tool_call(call, tools)
+                self.assertEqual(tool_call["arguments"], {"value": expected})
+
+    def test_pythonic_nested_args(self):
+        # Containers are rendered with tojson, so they hold true/false/null.
+        test_case = (
+            "[grocery.orderIngredients("
+            'ingredientList=[{"name": "noodles", "organic": true, "unit": null}], '
+            'deliveryAddress="845 Willow Lane, Springfield, IL 62704")]'
+        )
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            {
+                "name": "grocery.orderIngredients",
+                "arguments": {
+                    "ingredientList": [
+                        {"name": "noodles", "organic": True, "unit": None}
+                    ],
+                    "deliveryAddress": "845 Willow Lane, Springfield, IL 62704",
+                },
+            },
+        )
+
+    def test_pythonic_parallel_calls(self):
+        test_case = '[get_time(location="Paris"), get_temperature(location="Tokyo")]'
+        self.assertEqual(
+            pythonic.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"location": "Paris"}},
+                {"name": "get_temperature", "arguments": {"location": "Tokyo"}},
+            ],
+        )
+
+    def test_pythonic_invalid_calls(self):
+        for test_case in ['[manim-video(mode="plan")]', 'get_time(location="Paris")']:
+            with self.assertRaises(ValueError):
+                pythonic.parse_tool_call(test_case, None)
 
     def test_gemma4(self):
         # Nested object
@@ -287,6 +397,90 @@ class TestToolParsing(unittest.TestCase):
         self.assertEqual(tool_call["arguments"]["action"], "create")
         self.assertIn("{", tool_call["arguments"]["content"])
 
+    def test_mistral(self):
+        # Single call with trailing natural-language text.
+        test_case = 'get_weather[ARGS]{"city": "Paris"}\n\nLet me check that.'
+        tool_call = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call, {"name": "get_weather", "arguments": {"city": "Paris"}}
+        )
+
+        # Multiple (parallel) tool calls concatenated into one segment,
+        # separated by the "[TOOL_CALLS]" marker. These must all be returned as
+        # a list rather than dropped. Hyphens are legal in tool names.
+        test_case = (
+            'get-weather[ARGS]{"city": "Paris"}'
+            '[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}'
+        )
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        self.assertIsInstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 2)
+        self.assertEqual(
+            tool_calls[0], {"name": "get-weather", "arguments": {"city": "Paris"}}
+        )
+        self.assertEqual(
+            tool_calls[1], {"name": "get_weather", "arguments": {"city": "Tokyo"}}
+        )
+
+        # Multiple calls with no separator between them.
+        test_case = 'a[ARGS]{"x": 1}b[ARGS]{"y": 2}'
+        tool_calls = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "a", "arguments": {"x": 1}},
+                {"name": "b", "arguments": {"y": 2}},
+            ],
+        )
+
+        # Nested JSON and literal braces / "[ARGS]" inside a string must not
+        # confuse the parser.
+        test_case = (
+            'run[ARGS]{"cmd": "echo {x} [ARGS] }", '
+            '"opts": {"deep": [1, 2, {"k": "v"}]}}'
+        )
+        tool_call = mistral.parse_tool_call(test_case, None)
+        self.assertEqual(tool_call["name"], "run")
+        self.assertEqual(tool_call["arguments"]["cmd"], "echo {x} [ARGS] }")
+        self.assertEqual(tool_call["arguments"]["opts"], {"deep": [1, 2, {"k": "v"}]})
+
+        for test_case in (
+            "just some prose, no call here",
+            'a[ARGS]{"x": 1}b[ARGS]{"y":',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(test_case, None)
+
+    def test_mistral_json_list(self):
+        cases = [
+            (
+                '[{"name": "get_weather", "arguments": {"city": "Paris"}}]',
+                {"name": "get_weather", "arguments": {"city": "Paris"}},
+            ),
+            (
+                '[{"name": "c", "arguments": "{\\"e\\": \\"2+3\\"}", "id": "abcdefghi"}]',
+                {"name": "c", "arguments": {"e": "2+3"}, "id": "abcdefghi"},
+            ),
+            (
+                '[{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}]',
+                [{"name": "a", "arguments": {}}, {"name": "b", "arguments": {}}],
+            ),
+            (
+                '[{"name": "shell", "arguments": {"cmd": "run[ARGS]{}"}}]',
+                {"name": "shell", "arguments": {"cmd": "run[ARGS]{}"}},
+            ),
+        ]
+        for text, expected in cases:
+            self.assertEqual(mistral.parse_tool_call(text, None), expected)
+
+        # A malformed entry raises instead of falling back to the header parser.
+        for text in (
+            '[{"name": 1}]',
+            '[{"name": 1, "arguments": {"cmd": "run[ARGS]{}"}}]',
+        ):
+            with self.assertRaises(ValueError):
+                mistral.parse_tool_call(text, None)
+
     def test_kimi_k2(self):
         # Single tool call
         test_case = (
@@ -325,6 +519,189 @@ class TestToolParsing(unittest.TestCase):
         ]
         self.assertEqual(tool_calls, expected)
 
+    def test_kimi_k3(self):
+        # Typed per-key arguments
+        test_case = (
+            '<|open|>call tool="multiply" index="1"<|sep|>'
+            '<|open|>argument key="a" type="number"<|sep|>12234585<|close|>argument<|sep|>'
+            '<|open|>argument key="b" type="number"<|sep|>48838483920<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "multiply", "arguments": {"a": 12234585, "b": 48838483920}}
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # String argument stays raw, other types decode as JSON
+        test_case = (
+            '<|open|>call tool="search" index="1"<|sep|>'
+            '<|open|>argument key="query" type="string"<|sep|>{"not": "json"}<|close|>argument<|sep|>'
+            '<|open|>argument key="limit" type="number"<|sep|>5<|close|>argument<|sep|>'
+            '<|open|>argument key="safe" type="boolean"<|sep|>true<|close|>argument<|sep|>'
+            '<|open|>argument key="filters" type="array"<|sep|>["a", "b"]<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {
+                "name": "search",
+                "arguments": {
+                    "query": '{"not": "json"}',
+                    "limit": 5,
+                    "safe": True,
+                    "filters": ["a", "b"],
+                },
+            }
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Raw JSON object block
+        test_case = (
+            '<|open|>call tool="get_weather" index="1"<|sep|>'
+            '<|open|>json type="object"<|sep|>{"city": "Tokyo"}<|close|>json<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [{"name": "get_weather", "arguments": {"city": "Tokyo"}}]
+        self.assertEqual(tool_calls, expected)
+
+        # Multiple calls in one tools section, escaped attribute values
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="echo&amp;log" index="2"<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        expected = [
+            {"name": "say", "arguments": {"text": "hi"}},
+            {"name": "echo&log", "arguments": {}},
+        ]
+        self.assertEqual(tool_calls, expected)
+
+        # Malformed call (missing tool name) does not discard valid siblings
+        test_case = (
+            '<|open|>call index="1"<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="say" index="2"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Valid call followed by a call with a bad JSON block
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="broken" index="2"<|sep|>'
+            '<|open|>json type="object"<|sep|>{not json<|close|>json<|sep|>'
+            "<|close|>call<|sep|>"
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Truncated trailing call after a complete one
+        test_case = (
+            '<|open|>call tool="say" index="1"<|sep|>'
+            '<|open|>argument key="text" type="string"<|sep|>hi<|close|>argument<|sep|>'
+            "<|close|>call<|sep|>"
+            '<|open|>call tool="cut" index="2"<|sep|>'
+            '<|open|>argument key="x" type="num'
+        )
+        tool_calls = kimi_k3.parse_tool_call(test_case, None)
+        self.assertEqual(tool_calls, [{"name": "say", "arguments": {"text": "hi"}}])
+
+        # Nothing parseable still raises
+        with self.assertRaises(ValueError):
+            kimi_k3.parse_tool_call(
+                '<|open|>call index="1"<|sep|><|close|>call<|sep|>', None
+            )
+
+    def test_minicpm5(self):
+        properties = {
+            "city": {"type": "string"},
+            "days": {"type": "integer"},
+            "metric": {"type": "boolean"},
+            "note": {"type": ["string", "null"]},
+            "opts": {"type": "object"},
+        }
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": properties},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "g",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"nums": {"type": "array"}},
+                    },
+                },
+            },
+        ]
+        test_cases = [
+            # Markers stripped, as the server passes it.
+            (
+                '"f"><param name="city">Paris</param><param name="days">3</param>'
+                '<param name="metric">true</param>',
+                {"city": "Paris", "days": 3, "metric": True},
+            ),
+            (
+                "<function name='f'>\n<param name='city'> Paris </param>\n</function>",
+                {"city": "Paris"},
+            ),
+            (
+                '<function name="f"><param name="days">3</param>'
+                '<param name="city"><![CDATA[a\n<b>&</b>\n]]></param></function>',
+                {"days": 3, "city": "a\n<b>&</b>\n"},
+            ),
+            # Truncated: complete params survive.
+            (
+                '"f"><param name="city">Paris</param><param name="days">3',
+                {"city": "Paris"},
+            ),
+            ('<function name="f"><param name="city"></param></function>', {"city": ""}),
+            # Nullable keeps its value; "None" stays a string.
+            ('"f"><param name="note">Paris</param>', {"note": "Paris"}),
+            ('"f"><param name="city">None</param>', {"city": "None"}),
+            # History renders dicts in Python style.
+            (
+                '"f"><param name="opts">' "{'unit': 'c'}</param>",
+                {"opts": {"unit": "c"}},
+            ),
+        ]
+        for text, arguments in test_cases:
+            with self.subTest(text=text):
+                tool_call = minicpm5.parse_tool_call(text, tools)
+                self.assertEqual(tool_call, {"name": "f", "arguments": arguments})
+
+        tool_calls = minicpm5.parse_tool_call(
+            '<function name="f"><param name="days">3</param></function>\n'
+            '<function name="g"><param name="nums">[1, 2]</param></function>\n'
+            '<function name="h"></function>',
+            tools,
+        )
+        self.assertEqual(
+            tool_calls,
+            [
+                {"name": "f", "arguments": {"days": 3}},
+                {"name": "g", "arguments": {"nums": [1, 2]}},
+                {"name": "h", "arguments": {}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            minicpm5.parse_tool_call("no call here", tools)
+
     def test_minimax_m2(self):
         test_case = (
             '<invoke name="search">\n'
@@ -340,6 +717,76 @@ class TestToolParsing(unittest.TestCase):
         ]
         tool_calls = minimax_m2.parse_tool_call(test_case, None)
         self.assertEqual(expected, tool_calls)
+
+    def test_muse_spark(self):
+        # The server strips the markers.
+        test_case = (
+            '\n<atem:invoke name="search">\n'
+            '<atem:parameter name="query">weather in Paris</atem:parameter>'
+            '<atem:parameter name="limit">5</atem:parameter>'
+            '<atem:parameter name="ratio">0.5</atem:parameter>'
+            '<atem:parameter name="safe">true</atem:parameter>'
+            '<atem:parameter name="tags">["a", "b"]</atem:parameter>'
+            '<atem:parameter name="filters">{"unit": "c"}</atem:parameter>\n'
+            "</atem:invoke>\n"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "weather in Paris",
+                    "limit": 5,
+                    "ratio": 0.5,
+                    "safe": True,
+                    "tags": ["a", "b"],
+                    "filters": {"unit": "c"},
+                },
+            },
+        )
+
+        test_case = (
+            '<atem:invoke name="write">\n'
+            '<atem:parameter name="content">line 1\n  </atem:invoke>\n"quoted" line\n'
+            "</atem:parameter>\n</atem:invoke>"
+        )
+        tool_call = muse_spark.parse_tool_call(test_case, None)
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "write",
+                "arguments": {"content": 'line 1\n  </atem:invoke>\n"quoted" line'},
+            },
+        )
+
+        # Any name without a double quote, also after another attribute.
+        test_case = (
+            '<atem:invoke name="f">\n'
+            '<atem:parameter name="a:b">1</atem:parameter>\n'
+            '<atem:parameter type="text" name="max tokens">two words</atem:parameter>\n'
+            "</atem:invoke>"
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            {"name": "f", "arguments": {"a:b": 1, "max tokens": "two words"}},
+        )
+
+        test_case = (
+            '<atem:invoke name="get_time">\n'
+            '<atem:parameter name="city">Paris</atem:parameter>\n'
+            "</atem:invoke>\n"
+            '<atem:invoke name="clock.now">\n</atem:invoke>\n'
+        )
+        self.assertEqual(
+            muse_spark.parse_tool_call(test_case, None),
+            [
+                {"name": "get_time", "arguments": {"city": "Paris"}},
+                {"name": "clock.now", "arguments": {}},
+            ],
+        )
+
+        with self.assertRaises(ValueError):
+            muse_spark.parse_tool_call("no call here", None)
 
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""
@@ -404,6 +851,63 @@ class TestToolParsing(unittest.TestCase):
         tool_calls = qwen3_coder.parse_tool_call(test_case, tools)
         # parse_tool_call returns dict, not list
         self.assertEqual(tool_calls["arguments"]["msg"], "version 3.10.5-beta")
+
+    def test_qwen3_coder_missing_function_tag_close(self):
+        """Recover the function name when the model drops the ">" after it."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_current_time",
+                    "description": "Get the current time",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        # Missing ">" after the name plus an orphan "</parameter>"
+        test_case = "<function=get_current_time\n</parameter>\n</function>"
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "get_current_time")
+        self.assertEqual(tool_call["arguments"], {})
+
+    def test_qwen3_coder_missing_parameter_tag_close(self):
+        """Recover the parameter name when the model drops the ">" after it."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "description": "Read a file",
+                    "parameters": {
+                        "type": "object",
+                        "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        # Missing ">" after the parameter name
+        test_case = (
+            "<function=read_file>\n"
+            "<parameter=path\n"
+            "/etc/hosts\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "read_file")
+        self.assertEqual(tool_call["arguments"]["path"], "/etc/hosts")
+
+        # A ">" later in the value must not be mistaken for the name's
+        test_case = (
+            "<function=read_file>\n"
+            "<parameter=path\n"
+            "a>b\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"], {"path": "a>b"})
 
 
 if __name__ == "__main__":

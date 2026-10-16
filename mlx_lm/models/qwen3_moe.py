@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -181,7 +182,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         return out
 
 
-class Qwen3MoeModel(nn.Module):
+class Qwen3MoeModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -206,13 +207,30 @@ class Qwen3MoeModel(nn.Module):
         else:
             h = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
         mask = create_attention_mask(h, cache[0])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             h = layer(h, mask, c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
 
@@ -242,17 +260,20 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
-        if "model.layers.0.mlp.experts.0.up_proj.weight" not in weights:
-            return weights
-        for l in range(self.args.num_hidden_layers):
+        moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.up_proj.weight")
+        )
+        for l in moe_layers:
             prefix = f"model.layers.{l}"
             for n in ["up_proj", "down_proj", "gate_proj"]:
-                if f"{prefix}.mlp.experts.0.{n}.weight" in weights:
-                    to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
-                        for e in range(self.args.num_experts)
-                    ]
-                    weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
+                to_join = [
+                    weights.pop(f"{prefix}.mlp.experts.{e}.{n}.weight")
+                    for e in range(self.args.num_experts)
+                ]
+                weights[f"{prefix}.mlp.switch_mlp.{n}.weight"] = mx.stack(to_join)
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
@@ -312,4 +333,4 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
