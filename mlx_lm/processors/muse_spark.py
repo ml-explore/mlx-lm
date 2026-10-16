@@ -10,7 +10,6 @@ from typing import ClassVar, Sequence
 import mlx.core as mx
 import numpy as np
 
-IMAGE_PLACEHOLDER = "<image>"
 IMAGE_START = "<|image_start|>"
 IMAGE_PATCH = "<|patch|>"
 IMAGE_END = "<|image_end|>"
@@ -156,17 +155,18 @@ class Processor:
     def __call__(
         self, text: str, *, images: Sequence[np.ndarray]
     ) -> tuple[str, list[mx.array]]:
-        """Expand each "<image>" in text and preprocess the images."""
-        if text.count(IMAGE_PLACEHOLDER) != len(images):
+        """Expand each <|patch|> of the chat template to the tokens of one
+        image, and preprocess the images."""
+        parts = text.split(IMAGE_PATCH)
+        if len(parts) - 1 != len(images):
             raise ValueError(
-                f"The text has {text.count(IMAGE_PLACEHOLDER)} {IMAGE_PLACEHOLDER} "
+                f"The text has {len(parts) - 1} {IMAGE_PATCH} "
                 f"for {len(images)} images."
             )
-        if IMAGE_PATCH in text:
-            raise ValueError(f"The text already has {IMAGE_PATCH} tokens.")
         pixel_values = []
-        for image in images:
+        expanded = [parts[0]]
+        for image, part in zip(images, parts[1:], strict=True):
             pixels, num_tokens = self.preprocess_image(image)
-            text = text.replace(IMAGE_PLACEHOLDER, image_tokens(num_tokens), 1)
+            expanded += [image_tokens(num_tokens), part]
             pixel_values.append(pixels)
-        return text, pixel_values
+        return "".join(expanded), pixel_values
