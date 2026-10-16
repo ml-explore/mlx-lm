@@ -321,7 +321,7 @@ class GenerationContext:
 class Response:
     text: str
     token: int
-    logprob: float
+    logprob: Optional[float]
     finish_reason: Optional[str]
     top_tokens: Tuple[Dict[str, Any]]
 
@@ -878,6 +878,7 @@ class ResponseGenerator:
                         "rqueue": rqueue,
                         "detokenizer": current_tokenizer.detokenizer,
                         "segment_types": segment_types[::-1],
+                        "logprobs": args.logprobs,
                         "top_logprobs": args.top_logprobs,
                     }
                     # just making sure we don't leave a reference around
@@ -984,11 +985,16 @@ class ResponseGenerator:
                             result["detokenizer"].add_token(r.token)
                             text = result["detokenizer"].last_segment
 
+                        # .item() waits for the next step, so only read it if requested.
                         result["rqueue"].put(
                             Response(
                                 text,
                                 r.token,
-                                r.logprobs[r.token].item(),
+                                (
+                                    r.logprobs[r.token].item()
+                                    if result["logprobs"]
+                                    else None
+                                ),
                                 r.finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
@@ -1118,11 +1124,12 @@ class ResponseGenerator:
                 if stop_matcher.advance(gen.token):
                     finish_reason = "stop"
 
+                # .item() waits for the next step, so only read it if requested.
                 rqueue.put(
                     Response(
                         gen.text,
                         gen.token,
-                        gen.logprobs[gen.token].item(),
+                        gen.logprobs[gen.token].item() if args.logprobs else None,
                         finish_reason,
                         _format_top_logprobs(
                             gen.logprobs, args.top_logprobs, tokenizer
