@@ -72,6 +72,13 @@ class ModelArgs(BaseModelArgs):
         "conv": "M",
     }
 
+    # Fields a Puzzle ``block_configs`` entry may override for its layer.
+    _blockwise_fields = (
+        "moe_intermediate_size",
+        "num_experts_per_tok",
+        "n_routed_experts",
+    )
+
     @classmethod
     def from_dict(cls, params):
         params = dict(params)
@@ -81,17 +88,32 @@ class ModelArgs(BaseModelArgs):
                 params["num_hidden_layers"] = len(blocks)
         return super().from_dict(params)
 
+    @property
+    def is_puzzle(self) -> bool:
+        # Key off the per-layer block configuration rather than only the
+        # model_type: some converted Puzzle checkpoints ship
+        # ``model_type: nemotron_h`` together with ``block_configs``.
+        return self.block_configs is not None or self.model_type == "nemotron_h_puzzle"
+
     def __post_init__(self):
         if self.time_step_limit is None:
             lower_limit = (
                 self.time_step_min
-                if self.model_type == "nemotron_h_puzzle"
-                and self.time_step_min is not None
+                if self.is_puzzle and self.time_step_min is not None
                 else 0.0
             )
             self.time_step_limit = (lower_limit, float("inf"))
+        else:
+            # transformers serializes non-finite floats in config.json as
+            # {"__float__": "Infinity"}.
+            self.time_step_limit = tuple(
+                float(v["__float__"]) if isinstance(v, dict) else float(v)
+                for v in self.time_step_limit
+            )
 
         if self.block_configs is not None:
+            if self.num_hidden_layers is None:
+                self.num_hidden_layers = len(self.block_configs)
             if len(self.block_configs) != self.num_hidden_layers:
                 raise ValueError(
                     "block_configs must contain one entry per hidden layer: "
@@ -109,10 +131,13 @@ class ModelArgs(BaseModelArgs):
                     )
                 block_types.append(block_type)
                 if block_type == "moe":
-                    missing = {
-                        "moe_intermediate_size",
-                        "num_experts_per_tok",
-                    } - config.keys()
+                    # A blockwise field is either set on every MoE block or
+                    # left to the global config value.
+                    missing = [
+                        name
+                        for name in self._blockwise_fields
+                        if config.get(name) is None and getattr(self, name) is None
+                    ]
                     if missing:
                         raise ValueError(
                             f"Puzzle MoE block {layer_idx} is missing "
@@ -147,8 +172,8 @@ class ModelArgs(BaseModelArgs):
 
         layer_args = copy(self)
         block_config = self.block_configs[layer_idx]
-        for name in ("moe_intermediate_size", "num_experts_per_tok"):
-            if name in block_config:
+        for name in self._blockwise_fields:
+            if block_config.get(name) is not None:
                 setattr(layer_args, name, block_config[name])
         return layer_args
 
@@ -208,7 +233,7 @@ class NemotronHMamba2Mixer(nn.Module):
             bias=args.use_conv_bias,
         )
 
-        self.is_puzzle = args.model_type == "nemotron_h_puzzle"
+        self.is_puzzle = args.is_puzzle
         projection_bias = args.use_bias if self.is_puzzle else args.mamba_proj_bias
         projection_size = self.intermediate_size + self.conv_dim + self.num_heads
         self.in_proj = nn.Linear(
@@ -469,10 +494,15 @@ class MoEGate(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.norm_topk_prob = config.norm_topk_prob
         self.n_routed_experts = config.n_routed_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.n_group = config.n_group
-        self.topk_group = config.topk_group
-        self.is_puzzle = config.model_type == "nemotron_h_puzzle"
+        # Puzzle configs are not group-routed and may omit these fields.
+        self.routed_scaling_factor = (
+            config.routed_scaling_factor
+            if config.routed_scaling_factor is not None
+            else 1.0
+        )
+        self.n_group = config.n_group or 1
+        self.topk_group = config.topk_group or 1
+        self.is_puzzle = config.is_puzzle
         self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
         self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
 
@@ -552,9 +582,7 @@ class NemotronHMoE(nn.Module):
 class NemotronHBlock(nn.Module):
     def __init__(self, args: ModelArgs, block_type: str):
         super().__init__()
-        norm_cls = (
-            NemotronHRMSNorm if args.model_type == "nemotron_h_puzzle" else nn.RMSNorm
-        )
+        norm_cls = NemotronHRMSNorm if args.is_puzzle else nn.RMSNorm
         self.norm = norm_cls(args.hidden_size, eps=args.layer_norm_epsilon)
 
         self.block_type = block_type
@@ -591,9 +619,7 @@ class NemotronHModel(nn.Module):
             NemotronHBlock(args.for_layer(layer_idx), block_type)
             for layer_idx, block_type in enumerate(args.hybrid_override_pattern or [])
         ]
-        norm_cls = (
-            NemotronHRMSNorm if args.model_type == "nemotron_h_puzzle" else nn.RMSNorm
-        )
+        norm_cls = NemotronHRMSNorm if args.is_puzzle else nn.RMSNorm
         self.norm_f = norm_cls(args.hidden_size, eps=args.layer_norm_epsilon)
         self.fa_idx = 0
         self.ssm_idx = 0
@@ -668,7 +694,7 @@ class Model(nn.Module):
 
     @property
     def quant_predicate(self):
-        if self.model_type != "nemotron_h_puzzle":
+        if not self.args.is_puzzle:
             return lambda _path, _module: True
         # Puzzle's 131k-token output projection is unusually sensitive to
         # low-bit affine quantization. Quantizing it at 4 bits produced
@@ -677,6 +703,15 @@ class Model(nn.Module):
         return lambda path, _: path != "lm_head"
 
     def sanitize(self, weights):
+        # Multimodal Puzzle checkpoints (e.g. Nemotron 3.5 Bolt, model_type
+        # nemotron_h_omni) nest the text model under ``language_model.``;
+        # the vision tower and projector are not part of this model.
+        if any(k.startswith("language_model.") for k in weights):
+            weights = {
+                k[len("language_model.") :]: v
+                for k, v in weights.items()
+                if k.startswith("language_model.")
+            }
         # Official Hugging Face Puzzle checkpoints use ``model.*`` while MLX's
         # Nemotron-H implementation names the same module ``backbone.*``.
         weights = {
@@ -691,11 +726,12 @@ class Model(nn.Module):
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"backbone.layers.{l}.mixer"
+            n_experts = self.args.for_layer(l).n_routed_experts
             for m, n in [("down_proj", "fc2"), ("up_proj", "fc1")]:
                 if f"{prefix}.experts.0.{m}.weight" in weights:
                     to_join = [
                         weights.pop(f"{prefix}.experts.{e}.{m}.weight")
-                        for e in range(self.args.n_routed_experts)
+                        for e in range(n_experts)
                     ]
                     weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
 
