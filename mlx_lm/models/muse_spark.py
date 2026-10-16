@@ -123,6 +123,14 @@ def norm_gain(weight: mx.array) -> mx.array:
     return (1.0 + weight.astype(mx.float32)).astype(mx.bfloat16)
 
 
+def interleave_rope_rows(w: mx.array, head_dim: int) -> mx.array:
+    """Hugging Face orders the q and k rows of a head for RoPE pairs (i, i +
+    head_dim / 2). The model pairs neighbor rows (2i, 2i + 1)."""
+    shape = w.shape
+    w = w.reshape(-1, 2, head_dim // 2, *shape[1:])
+    return mx.swapaxes(w, 1, 2).reshape(shape)
+
+
 POOLED_TP_MAX_TOKENS = 8
 
 # Added to the sum of the top-k router scores.
@@ -966,14 +974,18 @@ class Model(nn.Module):
                 sanitized[k] = v
 
         # The model runs q, k, v and the output gate as one matmul.
+        head_dim = self.args.text.head_dim
         projections = ("q_proj", "k_proj", "v_proj", "gate_proj")
         for k in [k for k in sanitized if k.endswith("self_attn.q_proj.weight")]:
             attn = k[: -len("q_proj.weight")]
             for param in ("weight", "scales", "biases"):
                 keys = [f"{attn}{p}.{param}" for p in projections]
                 if all(key in sanitized for key in keys):
+                    q, k_, v, g = (sanitized.pop(key) for key in keys)
+                    q = interleave_rope_rows(q, head_dim)
+                    k_ = interleave_rope_rows(k_, head_dim)
                     sanitized[f"{attn}qkvg_proj.{param}"] = mx.concatenate(
-                        [sanitized.pop(key) for key in keys]
+                        [q, k_, v, g]
                     )
 
         vision_q = [
@@ -985,9 +997,10 @@ class Model(nn.Module):
             attn = k[: -len("q_proj.weight")]
             for param in ("weight", "bias"):
                 keys = [f"{attn}{p}_proj.{param}" for p in "qkv"]
-                sanitized[f"{attn}qkv_proj.{param}"] = mx.concatenate(
-                    [sanitized.pop(key) for key in keys]
-                )
+                q, k_, v = (sanitized.pop(key) for key in keys)
+                q = interleave_rope_rows(q, self.args.vision.head_dim)
+                k_ = interleave_rope_rows(k_, self.args.vision.head_dim)
+                sanitized[f"{attn}qkv_proj.{param}"] = mx.concatenate([q, k_, v])
         return sanitized
 
     def shard(self, group: mx.distributed.Group | None = None) -> None:
