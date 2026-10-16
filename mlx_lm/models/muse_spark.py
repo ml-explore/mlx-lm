@@ -79,8 +79,8 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
     vision_config: dict | None = None
-    # Image rows go at <|patch|>: the processor expands each <|image|> of the
-    # prompt to these.
+    # Image rows go at <|patch|>: the processor expands each <|patch|> of the
+    # prompt to the rows of one image.
     image_token_id: int = 200092
     out_hidden_size: int | None = None
     projector_hidden_size: int | None = None
@@ -543,7 +543,15 @@ class VisionArgs(BaseModelArgs):
         self.head_dim = self.hidden_size // self.num_attention_heads
         self.grid_size = self.pos_emb_height
         if self.layer_types is None:
-            self.layer_types = ["full_attention"] * self.num_hidden_layers
+            # As transformers: full attention in every 4th and the last layer.
+            self.layer_types = [
+                (
+                    "full_attention"
+                    if (i + 1) % 4 == 0 or i == self.num_hidden_layers - 1
+                    else "window_attention"
+                )
+                for i in range(self.num_hidden_layers)
+            ]
 
 
 class VisionRoPE2D(nn.Module):

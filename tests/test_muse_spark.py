@@ -133,6 +133,15 @@ class TestMuseSpark(unittest.TestCase):
             self.assertEqual(outputs.shape, (1, 2, model.args.text.vocab_size))
             self.assertEqual(outputs.dtype, mx.float32)
 
+    def test_vision_layer_types(self):
+        # As transformers: full attention in every 4th and the last layer.
+        vision = {**VISION_CONFIG, "num_hidden_layers": 6, "layer_types": None}
+        window, full = "window_attention", "full_attention"
+        self.assertEqual(
+            muse_spark.VisionArgs.from_dict(vision).layer_types,
+            [window, window, window, full, window, full],
+        )
+
     def test_left_padding(self):
         # Its prompts fit in the sliding window.
         test_models.TestModels.left_padding_test_runner(self, create_model())
