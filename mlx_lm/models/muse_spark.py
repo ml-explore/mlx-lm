@@ -62,6 +62,7 @@ class TextArgs(BaseModelArgs):
     num_experts_per_tok: int
     moe_hidden_size: int
     moe_intermediate_size: int
+    qk_scale_factor: float = 5.4730064863875
     routed_scaling_factor: float = 1.0
     num_shared_experts: int = 0
     mlp_layer_types: list[str] | None = None
@@ -209,7 +210,7 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
         # Queries carry a tuned constant scale of their own, on top of the
         # usual 1/sqrt(head_dim) applied inside the attention call
-        self.query_scale = 43.7840518911 / (head_dim**0.5)
+        self.query_scale = args.qk_scale_factor
         self.eps = args.rms_norm_eps
 
         self.qkvg_proj = nn.Linear(
