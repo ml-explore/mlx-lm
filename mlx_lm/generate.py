@@ -13,6 +13,7 @@ from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Un
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
@@ -25,6 +26,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
+from .processors import load_processor
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
@@ -91,6 +93,13 @@ def setup_arg_parser():
         "-p",
         default=DEFAULT_PROMPT,
         help="Message to be processed by the model ('-' reads from stdin)",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=(),
+        nargs="+",
+        help="Image files for the image placeholders of the prompt, in order.",
     )
     parser.add_argument(
         "--prefill-response",
@@ -715,6 +724,8 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        if kwargs.pop("input_embeddings", None) is not None:
+            raise ValueError("Speculative decoding does not support input embeddings.")
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )
@@ -964,21 +975,23 @@ class TextStateMachine:
         return (initial, self._states[initial][0], self._states, "")
 
     @staticmethod
-    def step(state, text):
+    def split(state, text):
         """Consume a chunk of decoded text.
 
-        Returns (new_state, emittable_text, current_state_name) where
-        emittable_text is the text safe to show (control sequences stripped,
-        possible partial matches held back in the buffer).
+        Returns (new_state, segments) with one (state_name, text) per state
+        passed. Control sequences are stripped and possible partial matches
+        held back in the buffer. The last segment is the current state.
         """
         s, n, states, buf = state
+        # n has already read the buffer.
+        start = len(buf)
         buf += text
         trie = states[s][0]
-        emittable = ""
-        # buf[:consumed] has been emitted or discarded; buf[consumed:] pending.
-        consumed = 0
+        segments = []
+        # buf[begin:consumed] is safe text of state s; buf[consumed:] pending.
+        begin = consumed = 0
 
-        for i in range(len(buf)):
+        for i in range(start, len(buf)):
             ch = buf[i]
             while ch not in n and n is not trie:
                 n = n["__fail__"]
@@ -987,20 +1000,26 @@ class TextStateMachine:
 
             match = n.get("__match__")
             if match is not None:
-                match_start = i + 1 - len(match[0])
-                emittable += buf[consumed:match_start]
-                consumed = i + 1
+                segments.append((s, buf[begin : i + 1 - len(match[0])]))
+                begin = consumed = i + 1
                 s = states[s][1][match[1]]
                 if s is None:
-                    return (s, None, states, buf[consumed:]), emittable, s
+                    segments.append((s, ""))
+                    return (s, None, states, buf[consumed:]), segments
                 trie = states[s][0]
                 n = trie
             elif n is trie:
                 # At the root: no partial match in progress, everything is safe.
-                emittable += buf[consumed : i + 1]
                 consumed = i + 1
 
-        return (s, n, states, buf[consumed:]), emittable, s
+        segments.append((s, buf[begin:consumed]))
+        return (s, n, states, buf[consumed:]), segments
+
+    @staticmethod
+    def step(state, text):
+        """As split, but returns (new_state, emittable_text, current_state_name)."""
+        state, segments = TextStateMachine.split(state, text)
+        return state, "".join(t for _, t in segments), state[0]
 
     @staticmethod
     def flush(state):
@@ -1040,7 +1059,14 @@ def make_text_state_machine(tokenizer, stop_words=None):
         transitions["reasoning"] = [(tokenizer.think_end, "normal")]
 
     if tokenizer.has_tool_calling:
-        transitions.setdefault("normal", []).append((tokenizer.tool_call_start, "tool"))
+        # A response format that goes to "tool" decides where calls start.
+        targets = set()
+        for edges in tokenizer.response_transitions.values():
+            targets.update(dst for _, dst in edges)
+        if "tool" not in targets:
+            transitions.setdefault("normal", []).append(
+                (tokenizer.tool_call_start, "tool")
+            )
         if tokenizer.has_thinking:
             transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
         transitions["tool"] = (
@@ -1050,6 +1076,9 @@ def make_text_state_machine(tokenizer, stop_words=None):
     if tokenizer.structural_markers:
         for w in tokenizer.structural_markers:
             transitions.setdefault("normal", []).append((w, "normal"))
+
+    for state_name, edges in tokenizer.response_transitions.items():
+        transitions.setdefault(state_name, []).extend(edges)
 
     if stop_words:
         for state_name in set(transitions) | {"normal"}:
@@ -2041,11 +2070,12 @@ def main():
             )
     model_path = model_path or DEFAULT_MODEL
 
-    model, tokenizer = load(
+    model, tokenizer, config = load(
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        return_config=True,
         trust_remote_code=args.trust_remote_code,
     )
     for eos_token in args.extra_eos_token:
@@ -2057,7 +2087,8 @@ def main():
 
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
     prompt = sys.stdin.read() if prompt == "-" else prompt
-    if not args.ignore_chat_template and tokenizer.has_chat_template:
+    use_chat_template = not args.ignore_chat_template and tokenizer.has_chat_template
+    if use_chat_template:
         if args.system_prompt is not None:
             messages = [{"role": "system", "content": args.system_prompt}]
         else:
@@ -2086,9 +2117,27 @@ def main():
                 add_generation_prompt=not has_prefill,
             )
             prompt = prompt[test_prompt.index("<query>") :]
-        prompt = tokenizer.encode(prompt, add_special_tokens=False)
+
+    if args.image:
+        processor = load_processor(model, config)
+        if processor is None:
+            raise ValueError(f"The model {model_path} does not take images.")
+        from PIL import Image
+
+        images = [np.asarray(Image.open(f).convert("RGB")) for f in args.image]
+        prompt, pixel_values = processor(prompt, images=images)
     else:
-        prompt = tokenizer.encode(prompt)
+        pixel_values = None
+    prompt = tokenizer.encode(prompt, add_special_tokens=not use_chat_template)
+
+    if pixel_values is not None:
+        input_embeddings = model.embed_inputs(
+            mx.array(prompt), pixel_values=pixel_values
+        )
+        # The prefill runs on another stream: compute the vision rows first.
+        mx.eval(input_embeddings)
+    else:
+        input_embeddings = None
 
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
@@ -2121,6 +2170,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        input_embeddings=input_embeddings,
     )
     if not args.verbose:
         print(response)
