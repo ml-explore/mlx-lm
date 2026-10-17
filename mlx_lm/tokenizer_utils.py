@@ -716,9 +716,18 @@ def load(
     chat_template = None
     response_format = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
+    except Exception:
+        # Transformers may not know the model's config yet (new architectures);
+        # the tokenizer files alone are enough.
+        if not tokenizer_file.exists():
+            raise
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
