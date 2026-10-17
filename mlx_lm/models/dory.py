@@ -1,5 +1,6 @@
-# MLX port of NVIDIA Dory (DoryForCausalLM): looped nGPT-style model. Written from vLLM PR #60149 / llama.cpp dory.cpp.
-# Drop-in for mlx_lm.models (model_type "dory"). v2: fused elementwise blocks, sliding-window cache, last-token logits.
+# Copyright © 2026 Apple Inc.
+# NVIDIA Dory (looped nGPT-style model), written from vLLM PR 60149 and llama.cpp.
+
 import math
 from dataclasses import dataclass
 from functools import partial
@@ -8,8 +9,8 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs
-from .cache import KVCache
+from .base import BaseModelArgs, create_attention_mask
+from .cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -99,77 +100,6 @@ def mlp_act(g, u, sg, su):
     return _jn32(nn.silu(gf) * uf).astype(g.dtype)
 
 
-class RingKVCache:
-    """Sliding-window KV cache with an in-place ring buffer for decoding (slot = abs_position % window)."""
-
-    def __init__(self, window):
-        self.W = window
-        self.keys = None
-        self.values = None
-        self.offset = 0
-
-    def _temporal(self):
-        if self.keys is None:
-            return None, None
-        if self.offset <= self.W:
-            return self.keys, self.values
-        shift = (self.offset - self.W) % self.W
-        return mx.roll(self.keys, -shift, axis=2), mx.roll(self.values, -shift, axis=2)
-
-    def update_and_fetch(self, k, v):
-        T = k.shape[2]
-        W = self.W
-        if T == 1 and self.keys is not None and self.keys.shape[2] == W:
-            slot = self.offset % W
-            self.keys[..., slot : slot + 1, :] = k
-            self.values[..., slot : slot + 1, :] = v
-            self.offset += 1
-            return (
-                self.keys,
-                self.values,
-            )  # order is irrelevant for T=1 (keys carry their own RoPE)
-        ok, ov = self._temporal()
-        K = k if ok is None else mx.concatenate([ok, k], axis=2)
-        V = v if ov is None else mx.concatenate([ov, v], axis=2)
-        self.offset += T
-        if K.shape[2] >= W:
-            shift = (self.offset - W) % W
-            self.keys = mx.contiguous(mx.roll(K[..., -W:, :], shift, axis=2))
-            self.values = mx.contiguous(mx.roll(V[..., -W:, :], shift, axis=2))
-        else:
-            self.keys, self.values = K, V
-        return K, V
-
-    @property
-    def state(self):
-        return [] if self.keys is None else (self.keys, self.values)
-
-    @state.setter
-    def state(self, v):
-        self.keys, self.values = v
-
-    @property
-    def meta_state(self):
-        return ""
-
-    @meta_state.setter
-    def meta_state(self, v):
-        pass
-
-    def is_trimmable(self):
-        return False
-
-    def size(self):
-        return 0 if self.keys is None else self.keys.shape[2]
-
-    def empty(self):
-        return self.keys is None
-
-    @property
-    def nbytes(self):
-        return 0 if self.keys is None else self.keys.nbytes + self.values.nbytes
-
-
 class DoryAttention(nn.Module):
     def __init__(self, args: ModelArgs, sliding: bool):
         super().__init__()
@@ -231,18 +161,11 @@ class DoryAttention(nn.Module):
             self.rope(qk, offset=off), qk_scale
         )  # RoPE first, then nGPT qk norm
         q, k = qk[:, :H], qk[:, H:]
+        mask = create_attention_mask(
+            x, cache, window_size=self.args.sliding_window if self.sliding else None
+        )
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-        S = k.shape[2]
-        W = self.args.sliding_window
-        mask = None
-        if self.sliding:
-            if T > 1 or S > W:
-                kpos = (mx.arange(S) + (off + T - S))[None, :]
-                qpos = (mx.arange(T) + off)[:, None]
-                mask = (kpos <= qpos) & (kpos > qpos - W)
-        elif T > 1:
-            mask = "causal"
         o = mx.fast.scaled_dot_product_attention(
             q, k, v, scale=1.0 / math.sqrt(d), mask=mask
         )
@@ -346,7 +269,7 @@ class Model(nn.Module):
         use_sliding = a.recurrent_kv_cache_mode == "per_loop"
         for (i, _l), idx in plan.items():
             if use_sliding and a.layer_types[i] == "sliding_attention":
-                caches[idx] = RingKVCache(a.sliding_window)
+                caches[idx] = RotatingKVCache(max_size=a.sliding_window)
             else:
                 caches[idx] = KVCache()
         return caches
