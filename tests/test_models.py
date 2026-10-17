@@ -621,6 +621,29 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_dory(self):
+        from mlx_lm.models import dory
+
+        args = dory.ModelArgs(
+            model_type="dory",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            sliding_window=16,
+            n_input_layers=4,
+            n_recurrent_layers=8,
+            n_output_layers=4,
+            n_recurrent_loops=2,
+        )
+        model = dory.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_lfm2(self):
         from mlx_lm.models import lfm2
 
