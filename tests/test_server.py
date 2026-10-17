@@ -31,6 +31,7 @@ class DummyModelProvider:
     def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
+        self.processor = None
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
 
@@ -212,6 +213,31 @@ class TestTextStateMachine(unittest.TestCase):
         self.assertEqual(text, "f[ARGS]{}")
         state, s = sm.discard(state)
         self.assertEqual(s, "tool")
+
+    def test_split_keeps_text_in_its_state(self):
+        # Held text released by a transition belongs to the state before it.
+        sm = TextStateMachine(
+            {
+                "normal": [("<think>", "reasoning"), ("<tool_call>", "tool")],
+                "reasoning": [("</think>", "normal")],
+                "tool": [("</tool_call>", "normal")],
+            }
+        )
+        state = sm.make_state()
+        state, segments = sm.split(state, "x <")
+        self.assertEqual(segments, [("normal", "x ")])
+        state, segments = sm.split(state, "<tool_call>{}")
+        self.assertEqual(segments, [("normal", "<"), ("tool", "{}")])
+        state, segments = sm.split(state, "</tool_call>")
+        self.assertEqual(segments, [("tool", ""), ("normal", "")])
+
+    def test_held_text_read_once(self):
+        sm = TextStateMachine({"normal": [("##", "normal")]})
+        state = sm.make_state()
+        state, t1, _ = sm.step(state, "a #")
+        state, t2, _ = sm.step(state, "# b")
+        state, rest, _ = sm.flush(state)
+        self.assertEqual(t1 + t2 + rest, "a  b")
 
 
 class TestToolCallFormatter(unittest.TestCase):
@@ -414,6 +440,7 @@ class TestServer(unittest.TestCase):
             tool_call_end_tokens = ()
             eos_token_ids = [2]
             structural_markers = ()
+            response_transitions = {}
 
             def convert_ids_to_tokens(self, t):
                 return f"<eos{t}>"
@@ -933,7 +960,7 @@ class TestModelSwapClearsCache(unittest.TestCase):
         tokenizer = mock.Mock()
         tokenizer.chat_template = None
         tokenizer.default_chat_template = None
-        load.return_value = (mock.Mock(), tokenizer)
+        load.return_value = (mock.Mock(), tokenizer, {})
         init.return_value.size.return_value = 1
 
         provider = ModelProvider(args)
