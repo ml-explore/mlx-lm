@@ -62,6 +62,14 @@ class Model(nn.Module):
         sanitized_lm = self.language_model.sanitize(lm_weights)
         return {"language_model." + k: v for k, v in sanitized_lm.items()}
 
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        self.language_model.shard(group)
+
+    @property
+    def model(self):
+        return self.language_model.model
+
     @property
     def layers(self):
-        return self.language_model.model.layers
+        # Only the layers of this pipeline stage, so caches match them.
+        return self.language_model.layers
