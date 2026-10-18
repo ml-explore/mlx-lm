@@ -1641,6 +1641,51 @@ class TestModels(unittest.TestCase):
             ],
         )
 
+    def test_plamo3_yarn(self):
+        from mlx_lm.models import plamo3
+
+        args = plamo3.ModelArgs(
+            hidden_size=128,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=128,
+            sliding_window_pattern=2,
+            rope_scaling_factor=256.0,
+            initial_context_length=4096,
+            max_position_embeddings=262144,
+        )
+        full = plamo3.Attention(args, layer_idx=1)
+        local = plamo3.Attention(args, layer_idx=0)
+
+        dims = args.head_dim
+        freq = args.rope_theta ** (np.arange(0, dims, 2, dtype=np.float32) / dims)
+        low = (
+            dims * math.log(4096 / (32 * 2 * math.pi)) / (2 * math.log(args.rope_theta))
+        )
+        high = dims * math.log(4096 / (2 * math.pi)) / (2 * math.log(args.rope_theta))
+        ramp = np.clip(
+            (np.arange(dims // 2, dtype=np.float32) - low) / (high - low), 0, 1
+        )
+        inv_freq = ((1 - ramp) / freq + ramp / (256 * freq)).astype(np.float32)
+        np.testing.assert_allclose(1 / np.array(full.rope._freqs), inv_freq, rtol=3e-7)
+
+        x = mx.sin(mx.arange(6 * dims, dtype=mx.float32)).reshape(1, 2, 3, dims)
+        x_np = np.array(x)
+        rotated = np.concatenate(
+            (-x_np[..., dims // 2 :], x_np[..., : dims // 2]), axis=-1
+        )
+        for offset in (0, 4096):
+            phase = np.arange(offset, offset + 3, dtype=np.float32)[:, None] * inv_freq
+            phase = np.concatenate((phase, phase), axis=-1)
+            expected = (x_np * np.cos(phase) + rotated * np.sin(phase)) * (
+                1 + 0.1 * math.log(256)
+            )
+            np.testing.assert_allclose(
+                np.array(full.rope(x, offset=offset)), expected, atol=1e-3, rtol=2e-4
+            )
+        expected_local = nn.RoPE(dims, traditional=False, base=args.rope_local_theta)
+        self.assertTrue(mx.array_equal(local.rope(x), expected_local(x)))
+
     def test_stablelm(self):
         from mlx_lm.models import stablelm
 
