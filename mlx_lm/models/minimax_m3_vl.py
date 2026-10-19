@@ -341,9 +341,11 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
             # Keep the indexer cache in the graph: below the block budget nothing
-            # consumes it, and the deferred updates pile up for the whole decode.
+            # consumes its keys, and nothing ever consumes its values.
+            # Metal buffers are exhausted on long generations.
             if self.is_sparse_attn:
-                kv_cache.keys = mx.depends(kv_cache.keys, cache[1].keys)
+                index_kv = [cache[1].keys, cache[1].values]
+                kv_cache.keys = mx.depends(kv_cache.keys, index_kv)
 
         out = scaled_dot_product_attention(
             q, k, v, cache=kv_cache, scale=self.scale, mask=mask

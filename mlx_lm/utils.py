@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import resource
 import shutil
 from decimal import Decimal
@@ -567,7 +568,17 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method == "modelopt":
-            quantization = _modelopt_quantization(quantization_config)
+            # NVIDIA ModelOpt.
+            # hf_quant_config.json nests the settings, config.json does not.
+            settings = quantization_config.get("quantization", quantization_config)
+            algo = settings["quant_algo"]
+            if algo != "NVFP4":
+                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+            quantization = {
+                "group_size": settings.get("group_size", 16),
+                "bits": 4,
+                "mode": "nvfp4",
+            }
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -636,7 +647,18 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
+        defaults=_tokenizer_defaults(model_path),
     )
+
+
+def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
+    """The TOKENIZER_DEFAULTS of the model module, if any."""
+    try:
+        model_class, _ = _get_classes(load_config(model_path))
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    module = importlib.import_module(model_class.__module__)
+    return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 
 def load(
@@ -752,19 +774,35 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
+        num_layers = len(model.model.layers)
         model.model.pipeline(pipeline_group)
+        start, end = model.model.start_idx, model.model.end_idx
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
+        # Match weights by layer number, since sanitize can rename them.
+        ckpt_layers = set()
         local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+        for k, f in weight_index.items():
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+            if m is None:
+                # Every stage keeps the embeddings, the final norm and the head.
+                local_files.add(f)
+            else:
+                layer = int(m.group(1))
+                ckpt_layers.add(layer)
+                if start <= layer < end:
+                    local_files.add(f)
+
+        # Layers past the last model layer are MTP layers, which sanitize drops.
+        missing = set(range(num_layers)) - ckpt_layers
+        if missing:
+            raise ValueError(
+                f"The checkpoint has no weights for layers {sorted(missing)}. "
+                "Convert the model with mlx_lm.convert first."
+            )
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
@@ -1133,6 +1171,8 @@ def dequantize_model(model: nn.Module) -> nn.Module:
 def save_config(
     config: dict,
     config_path: Union[str, Path],
+    *,
+    keep_vision_config: bool = False,
 ) -> None:
     """Save the model configuration to the ``config_path``.
 
@@ -1141,10 +1181,13 @@ def save_config(
     Args:
         config (dict): The model configuration.
         config_path (Union[str, Path]): Model configuration file path.
+        keep_vision_config (bool): Keep ``vision_config``, for models that keep
+            their vision tower. Default: ``False``.
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
-    config.pop("vision_config", None)
+    if not keep_vision_config:
+        config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
 
@@ -1173,8 +1216,14 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
+    # Models with a vision tower need vision_config to load it again.
+    keep_vision_config = "vision_tower" in getattr(model, "model", {})
     save_model(dst_path, model, donate_model=donate_model)
-    save_config(config, config_path=dst_path / "config.json")
+    save_config(
+        config,
+        config_path=dst_path / "config.json",
+        keep_vision_config=keep_vision_config,
+    )
     tokenizer.save_pretrained(dst_path)
 
     for p in ["*.py", "generation_config.json"]:

@@ -5,8 +5,34 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.models import qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.pipeline import PipelineMixin
+from mlx_lm.utils import quantize_model
+
+MUSE_SPARK_OPEN = {
+    "model_type": "muse_spark",
+    "text_config": {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rms_norm_eps": 1e-5,
+        "post_norm_eps": 1e-8,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+        "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+        "sliding_window": 8,
+        "final_logit_softcapping": 20.0,
+        "output_multiplier": 1.0,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_hidden_size": 64,
+        "moe_intermediate_size": 128,
+    },
+}
 
 
 class Group:
@@ -132,6 +158,7 @@ class TestModelParallel(unittest.TestCase):
                 "max_position_embeddings": 256,
                 "tie_word_embeddings": False,
             },
+            MUSE_SPARK_OPEN,
         ]
         mx.random.seed(0)
         for config in test_configs:
@@ -231,6 +258,7 @@ class TestModelParallel(unittest.TestCase):
                 "max_position_embeddings": 256,
                 "full_attention_interval": 4,
             },
+            MUSE_SPARK_OPEN,
         ]
         mx.random.seed(0)
         for config in test_configs:
@@ -245,6 +273,30 @@ class TestModelParallel(unittest.TestCase):
                 model.model.pipeline(mx.distributed.init())
                 out = model(x)
                 self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+
+    def test_muse_spark_decode(self):
+        # Prefill uses the whole pooler; decode steps of one token use the
+        # row-split pooler and unpooler.
+        for mode in (None, "nvfp4"):
+            with self.subTest(mode=mode):
+                mx.random.seed(0)
+                args = muse_spark.ModelArgs.from_dict(MUSE_SPARK_OPEN)
+                model = muse_spark.Model(args)
+                if mode is not None:
+                    quantize_model(model, {}, None, None, mode=mode, global_scale=True)
+                x = mx.random.randint(0, args.text.vocab_size, shape=(1, 13))
+
+                def run():
+                    cache = make_prompt_cache(model)
+                    outputs = [model(x[:, :10], cache=cache)]
+                    for i in range(10, 13):
+                        outputs.append(model(x[:, i : i + 1], cache=cache))
+                    return outputs
+
+                expected = run()
+                model.shard()
+                for e, out in zip(expected, run()):
+                    self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
 
     def test_pipeline_layer_assignment(self):
         def assignment(num_layers, size, split=None):
