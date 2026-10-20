@@ -968,12 +968,14 @@ class TestModels(unittest.TestCase):
     def test_ernie4_5_moe_sanitize_correction_bias(self):
         model = self.ernie4_5_moe_model()
         gate = "model.layers.1.mlp.gate.weight"
-        key = "model.layers.1.mlp.moe_statics.e_score_correction_bias"
+        old = "model.layers.1.mlp.moe_statics.e_score_correction_bias"
+        key = "model.layers.1.mlp.e_score_correction_bias"
         gate_weight = mx.zeros((4, 8))
 
         # The checkpoint stores the bias as [1, E]. The model expects [E].
         bias = mx.arange(4, dtype=mx.float32)
-        weights = model.sanitize({gate: gate_weight, key: bias[None]})
+        weights = model.sanitize({gate: gate_weight, old: bias[None]})
+        self.assertNotIn(old, weights)
         self.assertEqual(weights[key].shape, (4,))
         self.assertTrue(mx.array_equal(weights[key], bias))
         weights = model.sanitize(weights)
@@ -988,8 +990,12 @@ class TestModels(unittest.TestCase):
         dense = {"model.layers.0.mlp.gate_proj.weight": mx.zeros((8, 8))}
         self.assertEqual(list(model.sanitize(dense)), list(dense))
 
+        # The bias and the gate stay in fp32, as in the checkpoint.
         self.assertFalse(model.cast_predicate(key))
-        self.assertTrue(model.cast_predicate(gate))
+        self.assertFalse(model.cast_predicate(gate))
+        self.assertTrue(
+            model.cast_predicate("model.layers.1.mlp.switch_mlp.gate_proj.weight")
+        )
 
     def test_ernie4_5_moe_correction_bias_routing(self):
         model = self.ernie4_5_moe_model()
@@ -1006,7 +1012,7 @@ class TestModels(unittest.TestCase):
             None
         ].astype(mx.bfloat16)
         model.load_weights(list(model.sanitize(weights).items()), strict=True)
-        self.assertEqual(moe.moe_statics.e_score_correction_bias.dtype, mx.bfloat16)
+        self.assertEqual(moe.e_score_correction_bias.dtype, mx.bfloat16)
 
         probs = mx.softmax(logits)
         unbiased = set(mx.argsort(-probs)[:2].tolist())
