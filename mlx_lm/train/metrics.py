@@ -1,7 +1,13 @@
 # Copyright © 2026 Apple Inc.
 
+import atexit
 import dataclasses
+import json
 import logging
+import os
+import shutil
+import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -91,6 +97,54 @@ class Metrics:
             metrics.append(("valid_loss", self.valid_loss))
             metrics.append(("valid_ppl", self.valid_ppl))
         return metrics
+
+
+class Sensors:
+    """Temperature (C) and power (W) of this machine, read from `macmon pipe`."""
+
+    fields = ("gpu_temp", "cpu_temp", "gpu_power", "cpu_power", "ram_power")
+
+    def __init__(self, interval_ms=1000):
+        self.samples = []
+        path = os.pathsep.join(
+            [os.environ.get("PATH", os.defpath), "/opt/homebrew/bin"]
+        )
+        macmon = shutil.which("macmon", path=path)
+        if macmon is None:
+            logging.warning("macmon not found, temperature and power are not logged")
+            return
+        proc = subprocess.Popen(
+            [macmon, "pipe", "-i", str(interval_ms)], stdout=subprocess.PIPE, text=True
+        )
+        atexit.register(proc.terminate)
+        threading.Thread(target=self._read, args=(proc.stdout,), daemon=True).start()
+
+    def _read(self, lines):
+        for line in lines:
+            s = json.loads(line)
+            temp = s["temp"]
+            self.samples.append(
+                (
+                    temp["gpu_temp_avg"],
+                    temp["cpu_temp_avg"],
+                    s["gpu_power"],
+                    s["cpu_power"],
+                    s["ram_power"],
+                )
+            )
+
+    def report(self, group):
+        samples, self.samples = self.samples, []
+        local = (
+            np.mean(samples, axis=0) if samples else np.full(len(self.fields), np.nan)
+        )
+        rows = group.all_gather(mx.array(local, dtype=mx.float32))
+        return [
+            (f"{name}/rank{rank}", value)
+            for rank, row in enumerate(rows.reshape(group.size, -1).tolist())
+            for name, value in zip(self.fields, row)
+            if not np.isnan(value)
+        ]
 
 
 _wandb = None  # the module, once init_wandb has opened a run
