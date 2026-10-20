@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -28,12 +28,16 @@ class ModelArgs(BaseModelArgs):
     shared_expert_intermediate_size: int
     mlp_only_layers: List[int]
     layer_types: List[str]
-    no_rope_layer_indices: List[int]
     sliding_window: int
     rms_norm_eps: float
     vocab_size: int
     rope_theta: float = 10000.0
+    rope_parameters: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = False
+
+    def __post_init__(self):
+        if self.rope_parameters and self.rope_parameters.get("rope_theta") is not None:
+            self.rope_theta = self.rope_parameters["rope_theta"]
 
 
 class Attention(nn.Module):
@@ -54,10 +58,11 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.softmax_offset = mx.zeros((n_heads,))
 
-        if layer_idx in args.no_rope_layer_indices:
-            self.rope = None
-        else:
+        # Only sliding-window layers use RoPE; full-attention layers use NoPE.
+        if args.layer_types[layer_idx] == "sliding_attention":
             self.rope = nn.RoPE(head_dim, traditional=False, base=args.rope_theta)
+        else:
+            self.rope = None
 
     def __call__(
         self,
@@ -115,8 +120,6 @@ class SparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, args.num_experts, bias=False)
-        # TODO: preview checkpoint has no router bias; remove if the final one has none.
-        self.expert_bias = mx.zeros((args.num_experts,))
         self.switch_mlp = SwitchGLU(dim, args.moe_intermediate_size, args.num_experts)
         self.shared_expert = MLP(dim, args.shared_expert_intermediate_size)
 
@@ -126,13 +129,13 @@ class SparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        scores = mx.sigmoid(self.gate(x).astype(mx.float32))
+        # Router logits in float32, as in the reference.
+        scores = mx.sigmoid(self.gate(x.astype(mx.float32)))
 
         k = self.top_k
-        inds = mx.argpartition(-(scores + self.expert_bias), kth=k - 1, axis=-1)
-        inds = mx.stop_gradient(inds[..., :k])
+        inds = mx.stop_gradient(mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k])
         weights = mx.take_along_axis(scores, inds, axis=-1)
-        weights = weights / (weights.sum(axis=-1, keepdims=True) + 1e-20)
+        weights = weights / weights.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
@@ -238,11 +241,6 @@ class Model(nn.Module):
                         for e in range(self.args.num_experts)
                     ]
                     weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
-            bias = weights.pop(f"{prefix}.gate.e_score_correction_bias", None)
-            if f"{prefix}.expert_bias" not in weights:
-                weights[f"{prefix}.expert_bias"] = (
-                    bias if bias is not None else mx.zeros((self.args.num_experts,))
-                )
         return weights
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
@@ -293,14 +291,9 @@ class Model(nn.Module):
         ]
 
     @property
-    def cast_predicate(self):
-        return lambda k: "expert_bias" not in k
-
-    @property
     def quant_predicate(self):
         def predicate(path, _):
-            if path.endswith("mlp.gate"):
-                return {"group_size": 64, "bits": 8}
-            return True
+            # Keep the router unquantized; it runs in float32.
+            return not path.endswith("mlp.gate")
 
         return predicate
