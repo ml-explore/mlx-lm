@@ -1,7 +1,10 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+import base64
 import gc
+import hashlib
+import io
 import json
 import logging
 import pickle
@@ -20,26 +23,29 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterator,
     List,
     Literal,
     Optional,
     Tuple,
     Union,
 )
+from urllib.request import urlopen
 
 import mlx.core as mx
+import numpy as np
 from huggingface_hub import scan_cache_dir
 
 from ._version import __version__
 from .generate import (
     DEFAULT_QUANTIZED_KV_START,
     BatchGenerator,
+    TextState,
     TextStateMachine,
-    make_stop_sequences,
-    make_text_state_machine,
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .processors import load_processor
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -54,9 +60,23 @@ def get_system_fingerprint():
     return f"{__version__}-{mx.__version__}-{platform.platform()}-{gpu_arch}"
 
 
+def _apply_stop_words(
+    reader: TextStateMachine.Reader, text: str, *, finish_reason: str | None
+) -> tuple[str, str | None]:
+    """Return the text of a chunk up to a stop word, and the finish reason."""
+    if finish_reason is None:
+        delta = reader.feed(text)
+    else:
+        delta = reader.finish(text)
+    if reader.stopped:
+        finish_reason = "stop"
+    return delta.content, finish_reason
+
+
 class ToolCallFormatter:
     def __init__(self, tool_parser, tools, streaming=False):
-        self._idx = 0
+        # The number of tool calls formatted so far
+        self.count = 0
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
@@ -64,15 +84,11 @@ class ToolCallFormatter:
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
         tc["arguments"] = json.dumps(tc["arguments"], ensure_ascii=False)
-        out = {
+        return {
             "function": tc,
             "type": "function",
             "id": tc_id,
         }
-        if self._streaming:
-            out["index"] = self._idx
-            self._idx += 1
-        return out
 
     def __call__(self, tool_calls):
         if not tool_calls:
@@ -80,17 +96,23 @@ class ToolCallFormatter:
 
         result = []
         for tool_text in tool_calls:
+            # A broken tool call is dropped, whatever the parser raises.
             try:
                 parsed = self._tool_parser(tool_text, self._tools)
-            except (ValueError, json.JSONDecodeError) as e:
+                if not isinstance(parsed, list):
+                    parsed = [parsed]
+                formatted = [self._format(tc) for tc in parsed]
+            except Exception as e:
                 logging.warning(
                     f"Failed to parse tool call ({type(e).__name__}: {e}) — "
                     f"tool text was likely truncated mid-generation."
                 )
                 continue
-            if not isinstance(parsed, list):
-                parsed = [parsed]
-            result.extend(self._format(tc) for tc in parsed)
+            for out in formatted:
+                if self._streaming:
+                    out["index"] = self.count
+                self.count += 1
+                result.append(out)
         return result
 
 
@@ -118,7 +140,78 @@ def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
     return prompt.rstrip()
 
 
-def process_message_content(messages):
+def _image_url(part: Dict[str, Any]) -> Optional[str]:
+    """The URL of an image content part, or None for other parts."""
+    if part.get("type") not in ("image_url", "input_image", "image"):
+        return None
+    url = part.get("image_url", part.get("image"))
+    return url.get("url") if isinstance(url, dict) else url
+
+
+def _image_parts(messages: List[Dict[str, Any]]) -> Iterator[Dict[str, Any]]:
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list):
+            yield from (p for p in content if _image_url(p) is not None)
+
+
+def _inline_image_urls(messages: List[Dict[str, Any]]) -> None:
+    """Replace http(s) image URLs with data URLs: all ranks read the same bytes."""
+    for part in _image_parts(messages):
+        url = _image_url(part)
+        if not url.startswith(("http://", "https://")):
+            continue
+        with urlopen(url, timeout=30) as response:
+            mime = response.headers.get_content_type()
+            data = base64.b64encode(response.read()).decode()
+        part.clear()
+        part.update(type="image_url", image_url={"url": f"data:{mime};base64,{data}"})
+
+
+def _decode_image(url: str) -> np.ndarray:
+    """An RGB uint8 image from a data URL."""
+    from PIL import Image
+
+    if not url.startswith("data:"):
+        raise ValueError("Images must be data URLs or http(s) URLs.")
+    data = base64.b64decode(url.partition(",")[2])
+    return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+
+
+@dataclass
+class Vision:
+    """The images of a prompt."""
+
+    pixel_values: List[mx.array]
+    # The position of the first patch token of each image.
+    starts: List[int]
+    # The prompt with each patch token replaced by a negative id of its image,
+    # since two images of one size give the same tokens.
+    cache_key: List[int]
+
+
+def _make_vision(
+    prompt: List[int],
+    *,
+    urls: List[str],
+    pixel_values: List[mx.array],
+    token_id: int,
+) -> Vision:
+    ids = (-1 - int(hashlib.sha256(u.encode()).hexdigest()[:15], 16) for u in urls)
+    starts, cache_key = [], list(prompt)
+    for i, t in enumerate(prompt):
+        if t != token_id:
+            continue
+        if i == 0 or prompt[i - 1] != token_id:
+            starts.append(i)
+            image_id = next(ids)
+        cache_key[i] = image_id
+    return Vision(pixel_values=pixel_values, starts=starts, cache_key=cache_key)
+
+
+def process_message_content(
+    messages: List[Dict[str, Any]], *, keep_images: bool = False
+) -> List[str]:
     """
     Convert message content to a format suitable for `apply_chat_template`.
 
@@ -129,14 +222,25 @@ def process_message_content(messages):
         message_list (list): A list of dictionaries, where each dictionary may
           have a 'content' key containing a list of dictionaries with 'type' and
           'text' keys.
+        keep_images (bool): Keep the content lists with images, for the chat
+          template. Default: ``False``.
+
+    Returns:
+        The image URLs, in order.
 
     Raises:
         ValueError: If the 'content' type is not supported or if 'text' is missing.
 
     """
+    urls = []
     for message in messages:
         content = message.get("content")
-        if isinstance(content, list):
+        images = []
+        if keep_images and isinstance(content, list):
+            images = [u for p in content if (u := _image_url(p)) is not None]
+        if images:
+            urls.extend(images)
+        elif isinstance(content, list):
             text_fragments = [
                 fragment["text"] for fragment in content if fragment["type"] == "text"
             ]
@@ -152,6 +256,7 @@ def process_message_content(messages):
                     if args := func.get("arguments"):
                         if isinstance(args, str):
                             func["arguments"] = json.loads(args)
+    return urls
 
 
 @dataclass
@@ -216,7 +321,7 @@ class GenerationContext:
     tool_parser: Callable[[str, Any], Dict]
 
     text_sm: TextStateMachine
-    initial_state: str
+    initial_state: TextState
 
     prompt: List[int]
     prompt_cache_count: int = -1
@@ -283,6 +388,7 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.processor = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -312,6 +418,7 @@ class ModelProvider:
         self.model_key = None
         self.model = None
         self.tokenizer = None
+        self.processor = None
         self.draft_model = None
         self.is_batchable = False
 
@@ -332,18 +439,20 @@ class ModelProvider:
 
         # Load the model and tokenizer
         if self.is_distributed:
-            model, tokenizer = sharded_load(
+            model, tokenizer, config = sharded_load(
                 model_path,
                 pipeline_group=self.pipeline_group,
                 tensor_group=self.tensor_group,
+                return_config=True,
                 tokenizer_config=self._tokenizer_config,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
         else:
-            model, tokenizer = load(
+            model, tokenizer, config = load(
                 model_path,
                 adapter_path=adapter_path,
                 tokenizer_config=self._tokenizer_config,
+                return_config=True,
                 trust_remote_code=self.cli_args.trust_remote_code,
             )
 
@@ -372,6 +481,7 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
+        self.processor = load_processor(model, config)
         self.draft_model = draft_model
         self.is_batchable = is_batchable
 
@@ -434,7 +544,6 @@ class ResponseGenerator:
         self.model_provider = model_provider
         self.prompt_cache = prompt_cache
         self.requests = Queue()
-        self._state_machine_cache = {}
 
         self._time_budget = TimeBudget()
         self._is_distributed = mx.distributed.init().size() > 1
@@ -531,16 +640,21 @@ class ResponseGenerator:
           * segment_types - A string per segment indicating if the segment is a
             system prompt or a user prompt or nothing special.
           * initial state - A string that contains the initial state of the
-            state machine (normal or thinking depending on whether we have tail
+            state machine (normal or reasoning depending on whether we have tail
             or not)
+          * vision - The images of the prompt, or None
         """
+        vision = None
         if request.request_type == "chat":
             messages = request.messages
             tools = request.tools
             role_mapping = request.role_mapping
 
             if tokenizer.has_chat_template:
-                process_message_content(messages)
+                processor = self.model_provider.processor
+                urls = process_message_content(
+                    messages, keep_images=processor is not None
+                )
                 if tools and not tokenizer.has_tool_calling:
                     logging.warning(
                         "Received tools but model does not support tool calling. "
@@ -557,17 +671,34 @@ class ResponseGenerator:
                     tokenize=True,
                     **chat_template_args,
                 )
-                prompt = tokenizer.apply_chat_template(
-                    messages,
-                    add_generation_prompt=True,
-                    **template_kwargs,
-                )
+                if urls:
+                    text = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        **{**template_kwargs, "tokenize": False},
+                    )
+                    text, pixel_values = processor(
+                        text, images=[_decode_image(u) for u in urls]
+                    )
+                    prompt = tokenizer.encode(text, add_special_tokens=False)
+                    vision = _make_vision(
+                        prompt,
+                        urls=urls,
+                        pixel_values=pixel_values,
+                        token_id=tokenizer.convert_tokens_to_ids(processor.image_token),
+                    )
+                else:
+                    prompt = tokenizer.apply_chat_template(
+                        messages,
+                        add_generation_prompt=True,
+                        **template_kwargs,
+                    )
             else:
                 prompt = tokenizer.encode(convert_chat(messages, role_mapping))
-                return prompt, [prompt], ["assistant"], "normal"
+                return prompt, [prompt], ["assistant"], "normal", None
         else:
             prompt = tokenizer.encode(request.prompt)
-            return prompt, [prompt], ["assistant"], "normal"
+            return prompt, [prompt], ["assistant"], "normal", None
 
         # If we are here it means we have a chat request so we need to search
         # for segments for better cache management.
@@ -579,10 +710,12 @@ class ResponseGenerator:
             think_end = tokenizer.rfind_think_end(prompt)
             if think_start > think_end:
                 initial_state = "reasoning"
+        initial_state = tokenizer.response_initial_state or initial_state
 
-        # It is not a user message so no segmentation needed.
-        if messages[-1]["role"] != "user":
-            return prompt, [prompt], ["assistant"], initial_state
+        # It is not a user message, or it has images (served sequentially), so
+        # no segmentation needed.
+        if messages[-1]["role"] != "user" or vision is not None:
+            return prompt, [prompt], ["assistant"], initial_state, vision
 
         segments = []
         segment_types = []
@@ -628,23 +761,7 @@ class ResponseGenerator:
             segments = [prompt]
             segment_types = ["assistant"]
 
-        return prompt, segments, segment_types, initial_state
-
-    def _make_state_machine(self, model_key, tokenizer, stop_words):
-        """Make (and cache) a StopSequences and TextStateMachine."""
-        cache_key = (model_key, tuple(stop_words))
-        rs = self._state_machine_cache.get(cache_key)
-        if rs is not None:
-            return rs
-
-        stop_sequences = make_stop_sequences(tokenizer, stop_words)
-        text_sm = make_text_state_machine(tokenizer, stop_words)
-
-        if len(self._state_machine_cache) > 100:
-            self._state_machine_cache.clear()
-        self._state_machine_cache[cache_key] = (stop_sequences, text_sm)
-
-        return stop_sequences, text_sm
+        return prompt, segments, segment_types, initial_state, None
 
     def _is_batchable(self, args):
         return (
@@ -695,25 +812,27 @@ class ResponseGenerator:
             if request is not None:
                 rqueue, request, args = request
 
+                # Requests with images are served sequentially.
+                batchable = self._is_batchable(args) and not any(
+                    _image_parts(request.messages)
+                )
+
                 # Can it be added to the current batch?
                 if (
                     batch_generator is not None
                     and current_model == args.model
-                    and self._is_batchable(args)
+                    and batchable
                 ):
                     try:
-                        prompt, segments, segment_types, initial_state = self._tokenize(
-                            current_tokenizer, request, args
+                        prompt, segments, segment_types, initial_state, _ = (
+                            self._tokenize(current_tokenizer, request, args)
                         )
                     except Exception as e:
                         rqueue.put(e)
                         continue
 
-                    stop_sequences, text_sm = self._make_state_machine(
-                        self.model_provider.model_key,
-                        current_tokenizer,
-                        args.stop_words,
-                    )
+                    stop_sm = TextStateMachine.from_stop_words(args.stop_words)
+                    text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
 
                     self._log_cache_stats()
                     cache, rest = self.prompt_cache.fetch_nearest_cache(
@@ -747,12 +866,12 @@ class ResponseGenerator:
                         all_tokens=[prompt[:prompt_cache_count]],
                         samplers=[_make_sampler(args, current_tokenizer)],
                         logits_processors=[_make_logits_processors(args)],
-                        stop_sequences=[stop_sequences],
                     )
                     batch_results[uid] = {
                         "ctx": ctx,
                         "rqueue": rqueue,
                         "detokenizer": current_tokenizer.detokenizer,
+                        "stop_reader": stop_sm.reader(),
                         "segment_types": segment_types[::-1],
                         "top_logprobs": args.top_logprobs,
                     }
@@ -777,7 +896,7 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
-                    if not self._is_batchable(args):
+                    if not batchable:
                         self._serve_single((rqueue, request, args), generation_stream)
                         continue
 
@@ -787,6 +906,7 @@ class ResponseGenerator:
                     batch_results = {}
                     batch_generator = BatchGenerator(
                         model,
+                        stop_tokens=[[t] for t in tokenizer.eos_token_ids],
                         completion_batch_size=self.cli_args.decode_concurrency,
                         prefill_batch_size=self.cli_args.prompt_concurrency,
                         prefill_step_size=self.cli_args.prefill_step_size,
@@ -845,6 +965,7 @@ class ResponseGenerator:
                         )
                     del caches
 
+                    uids_to_finish = []
                     for r in gen_responses:
                         result = batch_results[r.uid]
 
@@ -859,13 +980,16 @@ class ResponseGenerator:
                         else:
                             result["detokenizer"].add_token(r.token)
                             text = result["detokenizer"].last_segment
+                        text, finish_reason = _apply_stop_words(
+                            result["stop_reader"], text, finish_reason=r.finish_reason
+                        )
 
                         result["rqueue"].put(
                             Response(
                                 text,
                                 r.token,
                                 r.logprobs[r.token].item(),
-                                r.finish_reason,
+                                finish_reason,
                                 _format_top_logprobs(
                                     r.logprobs,
                                     result["top_logprobs"],
@@ -874,18 +998,34 @@ class ResponseGenerator:
                             )
                         )
 
-                        if r.finish_reason is not None:
+                        if finish_reason is not None:
                             result["rqueue"].put(None)
-                            self.prompt_cache.insert_cache(
-                                current_model_key,
-                                r.all_tokens[:],
-                                r.prompt_cache,
-                                cache_type="assistant",
-                            )
+                            if r.finish_reason is not None:
+                                self.prompt_cache.insert_cache(
+                                    current_model_key,
+                                    r.all_tokens[:],
+                                    r.prompt_cache,
+                                    cache_type="assistant",
+                                )
+                            else:
+                                uids_to_finish.append(r.uid)
                             del batch_results[r.uid]
 
                         if result["ctx"]._should_stop:
                             uids_to_remove.append(r.uid)
+
+                    # End text-stopped requests like finished ones (same on all ranks).
+                    if uids_to_finish:
+                        caches = batch_generator.remove(
+                            uids_to_finish, return_prompt_caches=True
+                        )
+                        for cache, tokens in caches.values():
+                            self.prompt_cache.insert_cache(
+                                current_model_key,
+                                tokens[:],
+                                cache,
+                                cache_type="assistant",
+                            )
 
                 uids_to_remove = self._share_object(uids_to_remove)
                 if uids_to_remove:
@@ -915,12 +1055,11 @@ class ResponseGenerator:
             draft_model = self.model_provider.draft_model
 
             # Prepare the prompt and state machine
-            prompt, _, _, initial_state = self._tokenize(tokenizer, request, args)
-            stop_sequences, text_sm = self._make_state_machine(
-                self.model_provider.model_key,
-                tokenizer,
-                args.stop_words,
+            prompt, _, _, initial_state, vision = self._tokenize(
+                tokenizer, request, args
             )
+            stop_sm = TextStateMachine.from_stop_words(args.stop_words)
+            text_sm = TextStateMachine.from_tokenizer(tokenizer)
 
             # Start the generation context
             ctx = GenerationContext(
@@ -943,19 +1082,30 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
+            cache_key = vision.cache_key if vision is not None else prompt[:]
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                self.model_provider.model_key, cache_key
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
-            cache_key = prompt[:]
+            rest = prompt[ctx.prompt_cache_count :]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
                 if self.model_provider.draft_model is not None:
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
+            # The images after the cached tokens.
+            input_embeddings = None
+            if vision is not None:
+                n = sum(i < ctx.prompt_cache_count for i in vision.starts)
+                if pixel_values := vision.pixel_values[n:]:
+                    input_embeddings = model.embed_inputs(
+                        mx.array(rest), pixel_values=pixel_values
+                    )
+                    # The prefill runs on another stream: compute the vision rows first.
+                    mx.eval(input_embeddings)
+
             # Process the prompt and generate tokens
-            # Own matcher: the automaton is cached across requests.
-            stop_matcher = stop_sequences.matcher()
+            stop_reader = stop_sm.reader()
             for gen in stream_generate(
                 model=model,
                 stream=stream,
@@ -967,21 +1117,20 @@ class ResponseGenerator:
                 prompt_cache=cache,
                 draft_model=draft_model,
                 num_draft_tokens=args.num_draft_tokens,
+                input_embeddings=input_embeddings,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 kv_bits=self.cli_args.kv_bits,
                 kv_group_size=self.cli_args.kv_group_size,
                 quantized_kv_start=self.cli_args.quantized_kv_start,
             ):
-                finish_reason = gen.finish_reason
-
-                # Token-level stop word detection
-                if stop_matcher.advance(gen.token):
-                    finish_reason = "stop"
+                text, finish_reason = _apply_stop_words(
+                    stop_reader, gen.text, finish_reason=gen.finish_reason
+                )
 
                 rqueue.put(
                     Response(
-                        gen.text,
+                        text,
                         gen.token,
                         gen.logprobs[gen.token].item(),
                         finish_reason,
@@ -1188,6 +1337,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self.logprobs = self.body.get("logprobs", False)
         self.top_logprobs = self.body.get("top_logprobs", -1)
         self.seed = self.body.get("seed", None)
+        self.stop = self.body.get("stop", None)
         self.chat_template_kwargs = self.body.get("chat_template_kwargs")
         try:
             self.validate_model_parameters()
@@ -1198,12 +1348,17 @@ class APIHandler(BaseHTTPRequestHandler):
             return
 
         # Get stop sequences
-        stop_words = self.body.get("stop")
-        stop_words = stop_words or []
+        stop_words = self.stop or []
         stop_words = [stop_words] if isinstance(stop_words, str) else stop_words
 
         # Create the completion request
-        request = request_factories[self.path]()
+        try:
+            request = request_factories[self.path]()
+        except Exception as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         self.handle_completion(request, stop_words)
 
     def _validate(
@@ -1254,12 +1409,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("adapter", str, optional=True)
         self._validate("seed", int, optional=True)
         self._validate("logit_bias", dict, optional=True)
+        self._validate("stop", (str, list), optional=True)
 
         if self.logit_bias is not None:
             try:
                 self.logit_bias = {int(k): float(v) for k, v in self.logit_bias.items()}
             except ValueError as e:
                 raise ValueError("logit_bias must be a dict of int to float") from e
+
+        if isinstance(self.stop, list) and not all(
+            isinstance(w, str) for w in self.stop
+        ):
+            raise ValueError("stop must be a list of strings")
 
     def generate_response(
         self,
@@ -1448,16 +1609,11 @@ class APIHandler(BaseHTTPRequestHandler):
         tool_formatter = ToolCallFormatter(ctx.tool_parser, request.tools, self.stream)
 
         # Initialize the text state machine
-        sm_state = ctx.text_sm.make_state(ctx.initial_state)
+        reader = ctx.text_sm.reader(state=ctx.initial_state)
 
         # Variables to save the generated text, tokens, logprobs, tools etc
-        prev_state = ctx.initial_state
         finish_reason = "stop"
-        reasoning_text = ""
-        made_tool_call = False
-        tool_text = ""
-        tool_calls = []
-        text = ""
+        pending = TextStateMachine.Delta()
         tokens = []
         token_logprobs = []
         top_tokens = []
@@ -1467,31 +1623,12 @@ class APIHandler(BaseHTTPRequestHandler):
                 logging.debug(gen.text)
 
                 # Advance the text state machine to strip control sequences
-                if gen.finish_reason == "stop":
-                    sm_state, current_state = TextStateMachine.discard(sm_state)
-                    clean_text = ""
-                elif gen.finish_reason == "length":
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
-                    sm_state, flushed, current_state = TextStateMachine.flush(sm_state)
-                    clean_text += flushed
+                if gen.finish_reason is None:
+                    delta = reader.feed(gen.text)
                 else:
-                    sm_state, clean_text, current_state = TextStateMachine.step(
-                        sm_state, gen.text
-                    )
+                    delta = reader.finish(gen.text)
 
-                # Collect the clean text by state: reasoning, tool, or normal
-                if current_state == "reasoning":
-                    reasoning_text += clean_text
-                elif current_state == "tool":
-                    tool_text += clean_text
-                elif current_state == "normal":
-                    if prev_state == "tool":
-                        tool_calls.append(tool_text)
-                        tool_text = ""
-                        made_tool_call = True
-                    text += clean_text
+                pending += delta
 
                 # Add the tokens and logprobs to the vars.
                 tokens.append(gen.token)
@@ -1500,41 +1637,33 @@ class APIHandler(BaseHTTPRequestHandler):
                 if args.top_logprobs > 0:
                     top_tokens.append(gen.top_tokens)
 
-                if (
-                    self.stream
-                    and current_state != "tool"
-                    and (text or tool_calls or reasoning_text)
-                ):
-                    resp = self.generate_response(
-                        text,
-                        None,
-                        tool_calls=tool_formatter(tool_calls),
-                        reasoning_text=reasoning_text,
-                    )
-                    self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
-                    self.wfile.flush()
-                    reasoning_text = ""
-                    text = ""
-                    tool_calls = []
+                if self.stream:
+                    tool_calls = tool_formatter(pending.tool_calls)
+                    if pending.content or pending.reasoning or tool_calls:
+                        resp = self.generate_response(
+                            pending.content,
+                            None,
+                            tool_calls=tool_calls,
+                            reasoning_text=pending.reasoning,
+                        )
+                        self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
+                        self.wfile.flush()
+                    pending = TextStateMachine.Delta()
 
                 if gen.finish_reason is not None:
                     finish_reason = gen.finish_reason
 
-                prev_state = current_state
-
-            if prev_state == "tool" and tool_text:
-                tool_calls.append(tool_text)
-                made_tool_call = True
-
-            if finish_reason == "stop" and made_tool_call:
+            # Only tool calls that parse count for the finish reason.
+            tool_calls = tool_formatter(pending.tool_calls)
+            if finish_reason == "stop" and tool_formatter.count:
                 finish_reason = "tool_calls"
 
             if self.stream:
                 resp = self.generate_response(
-                    text,
+                    pending.content,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
-                    reasoning_text=reasoning_text,
+                    tool_calls=tool_calls,
+                    reasoning_text=pending.reasoning,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
                 self.wfile.flush()
@@ -1553,7 +1682,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             else:
                 resp = self.generate_response(
-                    text,
+                    pending.content,
                     finish_reason,
                     len(ctx.prompt),
                     len(tokens),
@@ -1561,8 +1690,8 @@ class APIHandler(BaseHTTPRequestHandler):
                     token_logprobs=token_logprobs,
                     top_tokens=top_tokens,
                     tokens=tokens,
-                    reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    reasoning_text=pending.reasoning,
+                    tool_calls=tool_calls,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
@@ -1614,6 +1743,7 @@ class APIHandler(BaseHTTPRequestHandler):
         # Determine response type
         self.request_id = f"chatcmpl-{uuid.uuid4()}"
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
+        _inline_image_urls(body["messages"])
 
         return CompletionRequest(
             "chat",
