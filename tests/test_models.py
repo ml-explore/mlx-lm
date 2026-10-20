@@ -474,7 +474,9 @@ class TestModels(unittest.TestCase):
         next_tok = mx.argmax(single)
         single_next = model(next_tok.reshape(1, 1), cache=cache)[0, -1]
 
-        batch_cache = [BatchKVCache(left_padding=[pad, 0]) for _ in model.layers]
+        batch_cache = [
+            BatchKVCache(left_padding=[pad, 0]) for _ in make_prompt_cache(model)
+        ]
         batch = mx.array([[0] * pad + short, long])
         batched = model(batch, cache=batch_cache)[0, -1]
         next_toks = mx.array([[next_tok.item()], [0]])
@@ -2071,6 +2073,22 @@ class TestModels(unittest.TestCase):
         )
         model = phixtral.Model(args)
         self.model_test_runner(model, args.model_type, args.num_vocab, args.num_layers)
+        self.left_padding_test_runner(model)
+
+    def test_afm7_left_padding(self):
+        from mlx_lm.models import afm7
+
+        args = afm7.ModelArgs(
+            model_type="afm7",
+            vocab_size=1000,
+            hidden_dim=256,
+            num_layers=16,
+            num_kv_reuse_layers=8,
+            num_heads=8,
+            num_kv_heads=4,
+        )
+        model = afm7.Model(args)
+        # The KV-reuse layers need the owner layer's offset in a padded batch.
         self.left_padding_test_runner(model)
 
     def test_mamba(self):
