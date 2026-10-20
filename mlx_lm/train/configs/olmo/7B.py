@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 import ml_collections
 
 
@@ -63,6 +65,6 @@ def get_config():
     config.steps_per_checkpoint = 100_000
     config.fsdp_dim = 1
     config.reduction_size = 32 * 1024 * 1024  # 32MB
-    config.grad_checkpoint = False
+    config.grad_checkpoint_layers = 0
 
     return config

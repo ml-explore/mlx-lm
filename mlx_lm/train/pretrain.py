@@ -66,8 +66,8 @@ def main(config, save_dir):
         resume_state=data_state,
     )
 
-    if config.get("grad_checkpoint", False):
-        utils.grad_checkpoint(model.layers[0], dtype=dtype)
+    for layer in model.layers[: config.get("grad_checkpoint_layers", 0)]:
+        utils.grad_checkpoint(layer, dtype=dtype)
 
     if fsdp_dim > 1:
         fsdp.shard_model(model, mesh.fsdp.group, dtype)
@@ -249,10 +249,11 @@ def build_parser():
         "rate schedule. Overrides the experiment config",
     )
     parser.add_argument(
-        "--grad-checkpoint",
-        action=argparse.BooleanOptionalAction,
+        "--grad-checkpoint-layers",
+        type=int,
         default=None,
-        help="Turn gradient checkpointing on or off. Overrides the experiment config",
+        help="Number of layers to checkpoint, from the first layer. 0 turns "
+        "gradient checkpointing off. Overrides the experiment config",
     )
     parser.add_argument(
         "--save-dir",
@@ -326,8 +327,8 @@ def cli():
         config.fsdp_dim = args.fsdp_dim
     if args.num_steps is not None:
         config.num_steps = args.num_steps
-    if args.grad_checkpoint is not None:
-        config.grad_checkpoint = args.grad_checkpoint
+    if args.grad_checkpoint_layers is not None:
+        config.grad_checkpoint_layers = args.grad_checkpoint_layers
     if args.all_reduce_size is not None:
         config.all_reduce_size = args.all_reduce_size
     if args.steps_per_report is not None:

@@ -78,7 +78,8 @@ def grad_checkpoint(layer, dtype=None):
     ``dtype`` casts the layer's parameters inside the checkpointed region, so the
     cast itself is recomputed rather than held.
     """
-    fn = type(layer).__call__
+    cls = type(layer)
+    fn = cls.__call__
 
     def checkpointed_fn(model, *args, **kwargs):
         def inner_fn(params, *args, **kwargs):
@@ -89,7 +90,8 @@ def grad_checkpoint(layer, dtype=None):
 
         return mx.checkpoint(inner_fn)(model.trainable_parameters(), *args, **kwargs)
 
-    type(layer).__call__ = checkpointed_fn
+    # Python looks up __call__ on the type, so give this layer its own subclass.
+    layer.__class__ = type(cls.__name__, (cls,), {"__call__": checkpointed_fn})
 
 
 def clip_grad_norm(grads, max_norm, fsdp_group=None):
