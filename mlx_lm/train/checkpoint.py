@@ -50,7 +50,7 @@ def save_checkpoint(save_dir, step, params, optimizer, data_state, mesh):
 
     # The data position is per rank: every rank reads a different slice.
     with open(checkpoint_dir / f"data_state_{mesh.world.rank}.json", "w") as fid:
-        json.dump(data_state, fid)
+        json.dump({**data_state, "world_size": mesh.world.size}, fid)
 
     mx.clear_cache()
     return checkpoint_dir
@@ -138,15 +138,13 @@ def load_training_state(model, optimizer, config, mesh):
             )
         return 0, {}
 
-    positions = list(checkpoint_dir.glob("data_state_*.json"))
-    if len(positions) != mesh.world.size:
+    position = checkpoint_dir / f"data_state_{mesh.world.rank}.json"
+    if not position.exists():
         raise SystemExit(
-            f"{checkpoint_dir} holds {len(positions)} data positions but this run "
-            f"has {mesh.world.size} ranks; the saved position only covers the "
-            "ranks that wrote it, so use restore 'optimizer' to start the data "
-            "over instead"
+            f"no data position for rank {mesh.world.rank} at {position}; use "
+            "restore 'optimizer' to start the data over instead"
         )
-    with open(checkpoint_dir / f"data_state_{mesh.world.rank}.json") as fid:
+    with open(position) as fid:
         data_state = json.load(fid)
 
     if mesh.is_master:
