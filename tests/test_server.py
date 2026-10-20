@@ -34,6 +34,7 @@ class DummyModelProvider:
     def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
+        self.processor = None
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
 
@@ -173,6 +174,7 @@ class TestTextStateMachine(unittest.TestCase):
             tool_call_start="<tool_call>",
             tool_call_end="</tool_call>",
             structural_markers=(),
+            response_transitions={},
         )
         reader = TextStateMachine.from_tokenizer(tokenizer).reader(state="reasoning")
         self.assertEqual(
@@ -187,6 +189,7 @@ class TestTextStateMachine(unittest.TestCase):
             tool_call_start="[TOOL_CALLS]",
             tool_call_end="",
             structural_markers=(),
+            response_transitions={},
         )
         reader = TextStateMachine.from_tokenizer(tokenizer).reader()
         self.assertEqual(
@@ -259,6 +262,11 @@ class TestHandleCompletion(unittest.TestCase):
         self.assertEqual(
             sent, [("Hi.", None, []), ("", None, ["f"]), ("", "tool_calls", [])]
         )
+
+    def test_held_text_read_once(self):
+        reader = TextStateMachine({"normal": [("##", "normal")]}).reader()
+        delta = reader.feed("a #") + reader.feed("# b") + reader.finish()
+        self.assertEqual(delta, TextStateMachine.Delta(content="a  b"))
 
 
 class TestToolCallFormatter(unittest.TestCase):
@@ -962,7 +970,7 @@ class TestModelSwapClearsCache(unittest.TestCase):
         tokenizer = mock.Mock()
         tokenizer.chat_template = None
         tokenizer.default_chat_template = None
-        load.return_value = (mock.Mock(), tokenizer)
+        load.return_value = (mock.Mock(), tokenizer, {})
         init.return_value.size.return_value = 1
 
         provider = ModelProvider(args)

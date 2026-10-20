@@ -24,6 +24,7 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
@@ -36,6 +37,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
+from .processors import load_processor
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
@@ -102,6 +104,13 @@ def setup_arg_parser():
         "-p",
         default=DEFAULT_PROMPT,
         help="Message to be processed by the model ('-' reads from stdin)",
+    )
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=(),
+        nargs="+",
+        help="Image files for the image placeholders of the prompt, in order.",
     )
     parser.add_argument(
         "--prefill-response",
@@ -726,6 +735,8 @@ def stream_generate(
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        if kwargs.pop("input_embeddings", None) is not None:
+            raise ValueError("Speculative decoding does not support input embeddings.")
         token_generator = speculative_generate_step(
             prompt, model, draft_model, stream, **kwargs
         )
@@ -938,7 +949,7 @@ class StopSequences:
         return self.Matcher(self._root)
 
 
-TextState = Literal["normal", "reasoning", "tool", "stop"]
+TextState = Literal["normal", "reasoning", "tool", "stop", "header"]
 
 
 def _check_state(state: str) -> None:
@@ -955,7 +966,8 @@ class TextStateMachine:
 
     ``normal`` text is the content, ``reasoning`` text the reasoning and each
     visit to ``tool`` one tool call. ``stop`` ends the text: the reader is
-    then ``stopped``.
+    then ``stopped``. The text of ``header``, for the headers of a response
+    format, is dropped.
 
     Example:
 
@@ -1105,9 +1117,14 @@ class TextStateMachine:
             transitions["reasoning"] = [(tokenizer.think_end, "normal")]
 
         if tokenizer.has_tool_calling:
-            transitions.setdefault("normal", []).append(
-                (tokenizer.tool_call_start, "tool")
-            )
+            # A response format that goes to "tool" decides where calls start.
+            targets = set()
+            for edges in tokenizer.response_transitions.values():
+                targets.update(dst for _, dst in edges)
+            if "tool" not in targets:
+                transitions.setdefault("normal", []).append(
+                    (tokenizer.tool_call_start, "tool")
+                )
             if tokenizer.has_thinking:
                 transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
             # Back to the state the tool call started in.
@@ -1118,6 +1135,9 @@ class TextStateMachine:
         if tokenizer.structural_markers:
             for w in tokenizer.structural_markers:
                 transitions.setdefault("normal", []).append((w, "normal"))
+
+        for state, edges in tokenizer.response_transitions.items():
+            transitions.setdefault(state, []).extend(edges)
 
         return cls(transitions)
 
@@ -2104,11 +2124,12 @@ def main():
             )
     model_path = model_path or DEFAULT_MODEL
 
-    model, tokenizer = load(
+    model, tokenizer, config = load(
         model_path,
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        return_config=True,
         trust_remote_code=args.trust_remote_code,
     )
     for eos_token in args.extra_eos_token:
@@ -2120,7 +2141,8 @@ def main():
 
     prompt = args.prompt.replace("\\n", "\n").replace("\\t", "\t")
     prompt = sys.stdin.read() if prompt == "-" else prompt
-    if not args.ignore_chat_template and tokenizer.has_chat_template:
+    use_chat_template = not args.ignore_chat_template and tokenizer.has_chat_template
+    if use_chat_template:
         if args.system_prompt is not None:
             messages = [{"role": "system", "content": args.system_prompt}]
         else:
@@ -2149,9 +2171,27 @@ def main():
                 add_generation_prompt=not has_prefill,
             )
             prompt = prompt[test_prompt.index("<query>") :]
-        prompt = tokenizer.encode(prompt, add_special_tokens=False)
+
+    if args.image:
+        processor = load_processor(model, config)
+        if processor is None:
+            raise ValueError(f"The model {model_path} does not take images.")
+        from PIL import Image
+
+        images = [np.asarray(Image.open(f).convert("RGB")) for f in args.image]
+        prompt, pixel_values = processor(prompt, images=images)
     else:
-        prompt = tokenizer.encode(prompt)
+        pixel_values = None
+    prompt = tokenizer.encode(prompt, add_special_tokens=not use_chat_template)
+
+    if pixel_values is not None:
+        input_embeddings = model.embed_inputs(
+            mx.array(prompt), pixel_values=pixel_values
+        )
+        # The prefill runs on another stream: compute the vision rows first.
+        mx.eval(input_embeddings)
+    else:
+        input_embeddings = None
 
     if args.draft_model is not None:
         draft_model, draft_tokenizer = load(args.draft_model)
@@ -2184,6 +2224,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        input_embeddings=input_embeddings,
     )
     if not args.verbose:
         print(response)

@@ -553,11 +553,13 @@ def load_model(
             _quantize(quantization)
         elif quant_method == "modelopt":
             # NVIDIA ModelOpt.
-            algo = quantization_config["quantization"]["quant_algo"]
+            # hf_quant_config.json nests the settings, config.json does not.
+            settings = quantization_config.get("quantization", quantization_config)
+            algo = settings["quant_algo"]
             if algo != "NVFP4":
                 raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
             quantization = {
-                "group_size": quantization_config["quantization"].get("group_size", 16),
+                "group_size": settings.get("group_size", 16),
                 "bits": 4,
                 "mode": "nvfp4",
             }
@@ -629,7 +631,18 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
+        defaults=_tokenizer_defaults(model_path),
     )
+
+
+def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
+    """The TOKENIZER_DEFAULTS of the model module, if any."""
+    try:
+        model_class, _ = _get_classes(load_config(model_path))
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    module = importlib.import_module(model_class.__module__)
+    return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 
 def load(
@@ -1126,6 +1139,8 @@ def dequantize_model(model: nn.Module) -> nn.Module:
 def save_config(
     config: dict,
     config_path: Union[str, Path],
+    *,
+    keep_vision_config: bool = False,
 ) -> None:
     """Save the model configuration to the ``config_path``.
 
@@ -1134,10 +1149,13 @@ def save_config(
     Args:
         config (dict): The model configuration.
         config_path (Union[str, Path]): Model configuration file path.
+        keep_vision_config (bool): Keep ``vision_config``, for models that keep
+            their vision tower. Default: ``False``.
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
-    config.pop("vision_config", None)
+    if not keep_vision_config:
+        config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
 
@@ -1166,8 +1184,14 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
+    # Models with a vision tower need vision_config to load it again.
+    keep_vision_config = "vision_tower" in getattr(model, "model", {})
     save_model(dst_path, model, donate_model=donate_model)
-    save_config(config, config_path=dst_path / "config.json")
+    save_config(
+        config,
+        config_path=dst_path / "config.json",
+        keep_vision_config=keep_vision_config,
+    )
     tokenizer.save_pretrained(dst_path)
 
     for p in ["*.py", "generation_config.json"]:
