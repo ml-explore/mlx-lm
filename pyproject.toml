@@ -22,7 +22,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [
-    "mlx>=0.32.2; platform_system == 'Darwin'",
+    "mlx>=0.32.3; platform_system == 'Darwin'",
     "numpy",
     "transformers>=5.7.0",
     "sentencepiece",
@@ -41,9 +41,9 @@ test = ["datasets", "lm-eval", "Pillow"]
 train = ["datasets", "tqdm"]
 evaluate = ["lm-eval", "tqdm"]
 vision = ["Pillow"]
-cuda13 = ["mlx[cuda13]>=0.32.2"]
-cuda12 = ["mlx[cuda12]>=0.32.2"]
-cpu = ["mlx[cpu]>=0.32.2"]
+cuda13 = ["mlx[cuda13]>=0.32.3"]
+cuda12 = ["mlx[cuda12]>=0.32.3"]
+cpu = ["mlx[cpu]>=0.32.3"]
 
 [project.scripts]
 mlx_lm = "mlx_lm.cli:main"
