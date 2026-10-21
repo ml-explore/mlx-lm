@@ -474,7 +474,9 @@ class TestModels(unittest.TestCase):
         next_tok = mx.argmax(single)
         single_next = model(next_tok.reshape(1, 1), cache=cache)[0, -1]
 
-        batch_cache = [BatchKVCache(left_padding=[pad, 0]) for _ in model.layers]
+        batch_cache = [
+            BatchKVCache(left_padding=[pad, 0]) for _ in make_prompt_cache(model)
+        ]
         batch = mx.array([[0] * pad + short, long])
         batched = model(batch, cache=batch_cache)[0, -1]
         next_toks = mx.array([[next_tok.item()], [0]])
@@ -941,6 +943,105 @@ class TestModels(unittest.TestCase):
             norm_topk_prob=True,
         )
         self.check_moe_sanitize(Klear.Model(args), args.num_experts, "experts")
+
+    def ernie4_5_moe_model(self):
+        from mlx_lm.models import ernie4_5_moe
+
+        args = ernie4_5_moe.ModelArgs(
+            hidden_size=8,
+            intermediate_size=8,
+            moe_intermediate_size=8,
+            model_type="ernie4_5_moe",
+            max_position_embeddings=64,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            num_hidden_layers=2,
+            rms_norm_eps=1e-5,
+            vocab_size=16,
+            rope_theta=1000.0,
+            use_bias=False,
+            tie_word_embeddings=True,
+            moe_num_experts=4,
+            moe_k=2,
+            moe_layer_start_index=1,
+        )
+        return ernie4_5_moe.Model(args)
+
+    def test_ernie4_5_moe_sanitize_correction_bias(self):
+        model = self.ernie4_5_moe_model()
+        gate = "model.layers.1.mlp.gate.weight"
+        old = "model.layers.1.mlp.moe_statics.e_score_correction_bias"
+        key = "model.layers.1.mlp.e_score_correction_bias"
+        gate_weight = mx.zeros((4, 8))
+
+        # The checkpoint stores the bias as [1, E]. The model expects [E].
+        bias = mx.arange(4, dtype=mx.float32)
+        weights = model.sanitize({gate: gate_weight, old: bias[None]})
+        self.assertNotIn(old, weights)
+        self.assertEqual(weights[key].shape, (4,))
+        self.assertTrue(mx.array_equal(weights[key], bias))
+        weights = model.sanitize(weights)
+        self.assertTrue(mx.array_equal(weights[key], bias))
+
+        # A MoE layer without a bias gets zeros.
+        weights = model.sanitize({gate: gate_weight})
+        self.assertTrue(mx.array_equal(weights[key], mx.zeros((4,))))
+
+        # Pipeline loading can pass only some layers, or none.
+        self.assertEqual(model.sanitize({}), {})
+        dense = {"model.layers.0.mlp.gate_proj.weight": mx.zeros((8, 8))}
+        self.assertEqual(list(model.sanitize(dense)), list(dense))
+
+        # The bias and the gate stay in fp32, as in the checkpoint.
+        self.assertFalse(model.cast_predicate(key))
+        self.assertFalse(model.cast_predicate(gate))
+        self.assertTrue(
+            model.cast_predicate("model.layers.1.mlp.switch_mlp.gate_proj.weight")
+        )
+
+    def test_ernie4_5_moe_correction_bias_routing(self):
+        model = self.ernie4_5_moe_model()
+        moe = model.layers[1].mlp
+
+        # With x = ones, the logit of expert e is the sum of its gate row.
+        logits = mx.array([2.0, 1.0, 0.99, -3.0])
+        bias = mx.array([0.0, 0.0, 0.05, 0.0])
+        weights = dict(tree_flatten(model.parameters()))
+        weights["model.layers.1.mlp.gate.weight"] = mx.broadcast_to(
+            logits[:, None] / 8, (4, 8)
+        )
+        weights["model.layers.1.mlp.moe_statics.e_score_correction_bias"] = bias[
+            None
+        ].astype(mx.bfloat16)
+        model.load_weights(list(model.sanitize(weights).items()), strict=True)
+        self.assertEqual(moe.e_score_correction_bias.dtype, mx.bfloat16)
+
+        probs = mx.softmax(logits)
+        unbiased = set(mx.argsort(-probs)[:2].tolist())
+        expected = set(mx.argsort(-(probs + bias))[:2].tolist())
+        # The bias must flip a near-tie, otherwise the test checks nothing.
+        self.assertNotEqual(unbiased, expected)
+
+        # Replace the experts with one-hot outputs to read the routing weights.
+        selected = {}
+
+        def switch_mlp(x, inds):
+            selected["inds"] = inds
+            one_hot = (inds[..., None] == mx.arange(4)).astype(mx.float32)
+            return mx.pad(one_hot, [(0, 0), (0, 0), (0, 0), (0, 4)])
+
+        moe.switch_mlp = switch_mlp
+        with mock.patch.object(mx, "argpartition", wraps=mx.argpartition) as argpart:
+            out = moe(mx.ones((1, 1, 8)))
+
+        # A bf16 bias must not lower the precision of the selection scores.
+        self.assertEqual(argpart.call_args.args[0].dtype, mx.float32)
+        self.assertEqual(set(selected["inds"].flatten().tolist()), expected)
+
+        expected_weights = mx.zeros(4)
+        for i in expected:
+            expected_weights[i] = probs[i] / sum(probs[j] for j in expected)
+        self.assertTrue(mx.allclose(out[0, 0, :4], expected_weights, atol=1e-5))
 
     def test_qwen3(self):
         from mlx_lm.models import qwen3
@@ -1972,6 +2073,22 @@ class TestModels(unittest.TestCase):
         )
         model = phixtral.Model(args)
         self.model_test_runner(model, args.model_type, args.num_vocab, args.num_layers)
+        self.left_padding_test_runner(model)
+
+    def test_afm7_left_padding(self):
+        from mlx_lm.models import afm7
+
+        args = afm7.ModelArgs(
+            model_type="afm7",
+            vocab_size=1000,
+            hidden_dim=256,
+            num_layers=16,
+            num_kv_reuse_layers=8,
+            num_heads=8,
+            num_kv_heads=4,
+        )
+        model = afm7.Model(args)
+        # The KV-reuse layers need the owner layer's offset in a padded batch.
         self.left_padding_test_runner(model)
 
     def test_mamba(self):

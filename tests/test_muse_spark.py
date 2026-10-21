@@ -9,7 +9,7 @@ from mlx.utils import tree_flatten, tree_map
 from model_parallel_tests import Group
 
 from mlx_lm.chat_templates.muse_spark import RESPONSE_FORMAT
-from mlx_lm.generate import TextStateMachine, make_text_state_machine
+from mlx_lm.generate import TextStateMachine
 from mlx_lm.models import muse_spark
 from mlx_lm.models.cache import RotatingKVCache
 
@@ -235,15 +235,13 @@ class TestMuseSparkResponseFormat(unittest.TestCase):
             structural_markers=(),
             response_transitions=RESPONSE_FORMAT["transitions"],
         )
-        sm = make_text_state_machine(tokenizer)
-        state = sm.make_state(RESPONSE_FORMAT["initial_state"])
-        out = {"reasoning": "", "tool": "", "normal": ""}
+        reader = TextStateMachine.from_tokenizer(tokenizer).reader(
+            state=RESPONSE_FORMAT["initial_state"]
+        )
+        delta = TextStateMachine.Delta()
         for i in range(0, len(text), step):
-            state, segments = TextStateMachine.split(state, text[i : i + step])
-            for name, chunk in segments:
-                if name in out:
-                    out[name] += chunk
-        return out
+            delta += reader.feed(text[i : i + step])
+        return delta + reader.finish()
 
     def test_message_headers(self):
         call = (
@@ -260,11 +258,17 @@ class TestMuseSparkResponseFormat(unittest.TestCase):
             )
             for step in (1, 3, 7, len(text)):
                 out = self.split(text, step)
-                self.assertEqual(out["reasoning"], "think")
-                self.assertEqual(out["normal"], "onetwo")
+                self.assertEqual(out.reasoning, "think")
+                self.assertEqual(out.content, "onetwo")
                 self.assertEqual(
-                    out["tool"],
-                    call[len("<atem:function_calls>") : -len("</atem:function_calls>")],
+                    out.tool_calls,
+                    (
+                        call[
+                            len("<atem:function_calls>") : -len(
+                                "</atem:function_calls>"
+                            )
+                        ],
+                    ),
                 )
 
     def test_quoted_call(self):
@@ -276,8 +280,8 @@ class TestMuseSparkResponseFormat(unittest.TestCase):
         text = f" to=user<|message|>Write {call} to search."
         for step in (1, 3, 7, len(text)):
             out = self.split(text, step)
-            self.assertEqual(out["normal"], f"Write {call} to search.")
-            self.assertEqual(out["tool"], "")
+            self.assertEqual(out.content, f"Write {call} to search.")
+            self.assertEqual(out.tool_calls, ())
 
 
 if __name__ == "__main__":
