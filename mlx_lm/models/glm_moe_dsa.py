@@ -215,7 +215,7 @@ class GlmMoeDsaModel(DeepseekV32Model):
         pipeline_size = self.pipeline_size
 
         if cache is None:
-            cache = [None] * self.num_layers
+            cache = [None] * len(self.pipeline_layers)
         mask = create_attention_mask(
             h, cache[0][0] if cache[0] else None, return_array=True
         )
@@ -225,10 +225,8 @@ class GlmMoeDsaModel(DeepseekV32Model):
             h = mx.distributed.recv_like(h, (pipeline_rank + 1))
 
         prev_topk_indices = None
-        for i in range(self.num_layers):
-            h, prev_topk_indices = self.layers[self.start_idx + i](
-                h, mask, cache[i], prev_topk_indices
-            )
+        for layer, c in zip(self.pipeline_layers, cache):
+            h, prev_topk_indices = layer(h, mask, c, prev_topk_indices)
 
         # Send to the next process in the pipeline
         if pipeline_rank != 0:
