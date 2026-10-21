@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from functools import partial
 from itertools import accumulate
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -245,14 +245,14 @@ class KVReuseAttention(nn.Module):
         x: mx.array,
         keys: mx.array,
         values: mx.array,
+        offset: Union[int, mx.array],
         mask: Optional[mx.array] = None,
     ) -> mx.array:
         B, L, D = x.shape
-        _, _, S, _ = keys.shape
 
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
-        queries = self.q_norm(self.rope(queries, offset=S - L))
+        queries = self.q_norm(self.rope(queries, offset=offset))
 
         output = scaled_dot_product_attention(
             queries, keys, values, cache=None, scale=self.scale, mask=mask
@@ -317,9 +317,10 @@ class KVReuseTransformerBlock(nn.Module):
         x: mx.array,
         keys: mx.array,
         values: mx.array,
+        offset: Union[int, mx.array],
         mask: Optional[mx.array] = None,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), keys, values, mask)
+        r = self.self_attn(self.input_layernorm(x), keys, values, offset, mask)
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         out = h + r
@@ -359,8 +360,10 @@ class AFMModel(nn.Module):
             h = layer(h, mask, cache=c)
 
         keys, values = cache[-1].keys_and_values()
+        # The cache already holds this step, so go back L to the start offset.
+        offset = cache[-1].offset - inputs.shape[1]
         for layer in self.kv_reuse_layers:
-            h = layer(h, keys, values, mask)
+            h = layer(h, keys, values, offset, mask)
 
         return self.output_norm(h)
 
