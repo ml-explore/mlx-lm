@@ -59,7 +59,6 @@ class Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.softmax_offset = mx.zeros((n_heads,))
 
-        # Only sliding-window layers use RoPE; full-attention layers use NoPE.
         if args.layer_types[layer_idx] == "sliding_attention":
             self.rope = nn.RoPE(head_dim, traditional=False, base=args.rope_theta)
         else:
@@ -123,7 +122,6 @@ class SparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, args.num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, args.moe_intermediate_size, args.num_experts)
         self.shared_expert = MLP(dim, args.shared_expert_intermediate_size)
-        # Flint has no expert bias. The underscore keeps it out of the weights.
         self._zero_bias = mx.zeros((args.num_experts,))
 
         self.sharding_group = None
@@ -132,7 +130,6 @@ class SparseMoeBlock(nn.Module):
         if self.sharding_group is not None:
             x = sum_gradients(self.sharding_group)(x)
 
-        # Router logits in float32, as in the reference.
         logits = self.gate(x.astype(mx.float32))
 
         k = self.top_k
@@ -310,7 +307,6 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            # Keep the router unquantized; it runs in float32.
             return not path.endswith("mlp.gate")
 
         return predicate
