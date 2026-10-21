@@ -943,6 +943,45 @@ class TestToolParsing(unittest.TestCase):
         # A parameter after the nested value still parses
         self.assertEqual(tool_call["arguments"]["mode"], "append")
 
+    def test_qwen3_coder_stray_parameter_tag_in_value(self):
+        """An unbalanced <parameter= tag inside a value is literal text."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "mode": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        test_case = (
+            "<function=write_file>\n"
+            "<parameter=path>\nREADME.md\n</parameter>\n"
+            "<parameter=content>\n"
+            "Wrap each argument in <parameter=NAME> and close it.\n"
+            "</parameter>\n"
+            "<parameter=mode>\nappend\n</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["arguments"]["path"], "README.md")
+        self.assertEqual(
+            tool_call["arguments"]["content"],
+            "Wrap each argument in <parameter=NAME> and close it.",
+        )
+        # No parameter is invented from the stray tag, and the parameter
+        # after the value still parses
+        self.assertNotIn("NAME", tool_call["arguments"])
+        self.assertEqual(tool_call["arguments"]["mode"], "append")
+
 
 if __name__ == "__main__":
     unittest.main()
