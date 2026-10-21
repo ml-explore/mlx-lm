@@ -909,6 +909,40 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"], {"path": "a>b"})
 
+    def test_qwen3_coder_nested_parameter_value(self):
+        """Markup inside a parameter value must not truncate the value."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "description": "Write a file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                            "mode": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        content = "<function=demo>\n<parameter=a>\nv\n</parameter>\n</function>"
+        test_case = (
+            "<function=write_file>\n"
+            "<parameter=path>\nexample.txt\n</parameter>\n"
+            f"<parameter=content>\n{content}\n</parameter>\n"
+            "<parameter=mode>\nappend\n</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "write_file")
+        self.assertEqual(tool_call["arguments"]["path"], "example.txt")
+        self.assertEqual(tool_call["arguments"]["content"], content)
+        # A parameter after the nested value still parses
+        self.assertEqual(tool_call["arguments"]["mode"], "append")
+
 
 if __name__ == "__main__":
     unittest.main()
