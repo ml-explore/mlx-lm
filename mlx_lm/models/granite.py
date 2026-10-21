@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
@@ -196,3 +196,19 @@ class Model(nn.Module):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
         return weights
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            # o_proj, down_proj, and lm_head run small enough in block absmax
+            # that low-bit fp quant modes (e.g. nvfp4) underflow their scale
+            # encoding, corrupting dequantization. Keep them safe at 8 bits.
+            if (
+                path.endswith("self_attn.o_proj")
+                or path.endswith("mlp.down_proj")
+                or path == "lm_head"
+            ):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate

@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 from typing import Optional, Tuple
 
 import mlx.core as mx
@@ -152,6 +154,8 @@ def ssm_attn(
     repeats = h // g
     A = -mx.exp(A_log).astype(dt.dtype)
     dtA = dt * A.reshape(1, 1, -1)
+    if mask is not None:
+        dtA = dtA * mask[..., None]
     dtx = dt.reshape(b, l, h, 1) * x
 
     def _step(dtx, dtA, B, C, state, mask):

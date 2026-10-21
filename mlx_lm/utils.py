@@ -1,13 +1,16 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import copy
 import glob
 import importlib
 import inspect
 import json
+import math
 import os
+import re
 import resource
 import shutil
+from decimal import Decimal
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -27,8 +30,8 @@ import mlx.nn as nn
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
-    except ImportError:
-        raise ImportError("Run `pip install modelscope` to use ModelScope.")
+    except ImportError as e:
+        raise ImportError("Run `pip install modelscope` to use ModelScope.") from e
 else:
     from huggingface_hub import snapshot_download
 
@@ -52,20 +55,42 @@ MODEL_REMAPPING = {
     "qwen2_5_vl": "qwen2_vl",
     "minimax_m2": "minimax",
     "iquestcoder": "llama",
+    "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
+    "deepseek_v41_text": "deepseek_v41",
+}
+
+MODEL_ARCHITECTURE_REMAPPING = {
+    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
 }
 
 MAX_FILE_SIZE_GB = 5
 
 
+def can_run_metal():
+    return mx.default_device() == mx.gpu and mx.metal.is_available()
+
+
+def maybe_set_recommended_wired_limit() -> Optional[int]:
+    """Set the wired limit to the recommended size.
+
+    Returns the previous limit, or ``None`` if the device reports no
+    recommended size.
+    """
+    max_rec_size = mx.device_info().get("max_recommended_working_set_size")
+    if max_rec_size is None:
+        return None
+    return mx.set_wired_limit(max_rec_size)
+
+
 def _parse_size(x):
-    sizes = {"M": 1e6, "G": 1e9, "MB": 1e6, "GB": 1e9, "": 1}
+    sizes = {"M": 10**6, "G": 10**9, "MB": 10**6, "GB": 10**9, "": 1}
     split = 0
     for xi in x:
         if not (xi.isdigit() or xi == "."):
             break
         split += 1
-    digits = float(x[:split])
+    digits = Decimal(x[:split])
     size = (x[split:]).strip().upper()
     return int(digits * sizes[size])
 
@@ -116,7 +141,6 @@ def _transform_awq_weights(
             pack_factor = 32 // bits
             in_features, packed_out = qweight.shape
             out_features = packed_out * pack_factor
-            n_groups = in_features // group_size
 
             # Unpack qweight: [in_features, out_features // pack_factor] -> [in_features, out_features]
             unpacked_weight = _unpack_awq_weights(qweight)
@@ -184,12 +208,21 @@ def _get_classes(config: dict):
         A tuple containing the Model class and the ModelArgs class.
     """
     model_type = config["model_type"]
-    model_type = MODEL_REMAPPING.get(model_type, model_type)
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            model_type = remapped
+            break
+    else:
+        model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except ImportError:
+    except ImportError as e:
         msg = f"Model type {model_type} not supported."
-        raise ValueError(msg)
+        raise ValueError(msg) from e
 
     return arch.Model, arch.ModelArgs
 
@@ -216,10 +249,23 @@ def compute_bits_per_weight(model):
     return model_bytes * 8 / model_params
 
 
+DEFAULT_ALLOW_PATTERNS = [
+    "*.json",
+    "model*.safetensors",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
+
 def _download(
     path_or_hf_repo: str,
     revision: Optional[str] = None,
-    allow_patterns: List[str] = None,
+    allow_patterns: Optional[List[str]] = None,
 ) -> Path:
     """
     Ensures the model is available locally. If the path does not exist locally,
@@ -235,17 +281,7 @@ def _download(
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        allow_patterns = allow_patterns or [
-            "*.json",
-            "model*.safetensors",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ]
+        allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
@@ -258,12 +294,75 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    # Restrict to the same patterns that `_download` fetches so the snapshot
+    # completeness check does not fail on files that were never downloaded
+    # (e.g. `.gitattributes`), which would raise an IncompleteSnapshotError.
+    return Path(
+        snapshot_download(
+            hf_repo,
+            local_files_only=True,
+            allow_patterns=DEFAULT_ALLOW_PATTERNS,
+        )
+    )
+
+
+def _compressed_tensors_quantization(quantization_config: dict) -> dict:
+    """Map a compressed-tensors config to an MLX quantization dict.
+
+    ``compressed-tensors`` is a container format. Only packed integer formats that
+    MLX already implements are accepted. Unknown formats such as ``float-quantized``
+    (FP8) used to fall through to 4-bit affine and silently misinterpret F8_E4M3
+    weights.
+    """
+    fmt = quantization_config.get("format")
+    if fmt == "nvfp4-pack-quantized":
+        return {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+    if fmt == "mxfp4-pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    if fmt == "pack-quantized":
+        return {"group_size": 32, "bits": 4, "mode": "affine"}
+    raise ValueError(
+        f"unsupported compressed-tensors format {fmt!r}; "
+        "dequantize to bf16 before converting"
+    )
+
+
+# transformers tags non-finite floats so config.json stays valid JSON, e.g.
+# {"__float__": "Infinity"}. Undo it or the value arrives as a dict.
+_FLOAT_TAG_KEY = "__float__"
+_FLOAT_TAGS = {
+    "Infinity": float("inf"),
+    "-Infinity": float("-inf"),
+    "NaN": float("nan"),
+}
+
+
+def _decode_tagged_floats(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        if set(obj) == {_FLOAT_TAG_KEY} and obj[_FLOAT_TAG_KEY] in _FLOAT_TAGS:
+            return _FLOAT_TAGS[obj[_FLOAT_TAG_KEY]]
+        return {k: _decode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_decode_tagged_floats(v) for v in obj]
+    return obj
+
+
+def _encode_tagged_floats(obj: Any) -> Any:
+    """Tag non-finite floats again, so a saved config stays valid JSON."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        if math.isnan(obj):
+            return {_FLOAT_TAG_KEY: "NaN"}
+        return {_FLOAT_TAG_KEY: "Infinity" if obj > 0 else "-Infinity"}
+    if isinstance(obj, dict):
+        return {k: _encode_tagged_floats(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_encode_tagged_floats(v) for v in obj]
+    return obj
 
 
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
-        config = json.load(f)
+        config = _decode_tagged_floats(json.load(f))
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
@@ -278,6 +377,33 @@ def load_config(model_path: Path) -> dict:
             config["eos_token_id"] = eos_token_id
 
     return config
+
+
+def infer_quant_config(path: str, module: nn.Module, weights: dict) -> dict:
+    """Recover the group_size, bits and mode a saved weight was packed with.
+
+    Use this for paths the per-tensor quantization map does not name, where the
+    top-level default can be wrong. ``module`` must still be unquantized.
+    """
+    scales = weights[f"{path}.scales"]
+    in_dims = module.weight.shape[-1]
+    group_size = in_dims // scales.shape[-1]
+    bits = (weights[f"{path}.weight"].shape[-1] * 32) // in_dims
+    # Only affine keeps the scales in the weight dtype. Each of the other modes
+    # allows exactly one (bits, group_size) pair.
+    if scales.dtype != mx.uint8:
+        return {"group_size": group_size, "bits": bits, "mode": "affine"}
+    if (bits, group_size) == (4, 16):
+        return {"group_size": group_size, "bits": bits, "mode": "nvfp4"}
+    if (bits, group_size) == (4, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp4"}
+    if (bits, group_size) == (8, 32):
+        return {"group_size": group_size, "bits": bits, "mode": "mxfp8"}
+
+    raise ValueError(
+        f"Cannot infer the quantization mode of {path}: "
+        f"{bits} bits with group size {group_size}."
+    )
 
 
 def load_model(
@@ -352,6 +478,14 @@ def load_model(
         if "quantization_config" in text_config:
             config["quantization_config"] = text_config["quantization_config"]
 
+    if "quantization_config" not in config:
+        # NVIDIA ModelOpt exports keep their quantization metadata in a separate
+        # file rather than in config.json.
+        hf_quant_config = model_path / "hf_quant_config.json"
+        if hf_quant_config.exists():
+            with open(hf_quant_config, "r") as fid:
+                config["quantization_config"] = json.load(fid)
+
     model_args = model_args_class.from_dict(config)
 
     model = model_class(model_args)
@@ -366,7 +500,12 @@ def load_model(
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            return f"{p}.scales" in weights
+            if f"{p}.scales" not in weights:
+                return False
+            params = infer_quant_config(p, m, weights)
+            if f"{p}.global_scale" in weights and _takes_global_scale(m):
+                params["global_scale"] = True
+            return params
 
         nn.quantize(
             model,
@@ -391,8 +530,39 @@ def load_model(
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
+        elif quant_method == "mxfp8":
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif (
+            quant_method == "fp8"
+            and quantization_config.get("scale_fmt") == "ue8m0"
+            and list(quantization_config.get("weight_block_size", ())) == [32, 32]
+        ):
+            # Power-of-two scales over 32x32 blocks are mxfp8, so the weights
+            # stay packed. Other fp8 checkpoints dequantize in their sanitize.
+            quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
         elif quant_method == "compressed-tensors":
-            quantization = {"group_size": 32, "bits": 4, "mode": "affine"}
+            quantization = _compressed_tensors_quantization(quantization_config)
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
+        elif quant_method == "modelopt":
+            # NVIDIA ModelOpt.
+            # hf_quant_config.json nests the settings, config.json does not.
+            settings = quantization_config.get("quantization", quantization_config)
+            algo = settings["quant_algo"]
+            if algo != "NVFP4":
+                raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
+            quantization = {
+                "group_size": settings.get("group_size", 16),
+                "bits": 4,
+                "mode": "nvfp4",
+            }
             config["quantization"] = quantization
             config["quantization_config"] = quantization
             _quantize(quantization)
@@ -461,7 +631,18 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
+        defaults=_tokenizer_defaults(model_path),
     )
+
+
+def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
+    """The TOKENIZER_DEFAULTS of the model module, if any."""
+    try:
+        model_class, _ = _get_classes(load_config(model_path))
+    except (FileNotFoundError, KeyError, ValueError):
+        return None
+    module = importlib.import_module(model_class.__module__)
+    return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 
 def load(
@@ -577,19 +758,35 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
+        num_layers = len(model.model.layers)
         model.model.pipeline(pipeline_group)
+        start, end = model.model.start_idx, model.model.end_idx
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
+        # Match weights by layer number, since sanitize can rename them.
+        ckpt_layers = set()
         local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
-            if file_name := weight_index.get(k, None) is None:
-                raise ValueError(
-                    "Pipeline loading is only supported for MLX converted models."
-                )
-            local_files.add(weight_index[k])
+        for k, f in weight_index.items():
+            m = re.search(r"(?:^|\.)layers\.(\d+)\.", k)
+            if m is None:
+                # Every stage keeps the embeddings, the final norm and the head.
+                local_files.add(f)
+            else:
+                layer = int(m.group(1))
+                ckpt_layers.add(layer)
+                if start <= layer < end:
+                    local_files.add(f)
+
+        # Layers past the last model layer are MTP layers, which sanitize drops.
+        missing = set(range(num_layers)) - ckpt_layers
+        if missing:
+            raise ValueError(
+                f"The checkpoint has no weights for layers {sorted(missing)}. "
+                "Convert the model with mlx_lm.convert first."
+            )
 
         # Download weights for local shard
         _download(repo, allow_patterns=local_files)
@@ -627,6 +824,9 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     """
     Splits the weights into smaller shards.
 
+    A tensor larger than the limit gets a shard of its own, since a single
+    tensor cannot be split.
+
     Args:
         weights (dict): Model weights.
         max_file_size_gb (int): Maximum size of each shard in gigabytes.
@@ -636,14 +836,13 @@ def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list
     """
     max_file_size_bytes = max_file_size_gb << 30
     shards = []
-    shard, shard_size = {}, 0
+    shard_size = 0
     for k, v in weights.items():
-        if shard_size + v.nbytes > max_file_size_bytes:
-            shards.append(shard)
-            shard, shard_size = {}, 0
-        shard[k] = v
+        if not shards or shard_size + v.nbytes > max_file_size_bytes:
+            shards.append({})
+            shard_size = 0
+        shards[-1][k] = v
         shard_size += v.nbytes
-    shards.append(shard)
     return shards
 
 
@@ -700,8 +899,7 @@ def upload_to_hub(path: str, upload_repo: str):
     else:
         provenance = ""
 
-    card.text = dedent(
-        f"""
+    card.text = dedent(f"""
         # {upload_repo}
         {provenance}
         ## Use with mlx
@@ -725,8 +923,7 @@ def upload_to_hub(path: str, upload_repo: str):
 
         response = generate(model, tokenizer, prompt=prompt, verbose=True)
         ```
-        """
-    )
+        """)
     card.save(card_path)
 
     api = HfApi()
@@ -799,12 +996,19 @@ def save_model(
         )
 
 
+def _takes_global_scale(module: nn.Module) -> bool:
+    """Only some layers hold an nvfp4 tensor scale."""
+    params = inspect.signature(module.to_quantized).parameters
+    return "global_scale" in params
+
+
 def quantize_model(
     model: nn.Module,
     config: dict,
     group_size: Optional[int],
     bits: Optional[int],
     mode: str = "affine",
+    global_scale: bool = False,
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
 ) -> Tuple[nn.Module, dict]:
     """
@@ -816,6 +1020,8 @@ def quantize_model(
         group_size (Optional[int]): Group size for quantization.
         bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
+        global_scale (bool): Use one ``nvfp4`` tensor scale per expert on the
+          switch layers. Only these layers support it for now.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
@@ -846,7 +1052,7 @@ def quantize_model(
         fine_grained_config = True
     else:
         fine_grained_config = False
-        quantized_config["quantization"] = quant_params
+        quantized_config["quantization"] = dict(quant_params)
 
     def wrapped_predicate(path, module):
         if not hasattr(module, "to_quantized"):
@@ -856,6 +1062,12 @@ def quantize_model(
         bool_or_params = True
         if quant_predicate is not None:
             bool_or_params = quant_predicate(path, module)
+        # The scale is a parameter of the layer, so the config must record it
+        # for the loader to rebuild the same shapes.
+        if global_scale and bool_or_params and _takes_global_scale(module):
+            if not isinstance(bool_or_params, dict):
+                bool_or_params = dict(quant_params)
+            bool_or_params["global_scale"] = True
         if isinstance(bool_or_params, dict):
             quantized_config["quantization"][path] = bool_or_params
         elif fine_grained_config and bool_or_params:
@@ -927,6 +1139,8 @@ def dequantize_model(model: nn.Module) -> nn.Module:
 def save_config(
     config: dict,
     config_path: Union[str, Path],
+    *,
+    keep_vision_config: bool = False,
 ) -> None:
     """Save the model configuration to the ``config_path``.
 
@@ -935,10 +1149,13 @@ def save_config(
     Args:
         config (dict): The model configuration.
         config_path (Union[str, Path]): Model configuration file path.
+        keep_vision_config (bool): Keep ``vision_config``, for models that keep
+            their vision tower. Default: ``False``.
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
-    config.pop("vision_config", None)
+    if not keep_vision_config:
+        config.pop("vision_config", None)
     if "quantization" in config:
         config["quantization_config"] = config["quantization"]
 
@@ -947,7 +1164,7 @@ def save_config(
 
     # write the updated config to the config_path (if provided)
     with open(config_path, "w") as fid:
-        json.dump(config, fid, indent=4)
+        json.dump(_encode_tagged_floats(config), fid, indent=4)
 
 
 def save(
@@ -967,8 +1184,14 @@ def save(
         hf_repo = None
 
     dst_path = Path(dst_path)
-    save_model(dst_path, model, donate_model=True)
-    save_config(config, config_path=dst_path / "config.json")
+    # Models with a vision tower need vision_config to load it again.
+    keep_vision_config = "vision_tower" in getattr(model, "model", {})
+    save_model(dst_path, model, donate_model=donate_model)
+    save_config(
+        config,
+        config_path=dst_path / "config.json",
+        keep_vision_config=keep_vision_config,
+    )
     tokenizer.save_pretrained(dst_path)
 
     for p in ["*.py", "generation_config.json"]:
