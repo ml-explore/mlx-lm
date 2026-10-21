@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import expert_routing
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -122,6 +123,8 @@ class SparseMoeBlock(nn.Module):
         self.gate = nn.Linear(dim, args.num_experts, bias=False)
         self.switch_mlp = SwitchGLU(dim, args.moe_intermediate_size, args.num_experts)
         self.shared_expert = MLP(dim, args.shared_expert_intermediate_size)
+        # Flint has no expert bias. The underscore keeps it out of the weights.
+        self._zero_bias = mx.zeros((args.num_experts,))
 
         self.sharding_group = None
 
@@ -130,12 +133,26 @@ class SparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         # Router logits in float32, as in the reference.
-        scores = mx.sigmoid(self.gate(x.astype(mx.float32)))
+        logits = self.gate(x.astype(mx.float32))
 
         k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k])
-        weights = mx.take_along_axis(scores, inds, axis=-1)
-        weights = weights / weights.sum(axis=-1, keepdims=True)
+        # The routing kernel has no vjp and needs Metal.
+        if self.training or not mx.metal.is_available():
+            scores = mx.sigmoid(logits)
+            inds = mx.stop_gradient(
+                mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            )
+            weights = mx.take_along_axis(scores, inds, axis=-1)
+            weights = weights / weights.sum(axis=-1, keepdims=True)
+        else:
+            inds, weights = expert_routing(
+                logits,
+                self._zero_bias,
+                top_k=k,
+                multiplier=1.0,
+                score_eps=0.0,
+                route_scale=1.0,
+            )
 
         y = self.switch_mlp(x, inds)
         y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
