@@ -1116,14 +1116,30 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             cls = SwitchLinear
         else:
             continue
-        weight = mx.dequantize(
-            module.weight,
-            module.scales,
-            module.biases,
-            module.group_size,
-            module.bits,
-            module.mode,
-        )
+        if (global_scale := module.get("global_scale")) is not None:
+            # dequantize takes one scalar nvfp4 tensor scale, so go per expert.
+            weight = mx.stack(
+                [
+                    mx.dequantize(
+                        module.weight[e],
+                        module.scales[e],
+                        group_size=module.group_size,
+                        bits=module.bits,
+                        mode=module.mode,
+                        global_scale=global_scale[e],
+                    )
+                    for e in range(global_scale.shape[0])
+                ]
+            )
+        else:
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                module.group_size,
+                module.bits,
+                module.mode,
+            )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:
