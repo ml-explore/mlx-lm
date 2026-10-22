@@ -2774,6 +2774,10 @@ class TestModels(unittest.TestCase):
         chunked = last_logits([[1, 2], [3, 4]])
         self.assertTrue(mx.allclose(whole, chunked).item())
 
+        # LoRA training and perplexity run without a cache.
+        no_cache = model(mx.array([[1, 2, 3, 4]]))[:, -1]
+        self.assertTrue(mx.allclose(no_cache, whole).item())
+
     def test_gemma4_text(self):
         from mlx_lm.models import gemma4_text
 
