@@ -56,7 +56,7 @@ class ModelArgs(BaseModelArgs):
     index_topk_freq: int = 1
     index_skip_topk_offset: int = 2
     sparse_prefill: bool = True
-    sparse_prefill_min_context: int = 8192
+    sparse_prefill_min_context: int = 16384
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
