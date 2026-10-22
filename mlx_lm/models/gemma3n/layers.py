@@ -69,16 +69,17 @@ class Gemma3nAttention(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         offset: int = 0,
-    ) -> mx.array:
+        shared_kv: Optional[tuple] = None,
+    ) -> tuple[mx.array, tuple]:
         B, L, _ = x.shape
 
         queries = self.q_proj(x)
         queries = queries.reshape(B, L, -1, self.head_dim)
         queries = self.q_norm(queries)
 
-        if self.is_kv_shared_layer and cache is not None:
-            # For shared layers, retrieve KV from the designated cache layer
-            keys, values = cache.keys_and_values()
+        if self.is_kv_shared_layer:
+            # Use the KV of the source layer, also when there is no cache.
+            keys, values = shared_kv
 
         else:
             keys = self.k_proj(x).reshape(B, L, -1, self.head_dim)
@@ -102,7 +103,7 @@ class Gemma3nAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        return self.o_proj(output)
+        return self.o_proj(output), (keys, values)
 
 
 @partial(mx.compile, shapeless=True)
@@ -299,6 +300,7 @@ class Gemma3nDecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         per_layer_input: Optional[mx.array] = None,
         offset: int = 0,
+        shared_kv: Optional[tuple] = None,
     ):
         predictions = self.altup.predict(x)
         active_prediction = predictions[self.config.altup_active_idx]
@@ -306,11 +308,12 @@ class Gemma3nDecoderLayer(nn.Module):
         active_prediction_normed = self.input_layernorm(active_prediction)
         laurel_output = self.laurel(active_prediction_normed)
 
-        attn = self.self_attn(
+        attn, kv = self.self_attn(
             active_prediction_normed,
             mask,
             cache,
             offset=offset,
+            shared_kv=shared_kv,
         )
 
         attn = self.post_attention_layernorm(attn)
@@ -338,4 +341,4 @@ class Gemma3nDecoderLayer(nn.Module):
 
         corrected_predictions[1:] = corrected_predictions[1:] + first_prediction
 
-        return corrected_predictions
+        return corrected_predictions, kv
