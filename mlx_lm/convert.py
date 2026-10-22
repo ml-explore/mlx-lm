@@ -137,6 +137,9 @@ def convert(
         cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
         def set_dtype(k, v):
+            # nvfp4 global scales must stay float32 for gather_qmm.
+            if k.endswith("global_scale"):
+                return v
             if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
                 return v.astype(dtype)
             else:
