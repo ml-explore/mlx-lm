@@ -107,6 +107,61 @@ def quantized_scaled_dot_product_attention(
     return out
 
 
+# Query rows per band, and the key-tile multiple band starts snap to. The fused
+# kernel's key tile (16 or 32) and query tile (32 or 64) divide these, so a band
+# sees the same tile grid and online-softmax order as the single call.
+_BAND_QUERIES = 256
+_BAND_KEY_ALIGN = 64
+# Other head dims run the unfused fallback, whose softmax reduction depends on the key count.
+_BAND_HEAD_DIMS = (64, 128)
+# Queries <= 8 take the sdpa_vector kernel, which accumulates in another order.
+_SDPA_VECTOR_MAX_QUERIES = 8
+
+
+def _banded_sliding_attention(queries, keys, values, cache, scale, mask, sinks):
+    """Sliding-window prefill attention that skips key tiles the window never reaches.
+
+    A rotating cache hands back ``window - 1 + L`` keys for an ``L``-token chunk,
+    and a full-width array mask makes the fused kernel visit all of them for every
+    query row. Fully masked key tiles add exactly zero to the online softmax, so
+    processing query bands over only the keys they can reach is bit-identical.
+    The mask must be the cache's own ``[L, kL]`` window mask (window <= max_size).
+    Returns None when the call does not fit that pattern.
+    """
+    from .cache import RotatingKVCache
+
+    L, kL = queries.shape[2], keys.shape[2]
+    if (
+        not isinstance(cache, RotatingKVCache)
+        or cache.keep != 0
+        or not isinstance(mask, mx.array)
+        or mask.shape != (L, kL)
+        or queries.shape[-1] not in _BAND_HEAD_DIMS
+        or L <= _SDPA_VECTOR_MAX_QUERIES
+        or 0 < L % _BAND_QUERIES <= _SDPA_VECTOR_MAX_QUERIES
+        or kL <= _BAND_QUERIES + cache.max_size
+    ):
+        return None
+    prior = kL - L
+    outs = []
+    for s in range(0, L, _BAND_QUERIES):
+        n = min(_BAND_QUERIES, L - s)
+        start = max(0, prior + s - cache.max_size + 1)
+        start -= start % _BAND_KEY_ALIGN
+        stop = prior + s + n
+        outs.append(
+            mx.fast.scaled_dot_product_attention(
+                queries[:, :, s : s + n],
+                keys[:, :, start:stop],
+                values[:, :, start:stop],
+                scale=scale,
+                mask=mask[s : s + n, start:stop],
+                sinks=sinks,
+            )
+        )
+    return mx.concatenate(outs, axis=2)
+
+
 def scaled_dot_product_attention(
     queries,
     keys,
@@ -129,6 +184,11 @@ def scaled_dot_product_attention(
             bits=cache.bits,
         )
     else:
+        banded = _banded_sliding_attention(
+            queries, keys, values, cache, scale, mask, sinks
+        )
+        if banded is not None:
+            return banded
         return mx.fast.scaled_dot_product_attention(
             queries,
             keys,

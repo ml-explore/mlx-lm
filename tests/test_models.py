@@ -312,6 +312,84 @@ class TestModels(unittest.TestCase):
         mx.eval(x)
         self.assertTrue((x == 1).all())
 
+    def test_banded_sliding_sdpa_matches_full_mask(self):
+        window = 513
+        mx.random.seed(0)
+        sinks = mx.random.normal((8,)).astype(mx.bfloat16)
+        # Chunks after a first one of 0, < window, = window - 1 and > window tokens,
+        # plus single-token steps that rotate the cache before the next chunk.
+        for dim in (64, 128, 256):
+            for prior, rotate in ((0, 0), (100, 0), (512, 0), (2048, 0), (700, 5)):
+                for length in (9, 257, 260, 2048, 2053):
+                    chunks = [prior] if prior else []
+                    chunks += [1] * rotate + [length]
+                    for use_sinks in (False, True):
+                        for additive in (False, True):
+                            with self.subTest(
+                                dim=dim,
+                                chunks=chunks,
+                                sinks=use_sinks,
+                                additive=additive,
+                            ):
+                                cache = RotatingKVCache(max_size=window)
+                                for n in chunks:
+                                    q = mx.random.normal((1, 8, n, dim)).astype(
+                                        mx.bfloat16
+                                    )
+                                    k = mx.random.normal((1, 2, n, dim)).astype(
+                                        mx.bfloat16
+                                    )
+                                    v = mx.random.normal((1, 2, n, dim)).astype(
+                                        mx.bfloat16
+                                    )
+                                    mask = cache.make_mask(n, window_size=window)
+                                    keys, values = cache.update_and_fetch(k, v)
+                                if additive and isinstance(mask, mx.array):
+                                    mask = mx.where(mask, 0, -mx.inf).astype(q.dtype)
+                                args = dict(
+                                    scale=dim**-0.5, sinks=sinks if use_sinks else None
+                                )
+                                expected = mx.fast.scaled_dot_product_attention(
+                                    q, keys, values, mask=mask, **args
+                                )
+                                out = scaled_dot_product_attention(
+                                    q, keys, values, cache, mask=mask, **args
+                                )
+                                self.assertTrue(mx.array_equal(out, expected).item())
+
+    def test_banded_sliding_prefill_model_matches_full_mask(self):
+        from mlx_lm.models import base, llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=1024,
+            num_hidden_layers=4,
+            intermediate_size=512,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            sliding_window=513,
+            layer_types=["full_attention", "sliding_attention"] * 2,
+            tie_word_embeddings=False,
+            rope_theta=10000.0,
+        )
+        mx.random.seed(0)
+        model = llama.Model(args)
+        tokens = mx.random.randint(0, 128, (1, 2048 + 2048 + 300))
+
+        def prefill():
+            cache = model.make_cache()
+            for start in range(0, tokens.shape[1], 2048):
+                out = model(tokens[:, start : start + 2048], cache=cache)
+                mx.eval(out)
+            return out
+
+        banded = prefill()
+        with mock.patch.object(base, "_banded_sliding_attention", lambda *a: None):
+            expected = prefill()
+        self.assertTrue(mx.array_equal(banded, expected).item())
+
     def test_quantized_sdpa(self):
         cache = KVCache()
 
