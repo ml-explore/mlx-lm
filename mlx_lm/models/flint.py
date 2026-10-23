@@ -244,6 +244,11 @@ class Model(nn.Module):
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
+        # RecursiveSI/flint-int4 stores the packed weights as uint8.
+        for k, v in weights.items():
+            name = k.removesuffix(".weight")
+            if v.dtype == mx.uint8 and f"{name}.scales" in weights:
+                weights[k] = v.view(mx.uint32)
         for l in range(self.args.num_hidden_layers):
             if l in self.args.mlp_only_layers:
                 continue
