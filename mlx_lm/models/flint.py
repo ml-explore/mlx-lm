@@ -96,7 +96,8 @@ class Attention(nn.Module):
             cache=cache,
             scale=self.scale,
             mask=mask,
-            sinks=self.softmax_offset,
+            # Checkpoints saved by transformers keep the sinks in float32.
+            sinks=self.softmax_offset.astype(queries.dtype),
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
@@ -192,8 +193,13 @@ class FlintModel(nn.Module):
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.fa_idx = args.layer_types.index("full_attention")
-        self.swa_idx = args.layer_types.index("sliding_attention")
+        # A config can use only one attention type.
+        self.fa_idx = None
+        self.swa_idx = None
+        if "full_attention" in args.layer_types:
+            self.fa_idx = args.layer_types.index("full_attention")
+        if "sliding_attention" in args.layer_types:
+            self.swa_idx = args.layer_types.index("sliding_attention")
 
     def __call__(
         self,
@@ -209,10 +215,14 @@ class FlintModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
-        swa_mask = create_attention_mask(
-            h, cache[self.swa_idx], window_size=self.args.sliding_window
-        )
+        fa_mask = None
+        swa_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        if self.swa_idx is not None:
+            swa_mask = create_attention_mask(
+                h, cache[self.swa_idx], window_size=self.args.sliding_window
+            )
 
         for layer, c in zip(self.layers, cache):
             mask = swa_mask if layer.use_sliding else fa_mask
