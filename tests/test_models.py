@@ -3436,6 +3436,8 @@ class TestModels(unittest.TestCase):
             self.model_test_runner(
                 model, args.model_type, args.vocab_size, args.num_hidden_layers
             )
+        model.eval()
+        self.left_padding_test_runner(model)
 
     def test_flint_sanitize(self):
         from mlx_lm.models import flint
@@ -3494,6 +3496,7 @@ class TestModels(unittest.TestCase):
             (Path(d) / "config.json").write_text(json.dumps(config))
             loaded, _ = load_model(Path(d))
         self.assertEqual(loaded.model.embed_tokens.bits, 8)
+        self.assertIsInstance(loaded.model.layers[1].mlp.gate, nn.Linear)
         self.assertTrue(mx.allclose(loaded(inputs), expected))
 
     def test_granitemoehybrid_rope_parameters(self):

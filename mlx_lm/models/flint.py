@@ -96,8 +96,7 @@ class Attention(nn.Module):
             cache=cache,
             scale=self.scale,
             mask=mask,
-            # Checkpoints saved by transformers keep the sinks in float32.
-            sinks=self.softmax_offset.astype(queries.dtype),
+            sinks=self.softmax_offset,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
