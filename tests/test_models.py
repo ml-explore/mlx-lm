@@ -4999,6 +4999,78 @@ class TestModels(unittest.TestCase):
         got = model(ids, cache=_merge_caches([model.make_cache()]))
         self.assertTrue(mx.allclose(got, want, atol=1e-5))
 
+    @unittest.skipIf(
+        not mx.metal.is_available(), "Global scale is only supported on Metal backend"
+    )
+    def test_minimax_m3_vl_nvfp4_experts(self):
+        from mlx_lm.models import minimax_m3_vl
+
+        mx.random.seed(0)
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": {
+                "vocab_size": 64,
+                "hidden_size": 64,
+                "intermediate_size": 32,
+                "dense_intermediate_size": 32,
+                "shared_intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rotary_dim": 8,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
+                "mlp_layer_types": ["dense", "sparse"],
+            },
+        }
+        args = minimax_m3_vl.ModelArgs.from_dict(config)
+        dense = minimax_m3_vl.Model(args)
+        model = minimax_m3_vl.Model(args)
+        model.update(dense.parameters())
+
+        # Compressed-tensors NVFP4 stores w = fp4 * scale / G per expert.
+        moe = "language_model.model.layers.1.block_sparse_moe"
+        weights = dict(tree_flatten(dense.parameters()))
+        projs = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
+        for _, dst in projs:
+            weights.pop(f"{moe}.switch_mlp.{dst}.weight")
+        for src, dst in projs:
+            mlp = getattr(dense.layers[1].block_sparse_moe.switch_mlp, dst)
+            w_hat = []
+            for e, w in enumerate(mlp.weight):
+                gs = mx.abs(w).max().astype(mx.float32)
+                q, s = mx.quantize(w, 16, 4, mode="nvfp4", global_scale=gs)
+                base = f"{moe}.experts.{e}.{src}"
+                weights[f"{base}.weight_packed"] = q.view(mx.uint8)
+                weights[f"{base}.weight_scale"] = s
+                weights[f"{base}.weight_global_scale"] = 2688.0 / gs
+                weights[f"{base}.input_global_scale"] = mx.array(1.0)
+                w_hat.append(
+                    mx.dequantize(q, s, mode="nvfp4", global_scale=gs, dtype=w.dtype)
+                )
+            mlp.weight = mx.stack(w_hat)
+
+        weights = model.sanitize(weights)
+        gs = weights[f"{moe}.switch_mlp.gate_proj.global_scale"]
+        self.assertEqual(gs.shape, (4,))
+        self.assertEqual(gs.dtype, mx.float32)
+        self.assertFalse(any(".experts." in k for k in weights))
+
+        nn.quantize(
+            model,
+            class_predicate=lambda p, m: (
+                {"group_size": 16, "bits": 4, "mode": "nvfp4", "global_scale": True}
+                if p.endswith(("gate_proj", "up_proj", "down_proj"))
+                and "switch_mlp" in p
+                else False
+            ),
+        )
+        model.load_weights(list(weights.items()))
+
+        x = mx.arange(8)[None]
+        self.assertTrue(mx.allclose(model(x), dense(x), atol=1e-3, rtol=1e-3))
+
     def test_llama4_chunked_kv_cache(self):
         # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
         # the number of valid cached tokens, not on the padded buffer size.
