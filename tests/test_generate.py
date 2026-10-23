@@ -551,6 +551,40 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(responses[uid1].finish_reason, "stop")
         self.assertEqual(responses[uid2].finish_reason, "stop")
 
+    def test_batch_generate_stop_match_sequence(self):
+        """The stopping response reports which stop sequence matched."""
+        batch_gen = BatchGenerator(
+            self.model,
+            max_tokens=10,
+        )
+        prompt = self.tokenizer.encode("hello")
+        force_0 = make_logits_processors({0: 2000.0})
+
+        uid0, uid1, uid2 = batch_gen.insert(
+            [prompt, prompt, prompt],
+            logits_processors=[force_0, force_0, force_0],
+            stop_sequences=[
+                StopSequences([[0]]),
+                StopSequences([[0, 0]]),
+                StopSequences([[1]]),
+            ],
+        )
+
+        responses = batch_gen.next_generated()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid0].finish_reason, "stop")
+        self.assertEqual(responses[uid0].match_sequence, (0,))
+        self.assertIsNone(responses[uid1].finish_reason)
+        self.assertIsNone(responses[uid1].match_sequence)
+        self.assertIsNone(responses[uid2].match_sequence)
+
+        responses = batch_gen.next_generated()
+        responses = {response.uid: response for response in responses}
+        self.assertEqual(responses[uid1].finish_reason, "stop")
+        self.assertEqual(responses[uid1].match_sequence, (0, 0))
+        self.assertIsNone(responses[uid2].finish_reason)
+        self.assertIsNone(responses[uid2].match_sequence)
+
     def test_batch_continued_generation(self):
         for rotating in [False, True]:
             if rotating:
