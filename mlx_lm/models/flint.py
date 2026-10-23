@@ -223,7 +223,7 @@ class FlintModel(nn.Module):
                 h, cache[self.swa_idx], window_size=self.args.sliding_window
             )
 
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(self.layers, cache, strict=True):
             mask = swa_mask if layer.use_sliding else fa_mask
             h = layer(h, mask, c)
 
