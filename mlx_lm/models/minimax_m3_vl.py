@@ -486,6 +486,17 @@ class Model(nn.Module):
             out[f"{base}.scales"] = out.pop(k)
             out[f"{base}.weight"] = out[f"{base}.weight"].view(mx.uint32)
 
+        # Compressed-tensors NVFP4 experts store w = fp4 * scale / G. MLX
+        # dequantizes with global_scale / (6 * 448), so its global scale is 2688 / G.
+        for k in [k for k in out if k.endswith(".weight_packed")]:
+            base = k[: -len(".weight_packed")]
+            out[f"{base}.weight"] = out.pop(k).view(mx.uint32)
+            out[f"{base}.scales"] = out.pop(f"{base}.weight_scale")
+            out[f"{base}.global_scale"] = 2688.0 / out.pop(
+                f"{base}.weight_global_scale"
+            )
+            out.pop(f"{base}.input_global_scale", None)
+
         experts = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
         for i in range(args.num_hidden_layers):
             moe = f"language_model.model.layers.{i}.block_sparse_moe"
@@ -527,7 +538,7 @@ class Model(nn.Module):
             if f"{moe}.experts.0.w1.weight" not in out:
                 continue
             for src, dst in experts:
-                for part in ("weight", "scales", "biases"):
+                for part in ("weight", "scales", "biases", "global_scale"):
                     if f"{moe}.experts.0.{src}.{part}" not in out:
                         continue
                     out[f"{moe}.switch_mlp.{dst}.{part}"] = mx.stack(
@@ -600,7 +611,10 @@ class Model(nn.Module):
     @property
     def cast_predicate(self) -> Callable[[str], bool]:
         def predicate(k):
-            return "e_score_correction_bias" not in k
+            # Keep the router in float32 as the original
+            return (
+                "e_score_correction_bias" not in k and "block_sparse_moe.gate." not in k
+            )
 
         return predicate
 

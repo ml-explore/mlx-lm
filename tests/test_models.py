@@ -2556,6 +2556,66 @@ class TestModels(unittest.TestCase):
             self.assertEqual(w.shape, shape)
             self.assertEqual(w.reshape(-1)[0].item(), value)
 
+    def test_glm_moe_dsa(self):
+        from mlx_lm.models import glm_moe_dsa
+
+        args = glm_moe_dsa.ModelArgs(
+            model_type="glm_moe_dsa",
+            vocab_size=1024,
+            hidden_size=128,
+            index_head_dim=16,
+            index_n_heads=4,
+            index_topk=4,
+            intermediate_size=256,
+            moe_intermediate_size=256,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            n_shared_experts=1,
+            n_routed_experts=4,
+            routed_scaling_factor=2.5,
+            kv_lora_rank=16,
+            q_lora_rank=24,
+            qk_rope_head_dim=16,
+            v_head_dim=32,
+            qk_nope_head_dim=16,
+            topk_method="noaux_tc",
+            scoring_func="sigmoid",
+            norm_topk_prob=True,
+            n_group=2,
+            topk_group=1,
+            num_experts_per_tok=2,
+            moe_layer_freq=1,
+            first_k_dense_replace=1,
+            max_position_embeddings=1024,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_theta": 10000.0},
+            attention_bias=False,
+            index_topk_pattern="FSFSFS",
+        )
+        self.assertEqual(
+            args.indexer_types,
+            ["full", "shared", "full", "shared", "full", "shared"],
+        )
+        model = glm_moe_dsa.Model(args)
+
+        has_indexer = [l.self_attn.indexer is not None for l in model.model.layers]
+        self.assertEqual(has_indexer, [True, False, True, False, True, False])
+
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        prompt = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+        cache = make_prompt_cache(model)
+        logits = model(prompt, cache=cache)
+        self.assertEqual(logits.shape, (1, 8, args.vocab_size))
+        nxt = mx.argmax(logits[0, -1:, :], keepdims=True)
+        logits = model(nxt, cache=cache)
+        self.assertEqual(logits.shape, (1, 1, args.vocab_size))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+        mx.eval([c.state for c in cache])
+
     def test_ministral3(self):
         from mlx_lm.models import ministral3, mistral3
 
@@ -5037,6 +5097,78 @@ class TestModels(unittest.TestCase):
         want = model(ids)
         got = model(ids, cache=_merge_caches([model.make_cache()]))
         self.assertTrue(mx.allclose(got, want, atol=1e-5))
+
+    @unittest.skipIf(
+        not mx.metal.is_available(), "Global scale is only supported on Metal backend"
+    )
+    def test_minimax_m3_vl_nvfp4_experts(self):
+        from mlx_lm.models import minimax_m3_vl
+
+        mx.random.seed(0)
+        config = {
+            "model_type": "minimax_m3_vl",
+            "text_config": {
+                "vocab_size": 64,
+                "hidden_size": 64,
+                "intermediate_size": 32,
+                "dense_intermediate_size": 32,
+                "shared_intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rotary_dim": 8,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
+                "mlp_layer_types": ["dense", "sparse"],
+            },
+        }
+        args = minimax_m3_vl.ModelArgs.from_dict(config)
+        dense = minimax_m3_vl.Model(args)
+        model = minimax_m3_vl.Model(args)
+        model.update(dense.parameters())
+
+        # Compressed-tensors NVFP4 stores w = fp4 * scale / G per expert.
+        moe = "language_model.model.layers.1.block_sparse_moe"
+        weights = dict(tree_flatten(dense.parameters()))
+        projs = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
+        for _, dst in projs:
+            weights.pop(f"{moe}.switch_mlp.{dst}.weight")
+        for src, dst in projs:
+            mlp = getattr(dense.layers[1].block_sparse_moe.switch_mlp, dst)
+            w_hat = []
+            for e, w in enumerate(mlp.weight):
+                gs = mx.abs(w).max().astype(mx.float32)
+                q, s = mx.quantize(w, 16, 4, mode="nvfp4", global_scale=gs)
+                base = f"{moe}.experts.{e}.{src}"
+                weights[f"{base}.weight_packed"] = q.view(mx.uint8)
+                weights[f"{base}.weight_scale"] = s
+                weights[f"{base}.weight_global_scale"] = 2688.0 / gs
+                weights[f"{base}.input_global_scale"] = mx.array(1.0)
+                w_hat.append(
+                    mx.dequantize(q, s, mode="nvfp4", global_scale=gs, dtype=w.dtype)
+                )
+            mlp.weight = mx.stack(w_hat)
+
+        weights = model.sanitize(weights)
+        gs = weights[f"{moe}.switch_mlp.gate_proj.global_scale"]
+        self.assertEqual(gs.shape, (4,))
+        self.assertEqual(gs.dtype, mx.float32)
+        self.assertFalse(any(".experts." in k for k in weights))
+
+        nn.quantize(
+            model,
+            class_predicate=lambda p, m: (
+                {"group_size": 16, "bits": 4, "mode": "nvfp4", "global_scale": True}
+                if p.endswith(("gate_proj", "up_proj", "down_proj"))
+                and "switch_mlp" in p
+                else False
+            ),
+        )
+        model.load_weights(list(weights.items()))
+
+        x = mx.arange(8)[None]
+        self.assertTrue(mx.allclose(model(x), dense(x), atol=1e-3, rtol=1e-3))
 
     def test_llama4_chunked_kv_cache(self):
         # Regression test for ChunkedKVCache.maybe_trim_front: it must trim on
