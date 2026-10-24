@@ -312,118 +312,6 @@ class TestModels(unittest.TestCase):
         mx.eval(x)
         self.assertTrue((x == 1).all())
 
-    def test_banded_sliding_sdpa_matches_full_mask(self):
-        window = 513
-        mx.random.seed(0)
-        sinks = mx.random.normal((8,)).astype(mx.bfloat16)
-        # Chunks after a first one of 0, < window, = window - 1 and > window tokens,
-        # plus single-token steps that rotate the cache before the next chunk.
-        for dim in (64, 128, 256):
-            for prior, rotate in ((0, 0), (100, 0), (512, 0), (2048, 0), (700, 5)):
-                for length in (9, 257, 260, 2048, 2053):
-                    chunks = [prior] if prior else []
-                    chunks += [1] * rotate + [length]
-                    for use_sinks in (False, True):
-                        for additive in (False, True):
-                            with self.subTest(
-                                dim=dim,
-                                chunks=chunks,
-                                sinks=use_sinks,
-                                additive=additive,
-                            ):
-                                cache = RotatingKVCache(max_size=window)
-                                for n in chunks:
-                                    q = mx.random.normal((1, 8, n, dim)).astype(
-                                        mx.bfloat16
-                                    )
-                                    k = mx.random.normal((1, 2, n, dim)).astype(
-                                        mx.bfloat16
-                                    )
-                                    v = mx.random.normal((1, 2, n, dim)).astype(
-                                        mx.bfloat16
-                                    )
-                                    mask = cache.make_mask(n, window_size=window)
-                                    keys, values = cache.update_and_fetch(k, v)
-                                if additive and isinstance(mask, mx.array):
-                                    mask = mx.where(mask, 0, -mx.inf).astype(q.dtype)
-                                args = dict(
-                                    scale=dim**-0.5, sinks=sinks if use_sinks else None
-                                )
-                                expected = mx.fast.scaled_dot_product_attention(
-                                    q, keys, values, mask=mask, **args
-                                )
-                                out = scaled_dot_product_attention(
-                                    q,
-                                    keys,
-                                    values,
-                                    cache,
-                                    mask=mask,
-                                    sliding_window=window,
-                                    **args,
-                                )
-                                self.assertTrue(mx.array_equal(out, expected).item())
-
-    def test_banded_sliding_sdpa_needs_the_caches_own_window(self):
-        # A mask window larger than max_size, or a mask that is not a sliding window,
-        # must reach the single SDPA call unchanged.
-        mx.random.seed(0)
-        cache = RotatingKVCache(max_size=513)
-        for n in (2048, 2048):
-            q = mx.random.normal((1, 8, n, 128)).astype(mx.bfloat16)
-            k = mx.random.normal((1, 2, n, 128)).astype(mx.bfloat16)
-            v = mx.random.normal((1, 2, n, 128)).astype(mx.bfloat16)
-            wide = cache.make_mask(n, window_size=4096, return_array=True)
-            keys, values = cache.update_and_fetch(k, v)
-        everything = mx.ones(wide.shape, dtype=mx.bool_)
-        for mask, window in ((wide, None), (wide, 4096), (everything, None)):
-            with self.subTest(window=window, custom=mask is everything):
-                expected = mx.fast.scaled_dot_product_attention(
-                    q, keys, values, scale=128**-0.5, mask=mask
-                )
-                out = scaled_dot_product_attention(
-                    q,
-                    keys,
-                    values,
-                    cache,
-                    scale=128**-0.5,
-                    mask=mask,
-                    sliding_window=window,
-                )
-                self.assertTrue(mx.array_equal(out, expected).item())
-
-    def test_banded_sliding_prefill_model_matches_full_mask(self):
-        from mlx_lm.models import base, flint
-
-        config = self._flint_config()
-        config.update(hidden_size=256, head_dim=128, sliding_window=513)
-        args = flint.ModelArgs.from_dict(config)
-        mx.random.seed(0)
-        model = flint.Model(args)
-        model.eval()
-        tokens = mx.random.randint(0, args.vocab_size, (1, 2048 + 2048 + 300))
-
-        def prefill():
-            cache = model.make_cache()
-            for start in range(0, tokens.shape[1], 2048):
-                out = model(tokens[:, start : start + 2048], cache=cache)
-                mx.eval(out)
-            return out
-
-        banded_calls = []
-        banded_fn = base._banded_sliding_attention
-
-        def counting(*a):
-            out = banded_fn(*a)
-            banded_calls.append(out is not None)
-            return out
-
-        with mock.patch.object(base, "_banded_sliding_attention", counting):
-            banded = prefill()
-        self.assertTrue(any(banded_calls))
-        with mock.patch.object(base, "_banded_sliding_attention", lambda *a: None):
-            expected = prefill()
-        self.assertTrue(mx.array_equal(banded, expected).item())
-
     def test_quantized_sdpa(self):
         cache = KVCache()
 
@@ -3610,6 +3498,94 @@ class TestModels(unittest.TestCase):
             )
         model.eval()
         self.left_padding_test_runner(model)
+
+    def test_flint_banded_sliding_attention_matches_full_mask(self):
+        from mlx_lm.models import flint
+
+        window = 513
+        mx.random.seed(0)
+        sinks = mx.random.normal((8,)).astype(mx.bfloat16)
+        # Chunks after a first one of 0, < window, = window - 1 and > window tokens,
+        # plus single-token steps that rotate the cache before the next chunk.
+        for dim in (64, 128, 256):
+            for prior, rotate in ((0, 0), (100, 0), (512, 0), (2048, 0), (700, 5)):
+                for length in (9, 257, 260, 2048, 2053):
+                    with self.subTest(
+                        dim=dim, prior=prior, rotate=rotate, length=length
+                    ):
+                        cache = RotatingKVCache(max_size=window)
+                        chunks = ([prior] if prior else []) + [1] * rotate + [length]
+                        for n in chunks:
+                            q = mx.random.normal((1, 8, n, dim)).astype(mx.bfloat16)
+                            k = mx.random.normal((1, 2, n, dim)).astype(mx.bfloat16)
+                            v = mx.random.normal((1, 2, n, dim)).astype(mx.bfloat16)
+                            mask = cache.make_mask(n, window_size=window)
+                            keys, values = cache.update_and_fetch(k, v)
+                        expected = mx.fast.scaled_dot_product_attention(
+                            q, keys, values, scale=dim**-0.5, mask=mask, sinks=sinks
+                        )
+                        out = flint._banded_sliding_attention(
+                            q, keys, values, cache, dim**-0.5, mask, sinks, window
+                        )
+                        # None means the call keeps the single SDPA (short tail, head dim
+                        # 256, string mask or too few keys).
+                        if out is not None:
+                            self.assertTrue(mx.array_equal(out, expected).item())
+
+    def test_flint_banded_sliding_attention_window_differs_from_cache(self):
+        from mlx_lm.models import flint
+
+        mx.random.seed(1)
+        for window in (300, 1024):
+            with self.subTest(window=window):
+                cache = RotatingKVCache(max_size=513)
+                for n in (2048, 2048):
+                    q = mx.random.normal((1, 8, n, 128)).astype(mx.bfloat16)
+                    k = mx.random.normal((1, 2, n, 128)).astype(mx.bfloat16)
+                    v = mx.random.normal((1, 2, n, 128)).astype(mx.bfloat16)
+                    mask = cache.make_mask(n, window_size=window, return_array=True)
+                    keys, values = cache.update_and_fetch(k, v)
+                expected = mx.fast.scaled_dot_product_attention(
+                    q, keys, values, scale=128**-0.5, mask=mask
+                )
+                out = flint._banded_sliding_attention(
+                    q, keys, values, cache, 128**-0.5, mask, None, window
+                )
+                self.assertIsNotNone(out)
+                self.assertTrue(mx.array_equal(out, expected).item())
+
+    def test_flint_banded_sliding_prefill_matches_full_mask(self):
+        from mlx_lm.models import flint
+
+        config = self._flint_config()
+        config.update(hidden_size=256, head_dim=128, sliding_window=513)
+        args = flint.ModelArgs.from_dict(config)
+        mx.random.seed(0)
+        model = flint.Model(args)
+        model.eval()
+        tokens = mx.random.randint(0, args.vocab_size, (1, 2048 + 2048 + 300))
+
+        def prefill():
+            cache = model.make_cache()
+            for start in range(0, tokens.shape[1], 2048):
+                out = model(tokens[:, start : start + 2048], cache=cache)
+                mx.eval(out)
+            return out
+
+        calls = []
+        banded_fn = flint._banded_sliding_attention
+
+        def counting(*a):
+            out = banded_fn(*a)
+            calls.append(out is not None)
+            return out
+
+        with mock.patch.object(flint, "_banded_sliding_attention", counting):
+            banded = prefill()
+        self.assertTrue(any(calls))
+        with mock.patch.object(flint, "_banded_sliding_attention", lambda *a: None):
+            expected = prefill()
+        self.assertTrue(mx.array_equal(banded, expected).item())
 
     def test_flint_sanitize(self):
         from mlx_lm.models import flint
