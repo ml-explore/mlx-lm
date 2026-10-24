@@ -230,6 +230,27 @@ def apply_top_p(logprobs: mx.array, top_p: float) -> mx.array:
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def _apply_xtc(
+    logits: mx.array,
+    xtc_probability: float,
+    xtc_threshold: float,
+    xtc_special_tokens: List[int],
+) -> mx.array:
+    """Compiled core of :func:`apply_xtc`. Arguments are validated by the caller."""
+    probs = mx.softmax(logits, -1)
+    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min(
+        axis=-1, keepdims=True
+    )
+    if xtc_special_tokens:
+        mask[..., xtc_special_tokens] = False
+
+    return mx.where(
+        mx.random.uniform(0, 1) > xtc_probability,
+        logits,
+        mx.where(mask, -mx.inf, logits),
+    )
+
+
 def apply_xtc(
     logits: mx.array,
     xtc_probability: float,
@@ -243,8 +264,14 @@ def apply_xtc(
         logits: The logits from the model's output.
         xtc_probability (float): Probability of XTC sampling to happen for each token
         xtc_threshold (float): The threshold the probs need to reach for being sampled.
-        special_tokens_ids (list(int)): List of special tokens IDs to be excluded from XTC sampling.
+        xtc_special_tokens (list(int)): List of special tokens IDs to be excluded from XTC sampling.
     """
+    # Validate before entering the compiled function. Raising inside it aborts
+    # the trace while mx.random.state is captured as an output, which leaves the
+    # state without a primitive -- every later call then fails with "[eval]
+    # Attempting to eval an array without a primitive" for the life of the
+    # process. _apply_xtc is the only sampler that reads mx.random.state, which
+    # is why the equivalent checks in apply_top_k and apply_min_p are harmless.
     if not (0 <= xtc_threshold <= 0.5):
         raise ValueError(
             f"`threshold` has to be a float in the [0, 0.5] interval, but is {xtc_threshold}"
@@ -254,18 +281,7 @@ def apply_xtc(
             f"`probability` has to be a float in the [0, 1] interval, but is {xtc_probability}"
         )
 
-    probs = mx.softmax(logits, -1)
-    mask = probs > mx.where(probs > xtc_threshold, probs, mx.inf).min(
-        axis=-1, keepdims=True
-    )
-    if xtc_special_tokens:
-        mask[..., xtc_special_tokens] = False
-
-    return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
-        logits,
-        mx.where(mask, -mx.inf, logits),
-    )
+    return _apply_xtc(logits, xtc_probability, xtc_threshold, xtc_special_tokens)
 
 
 @partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
