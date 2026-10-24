@@ -3460,6 +3460,105 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def _flint_config(self):
+        return {
+            "model_type": "flint",
+            "hidden_size": 64,
+            "num_hidden_layers": 4,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "shared_expert_intermediate_size": 64,
+            "mlp_only_layers": [0],
+            "layer_types": [
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+            "sliding_window": 4,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 100,
+        }
+
+    def test_flint(self):
+        from mlx_lm.models import flint
+
+        args = flint.ModelArgs.from_dict(self._flint_config())
+        model = flint.Model(args)
+        # Inference mode uses the routing kernel, training mode the ops path.
+        for training in [False, True]:
+            model.train(training)
+            self.model_test_runner(
+                model, args.model_type, args.vocab_size, args.num_hidden_layers
+            )
+        model.eval()
+        self.left_padding_test_runner(model)
+
+    def test_flint_sanitize(self):
+        from mlx_lm.models import flint
+
+        args = flint.ModelArgs.from_dict(self._flint_config())
+        model = flint.Model(args)
+        model.eval()
+        inputs = mx.array([[0, 1, 2, 3, 4, 5]])
+
+        # The HF checkpoint stores one tensor per expert.
+        weights = {}
+        for k, v in tree_flatten(model.parameters()):
+            if ".switch_mlp." in k:
+                base, proj = k.split(".switch_mlp.")
+                for e in range(args.num_experts):
+                    weights[f"{base}.experts.{e}.{proj}"] = v[e]
+            else:
+                weights[k] = v
+        loaded = flint.Model(args)
+        loaded.load_weights(list(loaded.sanitize(weights).items()), strict=True)
+        loaded.eval()
+        self.assertTrue(mx.allclose(loaded(inputs), model(inputs)))
+
+    def test_flint_int4_layout(self):
+        import json
+        import tempfile
+        from pathlib import Path
+
+        from mlx_lm.models import flint
+        from mlx_lm.utils import load_model
+
+        config = self._flint_config()
+        model = flint.Model(flint.ModelArgs.from_dict(config))
+        model.eval()
+
+        # RecursiveSI/flint-int4 stores the packed weights as uint8, and its
+        # config gives only the 4 bits of most layers, not the 8-bit embeddings.
+        def predicate(path, module):
+            if not hasattr(module, "to_quantized") or path.endswith("mlp.gate"):
+                return False
+            if path == "model.embed_tokens":
+                return {"group_size": 64, "bits": 8}
+            return {"group_size": 64, "bits": 4}
+
+        nn.quantize(model, class_predicate=predicate)
+        inputs = mx.array([[0, 1, 2, 3, 4, 5]])
+        expected = model(inputs)
+        weights = {}
+        for k, v in tree_flatten(model.parameters()):
+            if v.dtype == mx.uint32:
+                v = v.view(mx.uint8)
+            weights[k] = v
+        config["quantization"] = {"group_size": 64, "bits": 4}
+        with tempfile.TemporaryDirectory() as d:
+            mx.save_safetensors(str(Path(d) / "model.safetensors"), weights)
+            (Path(d) / "config.json").write_text(json.dumps(config))
+            loaded, _ = load_model(Path(d))
+        self.assertEqual(loaded.model.embed_tokens.bits, 8)
+        self.assertIsInstance(loaded.model.layers[1].mlp.gate, nn.Linear)
+        self.assertTrue(mx.allclose(loaded(inputs), expected))
+
     def test_granitemoehybrid_rope_parameters(self):
         # Regression test: some checkpoints (e.g. Granite 4.0 Hybrid) only
         # provide rope_theta nested under rope_parameters, with no flat
