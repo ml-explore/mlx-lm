@@ -2098,6 +2098,49 @@ class TestModels(unittest.TestCase):
         # The KV-reuse layers need the owner layer's offset in a padded batch.
         self.left_padding_test_runner(model)
 
+    def test_jamba_moe_routing(self):
+        from mlx_lm.models import jamba
+
+        args = jamba.ModelArgs(
+            model_type="jamba",
+            hidden_size=16,
+            intermediate_size=16,
+            num_hidden_layers=2,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            attn_layer_offset=1,
+            attn_layer_period=2,
+            expert_layer_offset=1,
+            expert_layer_period=2,
+            mamba_d_conv=4,
+            mamba_d_state=4,
+            mamba_expand=2,
+            num_experts=8,
+            num_experts_per_tok=2,
+            rms_norm_eps=1e-6,
+            max_position_embeddings=64,
+            vocab_size=32,
+        )
+        block = jamba.JambaSparseMoeBlock(args)
+        mx.random.seed(0)
+        block.router.weight = mx.random.normal(block.router.weight.shape)
+
+        # Each expert returns a one-hot, so the output is the weight per expert.
+        def one_hot_experts(x, inds):
+            return (inds[..., None] == mx.arange(args.num_experts)).astype(x.dtype)
+
+        block.switch_mlp = one_hot_experts
+        x = mx.random.normal((2, 5, args.hidden_size))
+        out = block(x)
+
+        # The reference does softmax over all experts, then top-k, with no
+        # renormalization.
+        probs = mx.softmax(block.router(x), axis=-1)
+        kth = mx.sort(probs, axis=-1)[..., -args.num_experts_per_tok]
+        expected = mx.where(probs >= kth[..., None], probs, 0)
+        self.assertTrue(mx.allclose(out, expected, atol=1e-6))
+        self.assertTrue(mx.all(out.sum(axis=-1) < 1).item())
+
     def test_mamba(self):
         from mlx_lm.models import mamba
 
