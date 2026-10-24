@@ -630,6 +630,60 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_dory(self):
+        from mlx_lm.models import dory
+
+        args = dory.ModelArgs(
+            model_type="dory",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            sliding_window=16,
+            n_input_layers=4,
+            n_recurrent_layers=8,
+            n_output_layers=4,
+            n_recurrent_loops=2,
+        )
+        model = dory.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_dory_sliding_window_cache(self):
+        from mlx_lm.models import dory
+        from mlx_lm.models.cache import RotatingKVCache
+
+        args = dory.ModelArgs(
+            model_type="dory",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            sliding_window=8,
+            n_input_layers=4,
+            n_recurrent_layers=8,
+            n_output_layers=4,
+        )
+        # A single sliding-window attention layer: chunked prefill followed by
+        # token-by-token decoding past the window must match one full pass.
+        attn = dory.DoryAttention(args, sliding=True)
+        mx.random.seed(0)
+        x = mx.random.normal((1, 40, args.hidden_size)) * 0.1
+        expected = attn(x)
+
+        cache = RotatingKVCache(max_size=args.sliding_window)
+        outs = [attn(x[:, :13], cache), attn(x[:, 13:30], cache)]
+        outs += [attn(x[:, i : i + 1], cache) for i in range(30, 40)]
+        out = mx.concatenate(outs, axis=1)
+        self.assertTrue(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
+
     def test_lfm2(self):
         from mlx_lm.models import lfm2
 
