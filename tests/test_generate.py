@@ -330,6 +330,42 @@ class TestGenerate(unittest.TestCase):
             batch_tokens = batch_responses[uids[e]]
             self.assertEqual(tokens, batch_tokens)
 
+    def test_prompt_cache_nbytes_estimate(self):
+        prompts = [
+            self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": p}],
+                tokenize=True,
+                add_generation_prompt=True,
+            )
+            for p in ["Write a story about Einstein", "Hi"]
+        ]
+
+        gen = BatchGenerator(
+            self.model,
+            stop_tokens=self.tokenizer.eos_token_ids,
+            max_tokens=1,
+            prefill_batch_size=1,
+            prefill_step_size=4,
+        )
+        gen.insert([prompts[0]])
+
+        # No batch cache has arrays yet, so the estimate has no per-token cost.
+        self.assertEqual(gen.estimated_prompt_cache_nbytes, gen.prompt_cache_nbytes)
+
+        # Prefill part of the first prompt so the batch caches allocate.
+        gen.next()
+        actual = gen.prompt_cache_nbytes
+        self.assertGreater(actual, 0)
+
+        # A pending sequence projects the KV its prefill will allocate.
+        gen.insert([prompts[1]])
+        estimated = gen.estimated_prompt_cache_nbytes
+        self.assertGreater(estimated, actual)
+
+        # The projection scales with the pending prompt length.
+        gen.insert([prompts[1] * 2])
+        self.assertGreater(gen.estimated_prompt_cache_nbytes, estimated)
+
     def test_batch_sliding_window(self):
         prompts = [
             "Write a story about Einstein",
