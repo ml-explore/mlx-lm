@@ -118,21 +118,24 @@ _BAND_HEAD_DIMS = (64, 128)
 _SDPA_VECTOR_MAX_QUERIES = 8
 
 
-def _banded_sliding_attention(queries, keys, values, cache, scale, mask, sinks):
+def _banded_sliding_attention(queries, keys, values, cache, scale, mask, sinks, window):
     """Sliding-window prefill attention that skips key tiles the window never reaches.
 
     A rotating cache hands back ``window - 1 + L`` keys for an ``L``-token chunk,
     and a full-width array mask makes the fused kernel visit all of them for every
     query row. Fully masked key tiles add exactly zero to the online softmax, so
     processing query bands over only the keys they can reach is bit-identical.
-    The mask must be the cache's own ``[L, kL]`` window mask (window <= max_size).
-    Returns None when the call does not fit that pattern.
+    Runs only when the caller passes ``window`` equal to ``cache.max_size``, which
+    states that ``mask`` is that cache's own sliding-window mask: the mask's shape
+    alone cannot tell a sliding window from any other ``[L, kL]`` mask. Returns None
+    when the call does not fit that pattern.
     """
     from .cache import RotatingKVCache
 
     L, kL = queries.shape[2], keys.shape[2]
     if (
         not isinstance(cache, RotatingKVCache)
+        or window != cache.max_size
         or cache.keep != 0
         or not isinstance(mask, mx.array)
         or mask.shape != (L, kL)
@@ -170,7 +173,10 @@ def scaled_dot_product_attention(
     scale: float,
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
+    sliding_window: Optional[int] = None,
 ) -> mx.array:
+    """``sliding_window``: set it only when ``mask`` is ``cache``'s own sliding-window
+    mask of that width, to let prefill skip the key tiles the window never reaches."""
     if hasattr(cache, "bits"):
         if sinks is not None:
             raise ValueError("Quantized SDPA does not support attention sinks.")
@@ -185,7 +191,7 @@ def scaled_dot_product_attention(
         )
     else:
         banded = _banded_sliding_attention(
-            queries, keys, values, cache, scale, mask, sinks
+            queries, keys, values, cache, scale, mask, sinks, sliding_window
         )
         if banded is not None:
             return banded

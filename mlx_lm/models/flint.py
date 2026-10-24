@@ -61,8 +61,10 @@ class Attention(nn.Module):
 
         if args.layer_types[layer_idx] == "sliding_attention":
             self.rope = nn.RoPE(head_dim, traditional=False, base=args.rope_theta)
+            self.sliding_window = args.sliding_window
         else:
             self.rope = None
+            self.sliding_window = None
 
     def __call__(
         self,
@@ -97,6 +99,7 @@ class Attention(nn.Module):
             scale=self.scale,
             mask=mask,
             sinks=self.softmax_offset,
+            sliding_window=self.sliding_window,
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)

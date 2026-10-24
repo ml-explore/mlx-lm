@@ -353,30 +353,54 @@ class TestModels(unittest.TestCase):
                                     q, keys, values, mask=mask, **args
                                 )
                                 out = scaled_dot_product_attention(
-                                    q, keys, values, cache, mask=mask, **args
+                                    q,
+                                    keys,
+                                    values,
+                                    cache,
+                                    mask=mask,
+                                    sliding_window=window,
+                                    **args,
                                 )
                                 self.assertTrue(mx.array_equal(out, expected).item())
 
-    def test_banded_sliding_prefill_model_matches_full_mask(self):
-        from mlx_lm.models import base, llama
-
-        args = llama.ModelArgs(
-            model_type="llama",
-            hidden_size=1024,
-            num_hidden_layers=4,
-            intermediate_size=512,
-            num_attention_heads=8,
-            num_key_value_heads=2,
-            rms_norm_eps=1e-5,
-            vocab_size=128,
-            sliding_window=513,
-            layer_types=["full_attention", "sliding_attention"] * 2,
-            tie_word_embeddings=False,
-            rope_theta=10000.0,
-        )
+    def test_banded_sliding_sdpa_needs_the_caches_own_window(self):
+        # A mask window larger than max_size, or a mask that is not a sliding window,
+        # must reach the single SDPA call unchanged.
         mx.random.seed(0)
-        model = llama.Model(args)
-        tokens = mx.random.randint(0, 128, (1, 2048 + 2048 + 300))
+        cache = RotatingKVCache(max_size=513)
+        for n in (2048, 2048):
+            q = mx.random.normal((1, 8, n, 128)).astype(mx.bfloat16)
+            k = mx.random.normal((1, 2, n, 128)).astype(mx.bfloat16)
+            v = mx.random.normal((1, 2, n, 128)).astype(mx.bfloat16)
+            wide = cache.make_mask(n, window_size=4096, return_array=True)
+            keys, values = cache.update_and_fetch(k, v)
+        everything = mx.ones(wide.shape, dtype=mx.bool_)
+        for mask, window in ((wide, None), (wide, 4096), (everything, None)):
+            with self.subTest(window=window, custom=mask is everything):
+                expected = mx.fast.scaled_dot_product_attention(
+                    q, keys, values, scale=128**-0.5, mask=mask
+                )
+                out = scaled_dot_product_attention(
+                    q,
+                    keys,
+                    values,
+                    cache,
+                    scale=128**-0.5,
+                    mask=mask,
+                    sliding_window=window,
+                )
+                self.assertTrue(mx.array_equal(out, expected).item())
+
+    def test_banded_sliding_prefill_model_matches_full_mask(self):
+        from mlx_lm.models import base, flint
+
+        config = self._flint_config()
+        config.update(hidden_size=256, head_dim=128, sliding_window=513)
+        args = flint.ModelArgs.from_dict(config)
+        mx.random.seed(0)
+        model = flint.Model(args)
+        model.eval()
+        tokens = mx.random.randint(0, args.vocab_size, (1, 2048 + 2048 + 300))
 
         def prefill():
             cache = model.make_cache()
@@ -385,7 +409,17 @@ class TestModels(unittest.TestCase):
                 mx.eval(out)
             return out
 
-        banded = prefill()
+        banded_calls = []
+        banded_fn = base._banded_sliding_attention
+
+        def counting(*a):
+            out = banded_fn(*a)
+            banded_calls.append(out is not None)
+            return out
+
+        with mock.patch.object(base, "_banded_sliding_attention", counting):
+            banded = prefill()
+        self.assertTrue(any(banded_calls))
         with mock.patch.object(base, "_banded_sliding_attention", lambda *a: None):
             expected = prefill()
         self.assertTrue(mx.array_equal(banded, expected).item())
