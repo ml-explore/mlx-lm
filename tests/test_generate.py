@@ -139,8 +139,8 @@ class TestGenerate(unittest.TestCase):
         self.assertEqual(drafted, [True, True, False, True, True])
 
     def test_speculative_processor_sees_prefilled_prompt(self):
-        # The draft and the target processors must see the whole prompt,
-        # also the tokens processed in prefill.
+        # prefill_step_size=2 leaves one prompt token for the first step, so
+        # the processors only see the whole prompt if prefill contributes.
         prompt = mx.array([2, 5, 7, 9])
         histories = []
 
@@ -164,14 +164,14 @@ class TestGenerate(unittest.TestCase):
             self.assertEqual(history[:4], [2, 5, 7, 9])
 
     def test_speculative_processor_history_matches_generate_step(self):
-        # The processor pushes a token set by the whole history, so the
-        # tokens match generate_step only if all histories match.
+        # The processor boosts a token picked by a hash of the history, so
+        # the tokens match generate_step only if every history matches.
         def processor(tokens, logits):
             idx = hash(tuple(tokens.tolist())) % logits.shape[-1]
             return logits.at[:, idx].add(1000.0)
 
+        # Every second call proposes token 0, to cause rejections.
         class FlakyDraft:
-            # Every second call proposes token 0, to cause rejections.
             def __init__(self, model):
                 self.model = model
                 self.layers = model.layers
