@@ -14,6 +14,7 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -136,6 +137,74 @@ class TestGenerate(unittest.TestCase):
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
+
+    def test_speculative_processor_sees_prefilled_prompt(self):
+        # The draft and the target processors must see the whole prompt,
+        # also the tokens processed in prefill.
+        prompt = mx.array([2, 5, 7, 9])
+        histories = []
+
+        def record_history(tokens, logits):
+            histories.append(tokens.tolist())
+            return logits
+
+        list(
+            speculative_generate_step(
+                prompt,
+                self.model,
+                self.model,
+                num_draft_tokens=2,
+                max_tokens=1,
+                prefill_step_size=2,
+                logits_processors=[record_history],
+            )
+        )
+
+        for history in histories:
+            self.assertEqual(history[:4], [2, 5, 7, 9])
+
+    def test_speculative_processor_history_matches_generate_step(self):
+        # The processor pushes a token set by the whole history, so the
+        # tokens match generate_step only if all histories match.
+        def processor(tokens, logits):
+            idx = hash(tuple(tokens.tolist())) % logits.shape[-1]
+            return logits.at[:, idx].add(1000.0)
+
+        class FlakyDraft:
+            # Every second call proposes token 0, to cause rejections.
+            def __init__(self, model):
+                self.model = model
+                self.layers = model.layers
+                self.calls = 0
+
+            def __call__(self, inputs, cache=None):
+                logits = self.model(inputs, cache=cache)
+                self.calls += 1
+                if self.calls % 2 == 0:
+                    logits = logits.at[..., 0].add(1e4)
+                return logits
+
+        prompt = mx.array(self.tokenizer.encode("Write a story about Einstein"))
+        expected = [
+            t
+            for t, _ in generate_step(
+                prompt, self.model, max_tokens=16, logits_processors=[processor]
+            )
+        ]
+        for draft in [self.model, FlakyDraft(self.model)]:
+            for num_draft_tokens in [0, 1, 2, 3]:
+                tokens = [
+                    t
+                    for t, _, _ in speculative_generate_step(
+                        prompt,
+                        self.model,
+                        draft,
+                        num_draft_tokens=num_draft_tokens,
+                        max_tokens=16,
+                        logits_processors=[processor],
+                    )
+                ]
+                self.assertEqual(tokens, expected)
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
