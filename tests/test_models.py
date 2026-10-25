@@ -5396,6 +5396,97 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
 
 
+
+    def test_sliding_window_default_layer_types(self):
+        # HF applies a bare sliding_window even when a checkpoint ships no
+        # layer_types; cache types and masks must follow the window.
+        from mlx_lm.models import (
+            gemma2,
+            llama,
+            ministral3,
+            mixtral,
+            phi3,
+            phimoe,
+            starcoder2,
+        )
+
+        common = dict(
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            vocab_size=128,
+            sliding_window=4,
+        )
+
+        # mistral applies the window to every layer; plain llama ignores it
+        for model_type, expect_sliding in (("mistral", True), ("llama", False)):
+            args = llama.ModelArgs(
+                model_type=model_type, rms_norm_eps=1e-5, **common
+            )
+            model = llama.Model(args)
+            expected_type = (
+                "sliding_attention" if expect_sliding else "full_attention"
+            )
+            self.assertEqual(
+                args.layer_types, [expected_type] * args.num_hidden_layers
+            )
+            expected_cache = RotatingKVCache if expect_sliding else KVCache
+            for c in model.make_cache():
+                self.assertIsInstance(c, expected_cache)
+
+        # an all-sliding ministral3 has no full-attention layer to find
+        args = ministral3.ModelArgs(
+            model_type="ministral3",
+            rms_norm_eps=1e-5,
+            rope_parameters={
+                "rope_theta": 10000.0,
+                "rope_type": "default",
+                "llama_4_scaling_beta": 0.1,
+                "original_max_position_embeddings": 512,
+            },
+            **common,
+        )
+        model = ministral3.Model(args)
+        self.assertIsNone(model.model.fa_idx)
+        for c in model.make_cache():
+            self.assertIsInstance(c, RotatingKVCache)
+        out = model(mx.array([[1, 2, 3, 4, 5]]))
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
+        # gemma2 alternates sliding/full, matching HF's derived pattern
+        args = gemma2.ModelArgs(
+            model_type="gemma2", head_dim=16, rms_norm_eps=1e-5, **common
+        )
+        model = gemma2.Model(args)
+        self.assertEqual(
+            args.layer_types,
+            [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention",
+            ],
+        )
+        for c, expect in zip(model.make_cache(), (True, False, True, False)):
+            self.assertIsInstance(c, RotatingKVCache if expect else KVCache)
+
+        # these models slide on every layer when sliding_window is set
+        for name, module, extra in (
+            ("mixtral", mixtral, dict(num_local_experts=4, num_experts_per_tok=2)),
+            ("phi3", phi3, dict(rms_norm_eps=1e-5)),
+            ("phimoe", phimoe, dict(num_local_experts=4, num_experts_per_tok=2)),
+            ("starcoder2", starcoder2, {}),
+        ):
+            with self.subTest(model_type=name):
+                args = module.ModelArgs(
+                    model_type=name, **{**common, **extra}
+                )
+                model = module.Model(args)
+                for c in model.make_cache():
+                    self.assertIsInstance(c, RotatingKVCache)
+
 class TestVLSanitize(unittest.TestCase):
     # Newer layout
     HF_WEIGHTS = {
