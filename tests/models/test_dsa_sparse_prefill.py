@@ -6,10 +6,11 @@ from unittest.mock import patch
 import mlx.core as mx
 
 from mlx_lm.models import deepseek_v32 as D
+from mlx_lm.models import dsa
 from mlx_lm.models import glm_moe_dsa as G
 from mlx_lm.models.cache import make_prompt_cache
 
-CONFIG = {
+GLM_CONFIG = {
     "model_type": "glm_moe_dsa",
     "vocab_size": 256,
     "hidden_size": 64,
@@ -49,7 +50,7 @@ CONFIG = {
 DSV32_CONFIG = {
     **{
         k: v
-        for k, v in CONFIG.items()
+        for k, v in GLM_CONFIG.items()
         if k not in ("rope_parameters", "index_topk_pattern")
     },
     "model_type": "deepseek_v32",
@@ -57,8 +58,8 @@ DSV32_CONFIG = {
 }
 
 
-class TestGlmSparsePrefill(unittest.TestCase):
-    module, config = G, CONFIG
+class _SparsePrefillTests:
+    module = config = None  # set by the model test classes below
 
     def _args(self):
         return self.module.ModelArgs.from_dict({**self.config, "sparse_prefill": False})
@@ -110,7 +111,7 @@ class TestGlmSparsePrefill(unittest.TestCase):
         qr = mx.random.normal((1, 64, 32))
         mask = create_causal_mask(64)
         stock = indexer(x, qr, mask)
-        blocked = D._blocked_topk(indexer, x, qr, mask, None, block=16)
+        blocked = dsa.blocked_topk(indexer, x, qr, mask, None, block=16)
         # Rows with fewer than index_topk causal keys also select masked keys.
         rows = slice(indexer.index_topk - 1, None)
         self.assertTrue(
@@ -167,7 +168,7 @@ class TestGlmSparsePrefill(unittest.TestCase):
             layer.self_attn.sparse_prefill_min_context = 0
         tokens = mx.random.randint(0, 256, (1, 128))
         whole = self._prefill(model, tokens, 64)
-        with patch.object(D, "_SPARSE_QUERY_BLOCK", 24):
+        with patch.object(dsa, "SPARSE_QUERY_BLOCK", 24):
             blocked = self._prefill(model, tokens, 64)
         self.assertTrue(bool(mx.array_equal(whole, blocked)))
 
@@ -187,7 +188,11 @@ class TestGlmSparsePrefill(unittest.TestCase):
         self.assertEqual(out.shape, (1, 1, 256))
 
 
-class TestDeepseekV32SparsePrefill(TestGlmSparsePrefill):
+class TestGlmSparsePrefill(_SparsePrefillTests, unittest.TestCase):
+    module, config = G, GLM_CONFIG
+
+
+class TestDeepseekV32SparsePrefill(_SparsePrefillTests, unittest.TestCase):
     module, config = D, DSV32_CONFIG
 
 

@@ -13,7 +13,7 @@ from .deepseek_v32 import (
     DeepseekV32Model,
 )
 from .deepseek_v32 import Model as DSV32Model
-from .deepseek_v32 import _blocked_topk, _sparse_prefill
+from .dsa import blocked_topk, sparse_attention
 
 
 @dataclass
@@ -130,7 +130,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         )
         if self.indexer is not None:
             if sparse:
-                topk_indices = _blocked_topk(self.indexer, x, qr, mask, cache[1])
+                topk_indices = blocked_topk(self.indexer, x, qr, mask, cache[1])
             else:
                 topk_indices = self.indexer(x, qr, mask, cache=cache[1])
         else:
@@ -141,7 +141,7 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
                 cache[0].keys = mx.depends(
                     cache[0].keys, (cache[1].keys, cache[1].values)
                 )
-            out = _sparse_prefill(
+            out = sparse_attention(
                 self, q_nope, q_pe, kv_latent, k_pe, topk_indices, mask, B, L
             )
             return out, topk_indices
