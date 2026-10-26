@@ -12,7 +12,6 @@ from tempfile import TemporaryDirectory
 from typing import Literal, Optional
 
 import mlx.core as mx
-from huggingface_hub.errors import LocalEntryNotFoundError
 from mlx._distributed_utils.common import Hostfile
 from mlx._distributed_utils.launch import launch_jaccl, launch_ring
 from tqdm import tqdm
@@ -257,7 +256,7 @@ def main():
                     f"The model repository appears to be corrupted, it resolved to {str(path)}"
                 )
             path, files = get_files(path.parent.parent)
-        except Exception as e:
+        except Exception:
             pass
     has_file = mx.distributed.all_gather(len(files) > 0)
     src = has_file.argmax().item()

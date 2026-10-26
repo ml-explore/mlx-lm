@@ -218,7 +218,7 @@ def parse_tool_call(text: str, tools: list[Any] | None = None):
             return fallback
         return dict(name="unknown", arguments={"raw": text.strip()})
 
-    func_name = match.group(1)
+    func_name = match.group(1).strip()
     string_args = _get_string_arg_names(func_name, tools)
     arg_dct = {}
     for match in _func_arg_regex.finditer(text):

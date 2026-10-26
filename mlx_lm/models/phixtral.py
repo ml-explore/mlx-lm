@@ -1,9 +1,8 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import inspect
 import math
 from dataclasses import dataclass
-from typing import Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -176,8 +175,11 @@ class Model(nn.Module):
         cache=None,
     ) -> mx.array:
 
+        if cache is None:
+            cache = [None] * len(self.transformer.h)
+
         if mask is None:
-            mask = create_attention_mask(x, cache)
+            mask = create_attention_mask(x, cache[0])
 
         y = self.transformer(x, mask, cache)
         return self.lm_head(y)

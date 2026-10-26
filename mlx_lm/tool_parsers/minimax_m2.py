@@ -1,3 +1,6 @@
+# Copyright © 2026 Apple Inc.
+
+import ast
 import json
 from typing import Any
 
@@ -93,7 +96,7 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
     normalized_types = [t.lower() for t in param_types]
 
     # Try null first if it's in the list
-    if "null" in normalized_types or value.lower() in ("null", "none", "nil"):
+    if "null" in normalized_types and value.lower() in ("null", "none", "nil"):
         return None
 
     # Try each type in order of preference (most specific first, string as fallback)
@@ -138,8 +141,12 @@ def _convert_param_value_with_types(value: str, param_types: list[str]) -> Any:
             continue
         elif param_type in ["object", "array"]:
             try:
-                return json.loads(value)
+                return json.loads(value, strict=False)
             except json.JSONDecodeError:
+                pass
+            try:
+                return ast.literal_eval(value)
+            except (ValueError, SyntaxError):
                 continue
 
     # Fallback: try JSON parse, then return as string
@@ -157,43 +164,44 @@ def _get_param_types_from_config(param_name: str, param_config: dict) -> list[st
 
 
 def parse_tool_call(text: str, tools: list | None = None):
-    invoke_match = _invoke_complete_regex.findall(text)
-    if not invoke_match:
+    invoke_matches = _invoke_complete_regex.findall(text)
+    if not invoke_matches:
         raise ValueError("No tool call found")
-    invoke_text = invoke_match[0]
 
-    name_match = re.search(r"^([^>]+)", invoke_text)
-    if not name_match:
-        return None
-
-    function_name = _extract_name(name_match.group(1))
-
-    # Get parameter configuration
-    param_config = {}
+    param_config_for = {}
     if tools:
         for tool in tools:
             if func := tool.get("function", False):
-                if func["name"] != function_name:
-                    continue
                 if params := func.get("parameters", False):
-                    param_config = params.get("properties", {})
+                    param_config_for[func["name"]] = params.get("properties", {})
 
-    # Extract parameters
-    param_dict = {}
-    for match in _parameter_complete_regex.findall(invoke_text):
-        param_match = re.search(r"^([^>]+)>(.*)", match, re.DOTALL)
-        if param_match:
-            param_name = _extract_name(param_match.group(1))
-            param_value = param_match.group(2).strip()
-            if param_value.startswith("\n"):
-                param_value = param_value[1:]
-            if param_value.endswith("\n"):
-                param_value = param_value[:-1]
+    calls = []
+    for invoke_text in invoke_matches:
+        name_match = re.search(r"^([^>]+)", invoke_text)
+        if not name_match:
+            continue
+        function_name = _extract_name(name_match.group(1))
+        param_config = param_config_for.get(function_name, {})
 
-            param_type = _get_param_types_from_config(param_name, param_config)
+        param_dict = {}
+        for match in _parameter_complete_regex.findall(invoke_text):
+            param_match = re.search(r"^([^>]+)>(.*)", match, re.DOTALL)
+            if param_match:
+                param_name = _extract_name(param_match.group(1))
+                param_value = param_match.group(2).strip()
+                if param_value.startswith("\n"):
+                    param_value = param_value[1:]
+                if param_value.endswith("\n"):
+                    param_value = param_value[:-1]
 
-            param_dict[param_name] = _convert_param_value_with_types(
-                param_value, param_type
-            )
+                param_type = _get_param_types_from_config(param_name, param_config)
 
-    return dict(name=function_name, arguments=param_dict)
+                param_dict[param_name] = _convert_param_value_with_types(
+                    param_value, param_type
+                )
+
+        calls.append(dict(name=function_name, arguments=param_dict))
+
+    if len(calls) == 1:
+        return calls[0]
+    return calls

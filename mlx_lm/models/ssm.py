@@ -194,11 +194,16 @@ def ssm_attn(
     dt = compute_dt(dt, dt_bias, time_step_limit)
     repeats = h // g
     A = -mx.exp(A_log).astype(dt.dtype)
-    dtA = dt * A.reshape(1, 1, -1) # decay always uses original dt
+    # dtA = dt * A.reshape(1, 1, -1) # decay always uses original dt
 
     # Mamba-3: swap in dt_eff for the input term only; Mamba-2: same as dt
-    dt_input = _dt_eff if _dt_eff is not None else dt
-    dtx = dt_input.reshape(b, l, h, 1) * x
+    # dt_input = _dt_eff if _dt_eff is not None else dt
+    # dtx = dt_input.reshape(b, l, h, 1) * x
+
+    dtA = dt * A.reshape(1, 1, -1)
+    if mask is not None:
+        dtA = dtA * mask[..., None]
+    dtx = dt.reshape(b, l, h, 1) * x
 
     def _step(dtx, dtA, B, C, state, mask):
         s = dtx.shape[1]

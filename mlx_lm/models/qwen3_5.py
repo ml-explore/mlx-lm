@@ -12,9 +12,11 @@ from .base import (
     BaseModelArgs,
     create_attention_mask,
     create_ssm_mask,
+    gather_last_axis,
 )
 from .cache import ArraysCache, KVCache
-from .gated_delta import gated_delta_update
+from .gated_delta import gated_delta_update, normalize_qk
+from .pipeline import PipelineMixin
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -157,7 +159,13 @@ class GatedDeltaNet(nn.Module):
             qkv = mx.where(mask[..., None], qkv, 0)
         conv_input = mx.concatenate([conv_state, qkv], axis=1)
         if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                ends = mx.clip(cache.lengths, 0, S)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
         conv_out = nn.silu(self.conv1d(conv_input))
 
         q, k, v = [
@@ -170,9 +178,7 @@ class GatedDeltaNet(nn.Module):
         ]
 
         state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+        q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
 
         out, state = gated_delta_update(
             q,
@@ -189,6 +195,7 @@ class GatedDeltaNet(nn.Module):
 
         if cache is not None:
             cache[1] = state
+            cache.advance(S)
 
         out = self.norm(out, z)
         out = self.out_proj(out.reshape(B, S, -1))
@@ -233,7 +240,7 @@ class DecoderLayer(nn.Module):
         return out
 
 
-class Qwen3_5TextModel(nn.Module):
+class Qwen3_5TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextModelArgs):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
@@ -243,6 +250,18 @@ class Qwen3_5TextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
+
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
+        self.ssm_idx = None
+        self.fa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.ssm_idx is None and l.is_linear:
+                self.ssm_idx = e
+            elif self.fa_idx is None and not l.is_linear:
+                self.fa_idx = e
+            if self.ssm_idx is not None and self.fa_idx is not None:
+                break
 
     def __call__(
         self,
@@ -255,15 +274,43 @@ class Qwen3_5TextModel(nn.Module):
         else:
             hidden_states = self.embed_tokens(inputs)
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
-        ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
+        fa_mask = None
+        ssm_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        if self.ssm_idx is not None:
+            ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            hidden_states = mx.distributed.recv_like(hidden_states, (pipeline_rank + 1))
+
+        for layer, c in zip(self.pipeline_layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
             hidden_states = layer(hidden_states, mask=mask, cache=c)
+
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            hidden_states = mx.distributed.send(
+                hidden_states, (pipeline_rank - 1) % pipeline_size
+            )
+            if cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, hidden_states)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], hidden_states)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            hidden_states = mx.distributed.all_gather(hidden_states)[
+                : hidden_states.shape[0]
+            ]
 
         return self.norm(hidden_states)
 
@@ -276,6 +323,7 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.sharding_group = None
 
     def __call__(
         self,
@@ -288,21 +336,21 @@ class TextModel(nn.Module):
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+            if self.sharding_group is not None:
+                out = gather_last_axis(out, self.sharding_group)
         return out
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
         weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
@@ -318,7 +366,7 @@ class TextModel(nn.Module):
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
                 weights[k] = v.moveaxis(2, 1)
-            if should_shift_norm_weights and any(k.endswith(sfx) for sfx in norm_keys):
+            if has_unsanitized_conv1d and any(k.endswith(sfx) for sfx in norm_keys):
                 if v.ndim == 1:
                     weights[k] = v + 1.0
         return weights
@@ -374,6 +422,10 @@ class Model(nn.Module):
             inputs, cache=cache, input_embeddings=input_embeddings
         )
 
+    @property
+    def model(self):
+        return self.language_model.model
+
     def sanitize(self, weights):
         sanitized = {}
         for key, value in weights.items():
@@ -394,6 +446,14 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         N = group.size()
         rank = group.rank()
+
+        # Each rank computes a slice of the vocabulary
+        lm = self.language_model
+        if not lm.args.tie_word_embeddings:
+            vocab = lm.args.vocab_size
+            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
+            lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
+            lm.sharding_group = group
 
         # A sharding factory for the convolution in gated delta net
         def conv_sharding(key_dim):
@@ -510,7 +570,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.language_model.model.pipeline_layers
 
     def make_cache(self):
         return self.language_model.make_cache()

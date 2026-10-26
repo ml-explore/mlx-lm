@@ -84,9 +84,9 @@ To see a description of all the arguments you can do:
 ```
 
 Check out the [generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
+example](https://github.com/ml-explore/mlx-lm/tree/main/examples/generate_response.py)
 to see how to use the API in more detail. Check out the [batch generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
+example](https://github.com/ml-explore/mlx-lm/tree/main/examples/batch_generate_response.py)
 to see how to efficiently generate continuations for a batch of prompts.
 
 The `mlx-lm` package also comes with functionality to quantize and optionally
@@ -200,11 +200,18 @@ Face Space.
 
 - A rotating fixed-size key-value cache.
 - Prompt caching
+- A configurable prefill step size
 
 To use the rotating key-value cache pass the argument `--max-kv-size n` where
 `n` can be any integer. Smaller values like `512` will use very little RAM but
 result in worse quality. Larger values like `4096` or higher will use more RAM
 but have better quality.
+
+Long prompts are read in steps, and the step size sets how many prompt tokens
+are processed at once. Smaller steps use less peak memory while the prompt is
+read, at some cost to prompt processing speed. To change it pass
+`--prefill-step-size n`. The default is `2048`, and `mlx_lm.generate`,
+`mlx_lm.chat`, `mlx_lm.server` and `mlx_lm.benchmark` all accept it.
 
 Caching prompts can substantially speedup reusing the same long context with
 different queries. To cache a prompt use `mlx_lm.cache_prompt`. For example:
@@ -231,7 +238,7 @@ not be supplied explicitly.
 Prompt caching can also be used in the Python API in order to avoid
 recomputing the prompt. This is useful in multi-turn dialogues or across
 requests that use the same context. See the
-[example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
+[example](https://github.com/ml-explore/mlx-lm/blob/main/examples/chat.py)
 for more usage details.
 
 ### Supported Models

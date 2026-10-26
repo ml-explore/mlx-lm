@@ -9,10 +9,10 @@ MLX LM was developed with contributions from the following individuals:
 
 - Shunta Saito: Added support for PLaMo models.
 - Gökdeniz Gülmez: Added support for the following architectures: 
-OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, State-Space's `Mamba v1`, 
+OpenBMB's `MiniCPM` and `MiniCPM3`, Kyutai's `Helium`, DeepSeek's `DeepSeek v4.1`, State-Space's `Mamba v1` and 
 `Mamba v2`, and `Mamba v3`, Z.ai & THUKEG's `GLM`, `GLM4`, `GLM5 (GLM MoE DSA)`, Rednote `dots.llm1`, Baidu's `Ernie4.5 MoE`, 
 inclusionAI's `Bailing MoE e.g. Ling-family`, `Bailing MoE Linear e.g. Ling-Linear-family`, 
-Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite MoE`, 
+Klear team - Kuaishou Technology's `Klear`, AI21 Lab's `Jamba` IBM's `Granite MoE`, Mistral AI's `Mistral4`, 
 Meituan's `LongCat`, Nvidia's `Nemotron H`, Swiss-AI's `Apertus`, Nikity's `Lille130m`, 
 Alibaba Qwen's `Qwen3Next`, Tele-AI's `TeleChat3`, and Allenai's `OLMoE` and `Olmo 3`; 
 Helped add support for the following model architectures: 
@@ -31,3 +31,4 @@ Added support for the following other features:
 MoonshotAI's `Kimi K2.5`, Upstage's `Solar Open`, LG AI Research's `K-Exaone MoE`, 
 Meituan's `LongCat Flash Lite` Helped add support for the following model architectures: 
 Z.ai & THUKEG's `GLM5 (GLM MoE DSA)`
+- Ethan Elasky: Added support for talkie-lm's `Talkie`.
