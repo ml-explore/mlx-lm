@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 from typing import Optional, Tuple
 
 import mlx.core as mx
