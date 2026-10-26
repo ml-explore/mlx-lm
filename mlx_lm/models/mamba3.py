@@ -1,303 +1,257 @@
 # Copyright © 2026 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_ssm_mask
 from .cache import ArraysCache
-from .ssm import ssm_update_trap  # mamba3 uses trapezoidal update instead of standard 2-term recurrence
 
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    model_type: str
-    num_heads: int
-    head_dim: int
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    state_size: int
-    num_hidden_layers: int
-    layer_norm_epsilon: float
-    n_groups: int
-    use_bias: bool
-    tie_word_embeddings: bool
-    time_step_limit: Tuple[float, float]
-    time_step_rank: Union[int, str]
-    ssm_state_size: Optional[int] = None
-    max_position_embeddings: int = 2056
+    model_type: str = "mamba3"
+    vocab_size: int = 50257
+    d_model: int = 256
+    n_layer: int = 2
+    d_state: int = 64
+    headdim: int = 64
+    mimo_rank: int = 2
+    chunk_size: int = 16
+    ssm_cfg: dict | None = None
+    d_intermediate: int = 0
+    rms_norm: bool = True
+    norm_epsilon: float = 1e-5
+    residual_in_fp32: bool = True
+    tie_embeddings: bool = True
+    pad_vocab_size_multiple: int = 16
+    attn_layer_idx: list | None = None
+    expand: int = 2
+    ngroups: int = 1
+    rope_fraction: float = 0.5
+    A_floor: float = 1e-4
+    is_mimo: bool = True
+    is_outproj_norm: bool = False
 
     def __post_init__(self):
-        if self.time_step_rank == "auto":
-            self.time_step_rank = math.ceil(self.hidden_size / 16)
-        if self.ssm_state_size is None:
-            self.ssm_state_size = self.state_size
+        if self.ssm_cfg is not None:
+            for key in (
+                "d_state",
+                "expand",
+                "headdim",
+                "ngroups",
+                "rope_fraction",
+                "A_floor",
+                "is_mimo",
+                "mimo_rank",
+                "is_outproj_norm",
+                "chunk_size",
+            ):
+                if key in self.ssm_cfg:
+                    setattr(self, key, self.ssm_cfg[key])
+            self.is_mimo = self.ssm_cfg.get("is_mimo", False)
+            if self.ssm_cfg.get("layer", "Mamba3") != "Mamba3":
+                raise ValueError("Expected a Mamba3 mixer.")
+        if not self.is_mimo:
+            self.mimo_rank = 1
+        if self.attn_layer_idx:
+            raise ValueError("Mamba3 attention layers are not supported.")
+        if min(self.d_model, self.n_layer, self.headdim, self.mimo_rank) <= 0:
+            raise ValueError("Model dimensions and MIMO rank must be positive.")
+        if self.expand * self.d_model % self.headdim:
+            raise ValueError("headdim must divide expand * d_model.")
+        if self.ngroups != 1:
+            raise ValueError("Mamba3 currently requires ngroups=1.")
+        if self.rope_fraction not in (0.5, 1.0):
+            raise ValueError("rope_fraction must be 0.5 or 1.0.")
+        if self.d_state < 4 or self.d_state % 4:
+            raise ValueError("d_state must be a positive multiple of four.")
 
 
-def apply_bc_rope(
-    bc: mx.array,
-    theta: mx.array,
-    dt: mx.array,
-    offset: int = 0,
-) -> mx.array:
-    """Apply data-dependent rotary embeddings to B or C.
-
-    The cumulative rotation product  ∏_{s=0}^{t} R_s^⊤  is equivalent to
-    standard RoPE with *data-dependent* angles:
-        φ_t = Σ_{s=0}^{t} Δs * θ_s[i]   (cumulative sum of Δt * θ)
-
-    In the SSD parallel form, each position t receives the cumulative angle
-    up to that position, so we compute the prefix sum of (dt * θ) and rotate
-    B/C with it.  During decode (seq_len == 1), the cache offset carries the
-    cumulative angle from prior tokens.
-
-    Note on state_size pairing:
-        Each pair of state dimensions (2i, 2i+1) shares one rotation angle.
-        If state_size // 2 > num_heads * n_groups_per_head, the angles are
-        tiled/repeated to fill all pairs (same convention as Transformer RoPE).
-    """
-    b, l, g, d = bc.shape
-    assert d % 2 == 0, "state_size must be even for RoPE pairing"
-
-    # Incremental angle: Δt * θ per head  →  (b, l, num_heads)
-    angle_step = dt * mx.softplus(theta) # keep θ > 0 for stable rotation
-
-    # Cumulative sum along sequence → φ_t = Σ_{s=0}^{t} angle_step_s
-    # During decode (l=1) this is just angle_step; prefill uses cumsum.
-    angle_cum = mx.cumsum(angle_step, axis=1)   # (b, l, num_heads)
-
-    # Add decode offset (stores cumulative angle from previous tokens)
-    # offset is a scalar int representing the *count* of past steps; we pass
-    # the actual cumulative angle tensor through cache[2] instead (see _ssm).
-    # Here offset is the pre-accumulated angle array of shape (b, 1, num_heads)
-    # or 0 for prefill from scratch.
-    if not isinstance(offset, (int, float)):
-        angle_cum = angle_cum + offset
-
-    # Broadcast angles from num_heads → n_groups * (state_size // 2)
-    # angle_cum: (b, l, num_heads) → (b, l, g, n_pairs)
-    # Strategy: tile along the last axis to cover g*n_pairs slots, then reshape.
-    # mx.broadcast_to requires equal or size-1 dims, so we tile explicitly.
-    n_pairs = d // 2
-    h = angle_cum.shape[-1] # num_heads
-    target = g * n_pairs
-    reps = math.ceil(target / h)
-    angle = mx.tile(angle_cum, (1, 1, reps))[:, :, :target].reshape(b, l, g, n_pairs)
-
-    # Build rotation: interleave cos/sin across paired dims
-    bc_r = bc.reshape(b, l, g, n_pairs, 2) # (..., 2) = (even, odd) pairs
-    cos = mx.cos(angle)[:, :, :, :, None] # (b, l, g, n_pairs, 1)
-    sin = mx.sin(angle)[:, :, :, :, None]
-
-    # Rotate: [x0, x1] → [x0*cos - x1*sin,  x0*sin + x1*cos]
-    x0 = bc_r[..., 0:1]
-    x1 = bc_r[..., 1:2]
-    bc_rot = mx.concatenate([x0 * cos - x1 * sin, x0 * sin + x1 * cos], axis=-1)
-    return bc_rot.reshape(b, l, g, d)
-
-
-class Mamba3Block(nn.Module):
-    """Mamba-3 SSM block (SISO).
-
-    Changes from Mamba-2:
-      - Conv1d removed (made redundant by BCNorm + B/C biases + Exp-Trap)
-      - BCNorm: RMSNorm applied to B and C (replaces post-gate MambaRMSNormGated)
-      - Learnable B_bias, C_bias (ones-init, shape n_groups × state_size)
-      - Θ (imaginary A) projected per-head for data-dependent RoPE on B and C
-      - ssm_update_trap (3-term recurrence) instead of ssm_update (2-term)
-      - Gate applied as plain SiLU multiply (no post-gate norm)
-      - cache: slot 0 = SSM state, slot 1 = prev_Bx, slot 2 = cumulative RoPE angle
-
-    in_proj splits:  gate | x | B | C | dt | lam | theta
-    """
-
-    def __init__(self, args: ModelArgs, layer_idx: int):
-        super().__init__()
-        self.layer_idx = layer_idx
-        self.num_heads = args.num_heads
-        self.hidden_size = args.hidden_size
-        self.ssm_state_size = args.ssm_state_size
-        self.intermediate_size = args.num_heads * args.head_dim
-        self.n_groups = args.n_groups
-        self.head_dim = args.head_dim
-        self.time_step_limit = args.time_step_limit
-        self.use_bias = args.use_bias
-
-        assert args.ssm_state_size % 2 == 0, (
-            "ssm_state_size must be even for data-dependent RoPE pairing"
+def rotate_bc(x, angle, is_mimo=True):
+    n, half = angle.shape[-1], x.shape[-1] // 2
+    cos, sin = mx.cos(angle)[:, :, None], mx.sin(angle)[:, :, None]
+    if is_mimo:
+        a, b = x[..., :n], x[..., half : half + n]
+        return mx.concatenate(
+            [a * cos - b * sin, x[..., n:half], a * sin + b * cos, x[..., half + n :]],
+            -1,
         )
-
-        bc_dim = self.n_groups * self.ssm_state_size
-
-        # in_proj splits: gate, x, B, C, dt, lam, theta
-        projection_size = (
-            2 * self.intermediate_size # gate + x
-            + 2 * bc_dim # B + C
-            + 3 * self.num_heads # dt + lam + theta (imaginary A)
-        )
-        self.in_proj = nn.Linear(self.hidden_size, projection_size, bias=args.use_bias)
-
-        # SSM parameters (real part of A — unchanged from Mamba-2)
-        self.dt_bias = mx.ones(self.num_heads)
-        self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
-        self.D = mx.ones(self.num_heads)
-
-        # BCNorm: one RMSNorm over state_size, applied per-group
-        self.bc_norm_B = nn.RMSNorm(self.ssm_state_size, eps=args.layer_norm_epsilon)
-        self.bc_norm_C = nn.RMSNorm(self.ssm_state_size, eps=args.layer_norm_epsilon)
-
-        # Learnable B/C biases (ones-init)
-        self.B_bias = mx.ones((self.n_groups, self.ssm_state_size))
-        self.C_bias = mx.ones((self.n_groups, self.ssm_state_size))
-
-        self.out_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.use_bias
-        )
-
-    def _apply_bc_norm(self, raw: mx.array, norm: nn.RMSNorm, bias: mx.array) -> mx.array:
-        """BCNorm + bias.  raw: (b, l, n_groups * state_size) → (b, l, n_groups, state_size)."""
-        b, l, _ = raw.shape
-        x = raw.reshape(b, l, self.n_groups, self.ssm_state_size)
-        x = norm(x) # over last dim
-        x = x + bias # broadcast over (b, l)
-        return x
-
-    def _ssm(
-        self,
-        x: mx.array,
-        B: mx.array,
-        C: mx.array,
-        dt: mx.array,
-        lam: mx.array,
-        theta: mx.array,
-        cache: Optional[ArraysCache],
-        mask: Optional[mx.array],
-    ) -> mx.array:
-        batch_size, seq_len, _ = x.shape
-
-        x = x.reshape(batch_size, seq_len, self.num_heads, self.head_dim)
-        # B, C already (b, l, n_groups, state_size) from _apply_bc_norm
-
-        # Retrieve or init cache slots
-        state = cache[0] if cache else None
-        prev_Bx = cache[1] if cache else None
-        angle_offset = cache[2] if cache else 0 # cumulative RoPE angle
-
-        lengths = cache.lengths if cache else None
-
-        # dt is raw logits here; process for RoPE angle scaling
-        from .ssm import compute_dt
-        dt_proc = compute_dt(dt, self.dt_bias, self.time_step_limit) # (b, l, h)
-
-        # Apply data-dependent RoPE to B and C (Proposition 4)
-        # angle_offset: (b, 1, num_heads) cumulative angle from prior tokens, or 0
-        B = apply_bc_rope(B, theta, dt_proc, offset=angle_offset)
-        C = apply_bc_rope(C, theta, dt_proc, offset=angle_offset)
-
-        # Update cumulative angle for next decode step
-        if cache:
-            new_angle = mx.sum(dt_proc * mx.softplus(theta), axis=1, keepdims=True)
-            if isinstance(angle_offset, mx.array):
-                cache[2] = angle_offset + new_angle
-            else:
-                cache[2] = new_angle
-
-        y, new_state, new_Bx = ssm_update_trap(
-            x,
-            self.A_log,
-            B,
-            C,
-            self.D,
-            dt,
-            self.dt_bias,
-            lam,
-            state,
-            prev_Bx,
-            self.time_step_limit,
-            mask,
-            lengths,
-        )
-
-        if cache:
-            cache[0] = new_state
-            cache[1] = new_Bx
-
-        return y.reshape(batch_size, seq_len, self.intermediate_size)
-
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        mask: Optional[mx.array],
-        cache: Optional[ArraysCache] = None,
-    ) -> mx.array:
-        projected = self.in_proj(hidden_states)
-
-        bc_dim = self.n_groups * self.ssm_state_size
-        gate, x, B_raw, C_raw, dt, lam, theta = mx.split(
-            projected,
-            [
-                self.intermediate_size,
-                2 * self.intermediate_size,
-                2 * self.intermediate_size + bc_dim,
-                2 * self.intermediate_size + 2 * bc_dim,
-                2 * self.intermediate_size + 2 * bc_dim + self.num_heads,
-                2 * self.intermediate_size + 2 * bc_dim + 2 * self.num_heads,
-            ],
-            axis=-1,
-        )
-
-        # BCNorm + learnable biases
-        B = self._apply_bc_norm(B_raw, self.bc_norm_B, self.B_bias)
-        C = self._apply_bc_norm(C_raw, self.bc_norm_C, self.C_bias)
-
-        y = self._ssm(x, B, C, dt, lam, theta, cache, mask=mask)
-
-        if cache:
-            cache.advance(y.shape[1])
-
-        # Gate: plain SiLU multiply (post-gate RMSNorm removed in Mamba-3)
-        y = y * nn.silu(gate)
-
-        return self.out_proj(y)
-
-
-class ResidualBlock(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
-        super().__init__()
-        self.mixer = Mamba3Block(args, layer_idx)
-        self.norm = nn.RMSNorm(args.hidden_size)
-
-    def __call__(
-        self, x: mx.array, mask: Optional[mx.array], cache: Optional[ArraysCache] = None
-    ) -> mx.array:
-        return self.mixer(self.norm(x), mask, cache) + x
+    pairs = x[..., : 2 * n].reshape(*x.shape[:-1], n, 2)
+    a, b = pairs[..., 0], pairs[..., 1]
+    rotated = mx.stack([a * cos - b * sin, a * sin + b * cos], -1)
+    return mx.concatenate([rotated.flatten(-2), x[..., 2 * n :]], -1)
 
 
 class Mamba3(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.args = args
-        self.embeddings = nn.Embedding(args.vocab_size, args.hidden_size)
-        self.layers = [ResidualBlock(args, i) for i in range(args.num_hidden_layers)]
-        self.norm_f = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
+        self.d_inner = args.expand * args.d_model
+        self.nheads = self.d_inner // args.headdim
+        self.headdim = args.headdim
+        self.d_state = args.d_state
+        self.rank = args.mimo_rank
+        self.is_mimo = args.is_mimo
+        self.num_angles = int(self.d_state * args.rope_fraction) // 2
+        self.A_floor = args.A_floor
+        self.is_outproj_norm = args.is_outproj_norm
+        self.in_proj = nn.Linear(
+            args.d_model,
+            2 * self.d_inner
+            + 2 * self.rank * self.d_state
+            + 3 * self.nheads
+            + self.num_angles,
+            bias=False,
+        )
+        self.B_norm = nn.RMSNorm(self.d_state, eps=1e-5)
+        self.C_norm = nn.RMSNorm(self.d_state, eps=1e-5)
+        self.B_bias = mx.ones((self.nheads, self.rank, self.d_state))
+        self.C_bias = mx.ones((self.nheads, self.rank, self.d_state))
+        self.dt_bias = mx.zeros(self.nheads)
+        self.D = mx.ones(self.nheads)
+        if self.is_mimo:
+            self.mimo_x = mx.ones((self.nheads, self.rank, self.headdim)) / self.rank
+            self.mimo_z = mx.ones((self.nheads, self.rank, self.headdim))
+            self.mimo_o = mx.ones((self.nheads, self.rank, self.headdim)) / self.rank
+        if self.is_outproj_norm:
+            self.norm = nn.RMSNorm(self.d_inner, eps=1e-5)
+        self.out_proj = nn.Linear(self.d_inner, args.d_model, bias=False)
 
-    def __call__(
-        self, x: mx.array, cache: Optional[list[ArraysCache]] = None
-    ) -> mx.array:
-        hidden = self.embeddings(x)
+    def __call__(self, u, mask=None, cache=None):
+        batch, length, _ = u.shape
+        sizes = [
+            self.d_inner,
+            self.d_inner,
+            self.rank * self.d_state,
+            self.rank * self.d_state,
+            self.nheads,
+            self.nheads,
+            self.nheads,
+        ]
+        offsets, total = [], 0
+        for size in sizes:
+            total += size
+            offsets.append(total)
+        projection_dtype = (
+            self.in_proj.scales.dtype
+            if isinstance(self.in_proj, nn.QuantizedLinear)
+            else self.in_proj.weight.dtype
+        )
+        projected = self.in_proj(u.astype(projection_dtype))
+        z, x, B, C, dt, A, trap, angles = mx.split(projected, offsets, axis=-1)
+        dtype = x.dtype
+        x = x.reshape(batch, length, self.nheads, self.headdim).astype(mx.float32)
+        z = z.reshape(batch, length, self.nheads, self.headdim).astype(mx.float32)
+        B = self.B_norm(B.reshape(batch, length, self.rank, self.d_state))
+        C = self.C_norm(C.reshape(batch, length, self.rank, self.d_state))
+        dt = nn.softplus(dt.astype(mx.float32) + self.dt_bias)
+        A = A.astype(mx.float32)
+        A = -mx.maximum(mx.maximum(A, 0) + 1 / (1 - mx.minimum(A, 0)), self.A_floor)
+        decay = mx.exp(A * dt)
+        trap = mx.sigmoid(trap.astype(mx.float32))
+        angle_steps = (
+            mx.tanh(angles.astype(mx.float32))[:, :, None] * dt[..., None] * mx.pi
+        )
 
-        if cache is None:
-            cache = [None] * len(self.layers)
+        if cache is not None and cache[0] is not None:
+            state, previous, angle = cache[0], cache[1], cache[2]
+        else:
+            state = mx.zeros((batch, self.nheads, self.headdim, self.d_state))
+            previous = mx.zeros(state.shape)
+            angle = mx.zeros((batch, self.nheads, self.num_angles))
+        outputs = []
+        for t in range(length):
+            next_angle = angle + angle_steps[:, t]
+            b = rotate_bc(
+                B[:, t, None].astype(mx.float32) + self.B_bias, next_angle, self.is_mimo
+            )
+            c = rotate_bc(
+                C[:, t, None].astype(mx.float32) + self.C_bias, next_angle, self.is_mimo
+            )
+            values = x[:, t, :, None] * (self.mimo_x if self.is_mimo else 1)
+            bx = mx.einsum("bhrp,bhrn->bhpn", values, b)
+            alpha = decay[:, t, :, None, None]
+            gamma = (trap[:, t] * dt[:, t])[:, :, None, None]
+            beta = ((1 - trap[:, t]) * dt[:, t])[:, :, None, None] * alpha
+            next_state = alpha * state + beta * previous + gamma * bx
+            if mask is not None:
+                valid = mask[:, t, None, None, None]
+                state = mx.where(valid, next_state, state)
+                previous = mx.where(valid, bx, previous)
+                angle = mx.where(valid[..., 0], next_angle, angle)
+            else:
+                state, previous, angle = next_state, bx, next_angle
+            y = mx.einsum("bhpn,bhrn->bhrp", state, c)
+            y = y + values * self.D[None, :, None, None]
+            if self.is_outproj_norm:
+                y = mx.fast.rms_norm(y, None, 1e-5) * self.norm.weight.reshape(
+                    self.nheads, 1, self.headdim
+                )
+            y = y * nn.silu(z[:, t, :, None] * (self.mimo_z if self.is_mimo else 1))
+            outputs.append(
+                mx.sum(y * (self.mimo_o if self.is_mimo else 1), axis=2).astype(dtype)
+            )
+        if cache is not None:
+            cache[0], cache[1], cache[2] = state, previous, angle
+            cache.advance(length)
+        y = mx.stack(outputs, axis=1).reshape(batch, length, self.d_inner)
+        return self.out_proj(y)
 
+
+class GatedMLP(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        hidden = (args.d_intermediate + 127) // 128 * 128
+        self.fc1 = nn.Linear(args.d_model, 2 * hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, args.d_model, bias=False)
+
+    def __call__(self, x):
+        y, gate = mx.split(self.fc1(x), 2, axis=-1)
+        return self.fc2(y * nn.silu(gate))
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        norm = nn.RMSNorm if args.rms_norm else nn.LayerNorm
+        self.norm = norm(args.d_model, eps=args.norm_epsilon)
+        self.mixer = Mamba3(args)
+        self.residual_in_fp32 = args.residual_in_fp32
+        if args.d_intermediate:
+            self.norm2 = norm(args.d_model, eps=args.norm_epsilon)
+            self.mlp = GatedMLP(args)
+
+    def __call__(self, x, mask, cache):
+        residual = x.astype(mx.float32) if self.residual_in_fp32 else x
+        x = residual + self.mixer(
+            self.norm(x.astype(self.norm.weight.dtype)), mask, cache
+        )
+        if hasattr(self, "mlp"):
+            x = x + self.mlp(self.norm2(x.astype(self.norm2.weight.dtype)))
+        return x
+
+
+class Backbone(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        official = args.ssm_cfg is not None
+        vocab_size = args.vocab_size
+        if official:
+            multiple = args.pad_vocab_size_multiple
+            vocab_size = (vocab_size + multiple - 1) // multiple * multiple
+        self.embedding = nn.Embedding(vocab_size, args.d_model)
+        block = ResidualBlock if official else Mamba3
+        self.layers = [block(args) for _ in range(args.n_layer)]
+        norm = nn.RMSNorm if official and args.rms_norm else nn.LayerNorm
+        self.norm_f = norm(args.d_model, eps=args.norm_epsilon)
+
+    def __call__(self, inputs, cache):
+        hidden = self.embedding(inputs)
         mask = create_ssm_mask(hidden, cache[0])
         for layer, c in zip(self.layers, cache):
             hidden = layer(hidden, mask, c)
-
-        return self.norm_f(hidden)
+        return self.norm_f(hidden.astype(self.norm_f.weight.dtype))
 
 
 class Model(nn.Module):
@@ -305,32 +259,43 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.backbone = Mamba3(args)
+        self.backbone = Backbone(args)
+        self.tied = args.ssm_cfg is not None and args.tie_embeddings
+        if not self.tied:
+            self.lm_head = nn.Linear(
+                args.d_model, self.backbone.embedding.weight.shape[0], bias=False
+            )
 
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
-
-    def __call__(
-        self, inputs: mx.array, cache: Optional[list[ArraysCache]] = None
-    ) -> mx.array:
+    def __call__(self, inputs, cache=None):
+        if cache is None:
+            cache = [None] * len(self.layers)
         hidden = self.backbone(inputs, cache)
+        if self.tied:
+            return self.backbone.embedding.as_linear(hidden)
+        output_dtype = (
+            self.lm_head.scales.dtype
+            if isinstance(self.lm_head, nn.QuantizedLinear)
+            else self.lm_head.weight.dtype
+        )
+        return self.lm_head(hidden.astype(output_dtype))
 
-        if self.args.tie_word_embeddings:
-            logits = self.backbone.embeddings.as_linear(hidden)
-        else:
-            logits = self.lm_head(hidden)
-        return logits
-
-    def make_cache(self, batch_size: int = 1) -> list[ArraysCache]:
-        # slot 0: SSM state
-        # slot 1: prev_Bx  (trapezoidal β term)
-        # slot 2: cumulative RoPE angle  (data-dependent, per-head)
-        return [ArraysCache(size=3) for _ in range(self.args.num_hidden_layers)]
+    def make_cache(self):
+        return [ArraysCache(size=3) for _ in self.layers]
 
     @property
     def layers(self):
         return self.backbone.layers
 
     def sanitize(self, weights):
-        # No conv1d in Mamba-3
+        if "embedding.weight" in weights:
+            weights = {
+                k if k.startswith("lm_head.") else "backbone." + k: v
+                for k, v in weights.items()
+            }
+        if self.tied:
+            weights = {k: v for k, v in weights.items() if not k.startswith("lm_head.")}
         return weights
+
+    @property
+    def cast_predicate(self):
+        return lambda key: key.endswith(".weight")
