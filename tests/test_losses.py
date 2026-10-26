@@ -63,6 +63,37 @@ class TestLosses(unittest.TestCase):
 
         self.assertTrue(mx.allclose(vjp_q, expected))
 
+    def _check_large_input(self, loss_fn):
+        self.assertTrue(can_run_metal())
+        mx.random.seed(0)
+
+        # Large inputs make a race between simdgroups likely.
+        logits_q = mx.random.normal((128, 151936))
+        logits_p = mx.random.normal((128, 151936))
+        cotan = mx.ones((128,))
+
+        def loss_and_grad():
+            (loss,), (grad, _) = mx.vjp(loss_fn, [logits_q, logits_p], [cotan])
+            return loss, grad
+
+        with mx.stream(mx.cpu):
+            expected_loss, expected_grad = loss_and_grad()
+        loss, grad = loss_and_grad()
+
+        self.assertTrue(mx.allclose(loss, expected_loss, rtol=1e-4))
+        self.assertTrue(mx.allclose(grad, expected_grad, rtol=1e-4))
+
+        for _ in range(10):
+            new_loss, new_grad = loss_and_grad()
+            self.assertTrue(mx.array_equal(new_loss, loss))
+            self.assertTrue(mx.array_equal(new_grad, grad))
+
+    def test_kl_div_loss_large_input(self):
+        self._check_large_input(kl_div_loss)
+
+    def test_js_div_loss_large_input(self):
+        self._check_large_input(js_div_loss)
+
 
 if __name__ == "__main__":
     unittest.main()
