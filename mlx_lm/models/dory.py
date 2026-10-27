@@ -267,8 +267,14 @@ class Model(nn.Module):
         a = self.args
         caches = [None] * n
         use_sliding = a.recurrent_kv_cache_mode == "per_loop"
+        lo = a.n_input_layers
+        hi = a.n_input_layers + a.n_recurrent_layers
         for (i, _l), idx in plan.items():
-            if use_sliding and a.layer_types[i] == "sliding_attention":
+            # last_loop rewinds offset in recurrent layers: they need a full KVCache
+            recurrent = lo <= i < hi
+            if a.layer_types[i] == "sliding_attention" and (
+                use_sliding or not recurrent
+            ):
                 caches[idx] = RotatingKVCache(max_size=a.sliding_window)
             else:
                 caches[idx] = KVCache()
