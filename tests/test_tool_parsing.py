@@ -909,6 +909,43 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"], {"path": "a>b"})
 
+    def test_qwen3_coder_nested_parameters(self):
+        """Preserve parameter value containing nested parameter tags."""
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        content = (
+            "<function=demo>\n" "<parameter=a>\n" "v\n" "</parameter>\n" "</function>"
+        )
+        test_case = (
+            "<function=write_file>\n"
+            "<parameter=path>\n"
+            "example.txt\n"
+            "</parameter>\n"
+            f"<parameter=content>\n"
+            f"{content}\n"
+            "</parameter>\n"
+            "</function>"
+        )
+        tool_call = qwen3_coder.parse_tool_call(test_case, tools)
+        self.assertEqual(tool_call["name"], "write_file")
+        self.assertEqual(
+            tool_call["arguments"],
+            {"path": "example.txt", "content": content},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
