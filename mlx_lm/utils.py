@@ -46,6 +46,7 @@ from .tokenizer_utils import load as _load_tokenizer
 
 # Constants
 MODEL_REMAPPING = {
+    "mamba3_custom": "mamba3",
     "mistral": "llama",
     "llava": "mistral3",
     "phi-msft": "phixtral",
@@ -363,6 +364,12 @@ def _encode_tagged_floats(obj: Any) -> Any:
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
         config = _decode_tagged_floats(json.load(f))
+
+    if (
+        "model_type" not in config
+        and (config.get("ssm_cfg") or {}).get("layer") == "Mamba3"
+    ):
+        config["model_type"] = "mamba3"
 
     generation_config_file = model_path / "generation_config.json"
     if generation_config_file.exists():
