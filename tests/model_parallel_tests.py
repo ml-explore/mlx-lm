@@ -5,30 +5,32 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.models import muse_spark_open, qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.models.pipeline import PipelineMixin
 from mlx_lm.utils import quantize_model
 
 MUSE_SPARK_OPEN = {
-    "model_type": "muse_spark_open",
-    "vocab_size": 128,
-    "hidden_size": 64,
-    "num_hidden_layers": 4,
-    "num_attention_heads": 4,
-    "num_key_value_heads": 2,
-    "head_dim": 16,
-    "rms_norm_eps": 1e-5,
-    "rms_post_norm_eps": 1e-8,
-    "rope_theta": 10000.0,
-    "every_n_layers_nope": 4,
-    "global_attn_cfg": [8, 8, 8, 0],
-    "output_soft_cap_temp": 20.0,
-    "moe": {
-        "is_enabled": True,
-        "num_experts": 4,
-        "topk": 2,
-        "router_in_fp32": True,
+    "model_type": "muse_spark",
+    "text_config": {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rms_norm_eps": 1e-5,
+        "post_norm_eps": 1e-8,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+        "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+        "sliding_window": 8,
+        "final_logit_softcapping": 20.0,
+        "output_multiplier": 1.0,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_hidden_size": 64,
+        "moe_intermediate_size": 128,
     },
 }
 
@@ -272,17 +274,17 @@ class TestModelParallel(unittest.TestCase):
                 out = model(x)
                 self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
 
-    def test_muse_spark_open_decode(self):
+    def test_muse_spark_decode(self):
         # Prefill uses the whole pooler; decode steps of one token use the
         # row-split pooler and unpooler.
         for mode in (None, "nvfp4"):
             with self.subTest(mode=mode):
                 mx.random.seed(0)
-                args = muse_spark_open.ModelArgs.from_dict(MUSE_SPARK_OPEN)
-                model = muse_spark_open.Model(args)
+                args = muse_spark.ModelArgs.from_dict(MUSE_SPARK_OPEN)
+                model = muse_spark.Model(args)
                 if mode is not None:
                     quantize_model(model, {}, None, None, mode=mode, global_scale=True)
-                x = mx.random.randint(0, args.vocab_size, shape=(1, 13))
+                x = mx.random.randint(0, args.text.vocab_size, shape=(1, 13))
 
                 def run():
                     cache = make_prompt_cache(model)

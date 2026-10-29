@@ -558,11 +558,13 @@ def load_model(
             _quantize(quantization)
         elif quant_method == "modelopt":
             # NVIDIA ModelOpt.
-            algo = quantization_config["quantization"]["quant_algo"]
+            # hf_quant_config.json nests the settings, config.json does not.
+            settings = quantization_config.get("quantization", quantization_config)
+            algo = settings["quant_algo"]
             if algo != "NVFP4":
                 raise ValueError(f"Unsupported modelopt quant_algo: {algo}")
             quantization = {
-                "group_size": quantization_config["quantization"].get("group_size", 16),
+                "group_size": settings.get("group_size", 16),
                 "bits": 4,
                 "mode": "nvfp4",
             }
@@ -1119,14 +1121,30 @@ def dequantize_model(model: nn.Module) -> nn.Module:
             cls = SwitchLinear
         else:
             continue
-        weight = mx.dequantize(
-            module.weight,
-            module.scales,
-            module.biases,
-            module.group_size,
-            module.bits,
-            module.mode,
-        )
+        if (global_scale := module.get("global_scale")) is not None:
+            # dequantize takes one scalar nvfp4 tensor scale, so go per expert.
+            weight = mx.stack(
+                [
+                    mx.dequantize(
+                        module.weight[e],
+                        module.scales[e],
+                        group_size=module.group_size,
+                        bits=module.bits,
+                        mode=module.mode,
+                        global_scale=global_scale[e],
+                    )
+                    for e in range(global_scale.shape[0])
+                ]
+            )
+        else:
+            weight = mx.dequantize(
+                module.weight,
+                module.scales,
+                module.biases,
+                module.group_size,
+                module.bits,
+                module.mode,
+            )
         args = weight.shape[::-1]
         m = cls(*args, **kwargs)
         if bias:
@@ -1188,7 +1206,7 @@ def save(
 
     dst_path = Path(dst_path)
     # Models with a vision tower need vision_config to load it again.
-    keep_vision_config = getattr(model, "vision_model", False)
+    keep_vision_config = "vision_tower" in getattr(model, "model", {})
     save_model(dst_path, model, donate_model=donate_model)
     save_config(
         config,
