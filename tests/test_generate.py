@@ -14,6 +14,7 @@ from mlx_lm.generate import (
     batch_generate,
     generate,
     generate_step,
+    speculative_generate_step,
     stream_generate,
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
@@ -136,6 +137,32 @@ class TestGenerate(unittest.TestCase):
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
+
+    def test_speculative_processor_history_matches_generate_step(self):
+        # The processor boosts a token picked by a hash of the history, so
+        # the tokens match generate_step only if every history matches.
+        def processor(tokens, logits):
+            idx = hash(tuple(tokens.tolist())) % logits.shape[-1]
+            return logits.at[:, idx].add(1000.0)
+
+        model = self.model
+
+        # Always proposes token 0, so the target rejects the drafts.
+        class RejectedDraft:
+            layers = model.layers
+
+            def __call__(self, inputs, cache=None):
+                return model(inputs, cache=cache).at[..., 0].add(1e4)
+
+        prompt = mx.array(self.tokenizer.encode("Write a story about Einstein"))
+        kwargs = {"max_tokens": 16, "logits_processors": [processor]}
+        expected = [t for t, _ in generate_step(prompt, model, **kwargs)]
+        for draft in [model, RejectedDraft()]:
+            for num_draft_tokens in [0, 2]:
+                gen = speculative_generate_step(
+                    prompt, model, draft, num_draft_tokens=num_draft_tokens, **kwargs
+                )
+                self.assertEqual([t for t, _, _ in gen], expected)
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler

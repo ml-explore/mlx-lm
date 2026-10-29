@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
+from .dsa import blocked_topk, sparse_attention
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -52,6 +53,8 @@ class ModelArgs(BaseModelArgs):
     rope_scaling: Dict = None
     attention_bias: bool = False
     indexer_rope_interleave: bool = False
+    sparse_prefill: bool = True
+    sparse_prefill_min_context: int = 16384
 
 
 class Indexer(nn.Module):
@@ -174,6 +177,8 @@ class DeepseekV32Attention(nn.Module):
                     self.scale = self.scale * s * s
 
         self.indexer = Indexer(config)
+        self.sparse_prefill = config.sparse_prefill
+        self.sparse_prefill_min_context = config.sparse_prefill_min_context
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -211,7 +216,28 @@ class DeepseekV32Attention(nn.Module):
         else:
             cache = [None] * 2
 
-        topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+        # Sparse prefill supports one sequence. Batches use the masked dense path.
+        # Below the minimum context the dense path is faster.
+        sparse = (
+            self.sparse_prefill
+            and B == 1
+            and L > 1
+            and kv_latent.shape[2] >= self.sparse_prefill_min_context
+        )
+        if sparse:
+            topk_indices = blocked_topk(self.indexer, x, qr, mask, cache[1])
+        else:
+            topk_indices = self.indexer(x, qr, mask, cache=cache[1])
+
+        if sparse and topk_indices is not None:
+            if cache[0] is not None:
+                cache[0].keys = mx.depends(
+                    cache[0].keys, (cache[1].keys, cache[1].values)
+                )
+            return sparse_attention(
+                self, q_nope, q_pe, kv_latent, k_pe, topk_indices, mask, B, L
+            )
+
         if topk_indices is not None:
             topk_indices = mx.stop_gradient(topk_indices)
             if L == 1:
