@@ -645,6 +645,8 @@ class TestModels(unittest.TestCase):
         )
 
     def test_dory_sliding_window_cache(self):
+        from mlx.utils import tree_map_with_path
+
         from mlx_lm.models import dory
         from mlx_lm.models.cache import RotatingKVCache
 
@@ -664,8 +666,21 @@ class TestModels(unittest.TestCase):
         )
         # A single sliding-window attention layer: chunked prefill followed by
         # token-by-token decoding past the window must match one full pass.
-        attn = dory.DoryAttention(args, sliding=True)
+        # Seed before building the layer, and set the scale parameters as a
+        # checkpoint stores them (multiples of initializer_range): left at ones,
+        # attention is so sharp that float32 rounding can exceed the tolerance.
         mx.random.seed(0)
+        attn = dory.DoryAttention(args, sliding=True)
+        attn.update(
+            tree_map_with_path(
+                lambda p, v: (
+                    mx.full(v.shape, args.initializer_range)
+                    if p.split(".")[-1] in ("sqk", "s_gate")
+                    else v
+                ),
+                attn.parameters(),
+            )
+        )
         x = mx.random.normal((1, 40, args.hidden_size)) * 0.1
         expected = attn(x)
 
