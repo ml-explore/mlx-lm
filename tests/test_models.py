@@ -2556,6 +2556,122 @@ class TestModels(unittest.TestCase):
             self.assertEqual(w.shape, shape)
             self.assertEqual(w.reshape(-1)[0].item(), value)
 
+    def test_mistral_large4(self):
+        from mlx_lm.models import mistral_large4
+
+        text_config = {
+            "vocab_size": 1024,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "moe_intermediate_size": 64,
+            "num_hidden_layers": 8,
+            "num_attention_heads": 4,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "kv_lora_rank": 32,
+            "qk_rope_head_dim": 16,
+            "qk_nope_head_dim": 16,
+            "v_head_dim": 32,
+            "index_topk": 4,
+            "index_head_dim": 32,
+            "index_n_heads": 4,
+            "rope_parameters": {"factor": 4.0, "original_max_position_embeddings": 8},
+            "indexer_types": ["full", "full", "shared", "full"]
+            + ["shared", "full", "full", "full"],
+            # Layer 6 (RoPE) reads layer 4 and layer 7 (NoPE) reads layer 3.
+            "kv_source_layers": [0, 1, 2, 3, 4, 5, 4, 3],
+        }
+        args = mistral_large4.ModelArgs(
+            model_type="mistral_large4", text_config=text_config
+        )
+        model = mistral_large4.Model(args)
+        self.assertEqual(model.text_args.no_rope_layers, [1, 1, 1, 0, 1, 1, 1, 0])
+
+        # KV-sharing layers keep only the indexer cache, shared-indexer layers
+        # only the latent cache.
+        sizes = [len(c.caches) for c in model.make_cache()]
+        self.assertEqual(sizes, [2, 2, 1, 2, 1, 2, 1, 1])
+
+        self.model_test_runner(model, args.model_type, 1024, 8)
+
+        # Longer than index_topk, so prefill and decode use the sparse path.
+        cache = make_prompt_cache(model)
+        logits = model(mx.array([list(range(1, 11))]), cache=cache)
+        logits = model(mx.argmax(logits[0, -1:, :], keepdims=True), cache=cache)
+        self.assertEqual(logits.shape, (1, 1, 1024))
+        self.assertTrue(mx.all(mx.isfinite(logits)).item())
+
+        # Native checkpoint names, block fp8 weights and a NoPE kv_b_proj.
+        fp8 = mx.full((256, 128), 0x38, dtype=mx.uint8)  # 0x38 is 1.0 in e4m3
+        kv_b = mx.zeros((4 * (32 + 32), 32), dtype=mx.bfloat16)
+
+        def native(q_scale=0.5):
+            weights = {
+                "layers.3.attention.wq.weight": fp8[:128],
+                "layers.3.attention.wq.qscale_weight": mx.full((1, 1), q_scale),
+                "layers.3.attention.wkv_b.weight": kv_b,
+                "layers.3.attention.ssmax_scaling.s": mx.zeros((4,)),
+                "layers.3.attention.indexer.ssmax_scaling.b": mx.zeros((4,)),
+                "lerope.alpha": mx.zeros((8,)),
+                "mtp_dspark.backbone.final_norm.weight": mx.zeros((128,)),
+                "layers.8.ffn_norm.weight": mx.zeros((128,)),
+            }
+            for e in range(4):
+                weights[f"layers.1.experts.{e}.w1.weight"] = fp8[:64]
+                weights[f"layers.1.experts.{e}.w1.qscale_weight"] = mx.full((1, 1), 2.0)
+            return weights
+
+        def mxfp8(out, p):
+            w, s = out[f"{p}.weight"], out[f"{p}.scales"]
+            return mx.dequantize(w, s, group_size=32, bits=8, mode="mxfp8")
+
+        # FP8 weights need the fp8 quantization_config, and power-of-two scales.
+        with self.assertRaises(ValueError):
+            model.sanitize(native())
+        args.quantization_config = {"quant_method": "fp8"}
+        with self.assertRaises(ValueError):
+            mistral_large4.Model(args).sanitize(native(q_scale=0.3))
+
+        model = mistral_large4.Model(args)
+        out = model.sanitize(native())
+        p = "model.layers.3.self_attn"
+        q_proj = model.layers[3].self_attn.q_proj
+        self.assertIsInstance(q_proj, mistral_large4.Fp8Linear)
+        self.assertEqual(out[f"{p}.q_proj.scales"].dtype, mx.uint8)
+        self.assertTrue(mx.all(mxfp8(out, f"{p}.q_proj") == 0.5).item())
+        self.assertEqual(out[f"{p}.embed_q.weight"].shape, (4, 32, 32))
+        self.assertEqual(out[f"{p}.unembed_out.weight"].shape, (4, 32, 32))
+        self.assertIn(f"{p}.softmax_scaling.scale", out)
+        self.assertIn(f"{p}.indexer.softmax_scaling.bias", out)
+        w1 = "model.layers.1.mlp.switch_mlp.gate_proj"
+        self.assertIsInstance(
+            model.layers[1].mlp.switch_mlp.gate_proj, mistral_large4.Fp8SwitchLinear
+        )
+        self.assertEqual(out[f"{w1}.scales"].shape, (4, 64, 4))
+        self.assertTrue(mx.all(mxfp8(out, w1) == 2.0).item())
+        self.assertIn("model.rope.alpha", out)
+        self.assertEqual(len(out), 9)
+
+        # The last 128x128 block can be smaller.
+        w, s = mistral_large4._fp8_as_mxfp8(fp8[:192], mx.array([[0.5], [2.0]]))
+        w = mx.dequantize(w, s, group_size=32, bits=8, mode="mxfp8")
+        self.assertTrue(mx.all(w[:128] == 0.5).item())
+        self.assertTrue(mx.all(w[128:] == 2.0).item())
+
+        # A pipeline stage can hold some experts of a layer that it does not run.
+        partial = native()
+        del partial["layers.1.experts.3.w1.weight"]
+        del partial["layers.1.experts.3.w1.qscale_weight"]
+        self.assertNotIn(f"{w1}.weight", mistral_large4.Model(args).sanitize(partial))
+
+        # convert -q quantizes the FP8 layers again.
+        model.load_weights(list(out.items()), strict=False)
+        q = q_proj.to_quantized(group_size=64, bits=4)
+        self.assertIsInstance(q, nn.QuantizedLinear)
+        self.assertEqual((q.bits, q.mode), (4, "affine"))
+        w = mx.dequantize(q.weight, q.scales, q.biases, group_size=64, bits=4)
+        self.assertTrue(mx.all(w == 0.5).item())
+
     def test_glm_moe_dsa(self):
         from mlx_lm.models import glm_moe_dsa
 
