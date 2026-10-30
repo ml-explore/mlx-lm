@@ -26,7 +26,7 @@ jobs:
   mac_build_and_test:
     name: macOS
     if: github.repository == 'ml-explore/mlx-lm'
-    runs-on: 'macos-26-xlarge'
+    runs-on: [self-hosted, macos]
     steps:
       - uses: actions/checkout@v7
         with:
