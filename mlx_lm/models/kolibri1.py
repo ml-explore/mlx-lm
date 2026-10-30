@@ -124,7 +124,7 @@ class SparseMoeBlock(nn.Module):
         )
 
     def __call__(self, x: mx.array) -> mx.array:
-        logits = self.gate(x).astype(mx.float32)
+        logits = self.gate(x.astype(mx.float32))
         k = self.top_k
         biased = logits + self.expert_bias.astype(mx.float32)
         inds = mx.stop_gradient(mx.argpartition(-biased, kth=k - 1, axis=-1)[..., :k])
