@@ -403,13 +403,16 @@ def generate_step(
 
     sampler = sampler or greedy_sampler
 
-    def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+    def _model_call(
+        input_tokens: mx.array, input_embeddings: Optional[mx.array], prefill=False
+    ):
+        model_call = getattr(model, "prefill", model) if prefill else model
         if input_embeddings is not None:
-            return model(
+            return model_call(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings
             )
         else:
-            return model(input_tokens, cache=prompt_cache)
+            return model_call(input_tokens, cache=prompt_cache)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
         nonlocal tokens
@@ -456,6 +459,7 @@ def generate_step(
                     if input_embeddings is not None
                     else None
                 ),
+                prefill=True,
             )
             quantize_cache_fn(prompt_cache)
             mx.eval([c.state for c in prompt_cache])
