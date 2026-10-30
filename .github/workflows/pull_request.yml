@@ -47,6 +47,10 @@ jobs:
           METAL_DEBUG_ERROR_MODE: 0
           HF_HOME: .
         run: |
+          if ${{ runner.environment == 'self-hosted' }} ; then
+            export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+            export SDKROOT=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+          fi
           curl -s -o test_data.zip -L https://github.com/ml-explore/mlx-lm/releases/download/test_data/test_data.zip
           unzip -q test_data.zip
           uv run python -m unittest discover -v tests
