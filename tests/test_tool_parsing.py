@@ -909,6 +909,38 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"], {"path": "a>b"})
 
+    def test_json_tools_misordered_closing_brackets(self):
+        raw = (
+            '{"name": "gtm_upsert_entity", "arguments": {'
+            '"parameter": [{"key": "html", "type": "template", '
+            '"value": "<!-- Custom HTML beacon -->"}}]}}'
+        )
+        parsed = json_tools.parse_tool_call(raw)
+        self.assertEqual(parsed["name"], "gtm_upsert_entity")
+        self.assertEqual(
+            parsed["arguments"],
+            {
+                "parameter": [
+                    {
+                        "key": "html",
+                        "type": "template",
+                        "value": "<!-- Custom HTML beacon -->",
+                    }
+                ]
+            },
+        )
+
+        # Swapped closing brackets in the middle of an object
+        mid_swapped = '{"name": "fn", "arguments": {"arr": [{"k": 1]}, "other": 2}}'
+        self.assertEqual(
+            json_tools.parse_tool_call(mid_swapped),
+            {"name": "fn", "arguments": {"arr": [{"k": 1}], "other": 2}},
+        )
+
+        # Unparseable placeholder ellipsis must still raise
+        with self.assertRaises(ValueError):
+            json_tools.parse_tool_call('{"name": "fn", "arguments": {...}}')
+
 
 if __name__ == "__main__":
     unittest.main()
