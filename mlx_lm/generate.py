@@ -1284,12 +1284,13 @@ class PromptProcessingBatch:
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
 
-        # Finalize the cache if there was any padding
-        if max_padding > 0:
-            for c in self.prompt_cache:
-                c.finalize()
-            mx.eval([c.state for c in self.prompt_cache])
-            mx.clear_cache()
+        # Finalize the cache for every batch. With no padding the left-padding
+        # mask is all-true, so keeping it materializes a no-op mask on every
+        # decode step and blocks maskless fast paths.
+        for c in self.prompt_cache:
+            c.finalize()
+        mx.eval([c.state for c in self.prompt_cache])
+        mx.clear_cache()
 
     def generate(self, tokens: List[List[int]]):
         """
