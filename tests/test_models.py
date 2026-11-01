@@ -3034,6 +3034,149 @@ class TestModels(unittest.TestCase):
             mx.allclose(direct.astype(mx.float32), explicit.astype(mx.float32))
         )
 
+    def test_gemma4_per_layer_config_derives_global_kv_dimensions(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4_text",
+                "hidden_size": 64,
+                "num_hidden_layers": 5,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "head_dim": 16,
+                "num_key_value_heads": 1,
+                "num_kv_shared_layers": 0,
+                "hidden_size_per_layer_input": 0,
+                "sliding_window": 8,
+                "sliding_window_pattern": 5,
+                "attention_k_eq_v": False,
+                "per_layer_config": {
+                    "00": {"head_dim": 16, "num_key_value_heads": 1},
+                    "04": {"head_dim": 32, "num_key_value_heads": 2},
+                },
+            }
+        )
+        self.assertEqual(args.global_head_dim, 32)
+        self.assertEqual(args.num_global_key_value_heads, 2)
+
+        model = gemma4_text.Model(args)
+        self.assertEqual(model.model.layers[0].self_attn.head_dim, 16)
+        self.assertEqual(model.model.layers[0].self_attn.n_kv_heads, 1)
+        self.assertEqual(model.model.layers[4].self_attn.head_dim, 32)
+        self.assertEqual(model.model.layers[4].self_attn.n_kv_heads, 2)
+
+    def test_gemma4_logits_to_keep_prefill_parity_across_kv_shared_layers(self):
+        from mlx_lm.models import gemma4_text
+
+        args = gemma4_text.ModelArgs(
+            model_type="gemma4_text",
+            hidden_size=32,
+            num_hidden_layers=6,
+            intermediate_size=64,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            num_global_key_value_heads=1,
+            head_dim=16,
+            global_head_dim=16,
+            sliding_window=8,
+            sliding_window_pattern=3,
+            hidden_size_per_layer_input=8,
+            vocab_size=64,
+            vocab_size_per_layer_input=64,
+            num_kv_shared_layers=3,
+        )
+        model = gemma4_text.Model(args)
+        tokens = mx.array([[1, 5, 9, 12, 19]], dtype=mx.int32)
+
+        full_out = model(tokens)
+        keep1_out = model(tokens, logits_to_keep=1)
+        keep2_out = model(tokens, logits_to_keep=2)
+        mx.eval(full_out, keep1_out, keep2_out)
+
+        self.assertEqual(keep1_out.shape, (1, 1, 64))
+        self.assertEqual(keep2_out.shape, (1, 2, 64))
+        self.assertTrue(
+            mx.allclose(
+                full_out[:, -1:, :].astype(mx.float32),
+                keep1_out.astype(mx.float32),
+                atol=1e-5,
+            )
+        )
+        self.assertTrue(
+            mx.allclose(
+                full_out[:, -2:, :].astype(mx.float32),
+                keep2_out.astype(mx.float32),
+                atol=1e-5,
+            )
+        )
+
+    def test_gemma4_sanitize_shared_kv_v_norm_quantized_moe_and_mtp(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 64,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 32,
+                    "num_hidden_layers": 4,
+                    "intermediate_size": 64,
+                    "num_attention_heads": 2,
+                    "head_dim": 16,
+                    "global_head_dim": 16,
+                    "num_key_value_heads": 1,
+                    "num_kv_shared_layers": 2,
+                    "hidden_size_per_layer_input": 0,
+                    "enable_moe_block": True,
+                    "num_experts": 4,
+                    "top_k_experts": 2,
+                    "moe_intermediate_size": 32,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+        raw_weights = {
+            "model.mtp.proj.weight": mx.ones((32, 32)),
+            "language_model.mtp.norm.weight": mx.ones((32,)),
+            "model.language_model.model.layers.0.input_layernorm.weight": mx.ones((32,)),
+            "model.language_model.layers.3.self_attn.v_norm.weight": mx.ones((16,)),
+            "model.language_model.layers.0.experts.gate_up_proj.scales": mx.ones(
+                (4, 64, 1)
+            ),
+            "model.language_model.layers.0.experts.down_proj.scales": mx.ones(
+                (4, 32, 1)
+            ),
+        }
+        sanitized = model.sanitize(raw_weights)
+        self.assertNotIn("mtp.proj.weight", sanitized)
+        self.assertNotIn("language_model.mtp.norm.weight", sanitized)
+        self.assertNotIn(
+            "language_model.model.layers.3.self_attn.v_norm.weight", sanitized
+        )
+        self.assertIn(
+            "language_model.model.layers.0.input_layernorm.weight", sanitized
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.experts.switch_glu.gate_proj.scales"
+            ].shape,
+            (4, 32, 1),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.experts.switch_glu.up_proj.scales"
+            ].shape,
+            (4, 32, 1),
+        )
+        self.assertEqual(
+            sanitized[
+                "language_model.model.layers.0.experts.switch_glu.down_proj.scales"
+            ].shape,
+            (4, 32, 1),
+        )
+
     def test_gpt_bigcode(self):
         from mlx_lm.models import gpt_bigcode
 
