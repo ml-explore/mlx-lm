@@ -25,6 +25,7 @@ class ModelArgs(BaseModelArgs):
     attention_bias: bool = True
     mlp_bias: bool = True
     tie_word_embeddings: bool = True
+    activation_function: str = "gelu_pytorch_tanh"
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -94,9 +95,11 @@ class MLP(nn.Module):
 
         self.c_fc = nn.Linear(dim, hidden_dim, bias=mlp_bias)
         self.c_proj = nn.Linear(hidden_dim, dim, bias=mlp_bias)
+        self.activation_function = args.activation_function
 
     def __call__(self, x) -> mx.array:
-        return self.c_proj(nn.gelu(self.c_fc(x)))
+        act_fn = nn.gelu if self.activation_function == "gelu" else nn.gelu_approx
+        return self.c_proj(act_fn(self.c_fc(x)))
 
 
 class TransformerBlock(nn.Module):
