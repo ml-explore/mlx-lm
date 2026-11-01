@@ -5,11 +5,49 @@
 
 import mlx.core as mx
 
+from ..kernels import sparse_mla
+
 SPARSE_QUERY_BLOCK = 1024
+
+
+def min_context(attn, q_pe, kv_latent, k_pe):
+    # Cache length from which prefill takes the sparse path. With the fused kernel it is
+    # faster than dense attention in our measurements as soon as the cache holds more than
+    # index_topk keys (when the indexer starts selecting).
+    if (
+        attn.sparse_prefill_fused
+        and not attn.training
+        and sparse_mla.supports(q_pe[0], kv_latent[0, 0], k_pe[0, 0])
+    ):
+        return attn.sparse_prefill_fused_min_context
+    return attn.sparse_prefill_min_context
+
+
+def fused_sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L):
+    # sparse_attention in one Metal kernel that reads the selected rows by index,
+    # or None when the kernel doesn't support the inputs.
+    kv, kp = kv_latent[0, 0], k_pe[0, 0]
+    if not sparse_mla.supports(q_pe[0], kv, kp):
+        return None
+    idx = topk[0, 0].astype(mx.int32)  # [L, K]
+    if mask is not None:
+        valid = mx.take_along_axis(mask.reshape(L, -1), idx, axis=-1)
+        idx = mx.where(valid, idx, -1)  # the kernel skips -1
+    q = attn.embed_q(q_nope)[0]  # [H, L, 512]
+    out = sparse_mla.sparse_mla_attention(q, q_pe[0], kv, kp, idx, attn.scale)
+    if out is None:
+        return None
+    out = attn.unembed_out(out[None])  # [1, H, L, v_head_dim]
+    return attn.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
 
 
 def sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L):
     # Absorbed form: 576-wide keys (512 latent + 64 rope), 512-wide values. B is 1.
+    if attn.sparse_prefill_fused and not attn.training:
+        args = (attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L)
+        out = fused_sparse_attention(*args)
+        if out is not None:
+            return out
     block = SPARSE_QUERY_BLOCK
     if L > block:
         # Query blocks keep the gathered keys small, which is faster for long chunks.
