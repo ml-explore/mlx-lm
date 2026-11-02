@@ -5,10 +5,12 @@ from unittest.mock import patch
 
 import mlx.core as mx
 
+from mlx_lm.models import deepseek_v32 as D
+from mlx_lm.models import dsa
 from mlx_lm.models import glm_moe_dsa as G
 from mlx_lm.models.cache import make_prompt_cache
 
-CONFIG = {
+GLM_CONFIG = {
     "model_type": "glm_moe_dsa",
     "vocab_size": 256,
     "hidden_size": 64,
@@ -44,11 +46,24 @@ CONFIG = {
 }
 
 
-def _args():
-    return G.ModelArgs.from_dict({**CONFIG, "sparse_prefill": False})
+# DeepSeek-V3.2 with the same sizes; every layer has its own indexer.
+DSV32_CONFIG = {
+    **{
+        k: v
+        for k, v in GLM_CONFIG.items()
+        if k not in ("rope_parameters", "index_topk_pattern")
+    },
+    "model_type": "deepseek_v32",
+    "rope_theta": 10000.0,
+}
 
 
-class TestGlmSparsePrefill(unittest.TestCase):
+class _SparsePrefillTests:
+    module = config = None  # set by the model test classes below
+
+    def _args(self):
+        return self.module.ModelArgs.from_dict({**self.config, "sparse_prefill": False})
+
     def setUp(self):
         # Tiny random models: GPU fp32 matmul rounding is larger than the dense/sparse difference we check.
         self._device = mx.default_device()
@@ -65,12 +80,14 @@ class TestGlmSparsePrefill(unittest.TestCase):
         return mx.concatenate(outs, axis=1)
 
     def test_default_is_on(self):
-        layers = G.Model(G.ModelArgs.from_dict(CONFIG)).model.layers
+        layers = self.module.Model(
+            self.module.ModelArgs.from_dict(self.config)
+        ).model.layers
         self.assertTrue(all(layer.self_attn.sparse_prefill for layer in layers))
 
     def test_sparse_prefill_matches_dense(self):
         mx.random.seed(0)
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         tokens = mx.random.randint(
             0, 256, (1, 128)
@@ -87,14 +104,14 @@ class TestGlmSparsePrefill(unittest.TestCase):
     def test_blocked_topk_matches_indexer(self):
         from mlx_lm.models.base import create_causal_mask
 
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         indexer = model.model.layers[0].self_attn.indexer
         x = mx.random.normal((1, 64, 64))
         qr = mx.random.normal((1, 64, 32))
         mask = create_causal_mask(64)
         stock = indexer(x, qr, mask)
-        blocked = G._blocked_topk(indexer, x, qr, mask, None, block=16)
+        blocked = dsa.blocked_topk(indexer, x, qr, mask, None, block=16)
         # Rows with fewer than index_topk causal keys also select masked keys.
         rows = slice(indexer.index_topk - 1, None)
         self.assertTrue(
@@ -108,7 +125,7 @@ class TestGlmSparsePrefill(unittest.TestCase):
     def test_short_context_is_unchanged(self):
         # With at most index_topk keys every key is selected, so the dense path runs.
         mx.random.seed(0)
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         tokens = mx.random.randint(0, 256, (1, 16))
         dense = self._prefill(model, tokens, 16)
@@ -120,7 +137,7 @@ class TestGlmSparsePrefill(unittest.TestCase):
 
     def test_batch_uses_dense_path(self):
         mx.random.seed(0)
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         tokens = mx.random.randint(0, 256, (2, 96))
         dense = self._prefill(model, tokens, 32)
@@ -132,7 +149,7 @@ class TestGlmSparsePrefill(unittest.TestCase):
 
     def test_min_context_uses_dense_path(self):
         mx.random.seed(0)
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         tokens = mx.random.randint(0, 256, (1, 128))
         dense = self._prefill(model, tokens, 32)
@@ -144,20 +161,20 @@ class TestGlmSparsePrefill(unittest.TestCase):
 
     def test_query_blocks_match(self):
         mx.random.seed(0)
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         for layer in model.model.layers:
             layer.self_attn.sparse_prefill = True
             layer.self_attn.sparse_prefill_min_context = 0
         tokens = mx.random.randint(0, 256, (1, 128))
         whole = self._prefill(model, tokens, 64)
-        with patch.object(G, "_SPARSE_QUERY_BLOCK", 24):
+        with patch.object(dsa, "SPARSE_QUERY_BLOCK", 24):
             blocked = self._prefill(model, tokens, 64)
         self.assertTrue(bool(mx.array_equal(whole, blocked)))
 
     def test_decode_after_sparse_prefill(self):
         mx.random.seed(0)
-        model = G.Model(_args())
+        model = self.module.Model(self._args())
         mx.eval(model.parameters())
         for layer in model.model.layers:
             layer.self_attn.sparse_prefill = True
@@ -169,6 +186,14 @@ class TestGlmSparsePrefill(unittest.TestCase):
         out = model(mx.array([[5]]), cache=cache)
         mx.eval(out)
         self.assertEqual(out.shape, (1, 1, 256))
+
+
+class TestGlmSparsePrefill(_SparsePrefillTests, unittest.TestCase):
+    module, config = G, GLM_CONFIG
+
+
+class TestDeepseekV32SparsePrefill(_SparsePrefillTests, unittest.TestCase):
+    module, config = D, DSV32_CONFIG
 
 
 if __name__ == "__main__":
