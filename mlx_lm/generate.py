@@ -540,7 +540,7 @@ def speculative_generate_step(
     """
 
     y = prompt.astype(mx.uint32)
-    prev_tokens = None
+    prev_tokens = y[:-1] if logits_processors else None
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -668,7 +668,7 @@ def speculative_generate_step(
                         [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
                     )
 
-                if prev_tokens is not None:
+                if prev_tokens is not None and num_draft > 0:
                     prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
                 _rewind_cache(num_draft, n)
         finally:
