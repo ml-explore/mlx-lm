@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Response format of Muse Spark Open.
+"""Response format of Muse Spark.
 
 One turn holds several messages, each with a header:
 

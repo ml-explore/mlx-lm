@@ -114,6 +114,7 @@ class Ernie4_5_MoeMLP(nn.Module):
         )
 
         self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
+        self.e_score_correction_bias = mx.zeros((args.moe_num_experts,))
 
         self.switch_mlp = SwitchGLU(
             args.hidden_size,
@@ -142,11 +143,15 @@ class Ernie4_5_MoeMLP(nn.Module):
             raise ValueError(f"{args.moe_gate_act} is not supported.")
 
     def __call__(self, x: mx.array) -> mx.array:
-        gates = self.gate(x)
-        gates = self.gate_act(gates.astype(mx.float32))
+        # HF multiplies in fp32, so near-ties pick the same experts.
+        gates = self.gate_act(self.gate(x.astype(mx.float32)))
 
         k = self.k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
+        bias = self.e_score_correction_bias
+        # The bias only ranks the experts. The weights use the unbiased gates.
+        inds = mx.stop_gradient(
+            mx.argpartition(-(gates + bias), kth=k - 1, axis=-1)[..., :k]
+        )
         scores = mx.take_along_axis(gates, inds, axis=-1)
 
         scores = scores / mx.maximum(scores.sum(axis=-1, keepdims=True), 1e-12)
@@ -266,7 +271,6 @@ class Model(nn.Module):
             "mtp_linear_proj.",
             "mtp_hidden_norm.",
             "mtp_emb_norm.",
-            "e_score_correction_bias",
         ]
 
         weights = {
@@ -278,6 +282,15 @@ class Model(nn.Module):
         # Stack experts
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
+            # Only MoE layers have a gate, and weights may hold only some layers.
+            if f"{prefix}.mlp.gate.weight" in weights:
+                old = f"{prefix}.mlp.moe_statics.e_score_correction_bias"
+                new = f"{prefix}.mlp.e_score_correction_bias"
+                bias = weights.pop(old, weights.get(new, None))
+                if bias is None:
+                    bias = mx.zeros((self.args.moe_num_experts,))
+                # The checkpoint stores [1, E]. Converted weights already have [E].
+                weights[new] = bias.squeeze(0) if bias.ndim == 2 else bias
             for m in ["gate_proj", "down_proj", "up_proj"]:
                 if f"{prefix}.mlp.experts.0.{m}.weight" in weights:
                     to_join = [
@@ -287,3 +300,10 @@ class Model(nn.Module):
                     weights[f"{prefix}.mlp.switch_mlp.{m}.weight"] = mx.stack(to_join)
 
         return weights
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k and "mlp.gate.weight" not in k
+
+        return predicate

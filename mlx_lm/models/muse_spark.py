@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Muse Spark Open.
+"""Muse Spark.
 
 https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B-NVFP4
 """
@@ -35,15 +35,14 @@ from .switch_layers import SwitchGLU
 
 # For checkpoints without them. Stop on <|eot|>, not on <|eom|>.
 TOKENIZER_DEFAULTS = {
-    "chat_template_type": "muse_spark_open",
-    "tool_parser_type": "muse_spark_open",
+    "chat_template_type": "muse_spark",
+    "tool_parser_type": "muse_spark",
     "eos_token_ids": [200001, 200008],
 }
 
 
 @dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str
+class TextArgs(BaseModelArgs):
     hidden_size: int
     num_attention_heads: int
     num_key_value_heads: int
@@ -51,89 +50,53 @@ class ModelArgs(BaseModelArgs):
     num_hidden_layers: int
     vocab_size: int
     rms_norm_eps: float
-    rms_post_norm_eps: float
-    rope_theta: float
-    every_n_layers_nope: int
-    global_attn_cfg: list[int]
-    output_soft_cap_temp: float
-    moe: dict = field(default_factory=dict)
-    metap: dict = field(default_factory=dict)
-    use_fp32_for_output: bool = False
-    numerics_args: dict = field(default_factory=dict)
-    ffn_dim_multiplier: float = 2.0
-    # Image rows go at <|patch|>: the processor expands each <|image|> of the
-    # prompt to these. The config does not store this id.
-    patch_token_id: int = 200092
-    vision_config: dict = field(default_factory=dict)
+    post_norm_eps: float
+    rope_parameters: dict
+    # A 0 marks a layer without RoPE.
+    layer_rope_theta: list[float]
+    layer_types: list[str]
+    sliding_window: int
+    final_logit_softcapping: float
+    output_multiplier: float
+    num_local_experts: int
+    num_experts_per_tok: int
+    moe_hidden_size: int
+    moe_intermediate_size: int
+    qk_scale_factor: float = 5.4730064863875
+    routed_scaling_factor: float = 1.0
+    num_shared_experts: int = 0
+    mlp_layer_types: list[str] | None = None
 
     def __post_init__(self) -> None:
-        spec = self.numerics_args.get("out_dtype_per_module_overrides") or ""
-        parts = (e.strip().split(":") for e in spec.split(","))
-        overrides = {p[0]: p[2].lower() for p in parts if len(p) == 3}
-        self.use_fp32_for_output = (
-            self.use_fp32_for_output
-            or self.numerics_args.get("use_fp32_for_output")
-            or overrides.get("output") == "fp32"
-        )
-
-        if (
-            not self.moe.get("is_enabled", False)
-            or self.moe.get("n_dense_layers_before_moe", 0) != 0
-            or self.moe.get("interleave_moe_layer_step", 1) != 1
+        if self.num_shared_experts or any(
+            t != "sparse" for t in self.mlp_layer_types or []
         ):
             raise NotImplementedError("Dense feed-forward layers are not supported.")
-        if not self.moe.get("router_in_fp32", False):
-            raise NotImplementedError("Only the fp32 router is supported.")
+        self.rope_theta = self.rope_parameters["rope_theta"]
 
-        self.use_rope_layers, self.layer_types, self.sliding_window = layer_schedule(
-            num_hidden_layers=self.num_hidden_layers,
-            every_n_layers_nope=self.every_n_layers_nope,
-            global_attn_cfg=self.global_attn_cfg,
-        )
 
-        use_metap = bool(self.metap.get("use_metap", False))
-        if use_metap and self.metap.get("router_has_one_inf_dim", False):
-            width_mult = self.hidden_size / self.metap.get("base_width", 256)
-            mup = self.metap.get("metap_mode", "sp") == "mup"
-            self.metap_multiplier = width_mult**-1 if mup else width_mult**-0.5
-        else:
-            self.metap_multiplier = 1.0
-        self.m_emb = self.metap.get("m_emb", 1.0) if use_metap else 1.0
+@dataclass
+class ModelArgs(BaseModelArgs):
+    model_type: str
+    text_config: dict
+    vision_config: dict | None = None
+    # Image rows go at <|patch|>: the processor expands each <|patch|> of the
+    # prompt to the rows of one image.
+    image_token_id: int = 200092
+    out_hidden_size: int | None = None
+    projector_hidden_size: int | None = None
 
-        self.expert_hidden_size = self.hidden_size // self.moe.get(
-            "compression_factor", 1
-        )
-
+    def __post_init__(self) -> None:
+        self.text = TextArgs.from_dict(self.text_config)
         self.vision = None
         if self.vision_config:
-            navit = dict(self.vision_config.get("navit_config", self.vision_config))
-            if self.vision_config.get("projector_input_dim") is not None:
-                navit["projector_input_dim"] = self.vision_config["projector_input_dim"]
-            self.vision = VisionArgs.from_dict(navit)
-
-
-def layer_schedule(
-    *, num_hidden_layers: int, every_n_layers_nope: int, global_attn_cfg: list[int]
-) -> tuple[list[bool], list[str], int | None]:
-
-    offset = every_n_layers_nope - (num_hidden_layers % every_n_layers_nope)
-    use_rope = []
-    layer_types = []
-    windows = set()
-    for i in range(num_hidden_layers):
-        use_rope.append((num_hidden_layers - i - 1) % every_n_layers_nope != 0)
-        window = global_attn_cfg[(i + offset) % len(global_attn_cfg)]
-        if isinstance(window, int) and window > 0:
-            layer_types.append("sliding_attention")
-            windows.add(window)
-        else:
-            layer_types.append("full_attention")
-    if len(windows) > 1:
-        raise NotImplementedError(
-            f"global_attn_cfg mixes window sizes {sorted(windows)}; "
-            "only one window size per model is supported"
-        )
-    return use_rope, layer_types, windows.pop() if windows else None
+            self.vision = VisionArgs.from_dict(self.vision_config)
+            if self.out_hidden_size is None:
+                self.out_hidden_size = (
+                    self.vision.hidden_size * self.vision.merge_size**2
+                )
+            if self.projector_hidden_size is None:
+                self.projector_hidden_size = self.out_hidden_size
 
 
 class InputScaleRMSNorm(nn.Module):
@@ -161,7 +124,18 @@ def norm_gain(weight: mx.array) -> mx.array:
     return (1.0 + weight.astype(mx.float32)).astype(mx.bfloat16)
 
 
+def interleave_rope_rows(w: mx.array, head_dim: int) -> mx.array:
+    """Hugging Face orders the q and k rows of a head for RoPE pairs (i, i +
+    head_dim / 2). The model pairs neighbor rows (2i, 2i + 1)."""
+    shape = w.shape
+    w = w.reshape(-1, 2, head_dim // 2, *shape[1:])
+    return mx.swapaxes(w, 1, 2).reshape(shape)
+
+
 POOLED_TP_MAX_TOKENS = 8
+
+# Added to the sum of the top-k router scores.
+_ROUTER_SCORE_EPS = 1e-15
 
 
 def row_parallel_linear(
@@ -175,20 +149,17 @@ def row_parallel_linear(
 
 
 _UNUSED_QUANT_TENSORS = (
-    "feed_forward.experts.w13_input_scale",
-    "feed_forward.experts.w2_input_scale",
-    "self_attn.q_scale",
-    "self_attn.k_scale",
-    "self_attn.v_scale",
+    "mlp.experts.gate_up_proj_input_scale",
+    "mlp.experts.down_proj_input_scale",
 )
 
 # Norm weights the checkpoint stores centered at zero; sanitize stores the gain.
 _ZERO_CENTERED_NORMS = (
-    "pre_attn_norm.weight",
-    "pre_ffn_norm.weight",
-    "post_ffn_norm.weight",
-    "feed_forward.pre_expert_norm.weight",
-    "feed_forward.post_expert_norm.weight",
+    "input_layernorm.weight",
+    "pre_feedforward_layernorm.weight",
+    "post_feedforward_layernorm.weight",
+    "mlp.pre_expert_norm.weight",
+    "mlp.experts.post_expert_norm.weight",
 )
 
 _NVFP4_E2M1_MAX = 6.0
@@ -228,7 +199,7 @@ def shard_experts_inplace(
 
 
 class Attention(nn.Module):
-    def __init__(self, args: ModelArgs, *, use_rope: bool):
+    def __init__(self, args: TextArgs, *, use_rope: bool):
         super().__init__()
 
         dim = args.hidden_size
@@ -239,7 +210,7 @@ class Attention(nn.Module):
         self.scale = head_dim**-0.5
         # Queries carry a tuned constant scale of their own, on top of the
         # usual 1/sqrt(head_dim) applied inside the attention call
-        self.query_scale = 43.7840518911 / (head_dim**0.5)
+        self.query_scale = args.qk_scale_factor
         self.eps = args.rms_norm_eps
 
         self.qkvg_proj = nn.Linear(
@@ -299,35 +270,44 @@ class PreciseSwiGLU(nn.Module):
         return precise_swiglu(x, gate, x)
 
 
+class MoEGate(nn.Module):
+    """The router, (num_experts, dim) for a gemv, and its score bias."""
+
+    def __init__(self, dim: int, num_experts: int):
+        super().__init__()
+        self.weight = mx.zeros((num_experts, dim), dtype=mx.float32)
+        self.e_score_correction_bias = mx.zeros((num_experts,), dtype=mx.float32)
+
+
 class MoE(nn.Module):
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: TextArgs):
         super().__init__()
 
         dim = args.hidden_size
-        compressed = args.expert_hidden_size
-        num_experts = args.moe.get("num_experts", 0)
+        compressed = args.moe_hidden_size
+        num_experts = args.num_local_experts
 
-        self.top_k = args.moe.get("topk", 1)
-        self.route_scale = args.moe.get("route_scale", 1.0)
-        self.score_eps = args.moe.get("router_score_division_eps", 0.0)
-        self.router_multiplier = args.metap_multiplier
+        self.top_k = args.num_experts_per_tok
+        self.route_scale = args.routed_scaling_factor
+        self.score_eps = _ROUTER_SCORE_EPS
+        self.router_multiplier = args.output_multiplier
 
-        self.router = mx.zeros((num_experts, dim), dtype=mx.float32)
-        self.expert_bias = mx.zeros((num_experts,), dtype=mx.float32)
+        self.gate = MoEGate(dim, num_experts)
 
-        # The experts run at a compressed width; pooler and unpooler bracket them.
-        self.pooler = nn.Linear(dim, compressed, bias=False)
+        # The experts run at a compressed width, between the two projections.
+        self.pre_expert_proj = nn.Linear(dim, compressed, bias=False)
         self.pre_expert_norm = nn.RMSNorm(compressed, eps=args.rms_norm_eps)
-        hidden_dims = args.moe.get("override_routed_hidden_dim") or int(
-            dim * args.ffn_dim_multiplier
+        self.experts = SwitchGLU(
+            compressed,
+            args.moe_intermediate_size,
+            num_experts,
+            activation=PreciseSwiGLU(),
         )
-        self.switch_mlp = SwitchGLU(
-            compressed, hidden_dims, num_experts, activation=PreciseSwiGLU()
+        # The checkpoint stores this norm under the experts.
+        self.experts.post_expert_norm = InputScaleRMSNorm(
+            compressed, eps=args.post_norm_eps
         )
-        self.post_expert_norm = InputScaleRMSNorm(
-            compressed, eps=args.rms_post_norm_eps
-        )
-        self.unpooler = nn.Linear(compressed, dim, bias=False)
+        self.post_expert_proj = nn.Linear(compressed, dim, bias=False)
 
         self.sharding_group = None
 
@@ -335,54 +315,56 @@ class MoE(nn.Module):
         group = self.sharding_group
         if group is not None:
             x = sum_gradients(group)(x)
-        # Quantized poolers stay whole.
+        # Quantized expert projections stay whole.
         split = (
             group is not None
             and group.size() > 1
             and x.size // x.shape[-1] <= POOLED_TP_MAX_TOKENS
-            and isinstance(self.pooler, nn.Linear)
-            and isinstance(self.unpooler, nn.Linear)
+            and isinstance(self.pre_expert_proj, nn.Linear)
+            and isinstance(self.post_expert_proj, nn.Linear)
         )
 
-        logits = x.astype(mx.float32) @ self.router.T
+        logits = x.astype(mx.float32) @ self.gate.weight.T
         inds, weights = expert_routing(
             logits,
-            self.expert_bias,
+            self.gate.e_score_correction_bias,
             top_k=self.top_k,
             multiplier=self.router_multiplier,
             score_eps=self.score_eps,
             route_scale=self.route_scale,
         )
 
-        h = row_parallel_linear(self.pooler, x, group) if split else self.pooler(x)
-        h = self.switch_mlp(self.pre_expert_norm(h), inds)
+        h = (
+            row_parallel_linear(self.pre_expert_proj, x, group)
+            if split
+            else self.pre_expert_proj(x)
+        )
+        h = self.experts(self.pre_expert_norm(h), inds)
         if group is not None:
             # Sum the expert outputs before the post-expert norm.
             h = mx.distributed.all_sum(h, group=group)
-        h = post_expert_norm_combine(
-            h,
-            weights,
-            norm_weight=self.post_expert_norm.weight,
-            eps=self.post_expert_norm.eps,
-        )
+        norm = self.experts.post_expert_norm
+        h = post_expert_norm_combine(h, weights, norm_weight=norm.weight, eps=norm.eps)
         return (
-            row_parallel_linear(self.unpooler, h, group) if split else self.unpooler(h)
+            row_parallel_linear(self.post_expert_proj, h, group)
+            if split
+            else self.post_expert_proj(h)
         )
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs, *, use_rope: bool, use_sliding: bool):
+    def __init__(self, args: TextArgs, *, use_rope: bool, use_sliding: bool):
         super().__init__()
 
         dim = args.hidden_size
         self.use_sliding = use_sliding
-        self.post_norm_eps = args.rms_post_norm_eps
+        self.post_norm_eps = args.post_norm_eps
 
-        self.pre_attn_norm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
+        self.input_layernorm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
         self.self_attn = Attention(args, use_rope=use_rope)
-        self.pre_ffn_norm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
-        self.feed_forward = MoE(args)
-        self.post_ffn_norm = InputScaleRMSNorm(dim, eps=args.rms_post_norm_eps)
+        self.pre_feedforward_layernorm = nn.RMSNorm(dim, eps=args.rms_norm_eps)
+        self.mlp = MoE(args)
+        self.post_feedforward_layernorm = InputScaleRMSNorm(dim, eps=args.post_norm_eps)
         # Sanitize computes these from the fixed gates. The defaults are the
         # values for a zero gate.
         zero_gate = mx.zeros((dim,))
@@ -399,7 +381,7 @@ class TransformerBlock(nn.Module):
         next_norm: nn.Module | None = None,
     ) -> tuple[mx.array, mx.array | None]:
         if attn_input is None:
-            attn_input = self.pre_attn_norm(x).astype(mx.bfloat16)
+            attn_input = self.input_layernorm(x).astype(mx.bfloat16)
         r = self.self_attn(attn_input, mask, cache)
         h, ffn_input = norm_add_norm(
             r,
@@ -408,16 +390,16 @@ class TransformerBlock(nn.Module):
             beta=self.add_attn_beta,
             post_weight=None,
             post_eps=self.post_norm_eps,
-            next_norm=self.pre_ffn_norm,
+            next_norm=self.pre_feedforward_layernorm,
         )
-        r = self.feed_forward(ffn_input)
+        r = self.mlp(ffn_input)
         return norm_add_norm(
             r,
             h,
             alpha=self.add_ffn_alpha,
             beta=self.add_ffn_beta,
-            post_weight=self.post_ffn_norm.weight,
-            post_eps=self.post_ffn_norm.eps,
+            post_weight=self.post_feedforward_layernorm.weight,
+            post_eps=self.post_feedforward_layernorm.eps,
             next_norm=next_norm,
         )
 
@@ -539,28 +521,38 @@ def _attention_tiles(
 
 @dataclass
 class VisionArgs(BaseModelArgs):
-    vision_output_dim: int = 6144
+    hidden_size: int = 1536
+    intermediate_size: int = 8960
     num_hidden_layers: int = 50
     num_attention_heads: int = 16
-    intermediate_size: int = 8960
     num_channels: int = 3
-    image_size: int = 448
     patch_size: int = 14
     patch_temporal: int = 2
-    downsample_factor: int = 2
-    sparse_attention_factor: int = 4
+    merge_size: int = 2
+    # The position table; images can be larger or smaller.
+    pos_emb_height: int = 32
+    pos_emb_width: int = 32
+    layer_norm_eps: float = 1e-5
+    rope_parameters: dict = field(default_factory=dict)
+    # window_attention attends inside pos_emb blocks of patches.
+    layer_types: list[str] | None = None
     use_ij_pos_encoding: bool = False
-    projector_input_dim: int | None = None
 
     def __post_init__(self) -> None:
-        # The width comes from vision_output_dim, not hidden_size.
-        self.hidden_size = self.vision_output_dim // self.downsample_factor**2
+        if self.pos_emb_height != self.pos_emb_width:
+            raise NotImplementedError("Only square position tables are supported.")
         self.head_dim = self.hidden_size // self.num_attention_heads
-        # The size of the position table and of the sparse attention blocks;
-        # images can be larger or smaller.
-        self.grid_size = self.image_size // self.patch_size
-        if self.projector_input_dim is None:
-            self.projector_input_dim = self.vision_output_dim
+        self.grid_size = self.pos_emb_height
+        if self.layer_types is None:
+            # As transformers: full attention in every 4th and the last layer.
+            self.layer_types = [
+                (
+                    "full_attention"
+                    if (i + 1) % 4 == 0 or i == self.num_hidden_layers - 1
+                    else "window_attention"
+                )
+                for i in range(self.num_hidden_layers)
+            ]
 
 
 class VisionRoPE2D(nn.Module):
@@ -603,7 +595,7 @@ class VisionAttention(nn.Module):
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
         self.qkv_proj = nn.Linear(dim, 3 * dim, bias=True)
-        self.out_proj = nn.Linear(dim, dim, bias=True)
+        self.proj = nn.Linear(dim, dim, bias=True)
 
     def _attention(self, q: mx.array, k: mx.array, v: mx.array) -> mx.array:
         """q, k, v and the output: (batch, N, n_heads, head_dim)."""
@@ -634,25 +626,25 @@ class VisionAttention(nn.Module):
             groups, order = tiles
             outs = [self._attention(q[0][i], k[0][i], v[0][i]) for i in groups]
             out = mx.concatenate([o.reshape(-1, *shape[2:]) for o in outs])[order]
-        return self.out_proj(out.reshape(N, -1))
+        return self.proj(out.reshape(N, -1))
 
 
 class VisionMLP(nn.Module):
     def __init__(self, args: VisionArgs):
         super().__init__()
-        self.c_fc = nn.Linear(args.hidden_size, args.intermediate_size, bias=True)
-        self.c_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=True)
+        self.fc1 = nn.Linear(args.hidden_size, args.intermediate_size, bias=True)
+        self.fc2 = nn.Linear(args.intermediate_size, args.hidden_size, bias=True)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.c_proj(_precise_gelu(self.c_fc(x)))
+        return self.fc2(_precise_gelu(self.fc1(x)))
 
 
 class VisionBlock(nn.Module):
     def __init__(self, args: VisionArgs):
         super().__init__()
-        self.ln_1 = PreciseLayerNorm(args.hidden_size, bias=True)
+        self.norm1 = PreciseLayerNorm(args.hidden_size, eps=args.layer_norm_eps)
         self.attn = VisionAttention(args)
-        self.ln_2 = PreciseLayerNorm(args.hidden_size, bias=True)
+        self.norm2 = PreciseLayerNorm(args.hidden_size, eps=args.layer_norm_eps)
         self.mlp = VisionMLP(args)
 
     def __call__(
@@ -663,22 +655,30 @@ class VisionBlock(nn.Module):
         sin: mx.array,
         tiles: tuple[list[mx.array], mx.array] | None = None,
     ) -> mx.array:
-        x = x + self.attn(self.ln_1(x), cos=cos, sin=sin, tiles=tiles)
-        x = x + self.mlp(self.ln_2(x))
+        x = x + self.attn(self.norm1(x), cos=cos, sin=sin, tiles=tiles)
+        x = x + self.mlp(self.norm2(x))
         return x
 
 
 class VisionAdapter(nn.Module):
-    def __init__(self, args: VisionArgs):
+    def __init__(self, input_dims: int, dims: int):
         super().__init__()
-        dim = args.projector_input_dim
-        self.c_fc = nn.Linear(args.vision_output_dim, dim, bias=False)
-        self.c_proj = nn.Linear(dim, dim, bias=False)
+        self.fc1 = nn.Linear(input_dims, dims, bias=False)
+        self.fc2 = nn.Linear(dims, dims, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = _precise_gelu(self.c_fc(x))
-        x = _precise_gelu(self.c_proj(x))
+        x = _precise_gelu(self.fc1(x))
+        x = _precise_gelu(self.fc2(x))
         return x
+
+
+class VisionPatchEmbedder(nn.Module):
+    def __init__(self, args: VisionArgs):
+        super().__init__()
+        dim = args.hidden_size
+        patch_dim = args.num_channels * args.patch_size**2 * args.patch_temporal
+        self.patch_embedding = nn.Linear(patch_dim, dim, bias=False)
+        self.position_embedding_table = nn.Embedding(args.grid_size**2, dim)
 
 
 class VisionTower(nn.Module):
@@ -686,21 +686,19 @@ class VisionTower(nn.Module):
         super().__init__()
         self.args = args
         dim = args.hidden_size
-        patch_dim = args.num_channels * args.patch_size**2 * args.patch_temporal
-        self.conv1_linear = nn.Linear(patch_dim, dim, bias=False)
-        self.positional_embedding_vlm = mx.zeros((args.grid_size**2, dim))
-        self.ln_pre = PreciseLayerNorm(dim, bias=True)
-        self.rope = VisionRoPE2D(head_dim=args.head_dim)
-        self.encoder = [VisionBlock(args) for _ in range(args.num_hidden_layers)]
-        self.ln_post = PreciseLayerNorm(dim, bias=True)
-        self.adapter = VisionAdapter(args)
+        self.patch_embedder = VisionPatchEmbedder(args)
+        self.ln_pre = PreciseLayerNorm(dim, eps=args.layer_norm_eps)
+        theta = args.rope_parameters.get("rope_theta", 10000.0)
+        self.rope = VisionRoPE2D(head_dim=args.head_dim, theta=theta)
+        self.layers = [VisionBlock(args) for _ in range(args.num_hidden_layers)]
+        self.ln_post = PreciseLayerNorm(dim, eps=args.layer_norm_eps)
 
     def __call__(self, pixel_values: mx.array) -> mx.array:
         """pixel_values: (num_channels, H, W), with H and W multiples of
-        patch_size * downsample_factor."""
+        patch_size * merge_size."""
         args = self.args
         C, H, W = pixel_values.shape
-        p, t, f = args.patch_size, args.patch_temporal, args.downsample_factor
+        p, t, f = args.patch_size, args.patch_temporal, args.merge_size
         if H % (p * f) or W % (p * f):
             raise ValueError(f"Image size {H}x{W} is not a multiple of {p * f}.")
         gh, gw = H // p, W // p
@@ -710,9 +708,9 @@ class VisionTower(nn.Module):
         patches = patches.transpose(2, 4, 0, 1, 3, 5)
         patches = patches.reshape(gh * gw, t * C * p * p)
 
-        h = self.conv1_linear(patches)
+        h = self.patch_embedder.patch_embedding(patches)
         h = h + _position_embedding(
-            self.positional_embedding_vlm,
+            self.patch_embedder.position_embedding_table.weight,
             size=args.grid_size,
             grid_h=gh,
             grid_w=gw,
@@ -720,21 +718,17 @@ class VisionTower(nn.Module):
         )
         h = self.ln_pre(h)
         cos, sin = self.rope(grid_h=gh, grid_w=gw)
-        # Attention inside grid_size blocks, except in every
-        # sparse_attention_factor-th layer and the last layer.
         tiles = _attention_tiles(grid_h=gh, grid_w=gw, tile=args.grid_size)
-        n, k = len(self.encoder), args.sparse_attention_factor
-        for i, block in enumerate(self.encoder):
-            full = k <= 1 or i == n - 1 or (i + 1) % k == 0
+        for block, layer_type in zip(self.layers, args.layer_types):
+            full = layer_type == "full_attention"
             h = block(h, cos=cos, sin=sin, tiles=None if full else tiles)
         h = self.ln_post(h)
 
-        h = _pixel_shuffle_downsample(h, grid_h=gh, grid_w=gw, factor=f)
-        return self.adapter(h)
+        return _pixel_shuffle_downsample(h, grid_h=gh, grid_w=gw, factor=f)
 
 
-class MuseSparkOpenModel(PipelineMixin, nn.Module):
-    def __init__(self, args: ModelArgs):
+class MuseSparkTextModel(PipelineMixin, nn.Module):
+    def __init__(self, args: TextArgs):
         super().__init__()
         self.args = args
         self.sliding_window = args.sliding_window
@@ -742,10 +736,10 @@ class MuseSparkOpenModel(PipelineMixin, nn.Module):
         self.layers = [
             TransformerBlock(
                 args,
-                use_rope=use_rope,
+                use_rope=bool(rope_theta),
                 use_sliding=layer_type == "sliding_attention",
             )
-            for use_rope, layer_type in zip(args.use_rope_layers, args.layer_types)
+            for rope_theta, layer_type in zip(args.layer_rope_theta, args.layer_types)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
@@ -761,10 +755,7 @@ class MuseSparkOpenModel(PipelineMixin, nn.Module):
 
     def embed(self, inputs: mx.array) -> mx.array:
         """The normalized token embeddings."""
-        h = mx.fast.rms_norm(self.embed_tokens(inputs), None, self.args.rms_norm_eps)
-        if self.args.m_emb != 1.0:
-            h = h * self.args.m_emb
-        return h
+        return mx.fast.rms_norm(self.embed_tokens(inputs), None, self.args.rms_norm_eps)
 
     def __call__(
         self,
@@ -791,15 +782,15 @@ class MuseSparkOpenModel(PipelineMixin, nn.Module):
         attn_input = None
         if rank < size - 1:
             h = mx.distributed.recv_like(h, rank + 1)
-            # Equal to the fused norm of the previous stage, not to pre_attn_norm.
-            norm = layers[0].pre_attn_norm
+            # Equal to the fused norm of the previous stage, not to input_layernorm.
+            norm = layers[0].input_layernorm
             attn_input = pre_norm(h, norm, dtype=norm.weight.dtype)
 
         # Each block also makes the next block's attention input, so that the
         # norm is fused with its add.
         for i, (layer, c) in enumerate(zip(layers, cache)):
             mask = swa_mask if layer.use_sliding else fa_mask
-            nxt = layers[i + 1].pre_attn_norm if i + 1 < len(layers) else None
+            nxt = layers[i + 1].input_layernorm if i + 1 < len(layers) else None
             h, attn_input = layer(
                 h, mask=mask, cache=c, attn_input=attn_input, next_norm=nxt
             )
@@ -818,22 +809,50 @@ class MuseSparkOpenModel(PipelineMixin, nn.Module):
         return self.norm(h).astype(mx.bfloat16)
 
 
+class MuseSparkModel(nn.Module):
+    """The language model and the vision tower, named as in the checkpoint."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = MuseSparkTextModel(args.text)
+        # The vision tower is not sharded.
+        if args.vision is not None:
+            self.vision_tower = VisionTower(args.vision)
+            self.vision_adapter = VisionAdapter(
+                args.out_hidden_size, args.projector_hidden_size
+            )
+            self.vision_projection = nn.Linear(
+                args.projector_hidden_size, args.text.hidden_size, bias=False
+            )
+
+    # mlx_lm.utils pipelines model.model with these.
+    @property
+    def layers(self) -> list[TransformerBlock | None]:
+        return self.language_model.layers
+
+    @property
+    def start_idx(self) -> int:
+        return self.language_model.start_idx
+
+    @property
+    def end_idx(self) -> int | None:
+        return self.language_model.end_idx
+
+    def pipeline(self, group, split=None) -> None:
+        self.language_model.pipeline(group, split)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = MuseSparkOpenModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model = MuseSparkModel(args)
+        text = args.text
+        self.lm_head = nn.Linear(text.hidden_size, text.vocab_size, bias=False)
         self.sharding_group = None
-
-        # The vision tower is not sharded.
         if args.vision is not None:
-            self.vision_model = VisionTower(args.vision)
-            self.vision_projection = nn.Linear(
-                args.vision.projector_input_dim, args.hidden_size, bias=False
-            )
-            self.perception_emb_norm = WeightlessRMSNorm(eps=1e-5)
+            self.perception_emb_norm = WeightlessRMSNorm(eps=text.rms_norm_eps)
 
     def encode_image(self, pixel_values: mx.array | list[mx.array]) -> mx.array:
         """pixel_values: one image (num_channels, H, W), a list of images of
@@ -842,11 +861,12 @@ class Model(nn.Module):
             pixel_values = [pixel_values]
         assert len(pixel_values), "No images."
         assert all(p.ndim == 3 for p in pixel_values), "Images must be (C, H, W)."
-        dtype = self.vision_model.conv1_linear.weight.dtype
+        tower, adapter = self.model.vision_tower, self.model.vision_adapter
+        dtype = tower.patch_embedder.patch_embedding.weight.dtype
         # TODO: consider packing the images into one sequence, with attention
         # per image (MLX has no varlen attention).
-        h = mx.concatenate([self.vision_model(p.astype(dtype)) for p in pixel_values])
-        h = self.vision_projection(h)
+        h = mx.concatenate([adapter(tower(p.astype(dtype))) for p in pixel_values])
+        h = self.model.vision_projection(h)
         return self.perception_emb_norm(h)
 
     def embed_inputs(
@@ -856,14 +876,14 @@ class Model(nn.Module):
         pixel_values: mx.array | list[mx.array] | None = None,
     ) -> mx.array:
         """The normalized input embeddings, with the vision rows at the patch tokens."""
-        h = self.model.embed(inputs)
+        h = self.model.language_model.embed(inputs)
         # The vision rows take the dtype of the text embeddings.
         if pixel_values is not None:
             h = _splice_vision_embeddings(
                 h,
                 inputs,
                 vision_embeds=self.encode_image(pixel_values),
-                patch_token_id=self.args.patch_token_id,
+                patch_token_id=self.args.image_token_id,
             )
         return h
 
@@ -878,153 +898,128 @@ class Model(nn.Module):
         if pixel_values is not None:
             assert input_embeddings is None, "Pass pixel_values or input_embeddings."
             input_embeddings = self.embed_inputs(inputs, pixel_values=pixel_values)
-        out = self.model(inputs, cache=cache, input_embeddings=input_embeddings)
-        # The head weight is fp32 with use_fp32_for_output (see sanitize).
+        out = self.model.language_model(
+            inputs, cache=cache, input_embeddings=input_embeddings
+        )
         out = self.lm_head(out.astype(self.lm_head.weight.dtype))
         if self.sharding_group is not None:
             out = gather_last_axis(out, self.sharding_group)
-        out = out.astype(mx.float32) * self.args.metap_multiplier
-        cap = self.args.output_soft_cap_temp
+        out = out.astype(mx.float32) * self.args.text.output_multiplier
+        cap = self.args.text.final_logit_softcapping
         return mx.tanh(out / cap) * cap
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
-        drop_prefixes = (
-            "audio_",
-            "input_drop.",
-            # Partial copies of the vision_model.* tensors.
-            "modalities.avocado_perception.encoder.vision_model.",
-            "modalities.avocado_perception.encoder.vision_module.",
-            "modalities.vision_perception.encoder.vision_model.",
-            "modalities.vision_perception.encoder.vision_module.",
-            # Muse Spark's audio tower is not supported.
-            "modalities.soft_audio_perception.",
-        )
+        # Muse Spark's audio tower is not supported.
+        drop_prefixes = ("model.audio_tower.",)
         if self.args.vision is None:
-            drop_prefixes += ("vision_", "modalities.", "pre_vision_projection_norm")
-        renames = {
-            "self_attn.pre_qkv_proj_norm.weight": "pre_attn_norm.weight",
-        }
-        # The gates are fixed, so compute their weights once. The underscore
-        # names are from MLX checkpoints that store the gate.
+            drop_prefixes += (
+                "model.vision_tower.",
+                "model.vision_adapter.",
+                "model.vision_projection.",
+            )
+        # The gates are fixed, so compute their weights once.
         gates = {
-            "add_attn.gate": "add_attn",
-            "add_ffn.gate": "add_ffn",
-            "add_attn_gate": "add_attn",
-            "add_ffn_gate": "add_ffn",
+            "post_attention_residual_gate.gate": "add_attn",
+            "post_feedforward_residual_gate.gate": "add_ffn",
         }
-        layer_re = re.compile(r"^(model\.layers\.\d+\.)(.+)$")
-        # Weights from mlx_lm.convert already store the norm gains.
-        converted = any(k.endswith(".feed_forward.router") for k in weights)
+        layer_re = re.compile(r"^(model\.language_model\.layers\.\d+\.)(.+)$")
+        # Weights from mlx_lm.convert already store the gate weights and the
+        # norm gains.
+        converted = any(k.endswith("_alpha") for k in weights)
 
         sanitized = {}
         for k, v in weights.items():
             if k.startswith(drop_prefixes):
                 continue
-            # The projection is stored only under the modalities prefix.
-            if k in (
-                "modalities.avocado_perception.encoder.vision_projection.weight",
-                "modalities.vision_perception.encoder.vision_projection.weight",
-            ):
-                sanitized["vision_projection.weight"] = v
-                continue
-            if k.startswith("vision_"):
-                sanitized[k.replace(".encoder.layers.", ".encoder.")] = v
-                continue
-            # embed_norm and the attention post-norm are weightless here
-            if k.endswith(("embed_norm.weight", "num_tokens_per_expert")):
-                continue
-
             m = layer_re.match(k)
-            if m is None:
+            if m is None or converted:
                 sanitized[k] = v
                 continue
 
             prefix, suffix = m.groups()
-            suffix = renames.get(suffix, suffix)
-            switch_mlp = prefix + "feed_forward.switch_mlp."
+            experts = prefix + "mlp.experts."
             if suffix in gates:
                 alpha, beta = residual_gate_coefficients(v)
                 sanitized[prefix + gates[suffix] + "_alpha"] = alpha
                 sanitized[prefix + gates[suffix] + "_beta"] = beta
-            elif suffix in _ZERO_CENTERED_NORMS and not converted:
-                sanitized[prefix + suffix] = norm_gain(v)
-            elif suffix == "feed_forward.router.weight":
-                # to use gemv instead of gemv_t
-                sanitized[prefix + "feed_forward.router"] = mx.contiguous(v.T)
-            elif suffix == "feed_forward.experts.w13_weight":
+            elif suffix in _ZERO_CENTERED_NORMS:
+                sanitized[k] = norm_gain(v)
+            elif suffix == "mlp.experts.gate_up_proj":
                 gate_proj, up_proj = mx.split(v, 2, axis=1)
                 if v.dtype == mx.uint8:
                     # In mlx quantized weights are packed into uint32
                     gate_proj = gate_proj.view(mx.uint32)
                     up_proj = up_proj.view(mx.uint32)
-                sanitized[switch_mlp + "gate_proj.weight"] = gate_proj
-                sanitized[switch_mlp + "up_proj.weight"] = up_proj
-            elif suffix == "feed_forward.experts.w13_weight_scale":
+                sanitized[experts + "gate_proj.weight"] = gate_proj
+                sanitized[experts + "up_proj.weight"] = up_proj
+            elif suffix == "mlp.experts.gate_up_proj_weight_scale":
                 # One e4m3 block scale per 16 inputs
                 gate_scales, up_scales = mx.split(v, 2, axis=1)
-                sanitized[switch_mlp + "gate_proj.scales"] = gate_scales
-                sanitized[switch_mlp + "up_proj.scales"] = up_scales
-            elif suffix == "feed_forward.experts.w13_weight_scale_2":
+                sanitized[experts + "gate_proj.scales"] = gate_scales
+                sanitized[experts + "up_proj.scales"] = up_scales
+            elif suffix == "mlp.experts.gate_up_proj_weight_scale_2":
                 # Column 0 is the gate half, column 1 the up half.
                 gate_gs, up_gs = v[:, 0], v[:, 1]
-                sanitized[switch_mlp + "gate_proj.global_scale"] = (
+                sanitized[experts + "gate_proj.global_scale"] = (
                     gate_gs * _NVFP4_SCALE_2_TO_GLOBAL
                 )
-                sanitized[switch_mlp + "up_proj.global_scale"] = (
+                sanitized[experts + "up_proj.global_scale"] = (
                     up_gs * _NVFP4_SCALE_2_TO_GLOBAL
                 )
-            elif suffix == "feed_forward.experts.w2_weight":
-                sanitized[switch_mlp + "down_proj.weight"] = (
+            elif suffix == "mlp.experts.down_proj":
+                sanitized[experts + "down_proj.weight"] = (
                     v.view(mx.uint32) if v.dtype == mx.uint8 else v
                 )
-            elif suffix == "feed_forward.experts.w2_weight_scale":
-                sanitized[switch_mlp + "down_proj.scales"] = v
-            elif suffix == "feed_forward.experts.w2_weight_scale_2":
-                sanitized[switch_mlp + "down_proj.global_scale"] = (
+            elif suffix == "mlp.experts.down_proj_weight_scale":
+                sanitized[experts + "down_proj.scales"] = v
+            elif suffix == "mlp.experts.down_proj_weight_scale_2":
+                sanitized[experts + "down_proj.global_scale"] = (
                     v * _NVFP4_SCALE_2_TO_GLOBAL
                 )
             elif suffix in _UNUSED_QUANT_TENSORS:
                 # we don't quantize activations
                 continue
             else:
-                sanitized[prefix + suffix] = v
+                sanitized[k] = v
 
-        if self.args.use_fp32_for_output:
-            head = sanitized["lm_head.weight"]
-            sanitized["lm_head.weight"] = head.astype(mx.float32)
-
-        projections = ("q_proj", "k_proj", "v_proj", "o_gate_proj")
+        # The model runs q, k, v and the output gate as one matmul.
+        head_dim = self.args.text.head_dim
+        projections = ("q_proj", "k_proj", "v_proj", "gate_proj")
         for k in [k for k in sanitized if k.endswith("self_attn.q_proj.weight")]:
             attn = k[: -len("q_proj.weight")]
             for param in ("weight", "scales", "biases"):
                 keys = [f"{attn}{p}.{param}" for p in projections]
                 if all(key in sanitized for key in keys):
+                    q, k_, v, g = (sanitized.pop(key) for key in keys)
+                    q = interleave_rope_rows(q, head_dim)
+                    k_ = interleave_rope_rows(k_, head_dim)
                     sanitized[f"{attn}qkvg_proj.{param}"] = mx.concatenate(
-                        [sanitized.pop(key) for key in keys]
+                        [q, k_, v, g]
                     )
 
         vision_q = [
             k
             for k in sanitized
-            if k.startswith("vision_model.") and k.endswith(".attn.q_proj.weight")
+            if k.startswith("model.vision_tower.") and k.endswith(".attn.q_proj.weight")
         ]
         for k in vision_q:
             attn = k[: -len("q_proj.weight")]
             for param in ("weight", "bias"):
                 keys = [f"{attn}{p}_proj.{param}" for p in "qkv"]
-                sanitized[f"{attn}qkv_proj.{param}"] = mx.concatenate(
-                    [sanitized.pop(key) for key in keys]
-                )
+                q, k_, v = (sanitized.pop(key) for key in keys)
+                q = interleave_rope_rows(q, self.args.vision.head_dim)
+                k_ = interleave_rope_rows(k_, self.args.vision.head_dim)
+                sanitized[f"{attn}qkv_proj.{param}"] = mx.concatenate([q, k_, v])
         return sanitized
 
     def shard(self, group: mx.distributed.Group | None = None) -> None:
         group = group or mx.distributed.init()
         N = group.size()
-        n_kv_heads = self.args.num_key_value_heads
+        n_kv_heads = self.args.text.num_key_value_heads
         assert (
             n_kv_heads % N == 0
         ), f"group size {N} must divide num_key_value_heads {n_kv_heads}"
-        vocab = self.args.vocab_size
+        vocab = self.args.text.vocab_size
         assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
         self.lm_head = shard_linear(self.lm_head, "all-to-sharded", group=group)
         self.sharding_group = group
@@ -1042,19 +1037,19 @@ class Model(nn.Module):
             attn.n_heads //= N
             attn.n_kv_heads //= N
 
-            layer.feed_forward.sharding_group = group
-            switch_mlp = layer.feed_forward.switch_mlp
-            shard_experts_inplace(switch_mlp.gate_proj, "all-to-sharded", group)
-            shard_experts_inplace(switch_mlp.down_proj, "sharded-to-all", group)
-            shard_experts_inplace(switch_mlp.up_proj, "all-to-sharded", group)
+            layer.mlp.sharding_group = group
+            experts = layer.mlp.experts
+            shard_experts_inplace(experts.gate_proj, "all-to-sharded", group)
+            shard_experts_inplace(experts.down_proj, "sharded-to-all", group)
+            shard_experts_inplace(experts.up_proj, "all-to-sharded", group)
 
     @property
     def quant_predicate(self) -> Callable[[str, nn.Module], bool]:
         """Quantize only MoE layers except the first one and the last one."""
         experts_re = re.compile(
-            r"^model\.layers\.(\d+)\.feed_forward\.switch_mlp\.\w+$"
+            r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate|up|down)_proj$"
         )
-        full_precision = {0, self.args.num_hidden_layers - 1}
+        full_precision = {0, self.args.text.num_hidden_layers - 1}
 
         def predicate(path: str, module: nn.Module) -> bool:
             m = experts_re.match(path)
@@ -1073,12 +1068,12 @@ class Model(nn.Module):
 
     @property
     def layers(self) -> list[TransformerBlock]:
-        return self.model.pipeline_layers
+        return self.model.language_model.pipeline_layers
 
     def make_cache(self) -> list[KVCache | RotatingKVCache]:
         return [
             (
-                RotatingKVCache(max_size=self.model.sliding_window)
+                RotatingKVCache(max_size=self.model.language_model.sliding_window)
                 if layer.use_sliding
                 else KVCache()
             )

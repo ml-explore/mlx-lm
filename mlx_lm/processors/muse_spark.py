@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Image processor of Muse Spark Open."""
+"""Image processor of Muse Spark."""
 
 import itertools
 import math
@@ -10,7 +10,6 @@ from typing import ClassVar, Sequence
 import mlx.core as mx
 import numpy as np
 
-IMAGE_PLACEHOLDER = "<image>"
 IMAGE_START = "<|image_start|>"
 IMAGE_PATCH = "<|patch|>"
 IMAGE_END = "<|image_end|>"
@@ -118,19 +117,10 @@ class Processor:
         vision = config.get("vision_config")
         if not vision:
             raise ValueError("The model config has no vision_config.")
-        navit = vision.get("navit_config", vision)
-        # The patch grid from vision_config, the rest from navit_config.
+        # The other settings are in processor_config.json; the defaults match it.
         return cls(
             patch_size=vision.get("patch_size", cls.patch_size),
-            downsample_factor=vision.get("downsample_factor", cls.downsample_factor),
-            min_num_image_tokens=navit.get(
-                "min_num_image_tokens", cls.min_num_image_tokens
-            ),
-            max_num_image_tokens=navit.get(
-                "max_num_image_tokens", cls.max_num_image_tokens
-            ),
-            image_mean=tuple(navit.get("image_mean", cls.image_mean)),
-            image_std=tuple(navit.get("image_std", cls.image_std)),
+            downsample_factor=vision.get("merge_size", cls.downsample_factor),
         )
 
     @property
@@ -165,17 +155,18 @@ class Processor:
     def __call__(
         self, text: str, *, images: Sequence[np.ndarray]
     ) -> tuple[str, list[mx.array]]:
-        """Expand each "<image>" in text and preprocess the images."""
-        if text.count(IMAGE_PLACEHOLDER) != len(images):
+        """Expand each <|patch|> of the chat template to the tokens of one
+        image, and preprocess the images."""
+        parts = text.split(IMAGE_PATCH)
+        if len(parts) - 1 != len(images):
             raise ValueError(
-                f"The text has {text.count(IMAGE_PLACEHOLDER)} {IMAGE_PLACEHOLDER} "
+                f"The text has {len(parts) - 1} {IMAGE_PATCH} "
                 f"for {len(images)} images."
             )
-        if IMAGE_PATCH in text:
-            raise ValueError(f"The text already has {IMAGE_PATCH} tokens.")
         pixel_values = []
-        for image in images:
+        expanded = [parts[0]]
+        for image, part in zip(images, parts[1:], strict=True):
             pixels, num_tokens = self.preprocess_image(image)
-            text = text.replace(IMAGE_PLACEHOLDER, image_tokens(num_tokens), 1)
+            expanded += [image_tokens(num_tokens), part]
             pixel_values.append(pixels)
-        return text, pixel_values
+        return "".join(expanded), pixel_values
