@@ -1,5 +1,6 @@
 # Copyright © 2024 Apple Inc.
 
+import argparse
 import http
 import io
 import json
@@ -13,6 +14,7 @@ from unittest import mock
 import mlx.core as mx
 import requests
 
+from mlx_lm import server
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
@@ -31,10 +33,13 @@ from mlx_lm.utils import load
 
 
 class DummyModelProvider:
-    def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
+    def __init__(
+        self, with_draft=False, kv_bits=None, quantized_kv_start=0, context_length=None
+    ):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.processor = None
+        self.context_length = context_length
         self.model_key = (HF_MODEL_PATH, None)
         self.is_batchable = True
 
@@ -90,6 +95,7 @@ class DummyModelProvider:
         self.tokenizer = None
         self.draft_model = None
         self.is_batchable = False
+        self.context_length = None
 
 
 class MockCache:
@@ -267,6 +273,27 @@ class TestHandleCompletion(unittest.TestCase):
         reader = TextStateMachine({"normal": [("##", "normal")]}).reader()
         delta = reader.feed("a #") + reader.feed("# b") + reader.finish()
         self.assertEqual(delta, TextStateMachine.Delta(content="a  b"))
+
+    def _refusal_status(self, error):
+        handler = mock.MagicMock(
+            stream=False, logprobs=False, top_logprobs=0, stream_options=None
+        )
+        handler.response_generator.generate.side_effect = error
+        APIHandler.handle_completion(handler, SimpleNamespace(tools=None), [])
+        handler._set_completion_headers.assert_called_once()
+        body = handler.wfile.write.call_args.args[0]
+        return handler._set_completion_headers.call_args.args[0], json.loads(body)
+
+    def test_prompt_too_long_is_a_bad_request(self):
+        error = server.PromptTooLongError("prompt of 9 tokens exceeds context of 8")
+        status, body = self._refusal_status(error)
+        self.assertEqual(status, 400)
+        self.assertEqual(body, {"error": str(error)})
+
+    def test_other_generation_errors_stay_not_found(self):
+        status, body = self._refusal_status(RuntimeError("generation thread died"))
+        self.assertEqual(status, 404)
+        self.assertEqual(body, {"error": "generation thread died"})
 
 
 class TestToolCallFormatter(unittest.TestCase):
@@ -948,16 +975,21 @@ class TestMakeSampler(unittest.TestCase):
         self.assertEqual(token.shape, (1,))
 
 
-class TestModelSwapClearsCache(unittest.TestCase):
-    @mock.patch("mlx_lm.server.mx.clear_cache")
-    @mock.patch("mlx_lm.server.make_prompt_cache", return_value=[])
-    @mock.patch("mlx_lm.server.load")
-    @mock.patch("mlx_lm.server.mx.distributed.init")
-    def test_load_clears_mlx_buffer_pool(self, init, load, make_cache, clear_cache):
-        import argparse
+class MockedLoadTestCase(unittest.TestCase):
+    def setUp(self):
+        self.clear_cache = self.enterContext(mock.patch("mlx_lm.server.mx.clear_cache"))
+        self.enterContext(
+            mock.patch("mlx_lm.server.make_prompt_cache", return_value=[])
+        )
+        self.load = self.enterContext(mock.patch("mlx_lm.server.load"))
+        init = self.enterContext(mock.patch("mlx_lm.server.mx.distributed.init"))
+        init.return_value.size.return_value = 1
+        self.tokenizer = mock.Mock()
+        self.tokenizer.chat_template = None
+        self.tokenizer.default_chat_template = None
+        self.load.return_value = (mock.Mock(), self.tokenizer, {})
 
-        from mlx_lm.server import ModelProvider
-
+    def make_provider(self):
         args = argparse.Namespace(
             adapter_path=None,
             chat_template=None,
@@ -967,16 +999,304 @@ class TestModelSwapClearsCache(unittest.TestCase):
             trust_remote_code=False,
             use_default_chat_template=False,
         )
-        tokenizer = mock.Mock()
-        tokenizer.chat_template = None
-        tokenizer.default_chat_template = None
-        load.return_value = (mock.Mock(), tokenizer, {})
-        init.return_value.size.return_value = 1
+        return server.ModelProvider(args)
 
-        provider = ModelProvider(args)
+
+class TestModelSwapClearsCache(MockedLoadTestCase):
+    def test_load_clears_mlx_buffer_pool(self):
+        provider = self.make_provider()
         provider._load("model-a")
         provider._load("model-b")
-        self.assertGreaterEqual(clear_cache.call_count, 2)
+        self.assertGreaterEqual(self.clear_cache.call_count, 2)
+
+
+class TestDeclaredContextLength(unittest.TestCase):
+    def test_top_level_value(self):
+        self.assertEqual(
+            server._declared_context_length({"max_position_embeddings": 4096}), 4096
+        )
+
+    def test_text_config_value(self):
+        config = {"text_config": {"max_position_embeddings": 8192}}
+        self.assertEqual(server._declared_context_length(config), 8192)
+
+    def test_top_level_wins_over_text_config(self):
+        config = {
+            "max_position_embeddings": 4096,
+            "text_config": {"max_position_embeddings": 8192},
+        }
+        self.assertEqual(server._declared_context_length(config), 4096)
+
+    def test_no_usable_limit(self):
+        for config in (
+            {},
+            {"text_config": {}},
+            {"text_config": None},
+            {"max_position_embeddings": None},
+            {"max_position_embeddings": 0},
+            {"max_position_embeddings": -1},
+            {"max_position_embeddings": True},
+            {"max_position_embeddings": "4096"},
+            {"max_position_embeddings": 4096.0},
+        ):
+            with self.subTest(config=config):
+                self.assertIsNone(server._declared_context_length(config))
+
+    def test_rope_scaling_is_not_checked(self):
+        yarn = {"rope_type": "yarn", "factor": 4.0}
+        for config in (
+            {"max_position_embeddings": 2048, "rope_scaling": yarn},
+            {"max_position_embeddings": 2048, "rope_parameters": yarn},
+            {
+                "max_position_embeddings": 2048,
+                "text_config": {"rope_scaling": yarn},
+            },
+            {
+                "text_config": {
+                    "max_position_embeddings": 2048,
+                    "rope_scaling": yarn,
+                }
+            },
+        ):
+            with self.subTest(config=config):
+                self.assertIsNone(server._declared_context_length(config))
+
+    def test_legacy_type_key_is_rope_scaling(self):
+        for key in ("rope_scaling", "rope_parameters"):
+            with self.subTest(key=key):
+                config = {
+                    "max_position_embeddings": 2048,
+                    key: {"type": "linear", "factor": 2.0},
+                }
+                self.assertIsNone(server._declared_context_length(config))
+
+    def test_unknown_rope_format_is_not_checked_and_logged(self):
+        for params in ("yarn", ["yarn"], 4.0):
+            with self.subTest(params=params):
+                config = {"max_position_embeddings": 2048, "rope_scaling": params}
+                with self.assertLogs(level="WARNING") as logs:
+                    self.assertIsNone(server._declared_context_length(config))
+                self.assertEqual(len(logs.records), 1)
+                self.assertIn("rope_scaling", logs.records[0].getMessage())
+
+    def test_known_rope_formats_are_not_logged(self):
+        config = {
+            "max_position_embeddings": 2048,
+            "rope_scaling": {"rope_type": "yarn", "factor": 4.0},
+        }
+        with self.assertNoLogs(level="WARNING"):
+            self.assertIsNone(server._declared_context_length(config))
+            self.assertEqual(
+                server._declared_context_length({"max_position_embeddings": 2048}),
+                2048,
+            )
+
+    def test_unscaled_rope_is_checked(self):
+        default = {"rope_type": "default", "rope_theta": 10000.0}
+        for config in (
+            {"max_position_embeddings": 2048, "rope_scaling": None},
+            {"max_position_embeddings": 2048, "rope_scaling": default},
+            {"max_position_embeddings": 2048, "rope_parameters": default},
+            {"max_position_embeddings": 2048, "rope_parameters": {"rope_theta": 1.0}},
+            {
+                "text_config": {
+                    "max_position_embeddings": 2048,
+                    "rope_parameters": default,
+                }
+            },
+        ):
+            with self.subTest(config=config):
+                self.assertEqual(server._declared_context_length(config), 2048)
+
+    def test_rope_scaling_per_layer_type_is_not_checked(self):
+        config = {
+            "max_position_embeddings": 2048,
+            "rope_parameters": {
+                "full_attention": {"rope_type": "yarn", "factor": 4.0},
+                "sliding_attention": {"rope_type": "default"},
+            },
+        }
+        self.assertIsNone(server._declared_context_length(config))
+
+
+class TestModelProviderContextLength(MockedLoadTestCase):
+    def _provider(self, config, load=True):
+        self.load.return_value = (mock.Mock(), self.tokenizer, config)
+        provider = self.make_provider()
+        if load:
+            provider._load("model-a")
+        return provider
+
+    def test_no_limit_before_the_first_load(self):
+        self.assertIsNone(self._provider({}, load=False).context_length)
+
+    def test_load_keeps_the_declared_context_length(self):
+        provider = self._provider({"max_position_embeddings": 4096})
+        self.assertEqual(provider.context_length, 4096)
+
+    def test_load_without_a_limit_keeps_none(self):
+        provider = self._provider({})
+        self.assertIsNone(provider.context_length)
+
+    def test_reset_forgets_the_context_length(self):
+        provider = self._provider({"max_position_embeddings": 4096})
+        provider.reset()
+        self.assertIsNone(provider.context_length)
+
+    def test_the_next_load_replaces_the_context_length(self):
+        provider = self._provider({"max_position_embeddings": 4096})
+        self.load.return_value = (mock.Mock(), self.tokenizer, {})
+        provider._load("model-b")
+        self.assertIsNone(provider.context_length)
+
+
+class TestCheckPromptLength(unittest.TestCase):
+    def _generator(self, context_length):
+        return SimpleNamespace(
+            model_provider=SimpleNamespace(context_length=context_length)
+        )
+
+    def test_limit_is_inclusive(self):
+        generator = self._generator(8)
+        ResponseGenerator._check_prompt_length(generator, [0] * 7)
+        ResponseGenerator._check_prompt_length(generator, [0] * 8)
+        with self.assertRaises(server.PromptTooLongError) as raised:
+            ResponseGenerator._check_prompt_length(generator, [0] * 9)
+        self.assertIn("8", str(raised.exception))
+        self.assertIn("9", str(raised.exception))
+        self.assertIn("context", str(raised.exception))
+
+    def test_unknown_limit_is_not_checked(self):
+        generator = self._generator(None)
+        ResponseGenerator._check_prompt_length(generator, [0] * 100000)
+
+
+class TestServerPromptTooLong(unittest.TestCase):
+    CONTEXT = 64
+
+    @classmethod
+    def setUpClass(cls):
+        cls.provider = DummyModelProvider(context_length=cls.CONTEXT)
+        cls.response_generator = ResponseGenerator(cls.provider, LRUPromptCache())
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def _chat_messages(self, n_tokens):
+        tokenizer = self.provider.tokenizer
+        for words in range(1, 4 * n_tokens):
+            messages = [{"role": "user", "content": "w " * words}]
+            prompt = tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, tokenize=True
+            )
+            if len(prompt) == n_tokens:
+                return messages
+        self.fail(f"no chat prompt of {n_tokens} tokens")
+
+    def _text_prompt(self, n_tokens):
+        tokenizer = self.provider.tokenizer
+        for words in range(1, 4 * n_tokens):
+            prompt = "w " * words
+            if len(tokenizer.encode(prompt)) == n_tokens:
+                return prompt
+        self.fail(f"no text prompt of {n_tokens} tokens")
+
+    def _request(self, kind, n_tokens, stream=False, path=None, **extra):
+        if kind == "chat":
+            path = path or "/v1/chat/completions"
+            body = {"messages": self._chat_messages(n_tokens)}
+        else:
+            path = "/v1/completions"
+            body = {"prompt": self._text_prompt(n_tokens)}
+        body.update({"max_tokens": 4, "stream": stream, **extra})
+        return requests.post(
+            f"http://localhost:{self.port}{path}",
+            json=body,
+            stream=stream,
+            timeout=60,
+        )
+
+    def _assert_refused(self, response, n_tokens):
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.headers["Content-Type"], "application/json")
+        error = response.json()["error"]
+        self.assertIn(str(self.CONTEXT), error)
+        self.assertIn(str(n_tokens), error)
+        self.assertIn("context", error)
+
+    def _assert_still_serving(self):
+        response = self._request("text", 8)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("choices", response.json())
+
+    def test_chat_over_the_limit_is_refused(self):
+        n = self.CONTEXT + 1
+        self._assert_refused(self._request("chat", n), n)
+        self._assert_still_serving()
+
+    def test_chat_alias_route_over_the_limit_is_refused(self):
+        n = self.CONTEXT + 1
+        self._assert_refused(self._request("chat", n, path="/chat/completions"), n)
+        self._assert_still_serving()
+
+    def test_chat_far_over_the_limit_is_refused(self):
+        n = 10 * self.CONTEXT
+        self._assert_refused(self._request("chat", n), n)
+        self._assert_still_serving()
+
+    def test_text_stream_over_the_limit_is_refused(self):
+        n = self.CONTEXT + 1
+        response = self._request("text", n, stream=True)
+        self._assert_refused(response, n)
+        self._assert_still_serving()
+
+    def test_chat_stream_over_the_limit_is_refused(self):
+        n = self.CONTEXT + 1
+        response = self._request("chat", n, stream=True)
+        self._assert_refused(response, n)
+        self._assert_still_serving()
+
+    def test_seed_request_over_the_limit_is_refused(self):
+        n = self.CONTEXT + 1
+        response = self._request("chat", n, seed=1)
+        self._assert_refused(response, n)
+        self._assert_still_serving()
+
+    def test_prompt_of_exactly_the_limit_is_served(self):
+        for kind in ("chat", "text"):
+            with self.subTest(kind=kind):
+                response = self._request(kind, self.CONTEXT)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(
+                    response.json()["usage"]["prompt_tokens"], self.CONTEXT
+                )
+
+    def test_prompt_under_the_limit_is_served(self):
+        response = self._request("chat", self.CONTEXT - 1, seed=1)
+        self.assertEqual(response.status_code, 200)
+
+    def test_unknown_limit_serves_a_long_prompt(self):
+        with mock.patch.object(self.provider, "context_length", None):
+            for kind in ("chat", "text"):
+                with self.subTest(kind=kind):
+                    response = self._request(kind, 3 * self.CONTEXT)
+                    self.assertEqual(response.status_code, 200)
+
+    def test_max_tokens_over_the_limit_is_served(self):
+        response = self._request("chat", 40, max_tokens=self.CONTEXT + 8)
+        self.assertEqual(response.status_code, 200)
 
 
 class FailingModelProvider:
