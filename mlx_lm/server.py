@@ -407,6 +407,8 @@ class ModelProvider:
         self._draft_model_map = {}
         self._model_map["default_model"] = self.cli_args.model
         self._adapter_map["default_model"] = self.cli_args.adapter_path
+        if self.cli_args.model is not None:
+            self._adapter_map[self.cli_args.model] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
 
         # Build the tokenizer config for later use in load

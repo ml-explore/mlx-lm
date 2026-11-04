@@ -978,6 +978,29 @@ class TestModelSwapClearsCache(unittest.TestCase):
         provider._load("model-b")
         self.assertGreaterEqual(clear_cache.call_count, 2)
 
+class TestModelProviderAdapterMapping(unittest.TestCase):
+    @mock.patch("mlx_lm.server.mx.distributed.init")
+    def test_adapter_path_applies_to_configured_model_name(self, init):
+        import argparse
+
+        from mlx_lm.server import ModelProvider
+
+        args = argparse.Namespace(
+            adapter_path="adapter-a",
+            chat_template=None,
+            draft_model=None,
+            model="model-a",
+            pipeline=False,
+            trust_remote_code=False,
+        )
+        init.return_value.size.return_value = 1
+
+        provider = ModelProvider(args)
+        provider._load = mock.Mock()
+
+        provider.load("model-a")
+        provider._load.assert_called_once_with("model-a", "adapter-a", None)
+
 
 class FailingModelProvider:
     def load_default(self):
