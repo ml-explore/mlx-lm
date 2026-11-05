@@ -232,7 +232,7 @@ class TestApplyStopWords(unittest.TestCase):
 
 
 class TestHandleCompletion(unittest.TestCase):
-    def test_stream_drops_tool_calls_that_do_not_parse(self):
+    def test_stream_folds_unparsed_tool_calls_into_content(self):
         ctx = GenerationContext(
             has_tool_calling=True,
             has_thinking=False,
@@ -259,8 +259,15 @@ class TestHandleCompletion(unittest.TestCase):
         handler.generate_response.side_effect = generate_response
         with self.assertLogs(level="WARNING"):
             APIHandler.handle_completion(handler, SimpleNamespace(tools=None), [])
+        # The unparseable "{oops}" call is delivered as content, not dropped.
         self.assertEqual(
-            sent, [("Hi.", None, []), ("", None, ["f"]), ("", "tool_calls", [])]
+            sent,
+            [
+                ("Hi.", None, []),
+                ("{oops}", None, []),
+                ("", None, ["f"]),
+                ("", "tool_calls", []),
+            ],
         )
 
     def test_held_text_read_once(self):
@@ -297,6 +304,49 @@ class TestToolCallFormatter(unittest.TestCase):
         self.assertEqual(
             [(tc["function"]["name"], tc["index"]) for tc in tool_calls], [("g", 0)]
         )
+
+    def test_unparsed_tool_call_folds_into_content(self):
+        def broken_parser(tool_text, tools):
+            raise ValueError("malformed call")
+
+        formatter = ToolCallFormatter(broken_parser, tools=None)
+        raw = '<tool_call>{"name": "get_weather"</tool_call>'
+
+        self.assertEqual(formatter([raw]), [])
+        self.assertEqual(formatter.unparsed, [raw])
+
+        text, finish_reason = formatter.fold_unparsed("", "tool_calls")
+        self.assertEqual(text, raw)
+        self.assertEqual(finish_reason, "stop")
+        self.assertEqual(formatter.unparsed, [])
+
+    def test_partial_parse_keeps_valid_call_and_unparsed_text(self):
+        good = 'get_time(location="Paris")'
+
+        def selective_parser(tool_text, tools):
+            if tool_text == good:
+                return {"name": "get_time", "arguments": {"location": "Paris"}}
+            raise ValueError("malformed call")
+
+        formatter = ToolCallFormatter(selective_parser, tools=None)
+        bad = '<tool_call>{"name": '
+
+        formatted = formatter([good, bad])
+
+        self.assertEqual(formatted[0]["function"]["name"], "get_time")
+        self.assertTrue(formatter.made_valid_call)
+        self.assertEqual(formatter.unparsed, [bad])
+
+        text, finish_reason = formatter.fold_unparsed("", "tool_calls")
+        self.assertEqual(text, bad)
+        self.assertEqual(finish_reason, "tool_calls")
+
+    def test_fold_unparsed_noop_without_failures(self):
+        formatter = ToolCallFormatter(pythonic.parse_tool_call, tools=None)
+        formatter(['[get_time(location="Paris")]'])
+
+        text, finish_reason = formatter.fold_unparsed("answer", "tool_calls")
+        self.assertEqual((text, finish_reason), ("answer", "tool_calls"))
 
 
 class TestServer(unittest.TestCase):

@@ -80,6 +80,8 @@ class ToolCallFormatter:
         self._tool_parser = tool_parser
         self._tools = tools
         self._streaming = streaming
+        self.unparsed: List[str] = []
+        self.made_valid_call = False
 
     def _format(self, tc):
         tc_id = tc.pop("id", None) or str(uuid.uuid4())
@@ -107,13 +109,32 @@ class ToolCallFormatter:
                     f"Failed to parse tool call ({type(e).__name__}: {e}) — "
                     f"tool text was likely truncated mid-generation."
                 )
+                self.unparsed.append(tool_text)
                 continue
+            self.made_valid_call = True
             for out in formatted:
                 if self._streaming:
                     out["index"] = self.count
                 self.count += 1
                 result.append(out)
         return result
+
+    def fold_unparsed(self, text, finish_reason):
+        """Fold tool text the parser rejected back into the response.
+
+        Generated text must never vanish from the response, and
+        ``finish_reason`` must not report ``tool_calls`` when no call
+        actually parsed. Unparsed tool text is appended to the message
+        content so the client still sees what the model produced, and the
+        finish reason is downgraded to ``stop`` unless at least one call
+        parsed successfully.
+        """
+        if self.unparsed:
+            text = text + "".join(self.unparsed)
+            self.unparsed = []
+        if finish_reason == "tool_calls" and not self.made_valid_call:
+            finish_reason = "stop"
+        return text, finish_reason
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -1639,9 +1660,12 @@ class APIHandler(BaseHTTPRequestHandler):
 
                 if self.stream:
                     tool_calls = tool_formatter(pending.tool_calls)
-                    if pending.content or pending.reasoning or tool_calls:
+                    # Tool text the parser rejected is folded into the
+                    # content delta instead of vanishing from the stream.
+                    content, _ = tool_formatter.fold_unparsed(pending.content, None)
+                    if content or pending.reasoning or tool_calls:
                         resp = self.generate_response(
-                            pending.content,
+                            content,
                             None,
                             tool_calls=tool_calls,
                             reasoning_text=pending.reasoning,
@@ -1659,8 +1683,13 @@ class APIHandler(BaseHTTPRequestHandler):
                 finish_reason = "tool_calls"
 
             if self.stream:
+                # Tool text the parser rejected is folded back into the
+                # final content chunk instead of vanishing.
+                content, finish_reason = tool_formatter.fold_unparsed(
+                    pending.content, finish_reason
+                )
                 resp = self.generate_response(
-                    pending.content,
+                    content,
                     finish_reason,
                     tool_calls=tool_calls,
                     reasoning_text=pending.reasoning,
@@ -1681,8 +1710,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.wfile.write("data: [DONE]\n\n".encode())
                 self.wfile.flush()
             else:
+                content, finish_reason = tool_formatter.fold_unparsed(
+                    pending.content, finish_reason
+                )
                 resp = self.generate_response(
-                    pending.content,
+                    content,
                     finish_reason,
                     len(ctx.prompt),
                     len(tokens),
