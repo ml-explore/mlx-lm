@@ -1,5 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
+import math
 import os
 from functools import partial
 from typing import Optional, Tuple
@@ -602,6 +603,95 @@ def gated_delta_ops(
     return y, state
 
 
+def _tri_inv(A: mx.array) -> mx.array:
+    """Inverse of ``A = I + N`` where ``N`` is strictly lower triangular.
+
+    Newton-Schulz iteration, which is exact in ``ceil(log2(C))`` steps for a
+    unipotent matrix (the residual squares each step and ``N`` is nilpotent).
+    Pure matmuls, so unlike ``mx.linalg.inv`` it runs on the GPU and is
+    differentiable by autograd.
+    """
+    C = A.shape[-1]
+    n_iter = max(1, math.ceil(math.log2(C))) if C > 1 else 1
+    eye = mx.eye(C, dtype=A.dtype)
+    X = eye + mx.zeros_like(A)
+    for _ in range(n_iter):
+        X = X @ (2.0 * eye - A @ X)
+    return X
+
+
+##     Numerical stability requires normalized keys (the normalize_qk contract); unnormalized keys can make the chunk inverse diverge.
+def gated_delta_chunked(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    beta: mx.array,
+    state: Optional[mx.array] = None,
+    chunk_size: int = 64,
+) -> Tuple[mx.array, mx.array]:
+    """Chunk-parallel, fully-differentiable gated delta rule for training.
+
+    Mathematically equivalent to ``gated_delta_ops`` but replaces the per-token
+    Python loop with a chunkwise UT (WY) transform, so the backward pass has
+    ``T / chunk_size`` sequential steps instead of ``T``. Scalar gate and no
+    padding mask only; other cases use ``gated_delta_ops``.
+
+    Shapes:
+      - q, k: [B, T, Hk, Dk]   (normalized per ``normalize_qk``)
+      - v: [B, T, Hv, Dv]
+      - g: [B, T, Hv]          (scalar decay in (0, 1])
+      - beta: [B, T, Hv]
+      - state: [B, Hv, Dv, Dk]
+    """
+    B, T, Hk, Dk = q.shape
+    Hv, Dv = v.shape[-2:]
+    if state is None:
+        state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+    if (repeat_factor := Hv // Hk) > 1:
+        q = mx.repeat(q, repeat_factor, -2)
+        k = mx.repeat(k, repeat_factor, -2)
+
+    ys = []
+    for start in range(0, T, chunk_size):
+        end = min(start + chunk_size, T)
+        qc = q[:, start:end].swapaxes(1, 2).astype(mx.float32)  # [B, H, C, Dk]
+        kc = k[:, start:end].swapaxes(1, 2).astype(mx.float32)
+        vc = v[:, start:end].swapaxes(1, 2).astype(mx.float32)  # [B, H, C, Dv]
+        gc = g[:, start:end].swapaxes(1, 2).astype(mx.float32)  # [B, H, C]
+        bc = beta[:, start:end].swapaxes(1, 2).astype(mx.float32)
+        C = qc.shape[2]
+
+        idx = mx.arange(C)
+        strict_lower = idx[:, None] > idx[None, :]
+        incl_lower = idx[:, None] >= idx[None, :]
+
+        log_gamma = mx.cumsum(mx.log(gc), axis=-1)  # [B, H, C]
+        gamma = mx.exp(log_gamma)
+        decay_ratio = mx.exp(log_gamma[..., :, None] - log_gamma[..., None, :])
+
+        kkt = kc @ kc.swapaxes(-1, -2)
+        A = mx.eye(C) + bc[..., :, None] * mx.where(
+            strict_lower, decay_ratio * kkt, 0.0
+        )
+        A_inv = _tri_inv(A)
+
+        v_prime = vc - gamma[..., :, None] * (kc @ state.swapaxes(-1, -2))
+        u = A_inv @ (bc[..., :, None] * v_prime)  # [B, H, C, Dv]
+
+        qkt = qc @ kc.swapaxes(-1, -2)
+        p = mx.where(incl_lower, decay_ratio * qkt, 0.0)
+        yc = gamma[..., :, None] * (qc @ state.swapaxes(-1, -2)) + p @ u
+
+        gamma_to_end = mx.exp(log_gamma[..., -1:] - log_gamma)
+        w = gamma_to_end[..., :, None] * u
+        state = gamma[..., -1][..., None, None] * state + w.swapaxes(-1, -2) @ kc
+
+        ys.append(yc.swapaxes(1, 2))  # [B, C, H, Dv]
+
+    return mx.concatenate(ys, axis=1).astype(q.dtype), state
+
+
 def gated_delta_update(
     q: mx.array,
     k: mx.array,
@@ -635,6 +725,13 @@ def gated_delta_update(
         B, _, Hk, Dk = q.shape
         Hv, Dv = v.shape[-2:]
         state = mx.zeros((B, Hv, Dv, Dk), dtype=mx.float32)
+
+    # Training (use_kernel=False): the Metal kernel has no VJP, so the only
+    # differentiable fallback was the per-token gated_delta_ops loop, whose
+    # backward scales with T. Use the chunk-parallel path when it applies
+    # (scalar gate, no padding mask, more than one step).
+    if not use_kernel and mask is None and g.ndim == 3 and q.shape[1] > 1:
+        return gated_delta_chunked(q, k, v, g, beta, state)
 
     if (
         not use_kernel
