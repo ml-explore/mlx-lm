@@ -264,13 +264,15 @@ class QuantizedKVCache(_BaseCache):
         prev = self.offset
 
         if self.keys is None or (prev + num_steps) > self.keys[0].shape[-2]:
-            el_per_int = 8 * mx.uint32.size // self.bits
             new_steps = (self.step + num_steps - 1) // self.step * self.step
             shape = (B, n_kv_heads, new_steps)
 
             def init_quant(dim):
                 return (
-                    mx.zeros((*shape, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros(
+                        (*shape, dim * self.bits // (8 * mx.uint32.size)),
+                        dtype=mx.uint32,
+                    ),
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                     mx.zeros((*shape, dim // self.group_size), dtype=keys.dtype),
                 )
