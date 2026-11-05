@@ -2,6 +2,7 @@
 
 import copy
 import io
+import itertools
 import os
 import tempfile
 import unittest
@@ -442,6 +443,138 @@ class TestPromptCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
         mask = create_attention_mask(mx.zeros((1, 4)), cache=cache, return_array=True)
         self.assertEqual(mask.shape, (4, 20))
+
+    def test_rotating_cache_mask_keep(self):
+        cache = RotatingKVCache(max_size=8, keep=2)
+        mask = cache.make_mask(20)
+        self.assertEqual(mask.shape, (20, 20))
+        self.assertTrue(mx.all(mask[2:, :2]))
+        self.assertFalse(mask[19, 10].item())
+
+        kv = mx.zeros((1, 1, 20, 32))
+        cache.update_and_fetch(kv, kv)
+        mask = cache.make_mask(5)
+        self.assertEqual(mask.shape, (5, 12))
+        self.assertTrue(mx.all(mask[:, :2]))
+        self.assertTrue(mx.all(mask.sum(axis=-1) == 8))
+
+    def test_rotating_cache_keep_chunked_prefill(self):
+        model = self.model
+        prompt = mx.array(list(range(100, 164)))[None]
+
+        def last_logits(step):
+            cache = [RotatingKVCache(max_size=16, keep=4) for _ in model.layers]
+            for i in range(0, prompt.shape[1] - 1, step):
+                model(prompt[:, i : min(i + step, prompt.shape[1] - 1)], cache=cache)
+            return model(prompt[:, -1:], cache=cache)[0, -1].astype(mx.float32)
+
+        expected = last_logits(1)
+        for step in [2, 3, 8, 15, 16, 17, 32]:
+            self.assertTrue(mx.allclose(last_logits(step), expected, atol=0.1))
+
+    def test_rotating_cache_keep_smaller_window(self):
+        cache = RotatingKVCache(max_size=4, keep=1)
+        for return_array in [False, True]:
+            mask = cache.make_mask(3, window_size=2, return_array=return_array)
+            self.assertEqual(mask[-1].tolist(), [False, True, True])
+
+        kv = mx.zeros((1, 1, 1, 1))
+        for _ in range(2):
+            cache.update_and_fetch(kv, kv)
+        self.assertEqual(cache.make_mask(1, window_size=2).tolist(), mask[-1].tolist())
+
+    def test_rotating_cache_keep_explicit_window(self):
+        # A different attention window must not force retained tokens visible.
+        for keep, history, n, window, return_array in itertools.product(
+            [0, 1, 3], [0, 3, 4, 9], [2, 6], [1, 2, 3, 7], [False, True]
+        ):
+            with self.subTest(
+                keep=keep, history=history, n=n, window=window, array=return_array
+            ):
+                cache = RotatingKVCache(max_size=4, keep=keep)
+                kv = mx.zeros((1, 1, 1, 1))
+                for _ in range(history):
+                    cache.update_and_fetch(kv, kv)
+                offset = min(3, history)
+                actual = cache.make_mask(n, window, return_array)
+                if offset + n > window or return_array:
+                    expected = create_causal_mask(n, offset, window_size=window)
+                    self.assertTrue(mx.array_equal(actual, expected))
+                else:
+                    self.assertEqual(actual, "causal")
+
+    def test_rotating_cache_keep_token_visibility(self):
+        for size in [2, 4, 8]:
+            for keep, history, step, n, window, return_array in itertools.product(
+                sorted({0, 1, size - 1}),
+                [0, 1, size - 1, size, 2 * size + 3],
+                [1, size + 1],
+                [2, 3, size + 2],
+                [None, size],
+                [False, True],
+            ):
+                with self.subTest(
+                    size=size,
+                    keep=keep,
+                    history=history,
+                    step=step,
+                    n=n,
+                    window=window,
+                    array=return_array,
+                ):
+                    cache = RotatingKVCache(max_size=size, keep=keep)
+                    for start in range(0, history, step):
+                        kv = mx.arange(start, min(start + step, history)).reshape(
+                            1, 1, -1, 1
+                        )
+                        cache.update_and_fetch(kv, kv)
+                    mask = cache.make_mask(n, window, return_array)
+                    kv = mx.arange(history, history + n).reshape(1, 1, n, 1)
+                    keys, _ = cache.update_and_fetch(kv, kv)
+                    ids = keys[0, 0, :, 0].tolist()
+                    rows = None if isinstance(mask, str) else mask.tolist()
+                    for row in range(n):
+                        end = history + row + 1
+                        actual = [
+                            token
+                            for col, token in enumerate(ids)
+                            if (token < end if rows is None else rows[row][col])
+                        ]
+                        expected = list(range(min(keep, end))) + list(
+                            range(max(keep, end - (size - keep)), end)
+                        )
+                        self.assertEqual(sorted(actual), expected)
+
+    def test_rotating_cache_keep_allocation_boundary(self):
+        # Cross the 256-token allocation boundary, then alternate cache update paths.
+        for size in [255, 256, 257, 512]:
+            for keep in [0, 4, size - 1]:
+                with self.subTest(size=size, keep=keep):
+                    cache = RotatingKVCache(size, keep)
+                    retained = []
+                    start = 0
+                    for n in [1] * 258 + [7, 1, 700, 1, 3]:
+                        mask = cache.make_mask(n)
+                        kv = mx.arange(start, start + n).reshape(1, 1, n, 1)
+                        keys, _ = cache.update_and_fetch(kv, kv)
+                        ids = keys[0, 0, :, 0].tolist()
+                        rows = mask.tolist() if isinstance(mask, mx.array) else None
+                        for row in range(n):
+                            # Independent reference: evict the oldest non-prefix token.
+                            retained.append(start + row)
+                            if len(retained) > size:
+                                del retained[keep]
+                            actual = [
+                                token
+                                for col, token in enumerate(ids)
+                                if (
+                                    token <= start + row
+                                    if rows is None
+                                    else rows[row][col]
+                                )
+                            ]
+                            self.assertEqual(sorted(actual), retained)
+                        start += n
 
     def test_rotating_cache_mask(self):
         cache = RotatingKVCache(max_size=8)
