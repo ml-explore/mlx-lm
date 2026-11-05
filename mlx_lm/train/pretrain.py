@@ -14,7 +14,7 @@ from mlx.utils import tree_map, tree_reduce
 from mlx_lm.train import data, fsdp, optim, utils
 from mlx_lm.train.checkpoint import load_training_state, save_checkpoint
 from mlx_lm.train.distributed import init_distributed
-from mlx_lm.train.metrics import Losses, Metrics, Sensors, init_wandb, log_metrics
+from mlx_lm.train.metrics import Losses, Metrics, init_wandb, log_metrics
 
 
 def main(config, save_dir):
@@ -133,7 +133,6 @@ def main(config, save_dir):
         tokens_per_step=tokens_per_step,
         steps_per_report=config.steps_per_report,
     )
-    sensors = Sensors()
     losses_sum = Losses()
     batches = data.prefetch(stream)
     exhausted = False
@@ -156,15 +155,13 @@ def main(config, save_dir):
             )
 
             losses_sum = losses_sum.plus(losses)
-            mx.eval(losses_sum)
-            mx.eval(grads, params, optimizer.state)
+            mx.eval(losses_sum, grads, params, optimizer.state)
 
         if exhausted:
             break
         step_done = it + 1
         reduced = losses_sum.all_reduce(mesh.world)
         losses_sum = Losses()
-        mx.eval(reduced, grad_norm)
 
         metrics.append(
             **reduced,
@@ -175,8 +172,6 @@ def main(config, save_dir):
 
         if (it + 1) % config.steps_per_report == 0:
             report = metrics.report(it + 1)
-            if sensors is not None:
-                report += sensors.report(mesh.world)
             if mesh.is_master:
                 log_metrics(report)
 
