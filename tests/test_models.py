@@ -657,6 +657,34 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_lfm3(self):
+        from mlx_lm.models import lfm3
+
+        args = lfm3.ModelArgs(
+            model_type="lfm3",
+            vocab_size=10_000,
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            max_position_embeddings=1000,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=7,
+            layer_types=["conv", "full_attention", "conv", "sliding_attention"],
+            sliding_window=8,
+            rope_parameters={
+                "full_attention": {"rope_theta": 1e6, "partial_rotary_factor": 0.5},
+                "sliding_attention": {"rope_theta": 1e4},
+            },
+        )
+        model = lfm3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
     def test_lfm2_intermediate_size(self):
         from mlx_lm.models import lfm2
 
