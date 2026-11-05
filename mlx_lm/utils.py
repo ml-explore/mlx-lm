@@ -502,6 +502,11 @@ def load_model(
                 return False
             if f"{p}.scales" not in weights:
                 return False
+            # A pipeline stage loads only the files holding its own layers. A
+            # file shared with another stage can carry a layer's scales without
+            # its weight; the stage drops that layer, so the default is enough.
+            if f"{p}.weight" not in weights:
+                return True
             params = infer_quant_config(p, m, weights)
             if f"{p}.global_scale" in weights and _takes_global_scale(m):
                 params["global_scale"] = True
