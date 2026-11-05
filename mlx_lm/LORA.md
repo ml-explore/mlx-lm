@@ -393,6 +393,13 @@ of memory. Here are some tips to reduce memory use should you need to do so:
    `--grad-checkpoint` flag. Gradient checkpointing will be more helpful for
    larger batch sizes or sequence lengths with smaller or quantized models.
 
+6. Models with a large vocabulary need much memory for the output logits.
+   Use `--loss-chunk-size` to compute the loss for a few tokens at a time
+   (for example `--loss-chunk-size 512`). The logits are not stored for the
+   whole sequence, and the loss is the same up to rounding. It is off by
+   default, and ignored with a warning for models that scale or cap their
+   logits.
+
 For example, for a machine with 32 GB the following should run reasonably fast:
 
 ```
