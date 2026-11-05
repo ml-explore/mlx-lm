@@ -43,12 +43,14 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        logits_to_keep: Optional[int] = None,
     ):
         return self.language_model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            logits_to_keep=logits_to_keep,
         )
 
     def sanitize(self, weights):
@@ -65,6 +67,8 @@ class Model(nn.Module):
                     "embed_audio",
                     "embed_vision",
                     "vision_embedder",  # gemma4_unified encoder-free vision
+                    "mtp.",
+                    "language_model.mtp.",
                 )
             ):
                 continue
@@ -73,8 +77,10 @@ class Model(nn.Module):
                 new_weights[k] = v
                 continue
 
-            if k.startswith("language_model"):
-                k = k.replace("language_model.", "language_model.model.")
+            if k.startswith("language_model.") and not k.startswith(
+                "language_model.model."
+            ):
+                k = k.replace("language_model.", "language_model.model.", 1)
 
             new_weights[k] = v
 
