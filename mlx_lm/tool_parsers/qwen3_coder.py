@@ -12,8 +12,11 @@ from typing import Any, Optional
 import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
-_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
 _name_regex = re.compile(r"\s*([^\s<>]+)>?")
+
+_parameter_open_tag = "<parameter="
+_parameter_close_tag = "</parameter>"
+_parameter_token_regex = re.compile(r"<parameter=|</parameter>")
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
 _bool_types = {"boolean", "bool", "binary"}
@@ -91,6 +94,37 @@ def _convert_param_value(param_value: str, param_name: str, param_config: dict) 
             return param_value
 
 
+def _find_parameter_blocks(text: str):
+    # Yield each parameter block, ending at the close tag that balances its
+    # opening tag so markup inside a value is kept intact. An opening tag
+    # inside a value that never balances is treated as literal text, and
+    # the block ends at the first close tag instead.
+    pos = 0
+    while (start := text.find(_parameter_open_tag, pos)) != -1:
+        content_start = start + len(_parameter_open_tag)
+        depth = 1
+        end = -1
+        first_close = -1
+        for token in _parameter_token_regex.finditer(text, content_start):
+            if token.group() == _parameter_close_tag:
+                if first_close == -1:
+                    first_close = token.start()
+                depth -= 1
+                if depth == 0:
+                    end = token.start()
+                    break
+            else:
+                depth += 1
+        if end != -1:
+            yield text[content_start:end]
+            pos = end + len(_parameter_close_tag)
+        elif first_close != -1:
+            yield text[content_start:first_close]
+            pos = first_close + len(_parameter_close_tag)
+        else:
+            return
+
+
 def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     name_match = _name_regex.match(function_call_str)
     if name_match is None:
@@ -99,7 +133,7 @@ def _parse_xml_function_call(function_call_str: str, tools: Optional[Any]):
     param_config = _get_arguments_config(function_name, tools)
     parameters = function_call_str[name_match.end() :]
     param_dict = {}
-    for match_text in _parameter_regex.findall(parameters):
+    for match_text in _find_parameter_blocks(parameters):
         param_match = _name_regex.match(match_text)
         if param_match is None:
             continue
