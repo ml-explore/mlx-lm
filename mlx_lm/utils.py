@@ -281,16 +281,31 @@ def _download(
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        allow_patterns = allow_patterns or DEFAULT_ALLOW_PATTERNS
         model_path = Path(
             snapshot_download(
                 path_or_hf_repo,
                 revision=revision,
-                allow_patterns=allow_patterns,
+                allow_patterns=allow_patterns or DEFAULT_ALLOW_PATTERNS,
             )
         )
+        if allow_patterns is None:
+            files = _transformers_weights(model_path, load_config(model_path))
+            if files:
+                snapshot_download(
+                    path_or_hf_repo, revision=revision, allow_patterns=files
+                )
 
     return model_path
+
+
+def _transformers_weights(model_path: Path, config: dict) -> Optional[List[str]]:
+    name = config.get("transformers_weights")
+    if name is None:
+        return None
+    if not name.endswith(".json"):
+        return [name]
+    with open(model_path / name, "r") as fid:
+        return sorted(set(json.load(fid)["weight_map"].values()))
 
 
 def hf_repo_to_path(hf_repo):
@@ -446,7 +461,10 @@ def load_model(
     if model_config is not None:
         config.update(model_config)
 
-    weight_files = glob.glob(str(model_path / "model*.safetensors"))
+    if (files := _transformers_weights(model_path, config)) is not None:
+        weight_files = [str(model_path / f) for f in files if (model_path / f).exists()]
+    else:
+        weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
     if not weight_files and strict:
         raise FileNotFoundError(f"No safetensors found in {model_path}")
@@ -763,7 +781,8 @@ def sharded_load(
         start, end = model.model.start_idx, model.model.end_idx
 
         # Figure out which files we need for the local shard
-        with open(model_path / "model.safetensors.index.json", "r") as fid:
+        index = config.get("transformers_weights", "model.safetensors.index.json")
+        with open(model_path / index, "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
         # Match weights by layer number, since sanitize can rename them.
@@ -1170,6 +1189,7 @@ def save_config(
     """
     # Clean unused keys
     config.pop("_name_or_path", None)
+    config.pop("transformers_weights", None)
     if not keep_vision_config:
         config.pop("vision_config", None)
     if "quantization" in config:
