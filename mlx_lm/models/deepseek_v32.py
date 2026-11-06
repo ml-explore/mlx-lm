@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
-from .dsa import blocked_topk, sparse_attention
+from .dsa import blocked_topk, min_context, sparse_attention
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
@@ -55,6 +55,8 @@ class ModelArgs(BaseModelArgs):
     indexer_rope_interleave: bool = False
     sparse_prefill: bool = True
     sparse_prefill_min_context: int = 16384
+    sparse_prefill_fused: bool = True  # sparse prefill attention in one Metal kernel
+    sparse_prefill_fused_min_context: int = 0  # with the kernel, sparse from here
 
 
 class Indexer(nn.Module):
@@ -179,6 +181,8 @@ class DeepseekV32Attention(nn.Module):
         self.indexer = Indexer(config)
         self.sparse_prefill = config.sparse_prefill
         self.sparse_prefill_min_context = config.sparse_prefill_min_context
+        self.sparse_prefill_fused = config.sparse_prefill_fused
+        self.sparse_prefill_fused_min_context = config.sparse_prefill_fused_min_context
         self.rope = initialize_rope(
             dims=self.qk_rope_head_dim,
             base=self.rope_theta,
@@ -217,12 +221,12 @@ class DeepseekV32Attention(nn.Module):
             cache = [None] * 2
 
         # Sparse prefill supports one sequence. Batches use the masked dense path.
-        # Below the minimum context the dense path is faster.
+        # Below the minimum context the dense path is faster (see dsa.min_context).
         sparse = (
             self.sparse_prefill
             and B == 1
             and L > 1
-            and kv_latent.shape[2] >= self.sparse_prefill_min_context
+            and kv_latent.shape[2] >= min_context(self, q_pe, kv_latent, k_pe)
         )
         if sparse:
             topk_indices = blocked_topk(self.indexer, x, qr, mask, cache[1])
