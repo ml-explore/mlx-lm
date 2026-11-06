@@ -788,6 +788,44 @@ class TestToolParsing(unittest.TestCase):
         with self.assertRaises(ValueError):
             muse_spark.parse_tool_call("no call here", None)
 
+    def test_qwen3_coder_large_integer(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "record_id": {"type": "integer"},
+                        },
+                    },
+                },
+            }
+        ]
+
+        for value, expected in (
+            # First integer that is not exactly representable by an IEEE-754 float.
+            ("9007199254740993", 9007199254740993),
+            ("140.0", 140),
+        ):
+            with self.subTest(value=value):
+                text = (
+                    "<function=lookup>"
+                    f"<parameter=record_id>{value}</parameter>"
+                    "</function>"
+                )
+
+                tool_call = qwen3_coder.parse_tool_call(text, tools)
+
+                self.assertEqual(
+                    tool_call,
+                    {
+                        "name": "lookup",
+                        "arguments": {"record_id": expected},
+                    },
+                )
+
     def test_qwen3_coder_iso_date(self):
         """Qwen3 coder parser should not crash on ISO 8601 dates."""
         tools = [
