@@ -240,8 +240,9 @@ class JambaSparseMoeBlock(nn.Module):
         gates = self.router(x)
         k = self.num_experts_per_tok
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = mx.softmax(scores, axis=-1, precise=True)
+        # Softmax over all experts. The top-k weights are not renormalized.
+        probs = mx.softmax(gates.astype(mx.float32), axis=-1)
+        scores = mx.take_along_axis(probs, inds, axis=-1).astype(x.dtype)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         return y
