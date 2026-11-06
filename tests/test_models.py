@@ -2033,6 +2033,51 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_minicpm_rope_theta_default(self):
+        from mlx_lm.models import minicpm
+
+        # Configs that omit rope_theta use the reference default of 1e4.
+        config = {
+            "model_type": "minicpm",
+            "hidden_size": 64,
+            "dim_model_base": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 1000,
+            "num_key_value_heads": 2,
+            "scale_depth": 1.0,
+            "scale_emb": 1.0,
+        }
+        args = minicpm.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 10000.0)
+
+    def test_minicpm3_rope_theta_default(self):
+        from mlx_lm.models import minicpm3
+
+        # Configs that omit rope_theta use the reference default of 1e4.
+        config = {
+            "model_type": "minicpm3",
+            "hidden_size": 64,
+            "dim_model_base": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 1000,
+            "num_key_value_heads": 2,
+            "q_lora_rank": 32,
+            "qk_nope_head_dim": 16,
+            "qk_rope_head_dim": 16,
+            "kv_lora_rank": 32,
+            "scale_depth": 1.0,
+            "scale_emb": 1.0,
+            "max_position_embeddings": 4096,
+        }
+        args = minicpm3.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 10000.0)
+
     def test_minicpm3(self):
         from mlx_lm.models import minicpm3
 
