@@ -3142,6 +3142,58 @@ class TestModels(unittest.TestCase):
         dummy = out[..., model._dummy_tokenizer_ids]
         self.assertTrue(mx.all(dummy == -float("inf")).item())
 
+        self.left_padding_test_runner(model)
+
+    def test_phi3small_left_padding_batch(self):
+        from mlx_lm.models import phi3small
+
+        args = phi3small.ModelArgs(
+            model_type="phi3small",
+            hidden_size=128,
+            dense_attention_every_n_layers=2,
+            ff_intermediate_size=256,
+            gegelu_limit=1.0,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            layer_norm_epsilon=1e-4,
+            vocab_size=100352,
+        )
+        model = phi3small.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+        prompts = [[5, 6, 7], [11, 12, 13, 14, 15, 16], [21, 22, 23, 24]]
+        pads = [3, 0, 2]
+        batch_cache = [BatchKVCache(left_padding=pads) for _ in model.layers]
+        batch = mx.array([[0] * pad + p for pad, p in zip(pads, prompts)])
+        batched = model(batch, cache=batch_cache)[:, -1]
+        for i, p in enumerate(prompts):
+            single = model(mx.array([p]), cache=make_prompt_cache(model))[0, -1]
+            finite = mx.isfinite(single)
+            diff = mx.where(finite, single - batched[i], 0)
+            self.assertTrue(mx.all(mx.abs(diff) < 1e-4).item())
+
+    def test_phi3small_causal_prefill(self):
+        from mlx_lm.models import phi3small
+
+        args = phi3small.ModelArgs(
+            model_type="phi3small",
+            hidden_size=128,
+            dense_attention_every_n_layers=2,
+            ff_intermediate_size=256,
+            gegelu_limit=1.0,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            layer_norm_epsilon=1e-4,
+            vocab_size=100352,
+        )
+        model = phi3small.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+        prompt = list(range(1, 11))
+        out = model(mx.array([prompt]))
+        changed = model(mx.array([prompt[:-1] + [99]]))
+        self.assertTrue(mx.array_equal(out[:, :-1], changed[:, :-1]).item())
+
     def test_phimoe(self):
         from mlx_lm.models import phimoe
 
