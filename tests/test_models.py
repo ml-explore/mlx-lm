@@ -2033,6 +2033,30 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_minicpm_config(self):
+        from mlx_lm.models import minicpm
+
+        config = {
+            "model_type": "minicpm",
+            "hidden_size": 64,
+            "dim_model_base": 64,
+            "num_hidden_layers": 1,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 128,
+            "scale_depth": 1.0,
+            "scale_emb": 1.0,
+        }
+
+        args = minicpm.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 10000.0)
+
+        config["rope_theta"] = 1000000.0
+        args = minicpm.ModelArgs.from_dict(config)
+        self.assertEqual(args.rope_theta, 1000000.0)
+
     def test_minicpm3(self):
         from mlx_lm.models import minicpm3
 
