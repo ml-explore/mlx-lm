@@ -5627,6 +5627,33 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
 
 
+
+    def test_glm_partial_rotary_factor(self):
+        # HF rotates head_dim * partial_rotary_factor dims (BC default 0.5);
+        # rotating the full head_dim misplaces every position.
+        from mlx_lm.models import glm
+
+        def make(**over):
+            return glm.Model(
+                glm.ModelArgs(
+                    model_type="glm",
+                    hidden_size=64,
+                    num_hidden_layers=2,
+                    intermediate_size=128,
+                    num_attention_heads=4,
+                    rms_norm_eps=1e-5,
+                    vocab_size=128,
+                    head_dim=16,
+                    num_key_value_heads=2,
+                    **over,
+                )
+            )
+
+        self.assertEqual(make().layers[0].self_attn.rope.dims, 8)
+        self.assertEqual(
+            make(partial_rotary_factor=0.25).layers[0].self_attn.rope.dims, 4
+        )
+
 class TestVLSanitize(unittest.TestCase):
     # Newer layout
     HF_WEIGHTS = {
