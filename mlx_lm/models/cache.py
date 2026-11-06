@@ -1678,11 +1678,14 @@ class LRUPromptCache:
         prompt_cache: List[Any],
         *,
         cache_type: str = "assistant",
+        nbytes: Optional[int] = None,
     ):
+        # The caller can give the size, e.g. the same one on all ranks.
+        if nbytes is None:
+            nbytes = sum(c.nbytes for c in prompt_cache)
+
         # Make the cache entry
-        entry = LRUPromptCache.CacheEntry(
-            prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type
-        )
+        entry = LRUPromptCache.CacheEntry(prompt_cache, nbytes, cache_type)
 
         # Insert into the trie and update the byte counter and lru position
         self._n_bytes += entry.nbytes
