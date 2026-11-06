@@ -1124,6 +1124,140 @@ class TestModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             qwen3.ModelArgs.from_dict(config)
 
+    def test_rope_parameters_from_transformers_v5(self):
+        # transformers >= 5 saves rope_theta, rope_scaling and
+        # partial_rotary_factor under rope_parameters, nested by layer type
+        # when sliding and full attention layers use different RoPE. Both
+        # layouts of the same config must build the same model.
+        from mlx_lm.models import exaone4, gemma3_text, granite, llama, phi3
+
+        base = {
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 128,
+        }
+        granite_config = {
+            **base,
+            "model_type": "granite",
+            "num_key_value_heads": 2,
+            "logits_scaling": 1.0,
+            "attention_multiplier": 1.0,
+            "embedding_multiplier": 1.0,
+            "residual_multiplier": 1.0,
+            "max_position_embeddings": 128,
+            "attention_bias": False,
+            "mlp_bias": False,
+        }
+        exaone4_config = {
+            **base,
+            "model_type": "exaone4",
+            "num_key_value_heads": 2,
+            "max_position_embeddings": 128,
+            "head_dim": 16,
+            "tie_word_embeddings": False,
+            "sliding_window": None,
+            "sliding_window_pattern": None,
+        }
+        gemma3_config = {
+            **base,
+            "model_type": "gemma3_text",
+            "head_dim": 16,
+            "num_key_value_heads": 1,
+            "sliding_window": 8,
+            "sliding_window_pattern": 2,
+        }
+        llama3 = {
+            "factor": 8.0,
+            "low_freq_factor": 1.0,
+            "high_freq_factor": 4.0,
+            "original_max_position_embeddings": 32,
+        }
+        longrope = {
+            "short_factor": [1.0, 1.1, 1.2, 1.3],
+            "long_factor": [2.0, 2.5, 3.0, 4.0],
+        }
+        cases = (
+            (
+                llama,
+                {**base, "model_type": "llama"},
+                {"rope_theta": 500000.0},
+                {"rope_type": "default", "rope_theta": 500000.0},
+            ),
+            (
+                llama,
+                {**base, "model_type": "llama"},
+                {
+                    "rope_theta": 500000.0,
+                    "rope_scaling": {"rope_type": "llama3", **llama3},
+                },
+                {"rope_type": "llama3", "rope_theta": 500000.0, **llama3},
+            ),
+            (
+                granite,
+                granite_config,
+                {"rope_theta": 300000.0},
+                {"rope_type": "default", "rope_theta": 300000.0},
+            ),
+            (
+                exaone4,
+                exaone4_config,
+                {"rope_theta": 1000000.0, "rope_scaling": None},
+                {"rope_type": "default", "rope_theta": 1000000.0},
+            ),
+            (
+                phi3,
+                {**base, "model_type": "phi3"},
+                {
+                    "rope_theta": 250000.0,
+                    "partial_rotary_factor": 0.5,
+                    "original_max_position_embeddings": 32,
+                    "rope_scaling": {"type": "longrope", **longrope},
+                },
+                {
+                    "rope_type": "longrope",
+                    "rope_theta": 250000.0,
+                    "partial_rotary_factor": 0.5,
+                    "original_max_position_embeddings": 32,
+                    **longrope,
+                },
+            ),
+            (
+                gemma3_text,
+                gemma3_config,
+                {
+                    "rope_theta": 500000.0,
+                    "rope_local_base_freq": 20000.0,
+                    "rope_scaling": {"rope_type": "linear", "factor": 8.0},
+                },
+                {
+                    "full_attention": {
+                        "rope_type": "linear",
+                        "factor": 8.0,
+                        "rope_theta": 500000.0,
+                    },
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 20000.0,
+                    },
+                },
+            ),
+        )
+        inputs = mx.arange(48)[None]
+        for module, config, flat, rope_parameters in cases:
+            expected = module.Model(module.ModelArgs.from_dict({**config, **flat}))
+            args = module.ModelArgs.from_dict(
+                {**config, "rope_parameters": rope_parameters}
+            )
+            self.assertEqual(args.rope_theta, flat["rope_theta"])
+            model = module.Model(args)
+            model.update(expected.parameters())
+            self.assertTrue(
+                mx.array_equal(model(inputs), expected(inputs)), config["model_type"]
+            )
+
     def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
         text_config = {
             "hidden_size": 8,
