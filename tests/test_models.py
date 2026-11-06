@@ -14,6 +14,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     KVCache,
     RotatingKVCache,
@@ -656,6 +657,86 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_lfm3(self):
+        from mlx_lm.models import lfm3
+
+        args = lfm3.ModelArgs(
+            model_type="lfm3",
+            vocab_size=10_000,
+            hidden_size=256,
+            intermediate_size=512,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+            max_position_embeddings=1000,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=7,
+            layer_types=["conv", "full_attention", "conv", "sliding_attention"],
+            sliding_window=8,
+            rope_parameters={
+                "full_attention": {"rope_theta": 1e6, "partial_rotary_factor": 0.5},
+                "sliding_attention": {"rope_theta": 1e4},
+            },
+        )
+        model = lfm3.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_lfm3_cache_matches_full_forward(self):
+        from mlx_lm.models import lfm3
+
+        mx.random.seed(0)
+        args = lfm3.ModelArgs(
+            model_type="lfm3",
+            vocab_size=128,
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=6,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            max_position_embeddings=1000,
+            norm_eps=1e-5,
+            conv_bias=False,
+            conv_L_cache=7,
+            layer_types=[
+                "conv",
+                "full_attention",
+                "conv",
+                "sliding_attention",
+                "conv",
+                "sliding_attention",
+            ],
+            sliding_window=8,
+            rope_parameters={
+                "full_attention": {"rope_theta": 1e6, "partial_rotary_factor": 0.5},
+                "sliding_attention": {"rope_theta": 1e4},
+            },
+        )
+        model = lfm3.Model(args)
+        caches = model.make_cache()
+        self.assertIsInstance(caches[0], ArraysCache)
+        self.assertIsInstance(caches[1], KVCache)
+        self.assertIsInstance(caches[3], RotatingKVCache)
+        self.assertEqual(caches[3].max_size, args.sliding_window)
+
+        tokens = mx.random.randint(0, args.vocab_size, (1, 3 * args.sliding_window))
+        full = model(tokens)
+
+        # Prefill shorter than, equal to and longer than the window, then decode
+        # one token at a time past it
+        for prefill in [1, args.sliding_window, args.sliding_window + 4]:
+            with self.subTest(prefill=prefill):
+                cache = model.make_cache()
+                steps = [model(tokens[:, :prefill], cache=cache)]
+                for i in range(prefill, tokens.shape[1]):
+                    steps.append(model(tokens[:, i : i + 1], cache=cache))
+                cached = mx.concatenate(steps, axis=1)
+                self.assertTrue(mx.allclose(full, cached, atol=1e-4))
 
     def test_lfm2_intermediate_size(self):
         from mlx_lm.models import lfm2
