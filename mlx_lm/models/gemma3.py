@@ -41,9 +41,13 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            image_groups=image_groups,
         )
 
     def sanitize(self, weights):

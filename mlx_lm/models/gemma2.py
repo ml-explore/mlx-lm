@@ -80,6 +80,12 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
 
+        if getattr(cache, "group", None) is not None:
+            output = cache.attend(
+                queries, keys, values, self.scale, softcap=self.attn_logit_softcapping
+            )
+            return self.o_proj(output.transpose(0, 2, 1, 3).reshape(B, L, -1))
+
         queries = queries * self.scale
 
         if self.repeats > 1:
