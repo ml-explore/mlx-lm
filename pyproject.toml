@@ -38,7 +38,8 @@ Repository = "https://github.com/ml-explore/mlx-lm"
 Issues = "https://github.com/ml-explore/mlx-lm/issues"
 
 [project.optional-dependencies]
-test = ["datasets", "lm-eval", "Pillow"]
+server = ["fastapi", "pydantic>=2", "uvicorn"]
+test = ["mlx-lm[server]", "datasets", "lm-eval", "Pillow", "httpx", "jsonschema", "openai"]
 train = ["datasets", "tqdm"]
 evaluate = ["lm-eval", "tqdm"]
 vision = ["Pillow"]
@@ -61,6 +62,7 @@ mlx_lm = "mlx_lm.cli:main"
 "mlx_lm.generate" = "mlx_lm.generate:main"
 "mlx_lm.lora" = "mlx_lm.lora:main"
 "mlx_lm.perplexity" = "mlx_lm.perplexity:main"
+"mlx_lm.server_v2" = "mlx_lm.server_v2.cli:main"
 "mlx_lm.server" = "mlx_lm.server:main"
 "mlx_lm.share" = "mlx_lm.share:main"
 "mlx_lm.manage" = "mlx_lm.manage:main"
