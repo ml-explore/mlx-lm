@@ -12,7 +12,9 @@ from typing import Any, Optional
 import regex as re
 
 _function_regex = re.compile(r"<function=(.*?)</function>$", re.DOTALL)
-_parameter_regex = re.compile(r"<parameter=(.*?)</parameter>", re.DOTALL)
+_parameter_regex = re.compile(
+    r"<parameter=((?:(?!<parameter=|</parameter>).|(?R))*)</parameter>", re.DOTALL
+)
 _name_regex = re.compile(r"\s*([^\s<>]+)>?")
 
 _string_types = {"string", "str", "text", "varchar", "char", "enum"}
