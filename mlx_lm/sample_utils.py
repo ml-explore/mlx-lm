@@ -262,7 +262,7 @@ def apply_xtc(
         mask[..., xtc_special_tokens] = False
 
     return mx.where(
-        mx.random.uniform(0, 1) > xtc_probability,
+        mx.random.uniform(shape=logits.shape[:-1] + (1,)) > xtc_probability,
         logits,
         mx.where(mask, -mx.inf, logits),
     )

@@ -6,6 +6,7 @@ from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
+from mlx_lm.chat_templates import deepseek_v32
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
@@ -207,6 +208,24 @@ class TestTokenizers(unittest.TestCase):
         prompt = [HI, THINK_START, THINK_END, THINK_START]
         self.assertEqual(find(prompt, [THINK_START], start=0), 1)
         self.assertEqual(find(prompt, [THINK_START], start=0, reverse=True), 3)
+
+    def test_deepseek_v32_dict_arguments(self):
+        call = {"name": "f", "arguments": {"a": 1}}
+        expected = deepseek_v32.encode_arguments_to_dsml(
+            {**call, "arguments": '{"a": 1}'}
+        )
+        self.assertEqual(deepseek_v32.encode_arguments_to_dsml(call), expected)
+
+    def test_deepseek_v32_unused_kwargs(self):
+        messages = [{"role": "user", "content": "Hi"}]
+        expected = deepseek_v32.apply_chat_template(
+            messages, add_generation_prompt=True
+        )
+        # E.g. reasoning_effort, which other templates read.
+        out = deepseek_v32.apply_chat_template(
+            messages, add_generation_prompt=True, reasoning_effort="low"
+        )
+        self.assertEqual(out, expected)
 
 
 if __name__ == "__main__":
