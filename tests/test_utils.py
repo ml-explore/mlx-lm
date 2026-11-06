@@ -196,6 +196,60 @@ class TestUtils(unittest.TestCase):
         self.assertIs(model_cls, bailing_moe_v3.Model)
         self.assertIs(args_cls, bailing_moe_v3.ModelArgs)
 
+    def test_load_model_text_only_qwen3_5(self):
+        # Qwen3_5ForCausalLM and Qwen3_5MoeForCausalLM checkpoints from
+        # transformers have a flat config, a *_text model type and weight
+        # names without the language_model prefix.
+        from mlx_lm.models import qwen3_5, qwen3_5_moe
+
+        text_config = {
+            "hidden_size": 32,
+            "num_hidden_layers": 2,
+            "full_attention_interval": 2,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "vocab_size": 64,
+            "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 8,
+            "linear_value_head_dim": 8,
+            "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 64,
+        }
+        moe_config = {
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+        }
+        for module, model_type, architecture, extra in (
+            (qwen3_5, "qwen3_5_text", "Qwen3_5ForCausalLM", {}),
+            (qwen3_5_moe, "qwen3_5_moe_text", "Qwen3_5MoeForCausalLM", moe_config),
+        ):
+            config = {
+                "model_type": model_type,
+                "architectures": [architecture],
+                **text_config,
+                **extra,
+            }
+            model = module.Model(module.ModelArgs.from_dict(config))
+            weights = {
+                k.removeprefix("language_model."): v
+                for k, v in tree_flatten(model.parameters())
+            }
+            with tempfile.TemporaryDirectory(dir=self.test_dir) as path:
+                mx.save_safetensors(os.path.join(path, "model.safetensors"), weights)
+                with open(os.path.join(path, "config.json"), "w") as f:
+                    json.dump(config, f)
+                loaded, _ = utils.load_model(Path(path))
+
+            self.assertIsInstance(loaded, module.Model)
+            inputs = mx.array([[1, 2, 3]])
+            self.assertTrue(mx.array_equal(loaded(inputs), model(inputs)))
+
     def test_load_model_gemma4_with_per_layer_projection_quantization(self):
         from mlx_lm.models import gemma4
 
