@@ -94,6 +94,15 @@ class Attention(nn.Module):
         scores *= self.attn_logit_softcapping
 
         if mask is not None:
+            # Under GQA the scores are 5-D (B, n_kv_heads, repeats, L, S) but
+            # masks arrive 4-D, either (B, 1, L, S) or (B, n_heads, L, S).
+            if self.repeats > 1 and mask.ndim == 4:
+                if mask.shape[1] == self.n_heads:
+                    mask = mask.reshape(
+                        mask.shape[0], self.n_kv_heads, self.repeats, *mask.shape[2:]
+                    )
+                else:
+                    mask = mx.expand_dims(mask, 2)
             if mask.dtype == mx.bool_:
                 scores = mx.where(
                     mask, scores, mx.array(mx.finfo(scores.dtype).min, scores.dtype)
