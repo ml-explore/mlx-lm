@@ -2255,6 +2255,28 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gpt_neox_hidden_act(self):
+        from mlx_lm.models import gpt_neox
+
+        args = gpt_neox.ModelArgs.from_dict(
+            {
+                "model_type": "gpt_neox",
+                "max_position_embeddings": 64,
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_hidden_layers": 1,
+                "layer_norm_eps": 1e-5,
+                "vocab_size": 64,
+                "rotary_emb_base": 10000,
+                "rotary_pct": 0.25,
+                "hidden_act": "gelu",
+            }
+        )
+        mlp = gpt_neox.MLP(args)
+        x = mx.random.normal((1, 4, args.hidden_size))
+        expected = mlp.dense_4h_to_h(nn.gelu(mlp.dense_h_to_4h(x)))
+        self.assertTrue(mx.allclose(mlp(x), expected))
+
     def test_openelm(self):
         from mlx_lm.models import openelm
 
@@ -3049,6 +3071,27 @@ class TestModels(unittest.TestCase):
         )
         model = gpt_bigcode.Model(args)
         self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
+
+    def test_gpt_bigcode_activation_function(self):
+        from mlx_lm.models import gpt_bigcode
+
+        args = gpt_bigcode.ModelArgs.from_dict(
+            {
+                "model_type": "gpt_bigcode",
+                "n_embd": 32,
+                "n_layer": 1,
+                "n_inner": 64,
+                "n_head": 4,
+                "n_positions": 64,
+                "layer_norm_epsilon": 1e-5,
+                "vocab_size": 64,
+                "activation_function": "gelu_pytorch_tanh",
+            }
+        )
+        mlp = gpt_bigcode.MLP(args)
+        x = mx.random.normal((1, 4, args.n_embd))
+        expected = mlp.c_proj(nn.gelu_approx(mlp.c_fc(x)))
+        self.assertTrue(mx.allclose(mlp(x), expected))
 
     def test_nemotron(self):
         from mlx_lm.models import nemotron
