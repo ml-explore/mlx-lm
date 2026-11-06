@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import SuScaledRoPE
 from .switch_layers import SwitchGLU
 
@@ -28,6 +29,7 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: int = 2
     rope_theta: float = 10000.0
     router_jitter_noise: float = 0.01
+    sliding_window: Optional[int] = None
 
 
 class Attention(nn.Module):
@@ -189,7 +191,9 @@ class PhiMoEModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(
+            h, cache[0], window_size=self.args.sliding_window
+        )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -212,6 +216,13 @@ class Model(nn.Module):
     ):
         out = self.model(inputs, cache)
         return self.lm_head(out)
+
+    def make_cache(self):
+        window = self.args.sliding_window
+        return [
+            RotatingKVCache(max_size=window) if window else KVCache()
+            for _ in range(self.args.num_hidden_layers)
+        ]
 
     def sanitize(self, weights):
         if "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in weights:

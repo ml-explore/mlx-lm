@@ -46,7 +46,9 @@ class ModelArgs(BaseModelArgs):
             self.num_key_value_heads = self.num_attention_heads
 
         if self.layer_types is None:
-            self.layer_types = ["full_attention"] * self.num_hidden_layers
+            # HF slides on every layer whenever sliding_window is set
+            t = "sliding_attention" if self.sliding_window else "full_attention"
+            self.layer_types = [t] * self.num_hidden_layers
 
 
 def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
@@ -302,7 +304,11 @@ class LanguageModel(PipelineMixin, nn.Module):
             for layer_type in self.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.fa_idx = self.layer_types.index("full_attention")
+        self.fa_idx = (
+            self.layer_types.index("full_attention")
+            if "full_attention" in self.layer_types
+            else None
+        )
         self.swa_idx = None
         for e, l in enumerate(self.layers):
             if l.use_sliding:

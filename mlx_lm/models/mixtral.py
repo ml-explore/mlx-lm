@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .switch_layers import SwitchGLU
 
 
@@ -26,6 +27,7 @@ class ModelArgs(BaseModelArgs):
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
     tie_word_embeddings: bool = False
+    sliding_window: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -152,6 +154,7 @@ class MixtralModel(nn.Module):
         super().__init__()
         self.vocab_size = args.vocab_size
         self.num_hidden_layers = args.num_hidden_layers
+        self.sliding_window = args.sliding_window
 
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
@@ -173,7 +176,9 @@ class MixtralModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(
+            h, cache[0], window_size=self.sliding_window
+        )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -201,6 +206,17 @@ class Model(nn.Module):
             return self.model.embed_tokens.as_linear(out)
         else:
             return self.lm_head(out)
+
+    def make_cache(self):
+        window = self.args.sliding_window
+        return [
+            (
+                RotatingKVCache(max_size=window)
+                if window
+                else KVCache()
+            )
+            for _ in range(self.args.num_hidden_layers)
+        ]
 
     def sanitize(self, weights):
         if self.args.tie_word_embeddings:

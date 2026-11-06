@@ -39,7 +39,14 @@ class ModelArgs(BaseModelArgs):
             self.num_key_value_heads = self.num_attention_heads
 
         if self.layer_types is None:
-            self.layer_types = ["full_attention"] * self.num_hidden_layers
+            # HF semantics: only mistral applies a bare sliding_window to
+            # every layer; plain llama ignores the field
+            t = (
+                "sliding_attention"
+                if self.sliding_window and self.model_type == "mistral"
+                else "full_attention"
+            )
+            self.layer_types = [t] * self.num_hidden_layers
 
 
 class Attention(nn.Module):
@@ -163,11 +170,14 @@ class LlamaModel(nn.Module):
             for layer_type in self.layer_types
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.fa_idx = self.layer_types.index("full_attention")
+        self.fa_idx = None
         self.swa_idx = None
         for e, l in enumerate(self.layers):
-            if l.use_sliding:
+            if l.use_sliding and self.swa_idx is None:
                 self.swa_idx = e
+            elif not l.use_sliding and self.fa_idx is None:
+                self.fa_idx = e
+            if self.fa_idx is not None and self.swa_idx is not None:
                 break
 
     def __call__(
@@ -184,7 +194,9 @@ class LlamaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(h, cache[self.fa_idx])
+        fa_mask = swa_mask = None
+        if self.fa_idx is not None:
+            fa_mask = create_attention_mask(h, cache[self.fa_idx])
         if self.swa_idx is not None:
             swa_mask = create_attention_mask(
                 h, cache[self.swa_idx], window_size=self.sliding_window
