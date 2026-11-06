@@ -387,9 +387,7 @@ class TestModels(unittest.TestCase):
             # Leave packed integer weights alone
             model.update(
                 tree_map(
-                    lambda p: (
-                        p.astype(t) if mx.issubdtype(p.dtype, mx.floating) else p
-                    ),
+                    lambda p: p.astype(t) if mx.issubdtype(p.dtype, mx.floating) else p,
                     model.parameters(),
                 )
             )
@@ -3458,6 +3456,183 @@ class TestModels(unittest.TestCase):
         model = gpt_oss.Model(args)
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def _gpt_oss_small_args(self, hidden=16, intermediate=24, experts=4, layers=2):
+        from mlx_lm.models import gpt_oss
+
+        return gpt_oss.ModelArgs(
+            model_type="gpt_oss",
+            num_hidden_layers=layers,
+            num_local_experts=experts,
+            num_experts_per_tok=2,
+            vocab_size=64,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            head_dim=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            sliding_window=8,
+            layer_types=["sliding_attention", "full_attention"] * (layers // 2),
+        )
+
+    def _gpt_oss_assert_switchlinear_shapes(self, sanitized, args, prefix):
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+        self.assertEqual(sanitized[f"{prefix}.gate_proj.weight"].shape, (E, F, H))
+        self.assertEqual(sanitized[f"{prefix}.up_proj.weight"].shape, (E, F, H))
+        self.assertEqual(sanitized[f"{prefix}.down_proj.weight"].shape, (E, H, F))
+        self.assertEqual(sanitized[f"{prefix}.gate_proj.bias"].shape, (E, F))
+        self.assertEqual(sanitized[f"{prefix}.up_proj.bias"].shape, (E, F))
+        self.assertEqual(sanitized[f"{prefix}.down_proj.bias"].shape, (E, H))
+
+    def test_gpt_oss_sanitize_layout_c_bf16(self):
+        """Current transformers BF16 layout: gate_up_proj (E, H, 2F), interleaved on last dim."""
+        args = self._gpt_oss_small_args()
+        from mlx_lm.models import gpt_oss
+
+        model = gpt_oss.Model(args)
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+
+        weights = {}
+        for i in range(args.num_hidden_layers):
+            base = f"model.layers.{i}.mlp.experts"
+            weights[f"{base}.gate_up_proj"] = mx.random.normal((E, H, 2 * F))
+            weights[f"{base}.gate_up_proj_bias"] = mx.random.normal((E, 2 * F))
+            weights[f"{base}.down_proj"] = mx.random.normal((E, F, H))
+            weights[f"{base}.down_proj_bias"] = mx.random.normal((E, H))
+
+        sanitized = model.sanitize(dict(weights))
+
+        self.assertFalse(any("gate_up_proj" in k for k in sanitized))
+        for i in range(args.num_hidden_layers):
+            self._gpt_oss_assert_switchlinear_shapes(
+                sanitized, args, f"model.layers.{i}.mlp.experts"
+            )
+
+    def test_gpt_oss_sanitize_layout_b_bf16(self):
+        """Older transformers BF16 layout: gate_up_proj (E, 2F, H)."""
+        args = self._gpt_oss_small_args()
+        from mlx_lm.models import gpt_oss
+
+        model = gpt_oss.Model(args)
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+
+        weights = {}
+        for i in range(args.num_hidden_layers):
+            base = f"model.layers.{i}.mlp.experts"
+            weights[f"{base}.gate_up_proj"] = mx.random.normal((E, 2 * F, H))
+            weights[f"{base}.gate_up_proj_bias"] = mx.random.normal((E, 2 * F))
+            weights[f"{base}.down_proj"] = mx.random.normal((E, F, H))
+            weights[f"{base}.down_proj_bias"] = mx.random.normal((E, H))
+
+        sanitized = model.sanitize(dict(weights))
+
+        self.assertFalse(any("gate_up_proj" in k for k in sanitized))
+        for i in range(args.num_hidden_layers):
+            self._gpt_oss_assert_switchlinear_shapes(
+                sanitized, args, f"model.layers.{i}.mlp.experts"
+            )
+
+    def test_gpt_oss_sanitize_mxfp4_blocks_unchanged(self):
+        """MXFP4 original-release path (_blocks / _scales keys) stays intact."""
+        args = self._gpt_oss_small_args(hidden=32, intermediate=64, layers=2)
+        from mlx_lm.models import gpt_oss
+
+        model = gpt_oss.Model(args)
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+
+        weights = {
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": mx.zeros(
+                (E, 2 * F, H // 32, 16), dtype=mx.uint8
+            ),
+            "model.layers.0.mlp.experts.gate_up_proj_scales": mx.zeros(
+                (E, 2 * F, H // 32), dtype=mx.uint8
+            ),
+            "model.layers.0.mlp.experts.down_proj_blocks": mx.zeros(
+                (E, H, F // 32, 16), dtype=mx.uint8
+            ),
+            "model.layers.0.mlp.experts.down_proj_scales": mx.zeros(
+                (E, H, F // 32), dtype=mx.uint8
+            ),
+        }
+        sanitized = model.sanitize(dict(weights))
+
+        for suffix in (
+            "gate_proj.weight",
+            "up_proj.weight",
+            "gate_proj.scales",
+            "up_proj.scales",
+            "down_proj.weight",
+            "down_proj.scales",
+        ):
+            self.assertIn(f"model.layers.0.mlp.experts.{suffix}", sanitized)
+        self.assertFalse(any("gate_up_proj" in k for k in sanitized))
+        self.assertFalse(any(k.endswith("_blocks") for k in sanitized))
+        self.assertFalse(any(k.endswith("_scales") for k in sanitized))
+        self.assertEqual(
+            sanitized["model.layers.0.mlp.experts.gate_proj.weight"].dtype, mx.uint32
+        )
+
+    def test_gpt_oss_sanitize_layout_c_interleave_direction(self):
+        """gate_proj must come from even indices on dim -1, up_proj from odd.
+        A ::2 / 1::2 swap would still typecheck but garble routing."""
+        args = self._gpt_oss_small_args()
+        from mlx_lm.models import gpt_oss
+
+        model = gpt_oss.Model(args)
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+
+        gate_up = mx.arange(E * H * 2 * F, dtype=mx.float32).reshape(E, H, 2 * F)
+        sanitized = model.sanitize({"model.layers.0.mlp.experts.gate_up_proj": gate_up})
+        gate = sanitized["model.layers.0.mlp.experts.gate_proj.weight"]
+        up = sanitized["model.layers.0.mlp.experts.up_proj.weight"]
+
+        self.assertEqual(gate.shape, (E, F, H))
+        self.assertEqual(up.shape, (E, F, H))
+        self.assertEqual(gate[0, 0, 0].item(), gate_up[0, 0, 0].item())
+        self.assertEqual(up[0, 0, 0].item(), gate_up[0, 0, 1].item())
+
+    def test_gpt_oss_sanitize_idempotent(self):
+        """sanitize(sanitize(w)) == sanitize(w)."""
+        args = self._gpt_oss_small_args()
+        from mlx_lm.models import gpt_oss
+
+        model = gpt_oss.Model(args)
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+
+        weights = {}
+        for i in range(args.num_hidden_layers):
+            base = f"model.layers.{i}.mlp.experts"
+            weights[f"{base}.gate_up_proj"] = mx.random.normal((E, H, 2 * F))
+            weights[f"{base}.gate_up_proj_bias"] = mx.random.normal((E, 2 * F))
+            weights[f"{base}.down_proj"] = mx.random.normal((E, F, H))
+            weights[f"{base}.down_proj_bias"] = mx.random.normal((E, H))
+
+        once = model.sanitize(dict(weights))
+        twice = model.sanitize(dict(once))
+        self.assertEqual(set(once.keys()), set(twice.keys()))
+        for k in once:
+            self.assertTrue(mx.array_equal(once[k], twice[k]), k)
+
+    def test_gpt_oss_sanitize_h_equals_f_uses_config(self):
+        """When H == F the gate_up_proj shape is ambiguous; must consult config."""
+        args = self._gpt_oss_small_args(hidden=16, intermediate=16)  # H == F
+        from mlx_lm.models import gpt_oss
+
+        model = gpt_oss.Model(args)
+        E, H, F = args.num_local_experts, args.hidden_size, args.intermediate_size
+
+        weights = {
+            "model.layers.0.mlp.experts.gate_up_proj": mx.random.normal((E, H, 2 * F)),
+            "model.layers.0.mlp.experts.gate_up_proj_bias": mx.random.normal(
+                (E, 2 * F)
+            ),
+            "model.layers.0.mlp.experts.down_proj": mx.random.normal((E, F, H)),
+            "model.layers.0.mlp.experts.down_proj_bias": mx.random.normal((E, H)),
+        }
+        sanitized = model.sanitize(dict(weights))
+        self._gpt_oss_assert_switchlinear_shapes(
+            sanitized, args, "model.layers.0.mlp.experts"
         )
 
     def _flint_config(self):
