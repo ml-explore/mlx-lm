@@ -231,6 +231,90 @@ class TestModels(unittest.TestCase):
         self.assertEqual(caches[0].offset, 3)
         self.assertEqual(caches[1].offset, 3)
 
+    def test_qwen3_5_layer_types(self):
+        from mlx_lm.models import qwen3_5
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        # Without an explicit layer_types the pattern is derived from the
+        # interval: full attention on every 4th layer.
+        args = qwen3_5.TextModelArgs(
+            model_type="qwen3_5",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            tie_word_embeddings=False,
+            full_attention_interval=4,
+        )
+        model = qwen3_5.TextModel(args)
+        self.assertEqual(
+            [not l.is_linear for l in model.layers],
+            [False, False, False, True, False, False, False, True],
+        )
+
+        # Qwen3.5 checkpoints ship an explicit layer_types list. When the
+        # pattern is not a uniform interval it must still be honoured, so
+        # load through from_dict the way a real config would.
+        config = dict(
+            model_type="qwen3_5",
+            hidden_size=64,
+            intermediate_size=128,
+            num_hidden_layers=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=16,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            linear_key_head_dim=8,
+            linear_value_head_dim=8,
+            linear_conv_kernel_dim=4,
+            rms_norm_eps=1e-5,
+            vocab_size=128,
+            tie_word_embeddings=False,
+            full_attention_interval=4,
+            layer_types=[
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+                "linear_attention",
+                "full_attention",
+                "linear_attention",
+                "linear_attention",
+            ],
+        )
+        args = qwen3_5.TextModelArgs.from_dict(config)
+        model = qwen3_5.TextModel(args)
+        self.assertEqual(
+            [not l.is_linear for l in model.layers],
+            [False, False, True, False, False, True, False, False],
+        )
+
+        # fa_idx must track the first full-attention layer rather than
+        # assuming it sits at full_attention_interval - 1.
+        self.assertEqual(model.model.fa_idx, 2)
+
+        # Caches follow the explicit pattern too.
+        caches = model.make_cache()
+        self.assertIsInstance(caches[2], KVCache)
+        self.assertIsInstance(caches[5], KVCache)
+        self.assertIsInstance(caches[3], ArraysCache)
+
+        # And the model still runs.
+        tokens = mx.array([[1, 2, 3, 4, 5]], dtype=mx.int32)
+        out = model(tokens)
+        mx.eval(out)
+        self.assertEqual(out.shape, (1, 5, args.vocab_size))
+
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
         self.assertTrue(isinstance(rope, nn.RoPE))
