@@ -2,14 +2,18 @@
 
 import copy
 import importlib
+import json
 import math
+import tempfile
 import unittest
+from dataclasses import asdict
+from pathlib import Path
 from unittest import mock
 
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
-from mlx.utils import tree_flatten, tree_map
+from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
@@ -28,6 +32,427 @@ from mlx_lm.models.ssm import ssm_attn, ssm_update
 
 
 class TestModels(unittest.TestCase):
+    def raon_args(self, **overrides):
+        from mlx_lm.models.raon1_mini import ModelArgs
+
+        args = dict(
+            hidden_size=128,
+            vocab_size=256,
+            intermediate_size=256,
+            num_hidden_layers=4,
+            num_attention_heads=2,
+            head_dim=128,
+            q_lora_rank=64,
+            kv_lora_rank=128,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            num_experts=4,
+            num_experts_per_token=2,
+            moe_intermediate_size=128,
+            num_nextn_predict_layers=0,
+            rda_decay_rank=128,
+            rda_config=dict(
+                num_heads=2,
+                head_dim=128,
+                conv_kernel_size=4,
+                full_rank_gate=True,
+                gate_lower_bound=-5.0,
+                rda_layers=[1, 2],
+                mla_layers=[3, 4],
+            ),
+        )
+        args.update(overrides)
+        return ModelArgs(**args)
+
+    def test_raon1_mini(self):
+        from mlx_lm.models.raon1_mini import Model
+
+        model = Model(self.raon_args())
+        self.model_test_runner(model, "raon1_mini", 256, 4)
+
+    def test_raon_mhc_chart(self):
+        from mlx_lm.models.raon1_mini import MHC
+
+        mx.random.seed(29)
+        module = MHC(self.raon_args())
+        module.res.phi_z = mx.random.normal(module.res.phi_z.shape)
+        module.res.b_z = mx.random.normal(module.res.b_z.shape)
+        stream = mx.random.normal((2, 7, 4, 128))
+        pre, post, residual = module.route(stream)
+        self.assertEqual(pre.shape, (14, 4))
+        self.assertTrue(mx.all((pre >= 0) & (pre <= 1)))
+        self.assertTrue(mx.all((post >= 0) & (post <= 2)))
+        self.assertTrue(mx.all(residual >= -1e-7))
+        self.assertTrue(mx.allclose(residual.sum(-1), mx.ones((14, 4)), atol=1e-6))
+        self.assertTrue(mx.allclose(residual.sum(-2), mx.ones((14, 4)), atol=1e-6))
+        self.assertFalse(
+            any("helmert" in key for key, _ in tree_flatten(module.parameters()))
+        )
+
+    def test_raon_cache_chunks(self):
+        from mlx_lm.models.raon1_mini import Model
+
+        mx.random.seed(30)
+        model = Model(self.raon_args())
+        model.eval()
+        for layer in model.layers:
+            if layer.is_linear:
+                for name in ["q_conv1d", "k_conv1d", "v_conv1d"]:
+                    conv = getattr(layer.self_attn, name)
+                    conv.weight = mx.random.normal(conv.weight.shape) * 0.05
+            if layer.is_moe:
+                layer.moe.gate.weight = mx.random.normal((4, 128)) * 0.05
+        tokens = mx.array([[1, 3, 9, 2, 4, 8, 7, 6, 5]])
+        expected = model(tokens)
+        for chunk in [1, 2, 4]:
+            cache = model.make_cache()
+            parts = [
+                model(tokens[:, i : i + chunk], cache=cache) for i in range(0, 9, chunk)
+            ]
+            actual = mx.concatenate(parts, axis=1)
+            self.assertTrue(mx.allclose(actual, expected, atol=2e-5, rtol=2e-5))
+            self.assertEqual(cache[2].offset, 9)
+            self.assertEqual(cache[0][3].dtype, mx.float32)
+            self.assertEqual(cache[0][0].shape, (1, 3, 256))
+
+    def test_raon_sanitize(self):
+        from mlx_lm.models.raon1_mini import Model
+
+        model = Model(self.raon_args(num_nextn_predict_layers=1))
+        weights = dict(tree_flatten(model.parameters()))
+        source = dict(weights)
+        for i, layer in enumerate(model.layers):
+            p = f"model.layers.{i}."
+            if layer.is_linear:
+                for name in ["q_conv1d", "k_conv1d", "v_conv1d"]:
+                    key = p + f"self_attn.{name}.weight"
+                    source[key] = source[key].squeeze(-1)
+            else:
+                q = source.pop(p + "self_attn.embed_q.weight").swapaxes(-1, -2)
+                v = source.pop(p + "self_attn.unembed_out.weight")
+                source[p + "self_attn.kv_b_proj.weight"] = mx.concatenate(
+                    [q, v], axis=1
+                ).reshape(-1, 128)
+            if layer.is_moe:
+                for old, new in [
+                    ("gate_proj", "gate_proj"),
+                    ("up_proj", "up_proj"),
+                    ("down_proj", "down_proj"),
+                ]:
+                    stacked = source.pop(p + f"moe.switch_mlp.{new}.weight")
+                    for e in range(4):
+                        source[p + f"moe.experts.{e}.{old}.weight"] = stacked[e]
+        source["model.layers.4.enorm.weight"] = mx.ones((128,))
+        converted = model.sanitize(source)
+        self.assertEqual(set(converted), set(weights))
+        for key in weights:
+            self.assertTrue(mx.array_equal(converted[key], weights[key]), key)
+        again = model.sanitize(converted)
+        self.assertEqual(set(again), set(converted))
+        for key in converted:
+            self.assertTrue(mx.array_equal(again[key], converted[key]), key)
+
+    def test_raon_quantized_roundtrip(self):
+        from mlx_lm.models.raon1_mini import Model
+        from mlx_lm.utils import load_model, quantize_model, save_model
+
+        for bits in [4, 6, 8]:
+            mx.random.seed(31)
+            args = self.raon_args()
+            model, config = quantize_model(Model(args), asdict(args), 64, bits)
+            model.eval()
+            inputs = mx.array([[1, 2, 3]])
+            expected = model(inputs)
+            self.assertTrue(mx.all(mx.isfinite(expected)))
+            self.assertEqual(model.layers[1].moe.gate.weight.dtype, mx.float32)
+            self.assertEqual(model.layers[1].moe.switch_mlp.gate_proj.bits, bits)
+            with tempfile.TemporaryDirectory() as path:
+                save_model(path, model)
+                (Path(path) / "config.json").write_text(json.dumps(config))
+                restored, _ = load_model(Path(path))
+                actual = restored(inputs)
+                self.assertTrue(mx.array_equal(actual, expected))
+
+    def test_raon_original_mxfp8_checkpoint(self):
+        from mlx_lm.models.raon1_mini import Model
+        from mlx_lm.utils import load_model
+
+        mx.random.seed(7)
+        args = self.raon_args()
+        model = Model(args)
+        weights = dict(tree_flatten(model.parameters()))
+        packed = {}
+        for i, layer in enumerate(model.layers):
+            if not layer.is_moe:
+                continue
+            for name in ["gate_proj", "up_proj", "down_proj"]:
+                key = f"model.layers.{i}.moe.switch_mlp.{name}"
+                w, s = mx.quantize(
+                    weights.pop(key + ".weight"), group_size=32, bits=8, mode="mxfp8"
+                )
+                packed[key] = (w, s)
+                # The original checkpoint has one e4m3 tensor per expert.
+                for e in range(args.num_experts):
+                    expert = f"model.layers.{i}.moe.experts.{e}.{name}"
+                    weights[expert + ".weight"] = w[e].view(mx.uint8)
+                    weights[expert + ".weight_scale_inv"] = s[e]
+        config = asdict(args)
+        config["quantization_config"] = {
+            "quant_method": "mxfp8",
+            "weight_block_size": [1, 32],
+        }
+        with tempfile.TemporaryDirectory() as path:
+            mx.save_safetensors(str(Path(path) / "model.safetensors"), weights)
+            (Path(path) / "config.json").write_text(json.dumps(config))
+            restored, _ = load_model(Path(path))
+        for key, (w, s) in packed.items():
+            layer = restored
+            for part in key.split("."):
+                layer = layer[int(part)] if part.isdigit() else getattr(layer, part)
+            self.assertEqual(layer.mode, "mxfp8")
+            self.assertTrue(mx.array_equal(layer.weight, w), key)
+            self.assertTrue(mx.array_equal(layer.scales, s), key)
+        self.assertIsInstance(
+            restored.layers[1].moe.shared_experts.gate_proj, nn.Linear
+        )
+        self.assertIsInstance(restored.lm_head, nn.Linear)
+        output = restored(mx.array([[1, 2, 3]]))
+        self.assertTrue(mx.all(mx.isfinite(output)))
+
+    def test_raon_quantized_cache(self):
+        from mlx_lm.models.cache import QuantizedKVCache
+        from mlx_lm.models.raon1_mini import Model
+
+        model = Model(self.raon_args())
+        model.eval()
+        for bits in [4, 8]:
+            cache = model.make_cache()
+            for i, layer in enumerate(model.layers):
+                if not layer.is_linear:
+                    cache[i] = QuantizedKVCache(group_size=64, bits=bits)
+            for tokens in [[[1, 2, 3]], [[4]], [[5, 6]]]:
+                output = model(mx.array(tokens), cache=cache)
+                self.assertEqual(output.shape, (1, len(tokens[0]), 256))
+                self.assertTrue(mx.all(mx.isfinite(output)))
+            self.assertEqual(cache[2].offset, 6)
+
+    def test_raon_preserve_fp32_head(self):
+        from mlx_lm.models.raon1_mini import Model
+        from mlx_lm.utils import quantize_model
+
+        args = self.raon_args(raon_fp32_export_head=True)
+        model = Model(args)
+        head = model.lm_head.weight
+        model.update(
+            tree_map_with_path(
+                lambda key, value: (
+                    value.astype(mx.bfloat16) if model.cast_predicate(key) else value
+                ),
+                model.parameters(),
+            )
+        )
+        model, _ = quantize_model(model, asdict(args), 64, 4)
+        output = model(mx.array([[1, 2, 3]]))
+        mx.eval(output)
+        self.assertIsInstance(model.lm_head, nn.Linear)
+        self.assertEqual(model.lm_head.weight.dtype, mx.float32)
+        self.assertTrue(mx.array_equal(model.lm_head.weight, head))
+        self.assertEqual(output.dtype, mx.float32)
+        self.assertTrue(mx.all(mx.isfinite(output)))
+
+    def test_raon_fp16_rda_dynamic_range(self):
+        from mlx_lm.models.raon1_mini import RDA
+
+        mx.random.seed(53)
+        block = RDA(self.raon_args())
+        block.update(
+            tree_map_with_path(
+                lambda path, value: (
+                    value if path in {"A_log", "dt_bias"} else value.astype(mx.float16)
+                ),
+                block.parameters(),
+            )
+        )
+        block.b_proj.weight = mx.full(block.b_proj.weight.shape, -40 / 128, mx.float16)
+        block.rda_w_proj.weight = mx.full(
+            block.rda_w_proj.weight.shape, 40 / 128, mx.float16
+        )
+        block.v_proj.weight = mx.full(block.v_proj.weight.shape, 1 / 128, mx.float16)
+        block.v_conv1d.weight = mx.ones_like(block.v_conv1d.weight)
+        block.eval()
+        result = block(mx.ones((1, 1, 128), dtype=mx.float16))
+        mx.eval(result)
+        self.assertEqual(result.dtype, mx.float16)
+        self.assertTrue(mx.all(mx.isfinite(result)).item())
+        reference = copy.deepcopy(block)
+        reference.update(
+            tree_map(lambda value: value.astype(mx.float32), reference.parameters())
+        )
+        expected = reference(mx.ones((1, 1, 128), dtype=mx.float32))
+        mx.eval(expected)
+        self.assertTrue(
+            mx.allclose(
+                result.astype(mx.float32), expected, rtol=0.01, atol=0.01
+            ).item()
+        )
+
+    def test_raon_decode_matches_prefill(self):
+        from mlx_lm.models.raon1_mini import Model
+
+        mx.random.seed(41)
+        model = Model(self.raon_args())
+        model.update(
+            tree_map(
+                lambda p: (mx.random.normal(p.shape) * 0.05).astype(mx.bfloat16),
+                model.parameters(),
+            )
+        )
+        model.eval()
+        tokens = [5, 17, 3, 99, 42, 7, 64, 21, 8, 130]
+        full = model(mx.array([tokens]))[0].astype(mx.float32)
+        cache = model.make_cache()
+        steps = [model(mx.array([tokens[:4]]), cache=cache)[0, -1]]
+        for t in tokens[4:]:
+            steps.append(model(mx.array([[t]]), cache=cache)[0, -1])
+        steps = mx.stack(steps).astype(mx.float32)
+        self.assertTrue(mx.allclose(full[3:], steps, atol=5e-2, rtol=5e-2))
+        self.assertTrue(mx.array_equal(full[3:].argmax(-1), steps.argmax(-1)))
+
+    def test_raon_prefill_query_blocks(self):
+        import mlx_lm.models.raon1_mini as raon
+
+        mx.random.seed(43)
+        model = raon.Model(self.raon_args())
+        model.update(
+            tree_map(
+                lambda p: (mx.random.normal(p.shape) * 0.05).astype(mx.bfloat16),
+                model.parameters(),
+            )
+        )
+        model.eval()
+        tokens = [(7 * i + 3) % 256 for i in range(37)]
+
+        def run(block):
+            old = raon._PREFILL_QUERY_BLOCK
+            raon._PREFILL_QUERY_BLOCK = block
+            try:
+                cache = model.make_cache()
+                out = [model(mx.array([tokens]), cache=cache)[0]]
+            finally:
+                raon._PREFILL_QUERY_BLOCK = old
+            for t in (11, 12, 13):
+                out.append(model(mx.array([[t]]), cache=cache)[0])
+            return mx.concatenate(out)
+
+        expected = run(1 << 30)
+        for block in (9, 16, 18):
+            self.assertTrue(mx.array_equal(run(block), expected))
+
+    def test_raon_long_batched_generation(self):
+        from mlx_lm.generate import BatchGenerator
+        from mlx_lm.models.raon1_mini import Model
+
+        def graph_edges(array):
+            with tempfile.NamedTemporaryFile(suffix=".dot") as f:
+                mx.export_to_dot(f.name, array)
+                with open(f.name) as dot:
+                    return sum(1 for line in dot if "->" in line)
+
+        mx.random.seed(5)
+        model = Model(self.raon_args())
+        model.update(
+            tree_map(
+                lambda p: (mx.random.normal(p.shape) * 0.05).astype(mx.bfloat16),
+                model.parameters(),
+            )
+        )
+        model.eval()
+        rng = np.random.default_rng(0)
+        gen = BatchGenerator(
+            model,
+            stop_tokens=[[255]],
+            completion_batch_size=4,
+            prefill_batch_size=4,
+            prefill_step_size=64,
+            max_kv_size=None,
+        )
+        prompts = [
+            rng.integers(1, 250, int(rng.integers(3, 30))).tolist() for _ in range(16)
+        ]
+        gen.insert(prompts, max_tokens=rng.integers(80, 200, len(prompts)).tolist())
+        steps, worst = 0, 0
+        while gen.next_generated():
+            steps += 1
+            if steps % 50 == 0 and gen._generation_batch is not None:
+                for c in gen._generation_batch.prompt_cache:
+                    for name in ("offset", "left_padding", "lengths"):
+                        value = getattr(c, name, None)
+                        if isinstance(value, mx.array):
+                            worst = max(worst, graph_edges(value))
+        gen.close()
+        self.assertGreater(steps, 200)
+        self.assertLess(worst, 64 * 8)
+
+    def test_raon_merged_conv(self):
+        from mlx_lm.models.raon1_mini import Model
+
+        model = Model(self.raon_args())
+        weights = dict(tree_flatten(model.parameters()))
+        source = dict(weights)
+        names = ["q_conv1d", "k_conv1d", "v_conv1d"]
+        for i, layer in enumerate(model.layers):
+            if layer.is_linear:
+                p = f"model.layers.{i}.self_attn."
+                parts = [source.pop(p + f"{name}.weight") for name in names]
+                source[p + "qkv_conv1d.weight"] = mx.concatenate(parts, axis=0)
+        converted = model.sanitize(source)
+        self.assertEqual(set(converted), set(weights))
+        for key in weights:
+            self.assertTrue(mx.array_equal(converted[key], weights[key]), key)
+
+    def test_raon_global_scaled_linear(self):
+        from mlx_lm.models.raon1_mini import GlobalScaledLinear, Model
+        from mlx_lm.utils import load_model, quantize_model, save_model
+
+        mx.random.seed(37)
+        path = "model.layers.1.moe.shared_experts.down_proj"
+        args = self.raon_args()
+        model, config = quantize_model(Model(args), asdict(args), 16, 4, mode="nvfp4")
+        model.eval()
+        linear = model.layers[1].moe.shared_experts.down_proj
+        scale = mx.array(0.25, mx.float32)
+        inputs = mx.array([[1, 2, 3]])
+        with tempfile.TemporaryDirectory() as tmp:
+            save_model(tmp, model)
+            config["raon_global_scaled_linears"] = [path]
+            config["quantization"][path] = False
+            weights = mx.load(str(Path(tmp) / "model.safetensors"))
+            weights[path + ".global_scale"] = scale
+            mx.save_safetensors(str(Path(tmp) / "model.safetensors"), weights)
+            (Path(tmp) / "config.json").write_text(json.dumps(config))
+            restored, _ = load_model(Path(tmp))
+            restored.eval()
+            layer = restored.layers[1].moe.shared_experts.down_proj
+            self.assertIsInstance(layer, GlobalScaledLinear)
+            self.assertEqual(layer.global_scale.dtype, mx.float32)
+            x = mx.random.normal((1, 3, linear.weight.shape[1] * 8)).astype(mx.bfloat16)
+            expected = (linear(x).astype(mx.float32) * scale).astype(mx.bfloat16)
+            self.assertTrue(mx.array_equal(layer(x), expected))
+            self.assertTrue(mx.all(mx.isfinite(restored(inputs))))
+
+    def test_raon_invalid_config(self):
+        for override in [
+            dict(use_grouped_topk=True),
+            dict(mla_use_nope=False),
+            dict(hidden_act="silu"),
+            dict(raon_mhc_streams=1),
+            dict(num_experts_per_token=5),
+            dict(moe_layer_freq=0),
+        ]:
+            with self.assertRaises(ValueError):
+                self.raon_args(**override)
+
     def test_kv_cache(self):
         cache = KVCache()
 
