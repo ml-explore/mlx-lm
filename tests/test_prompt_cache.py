@@ -496,6 +496,33 @@ class TestPromptCache(unittest.TestCase):
         cmask = create_attention_mask(mx.zeros((1, 1, 32)), cache, window_size=5)
         self.assertTrue(mx.array_equal(cmask, mask))
 
+    def test_rotating_cache_mask_keeps_sinks_visible(self):
+        # Issue #2028: once the cache is full, the stored keys are
+        # [keep sinks][recent window][new chunk]. The multi-token mask must
+        # keep the sink columns visible to every query in the chunk.
+        cache = RotatingKVCache(max_size=16, keep=4)
+        kv = mx.zeros((1, 1, 16, 8))
+        cache.update_and_fetch(kv, kv)  # cache is now full
+
+        mask = cache.make_mask(4, return_array=True)
+        self.assertEqual(mask.shape, (4, 19))
+        # Every query can see all 4 sink columns
+        self.assertTrue(mx.all(mask[:, :4]))
+        # ... while causality still applies inside the chunk itself:
+        # the last `keep` columns are the new tokens, lower-triangular
+        self.assertTrue(
+            mx.all(mask[:, -4:] == mx.tril(mx.ones((4, 4), dtype=mx.bool_)))
+        )
+
+        # A cache that has not filled yet must be unaffected:
+        # contiguous keys, stock window mask.
+        cache = RotatingKVCache(max_size=16, keep=4)
+        kv = mx.zeros((1, 1, 8, 8))
+        cache.update_and_fetch(kv, kv)
+        mask = cache.make_mask(4, return_array=True)
+        expected = create_causal_mask(4, 8, window_size=16)
+        self.assertTrue(mx.array_equal(mask, expected))
+
     def test_batch_kv_cache(self):
         cache = BatchKVCache(left_padding=[2, 3, 4])
         k, v = mx.zeros((3, 1, 4, 8)), mx.zeros((3, 1, 4, 8))

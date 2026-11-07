@@ -560,7 +560,15 @@ class RotatingKVCache(_BaseCache):
             window_size = window_size or self.max_size
             offset = min(self.max_size - 1, self.offset)
             if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
+                mask = create_causal_mask(N, offset, window_size=window_size)
+                if self.keep > 0 and self.offset >= self.max_size:
+                    # Once the cache is full, _update_concat stores the keys
+                    # as [keep sink tokens][recent window][new chunk], so the
+                    # first `keep` columns are absolute positions 0..keep-1,
+                    # not the contiguous positions the window mask assumes.
+                    # The sinks must stay visible to every query.
+                    mask = mask.at[:, : self.keep].add(True)
+                return mask
             else:
                 return "causal"
         else:
