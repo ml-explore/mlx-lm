@@ -148,6 +148,8 @@ class Router(nn.Module):
 class GeGLU(nn.Module):
     """GELU-gated linear unit activation for SwitchGLU."""
 
+    metal_act = 1  # activation id for switch_kernels: gelu_approx(gate) * x
+
     def __call__(self, x, gate):
         return geglu(gate, x)
 
