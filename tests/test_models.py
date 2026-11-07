@@ -630,6 +630,170 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_dory(self):
+        from mlx_lm.models import dory
+
+        args = dory.ModelArgs(
+            model_type="dory",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            sliding_window=16,
+            n_input_layers=4,
+            n_recurrent_layers=8,
+            n_output_layers=4,
+            n_recurrent_loops=2,
+        )
+        model = dory.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_dory_sliding_window_cache(self):
+        from mlx.utils import tree_map_with_path
+
+        from mlx_lm.models import dory
+        from mlx_lm.models.cache import RotatingKVCache
+
+        args = dory.ModelArgs(
+            model_type="dory",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            sliding_window=8,
+            n_input_layers=4,
+            n_recurrent_layers=8,
+            n_output_layers=4,
+        )
+        # A single sliding-window attention layer: chunked prefill followed by
+        # token-by-token decoding past the window must match one full pass.
+        # Seed before building the layer, and set the scale parameters as a
+        # checkpoint stores them (multiples of initializer_range): left at ones,
+        # attention is so sharp that float32 rounding can exceed the tolerance.
+        mx.random.seed(0)
+        attn = dory.DoryAttention(args, sliding=True)
+        attn.update(
+            tree_map_with_path(
+                lambda p, v: (
+                    mx.full(v.shape, args.initializer_range)
+                    if p.split(".")[-1] in ("sqk", "s_gate")
+                    else v
+                ),
+                attn.parameters(),
+            )
+        )
+        x = mx.random.normal((1, 40, args.hidden_size)) * 0.1
+        expected = attn(x)
+
+        cache = RotatingKVCache(max_size=args.sliding_window)
+        outs = [attn(x[:, :13], cache), attn(x[:, 13:30], cache)]
+        outs += [attn(x[:, i : i + 1], cache) for i in range(30, 40)]
+        out = mx.concatenate(outs, axis=1)
+        self.assertTrue(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
+
+    def _dory_tiny_args(self, **kw):
+        from mlx_lm.models import dory
+
+        return dory.ModelArgs(
+            model_type="dory",
+            vocab_size=1000,
+            hidden_size=128,
+            intermediate_size=256,
+            num_hidden_layers=16,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=32,
+            n_input_layers=4,
+            n_recurrent_layers=8,
+            n_output_layers=4,
+            **kw,
+        )
+
+    def test_dory_last_loop_cache_types(self):
+        from mlx_lm.models import dory
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        args = self._dory_tiny_args(
+            sliding_window=8, n_recurrent_loops=2, recurrent_kv_cache_mode="last_loop"
+        )
+        model = dory.Model(args)
+        plan, _ = model._cache_plan()
+        cache = model.make_cache()
+        lo, hi = args.n_input_layers, args.n_input_layers + args.n_recurrent_layers
+        for (i, _), idx in plan.items():
+            sliding = args.layer_types[i] == "sliding_attention"
+            if sliding and not lo <= i < hi:
+                self.assertIsInstance(cache[idx], RotatingKVCache)
+            else:
+                self.assertIs(type(cache[idx]), KVCache)
+
+        args = self._dory_tiny_args(
+            sliding_window=8, n_recurrent_loops=2, recurrent_kv_cache_mode="per_loop"
+        )
+        model = dory.Model(args)
+        plan, _ = model._cache_plan()
+        cache = model.make_cache()
+        for (i, _), idx in plan.items():
+            if args.layer_types[i] == "sliding_attention":
+                self.assertIsInstance(cache[idx], RotatingKVCache)
+            else:
+                self.assertIs(type(cache[idx]), KVCache)
+
+    def test_dory_last_loop_past_window(self):
+        from mlx.utils import tree_map_with_path
+
+        from mlx_lm.models import dory
+        from mlx_lm.models.cache import KVCache
+
+        def run(mode, full_kv=False):
+            args = self._dory_tiny_args(
+                sliding_window=8, n_recurrent_loops=2, recurrent_kv_cache_mode=mode
+            )
+            mx.random.seed(0)
+            model = dory.Model(args)
+            # Scale parameters as stored in a checkpoint (multiples of
+            # initializer_range); all-ones would make attention extremely sharp.
+            names = {"sqk", "s_gate", "suv_gate", "suv_up", "attn_alpha"}
+            names |= {"mlp_alpha", "logit_scale"}
+            std = args.initializer_range
+            model.update(
+                tree_map_with_path(
+                    lambda p, v: (
+                        mx.full(v.shape, std) if p.split(".")[-1] in names else v
+                    ),
+                    model.parameters(),
+                )
+            )
+            inputs = mx.random.randint(0, args.vocab_size, (1, 40))
+            expected = model(inputs)
+            cache = model.make_cache()
+            if full_kv:
+                cache = [KVCache() for _ in cache]
+            # Chunked prefill, then token-by-token decoding well past the window.
+            outs = [model(inputs[:, i : i + 5], cache=cache) for i in range(0, 30, 5)]
+            outs += [model(inputs[:, i : i + 1], cache=cache) for i in range(30, 40)]
+            return mx.concatenate(outs, axis=1), expected
+
+        # per_loop: the cached run matches one full uncached pass.
+        out, expected = run("per_loop")
+        self.assertTrue(mx.allclose(out, expected, rtol=1e-3, atol=1e-3))
+
+        # last_loop keeps only the last loop's keys/values for the recurrent
+        # layers (by design), so compare its cache layout with an all-KVCache
+        # cache: rotating caches on the non-recurrent sliding layers must give
+        # the same outputs past the window (the mask enforces the window).
+        out, _ = run("last_loop")
+        ref, _ = run("last_loop", full_kv=True)
+        self.assertTrue(mx.allclose(out, ref, rtol=1e-4, atol=1e-4))
+
     def test_lfm2(self):
         from mlx_lm.models import lfm2
 
