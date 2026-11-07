@@ -280,6 +280,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        clear_cache_threshold=args.clear_cache_threshold,
     )
 
     # Initialize the selected optimizer
