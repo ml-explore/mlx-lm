@@ -322,6 +322,13 @@ class TestServer(unittest.TestCase):
         cls.server_thread.join()
         cls.response_generator.stop_and_join()
 
+    def test_empty_prompt_is_rejected_and_server_survives(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        response = requests.post(url, json={"prompt": "", "max_tokens": 4})
+        self.assertEqual(response.status_code, 400)
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 4})
+        self.assertEqual(response.status_code, 200)
+
     def test_max_tokens_zero_is_rejected(self):
         url = f"http://localhost:{self.port}/v1/completions"
         response = requests.post(url, json={"prompt": "hi", "max_tokens": 0})

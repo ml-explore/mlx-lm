@@ -831,6 +831,12 @@ class ResponseGenerator:
                         rqueue.put(e)
                         continue
 
+                    # BatchGenerator raises on an empty prompt, and an exception
+                    # here would end the generation thread for every client.
+                    if len(prompt) == 0:
+                        rqueue.put(ValueError("The prompt is empty."))
+                        continue
+
                     stop_sm = TextStateMachine.from_stop_words(args.stop_words)
                     text_sm = TextStateMachine.from_tokenizer(current_tokenizer)
 
@@ -1591,7 +1597,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 progress_callback=keepalive_callback,
             )
         except Exception as e:
-            self._set_completion_headers(404)
+            self._set_completion_headers(400 if isinstance(e, ValueError) else 404)
             self.end_headers()
             self.wfile.write(json.dumps({"error": str(e)}).encode())
             return
