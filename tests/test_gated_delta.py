@@ -340,6 +340,34 @@ class TestGatedDelta(unittest.TestCase):
         mx.eval(yf, yt)
         self.assertLess(_rel_l2(yf, yt), 5e-3)
 
+    def test_chunked_decay_nan_free_hard_gates(self):
+        # Regression: hard-decaying gates make decay_ratio's masked upper
+        # triangle overflow to inf; its backward (0*inf) produced NaN grads in
+        # real training. The exp(min(., 0)) clamp fixes it without changing the
+        # used lower triangle. Fails on the pre-clamp code, passes now.
+        mx.random.seed(0)
+        B, Hk, Hv, T, Dk, Dv = 1, 2, 4, 64, 32, 32
+        base = mx.random.normal((B, T, Hk, Dk))
+        k = 0.9 * base + 0.1 * mx.random.normal((B, T, Hk, Dk))
+        q = mx.random.normal((B, T, Hk, Dk))
+        v = mx.random.normal((B, T, Hv, Dv))
+        k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
+        q = q / mx.linalg.norm(q, axis=-1, keepdims=True)
+        # Sum(log g) ~ -170 over the 64-token chunk.
+        g = mx.exp(mx.random.uniform(-5.4, 0.0, (B, T, Hv)))
+        beta = mx.random.uniform(0.85, 1.0, (B, T, Hv))
+
+        def loss(q, k, v, g, beta):
+            y, _ = gated_delta_chunked(q, k, v, g, beta)
+            return (y**2).sum()
+
+        y, _ = gated_delta_chunked(q, k, v, g, beta)
+        self.assertFalse(bool(mx.isnan(y).any()))
+        grads = mx.grad(loss, argnums=(0, 1, 2, 3, 4))(q, k, v, g, beta)
+        for gr in grads:
+            self.assertFalse(bool(mx.isnan(gr).any()))
+            self.assertFalse(bool(mx.isinf(gr).any()))
+
 
 if __name__ == "__main__":
     unittest.main()

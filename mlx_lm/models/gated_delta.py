@@ -658,7 +658,9 @@ def gated_delta_chunked(
         qc = q[:, start:end].swapaxes(1, 2).astype(mx.float32)  # [B, H, C, Dk]
         kc = k[:, start:end].swapaxes(1, 2).astype(mx.float32)
         vc = v[:, start:end].swapaxes(1, 2).astype(mx.float32)  # [B, H, C, Dv]
-        gc = g[:, start:end].swapaxes(1, 2).astype(mx.float32)  # [B, H, C]
+        gc = mx.maximum(
+            g[:, start:end].swapaxes(1, 2).astype(mx.float32), 1e-8
+        )  # [B, H, C]
         bc = beta[:, start:end].swapaxes(1, 2).astype(mx.float32)
         C = qc.shape[2]
 
@@ -668,7 +670,12 @@ def gated_delta_chunked(
 
         log_gamma = mx.cumsum(mx.log(gc), axis=-1)  # [B, H, C]
         gamma = mx.exp(log_gamma)
-        decay_ratio = mx.exp(log_gamma[..., :, None] - log_gamma[..., None, :])
+        # Upper triangle (i<j) is masked away below, but exp(+sum log g)
+        # overflows to inf and its backward (0*inf) poisons every gradient.
+        # Clamp to <=0: a no-op on the used lower triangle (i>=j, exponent <=0).
+        decay_ratio = mx.exp(
+            mx.minimum(log_gamma[..., :, None] - log_gamma[..., None, :], 0.0)
+        )
 
         kkt = kc @ kc.swapaxes(-1, -2)
         A = mx.eye(C) + bc[..., :, None] * mx.where(
