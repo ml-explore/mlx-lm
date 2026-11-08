@@ -368,6 +368,35 @@ class TestGatedDelta(unittest.TestCase):
             self.assertFalse(bool(mx.isnan(gr).any()))
             self.assertFalse(bool(mx.isinf(gr).any()))
 
+    def test_tri_inv_near_singular_identical_keys(self):
+        # Regression: a Newton-Schulz inverse from the identity diverges when
+        # A = I + N is near-singular even at modest ||N||. The deterministic
+        # worst case is identical keys (KKt = ones) with chunk_size 64: NS
+        # reached ~1e9 error there, the block-Schur recursion is exact. No
+        # randomness, so this pins the failure the recursion fixes.
+        from mlx_lm.models.gated_delta import _tri_inv
+
+        C = 64
+        g = 0.95
+        idx = mx.arange(C)
+        log_gamma = (idx + 1) * mx.log(mx.array(g))
+        decay = mx.exp(log_gamma[:, None] - log_gamma[None, :])
+        strict_lower = idx[:, None] > idx[None, :]
+        A = mx.eye(C) + mx.where(strict_lower, decay * mx.ones((C, C)), 0.0)
+
+        X = _tri_inv(A)
+        err = float(mx.abs(A @ X - mx.eye(C)).max())
+        self.assertFalse(bool(mx.isnan(mx.array(err))))
+        self.assertLess(err, 1e-6)
+
+        # Differentiable with no custom VJP: finite gradients.
+        def f(A):
+            return (_tri_inv(A) ** 2).sum()
+
+        gA = mx.grad(f)(A)
+        self.assertFalse(bool(mx.isnan(gA).any()))
+        self.assertFalse(bool(mx.isinf(gA).any()))
+
 
 if __name__ == "__main__":
     unittest.main()

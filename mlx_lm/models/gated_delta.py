@@ -1,6 +1,4 @@
 # Copyright © 2025 Apple Inc.
-
-import math
 import os
 from functools import partial
 from typing import Optional, Tuple
@@ -606,16 +604,37 @@ def gated_delta_ops(
 def _tri_inv(A: mx.array) -> mx.array:
     """Inverse of ``A = I + N`` where ``N`` is strictly lower triangular.
 
-    Newton-Schulz iteration, which is exact in ``ceil(log2(C))`` steps for a
-    unipotent matrix (the residual squares each step and ``N`` is nilpotent).
-    Pure matmuls, so unlike ``mx.linalg.inv`` it runs on the GPU and is
+    Block-Schur recursion: for a unit lower-triangular
+    ``A = [[A11, 0], [A21, A22]]`` the exact inverse is
+    ``[[A11^-1, 0], [-A22^-1 @ A21 @ A11^-1, A22^-1]]``, recursing to 1x1
+    blocks (which are ``[[1]]`` for a unit diagonal), then two Newton polish
+    steps for the matmul rounding. Pure matmuls, so it runs on the GPU and is
     differentiable by autograd.
+
+    A Newton-Schulz iteration from the identity instead diverges when A is
+    near-singular even at modest ``||N||`` -- e.g. near-duplicate keys at
+    chunk_size 64 drive its error to ~1e9 while this recursion stays at
+    machine precision. (Both lose accuracy only once the true inverse itself
+    overflows fp32, which the normalize_qk contract keeps real inputs clear
+    of.)
     """
+
+    def _rec(M: mx.array) -> mx.array:
+        n = M.shape[-1]
+        if n == 1:
+            return mx.ones_like(M)
+        h = n // 2
+        A11 = _rec(M[..., :h, :h])
+        A22 = _rec(M[..., h:, h:])
+        A21 = -A22 @ (M[..., h:, :h] @ A11)
+        top = mx.concatenate([A11, mx.zeros_like(A21).swapaxes(-1, -2)], axis=-1)
+        bot = mx.concatenate([A21, A22], axis=-1)
+        return mx.concatenate([top, bot], axis=-2)
+
     C = A.shape[-1]
-    n_iter = max(1, math.ceil(math.log2(C))) if C > 1 else 1
+    X = _rec(A)
     eye = mx.eye(C, dtype=A.dtype)
-    X = eye + mx.zeros_like(A)
-    for _ in range(n_iter):
+    for _ in range(2):  # Newton polish for matmul rounding
         X = X @ (2.0 * eye - A @ X)
     return X
 
