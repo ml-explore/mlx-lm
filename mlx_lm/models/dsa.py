@@ -3,11 +3,29 @@
 # Sparse prefill for DeepSeek sparse attention (DSA) models (deepseek_v32, glm_moe_dsa):
 # attention over each query's top-k keys from the indexer.
 
+from functools import partial
+
 import mlx.core as mx
 
 from ..kernels import sparse_mla
 
 SPARSE_QUERY_BLOCK = 1024
+
+
+@partial(mx.compile, shapeless=True)
+def _head_sum(scores, weights):
+    # One score and one weight slice per head: ReLU, weight and add, in head order.
+    out = 0
+    for score, weight in zip(scores, weights):
+        out = out + mx.maximum(score, 0) * weight
+    return out
+
+
+def head_sum(scores, weights):
+    # Indexer scores summed over heads in the stock order: [b, H, s, n] -> [b, 1, s, n].
+    # Split outside the compiled graph, which is shapeless: one graph for every shape.
+    H = scores.shape[1]
+    return _head_sum(mx.split(scores, H, axis=1), mx.split(weights, H, axis=1))
 
 
 def min_context(attn, q_pe, kv_latent, k_pe):
@@ -102,8 +120,11 @@ def blocked_topk(indexer, x, qr, mask, cache, block=4096):
     best_v = best_i = None
     for s0 in range(0, n, block):
         s1 = min(n, s0 + block)
-        sc = mx.maximum(q @ k[:, :, s0:s1].swapaxes(-1, -2), 0) * weights
-        sc = sum(sc[:, h : h + 1] for h in range(sc.shape[1]))  # [b, 1, s, blk]
+        kb = k[:, :, s0:s1]
+        if best_v is not None:
+            # Only after the previous merge: one block's scores alive at a time.
+            kb = mx.depends(kb, best_v)
+        sc = head_sum(q @ kb.swapaxes(-1, -2), weights)  # [b, 1, s, blk]
         if mask is not None:
             sc = mx.where(mask[..., s0:s1], sc, -float("inf"))
         ids = mx.broadcast_to(mx.arange(s0, s1), sc.shape)
