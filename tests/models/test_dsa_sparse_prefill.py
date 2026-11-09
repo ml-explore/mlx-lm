@@ -267,6 +267,33 @@ class _SparsePrefillTests:
         self.assertLess(float(diff.mean()), 0.014)
 
 
+class TestHeadSum(unittest.TestCase):
+    def test_matches_ops(self):
+        # Same values as the stock ops: ReLU, times the weight, heads added in order.
+        mx.random.seed(0)
+        device = mx.default_device()
+        try:
+            for d in (mx.cpu, mx.gpu) if mx.metal.is_available() else (mx.cpu,):
+                mx.set_default_device(d)
+                # One compiled graph serves all shapes, so the shapes change too.
+                for b, s, n, dtype in (
+                    (1, 33, 300, mx.bfloat16),
+                    (2, 17, 129, mx.bfloat16),
+                    (1, 33, 300, mx.float16),
+                    (1, 5, 1000, mx.float32),
+                ):
+                    scores = mx.random.normal((b, 8, s, n)).astype(dtype)
+                    weights = mx.random.normal((b, s, 8)).astype(dtype)
+                    weights = weights.swapaxes(-1, -2)[..., None]  # as the indexer's
+                    ref = mx.maximum(scores, 0) * weights
+                    ref = sum(ref[:, h : h + 1] for h in range(ref.shape[1]))
+                    out = dsa.head_sum(scores, weights)
+                    self.assertEqual(out.dtype, dtype)
+                    self.assertTrue(bool(mx.array_equal(out, ref)))
+        finally:
+            mx.set_default_device(device)
+
+
 class TestGlmSparsePrefill(_SparsePrefillTests, unittest.TestCase):
     module, config = G, GLM_CONFIG
 
