@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import sum_gradients
 from mlx_lm.layers.attention import (
     MultiLinear,
     blocked_topk,
+    head_sum,
     min_context,
     scaled_dot_product_attention,
     sparse_attention,
@@ -104,15 +105,13 @@ class Indexer(nn.Module):
         if k.shape[2] <= self.index_topk:
             return None
         scores = q @ k.swapaxes(-1, -2)
-        scores = mx.maximum(scores, 0)
         weights = self.weights_proj(x) * (self.n_heads**-0.5 * self.softmax_scale)
         weights = weights.swapaxes(-1, -2)[..., None]
-        scores = scores * weights
         # TODO(michalk8): remove once ml-explore/mlx#3784 is merged
         if s > 1:
-            scores = sum(scores[:, h : h + 1] for h in range(scores.shape[1]))
+            scores = head_sum(scores, weights)
         else:
-            scores = scores.sum(axis=1, keepdims=True)
+            scores = (mx.maximum(scores, 0) * weights).sum(axis=1, keepdims=True)
         if mask is not None:
             scores = mx.where(mask, scores, -float("inf"))
         return mx.argpartition(scores, kth=-self.index_topk, axis=-1)[
