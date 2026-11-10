@@ -6,6 +6,7 @@ from mlx_lm.tool_parsers import (
     function_gemma,
     gemma4,
     glm47,
+    harmony,
     json_tools,
     kimi_k2,
     kimi_k3,
@@ -68,6 +69,14 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<atem:invoke name="multiply">\n<atem:parameter name="a">12234585</atem:parameter><atem:parameter name="b">48838483920</atem:parameter>\n</atem:invoke>',
                 muse_spark,
+            ),
+            (
+                'multiply<|channel|>commentary json<|message|>{"a": 12234585, "b": 48838483920}',
+                harmony,
+            ),
+            (
+                'multiply <|constrain|>json<|message|>{"a": 12234585, "b": 48838483920}',
+                harmony,
             ),
         ]
 
@@ -204,7 +213,7 @@ class TestToolParsing(unittest.TestCase):
 
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
-        test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
+        test_case = "[write(filePath='/tmp/hello.py', content='# Hello, world!')]"
         tool_call = pythonic.parse_tool_call(test_case, None)
         self.assertEqual(tool_call["name"], "write")
         self.assertEqual(tool_call["arguments"]["filePath"], "/tmp/hello.py")
@@ -675,7 +684,7 @@ class TestToolParsing(unittest.TestCase):
             ('"f"><param name="city">None</param>', {"city": "None"}),
             # History renders dicts in Python style.
             (
-                '"f"><param name="opts">' "{'unit': 'c'}</param>",
+                "\"f\"><param name=\"opts\">{'unit': 'c'}</param>",
                 {"opts": {"unit": "c"}},
             ),
         ]
@@ -900,14 +909,73 @@ class TestToolParsing(unittest.TestCase):
 
         # A ">" later in the value must not be mistaken for the name's
         test_case = (
-            "<function=read_file>\n"
-            "<parameter=path\n"
-            "a>b\n"
-            "</parameter>\n"
-            "</function>"
+            "<function=read_file>\n<parameter=path\na>b\n</parameter>\n</function>"
         )
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"], {"path": "a>b"})
+
+    def test_harmony_channels(self):
+        # Channel-first (what gpt-oss emits) and recipient-first (what the
+        # chat template writes back). The call text is what the state machine
+        # keeps after ``to=functions.``.
+        from types import SimpleNamespace
+
+        from mlx_lm.chat_templates.harmony import RESPONSE_FORMAT, prepare_messages
+        from mlx_lm.generate import TextStateMachine
+
+        tokenizer = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=True,
+            tool_call_start=harmony.tool_call_start,
+            tool_call_end=harmony.tool_call_end,
+            structural_markers=(),
+            response_transitions=RESPONSE_FORMAT["transitions"],
+        )
+
+        def split(text):
+            reader = TextStateMachine.from_tokenizer(tokenizer).reader(
+                state=RESPONSE_FORMAT["initial_state"]
+            )
+            return reader.feed(text) + reader.finish()
+
+        delta = split(
+            "<|channel|>analysis<|message|>Need the file.<|end|>"
+            "<|start|>assistant<|channel|>commentary to=functions.read"
+            '<|constrain|>json<|message|>{"path": "a"}<|call|>'
+            "<|start|>assistant<|channel|>final<|message|>Done.<|return|>"
+        )
+        self.assertEqual(delta.reasoning, "Need the file.")
+        self.assertEqual(delta.content, "Done.")
+        self.assertEqual(
+            harmony.parse_tool_call(delta.tool_calls[0]),
+            {"name": "read", "arguments": {"path": "a"}},
+        )
+
+        delta = split(
+            "<|channel|>analysis<|message|>Run it.<|end|>"
+            "<|start|>assistant to=functions.bash<|channel|>commentary "
+            'json<|message|>{"command": "echo TOOL_OK"}<|call|>'
+        )
+        self.assertEqual(delta.reasoning, "Run it.")
+        self.assertEqual(delta.content, "")
+        self.assertEqual(
+            harmony.parse_tool_call(delta.tool_calls[0]),
+            {"name": "bash", "arguments": {"command": "echo TOOL_OK"}},
+        )
+
+        messages = [
+            {
+                "role": "assistant",
+                "content": "preamble",
+                "reasoning": "Need the file.",
+                "tool_calls": [
+                    {"function": {"name": "read", "arguments": {"path": "a"}}}
+                ],
+            }
+        ]
+        prepare_messages(messages)
+        self.assertEqual(messages[0]["thinking"], "Need the file.")
+        self.assertEqual(messages[0]["content"], "")
 
 
 if __name__ == "__main__":

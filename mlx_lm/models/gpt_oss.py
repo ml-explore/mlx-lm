@@ -14,6 +14,13 @@ from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
+# The checkpoint already carries the harmony chat template. These select the
+# response format and the tool parser for checkpoints that do not name them.
+TOKENIZER_DEFAULTS = {
+    "chat_template_type": "harmony",
+    "tool_parser_type": "harmony",
+}
+
 
 @dataclass
 class ModelArgs(BaseModelArgs):
