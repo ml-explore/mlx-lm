@@ -345,7 +345,7 @@ def run(args, training_callback: TrainingCallback = None):
         config=vars(args),
     )
 
-    rprint("Loading pretrained model")
+    rprint("Loading pretrained model", args.model)
     model, tokenizer = load(
         args.model,
         tokenizer_config={"trust_remote_code": args.trust_remote_code},
@@ -387,6 +387,11 @@ def main():
                 args[k] = v
 
     # Update defaults for unspecified parameters
+    if args.get("model", None) is None:
+        rprint(
+            "No model given with --model or in the config;"
+            f" using the default {CONFIG_DEFAULTS['model']}"
+        )
     for k, v in CONFIG_DEFAULTS.items():
         if args.get(k, None) is None:
             args[k] = v
