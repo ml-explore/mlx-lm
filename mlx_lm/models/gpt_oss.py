@@ -32,6 +32,7 @@ class ModelArgs(BaseModelArgs):
     rope_theta: int = 150000
     rope_scaling: Any = None
     layer_types: list = None
+    tie_word_embeddings: bool = False
 
 
 # These operators emulate particular methods in torch that don't exist in MLX natively
@@ -212,12 +213,19 @@ class Model(nn.Module):
         self.args = args
         self.model_type = args.model_type
         self.model = GptOssMoeModel(args)
-        self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache=None):
-        return self.lm_head(self.model(inputs, cache))
+        out = self.model(inputs, cache)
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(out)
+        return self.lm_head(out)
 
     def sanitize(self, weights):
+        if self.args.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+
         if any("gate_proj.weight" in k for k in weights.keys()):
             return weights  # already sanitized
 

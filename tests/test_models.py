@@ -3460,6 +3460,39 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
+    def test_gpt_oss_tie_word_embeddings(self):
+        from mlx_lm.models import gpt_oss
+
+        args = gpt_oss.ModelArgs.from_dict(
+            {
+                "model_type": "gpt_oss",
+                "hidden_size": 64,
+                "num_hidden_layers": 2,
+                "intermediate_size": 64,
+                "head_dim": 16,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_local_experts": 4,
+                "num_experts_per_tok": 2,
+                "sliding_window": 8,
+                "vocab_size": 100,
+                "tie_word_embeddings": True,
+            }
+        )
+        self.assertTrue(args.tie_word_embeddings)
+        model = gpt_oss.Model(args)
+        self.assertFalse(hasattr(model, "lm_head"))
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # sanitize drops lm_head.weight, also on the already-sanitized path.
+        weights = dict(tree_flatten(model.parameters()))
+        weights["lm_head.weight"] = mx.zeros((args.vocab_size, args.hidden_size))
+        sanitized = model.sanitize(dict(weights))
+        self.assertNotIn("lm_head.weight", sanitized)
+        model.load_weights(list(sanitized.items()), strict=True)
+
     def _flint_config(self):
         return {
             "model_type": "flint",
