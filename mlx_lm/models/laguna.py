@@ -215,8 +215,7 @@ class MoE(nn.Module):
         shared_out = self.shared_expert(x)
 
         inds, weights = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * weights[..., None]).sum(axis=-2).astype(x.dtype)
+        y = self.switch_mlp.combine(x, inds, weights).astype(x.dtype)
 
         return y * self.routed_scaling_factor + shared_out
 

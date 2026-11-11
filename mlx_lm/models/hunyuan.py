@@ -197,8 +197,7 @@ class MoeBlock(nn.Module):
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None].astype(mx.float32)).sum(axis=-2).astype(y.dtype)
+        y = self.switch_mlp.combine(x, inds, scores.astype(mx.float32)).astype(x.dtype)
 
         if self.use_shared_mlp:
             shared_expert_output = self.shared_mlp(x)

@@ -512,8 +512,7 @@ class SparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         topk_idx, topk_weight = self.gate(x)
-        out = self.switch_mlp(x, topk_idx)
-        out = (out * topk_weight[..., None]).sum(axis=-2)
+        out = self.switch_mlp.combine(x, topk_idx, topk_weight)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         return out

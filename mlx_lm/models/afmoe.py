@@ -231,8 +231,7 @@ class AfmoeMoE(nn.Module):
 
         selected_scores = selected_scores * self.route_scale
 
-        y = self.experts(x, inds)
-        y = (y * selected_scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = self.experts.combine(x, inds, selected_scores).astype(x.dtype)
 
         if self.args.num_shared_experts > 0:
             y = y + self.shared_experts(x)

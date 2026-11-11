@@ -126,8 +126,7 @@ class MellumSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x, inds, scores)
         return y
 
 

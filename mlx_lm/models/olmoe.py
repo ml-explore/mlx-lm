@@ -120,8 +120,7 @@ class OlmoeSparseMoeBlock(nn.Module):
         scores = mx.take_along_axis(routing_weights, indices, axis=-1)
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
-        y = self.switch_mlp(x_flat, indices)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x_flat, indices, scores)
         return y.reshape(B, L, D)
 
 

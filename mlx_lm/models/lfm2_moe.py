@@ -229,8 +229,7 @@ class Lfm2MoeSparseMoeBlock(nn.Module):
         scores = scores * self.routed_scaling_factor
         scores = scores.astype(x.dtype)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x, inds, scores)
 
         return y
 

@@ -332,8 +332,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x, inds, scores)
 
         shared_y = self.shared_expert(x)
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y

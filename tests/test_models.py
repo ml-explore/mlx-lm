@@ -1037,6 +1037,10 @@ class TestModels(unittest.TestCase):
             one_hot = (inds[..., None] == mx.arange(4)).astype(mx.float32)
             return mx.pad(one_hot, [(0, 0), (0, 0), (0, 0), (0, 4)])
 
+        # As SwitchGLU.combine, which the block calls.
+        switch_mlp.combine = lambda x, inds, scores: (
+            switch_mlp(x, inds) * scores[..., None]
+        ).sum(axis=-2)
         moe.switch_mlp = switch_mlp
         with mock.patch.object(mx, "argpartition", wraps=mx.argpartition) as argpart:
             out = moe(mx.ones((1, 1, 8)))

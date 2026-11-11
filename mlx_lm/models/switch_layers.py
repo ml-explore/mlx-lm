@@ -5,6 +5,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import can_combine, switch_glu_combine
 from .activations import swiglu
 
 
@@ -172,6 +173,9 @@ class SwitchLinear(nn.Module):
 
 
 class SwiGLU(nn.Module):
+    # The activation in the fused Metal kernels (kernels/switch_glu.py): SiLU.
+    metal_act = 0
+
     def __init__(self):
         super().__init__()
 
@@ -218,6 +222,14 @@ class SwitchGLU(nn.Module):
             x = _scatter_unsort(x, inv_order, indices.shape)
 
         return x.squeeze(-2)
+
+    def combine(self, x, indices, scores) -> mx.array:
+        """The experts' outputs weighted by ``scores`` and summed over the experts,
+        ``(self(x, indices) * scores[..., None]).sum(axis=-2)``: in fused Metal kernels
+        for one token where they apply (``kernels.can_combine``)."""
+        if can_combine(self, x):
+            return switch_glu_combine(self, x, indices, scores)
+        return (self(x, indices) * scores[..., None]).sum(axis=-2)
 
 
 class SwitchMLP(nn.Module):

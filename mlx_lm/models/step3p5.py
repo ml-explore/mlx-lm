@@ -170,11 +170,8 @@ class Step3p5MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         topk_indices, topk_weights = self.gate(x)
-        routed_output = self.switch_mlp(x, topk_indices)
-        routed_output = (
-            (routed_output * topk_weights[..., None])
-            .sum(axis=-2)
-            .astype(routed_output.dtype)
+        routed_output = self.switch_mlp.combine(x, topk_indices, topk_weights).astype(
+            x.dtype
         )
         y = routed_output + self.share_expert(x)
 

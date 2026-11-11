@@ -9,8 +9,10 @@ from .qk_norm import qk_norm
 from .qk_norm_rope import qk_norm_rope
 from .rms_norm_sigmoid_gate import rms_norm_sigmoid_gate
 from .sparse_mla import sparse_mla_attention
+from .switch_glu import can_combine, switch_glu_combine
 
 __all__ = [
+    "can_combine",
     "expert_routing",
     "norm_add_norm",
     "post_expert_norm_combine",
@@ -19,4 +21,5 @@ __all__ = [
     "qk_norm_rope",
     "rms_norm_sigmoid_gate",
     "sparse_mla_attention",
+    "switch_glu_combine",
 ]
