@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+import weakref
 from collections.abc import AsyncIterator
 
 import mlx.core as mx
@@ -46,7 +47,7 @@ def load_chat_tokenizer() -> tokenizer_utils.TokenizerWrapper:
 class StubEngine:
     """Serves ``events`` to each request as one response.
 
-    A request that has no end waits, with idle updates, until its updates close.
+    A request that has no end waits until its updates close.
     """
 
     def __init__(self, *events: protocol.Event):
@@ -77,17 +78,22 @@ class StubEngine:
         return len(self.requests) - 1
 
     def updates(self, handle: int) -> AsyncIterator[protocol.Update]:
-        return self._updates(handle)
+        stream = self._updates(handle)
+        # Like Engine.updates: cancel a stream that never started.
+        weakref.finalize(stream, self._leave, handle)
+        return stream
 
     async def _updates(self, handle: int) -> AsyncIterator[protocol.Update]:
         try:
             if self.events:
                 yield protocol.Update.from_events(list(self.events))
             if not self.events or isinstance(self.events[-1], protocol.TokensEvent):
-                while True:
-                    await asyncio.sleep(self.config.keepalive)
-                    yield protocol.Update([])
+                await asyncio.Event().wait()
         finally:
+            self._leave(handle)
+
+    def _leave(self, handle: int) -> None:
+        if handle not in self.cancelled:
             self.cancelled.append(handle)
             self.cancel_called.set()
 

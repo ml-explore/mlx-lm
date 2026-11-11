@@ -113,11 +113,6 @@ class Update:
     events: list[TokensEvent]
     end: FinishedEvent | None = None
 
-    @property
-    def is_empty(self) -> bool:
-        """Whether nothing happened: the request waits, e.g. for its prefill."""
-        return not self.events and self.end is None
-
     @classmethod
     def from_events(cls, events: list[Event]) -> Self:
         """The update of a list of events. Raises the error of a failed request."""

@@ -155,7 +155,7 @@ class Engine:
         return handle
 
     def updates(self, handle: int) -> AsyncIterator[protocol.Update]:
-        """The updates of a request: new events, or none after the keepalive time.
+        """The updates of a request, each with its new events.
 
         They end with the request; closing or freeing them cancels it. Reading raises
         ``EngineError`` if the request fails, ``UnavailableError`` if the engine stops.
@@ -218,14 +218,7 @@ class Engine:
         ended = False
         try:
             while True:
-                try:
-                    new_events = await asyncio.wait_for(
-                        queue.get(), timeout=self.config.keepalive
-                    )
-                except TimeoutError:
-                    new_events = []
-
-                update = protocol.Update.from_events(new_events)
+                update = protocol.Update.from_events(await queue.get())
                 ended = update.end is not None
                 yield update
                 if ended:

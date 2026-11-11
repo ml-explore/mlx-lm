@@ -139,12 +139,39 @@ async def answer_http_error(
     return error.to_response(body)
 
 
-def event_stream(events: AsyncIterator[str]) -> responses.StreamingResponse:
+def event_stream(
+    events: AsyncIterator[str], *, keepalive_event: str, keepalive: float
+) -> responses.StreamingResponse:
     """Server-sent events that no cache may store, as in mlx_lm.server."""
     headers = {"cache-control": "no-cache"}
     return responses.StreamingResponse(
-        events, media_type="text/event-stream", headers=headers
+        _with_keepalive(events, keepalive_event=keepalive_event, keepalive=keepalive),
+        media_type="text/event-stream",
+        headers=headers,
     )
+
+
+async def _with_keepalive(
+    events: AsyncIterator[str], *, keepalive_event: str, keepalive: float
+) -> AsyncIterator[str]:
+    """The events, and ``keepalive_event`` after ``keepalive`` seconds without one."""
+    next_event = asyncio.ensure_future(anext(events))
+    try:
+        while True:
+            done, _ = await asyncio.wait({next_event}, timeout=keepalive)
+            if not done:
+                yield keepalive_event
+                continue
+            try:
+                event = next_event.result()
+            except StopAsyncIteration:
+                return
+            yield event
+            next_event = asyncio.ensure_future(anext(events))
+    finally:
+        # Cancel the request now, not when the GC frees the events.
+        next_event.cancel()
+        asyncio.ensure_future(events.aclose())
 
 
 async def while_connected(req: fastapi.Request, awaitable: Awaitable[_T]) -> _T:

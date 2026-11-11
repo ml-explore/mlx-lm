@@ -35,7 +35,6 @@ class TestApp(unittest.IsolatedAsyncioTestCase):
 
     async def asyncSetUp(self):
         self.engine = helpers.StubEngine()
-        self.engine.config = settings.EngineConfig(keepalive=0.001)
         config = settings.ServerConfig(model_id="m")
         self.state = app.ServerState(engine=self.engine, tokenizer=None, config=config)
         router = fastapi.APIRouter(route_class=_TestRoute)
@@ -166,6 +165,22 @@ class TestApp(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await http.while_connected(req, asyncio.sleep(0, "x")), "x")
         await asyncio.sleep(0)
         self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
+
+    async def test_event_stream_keepalive(self):
+        closed = asyncio.Event()
+
+        async def events():
+            try:
+                yield "a"
+                await asyncio.Event().wait()
+            finally:
+                closed.set()
+
+        response = http.event_stream(events(), keepalive_event="k", keepalive=0.01)
+        stream = response.body_iterator
+        self.assertEqual([await anext(stream) for _ in range(3)], ["a", "k", "k"])
+        await stream.aclose()
+        await asyncio.wait_for(closed.wait(), timeout=10)
 
 
 class TestLifespan(unittest.TestCase):

@@ -13,7 +13,9 @@ from mlx_lm.server_v2.api.openai import schema
 from mlx_lm.server_v2.chat import tool_call
 from mlx_lm.server_v2.engine import protocol
 
-__all__ = ["ChatOutput", "CompletionOutput", "error_body"]
+__all__ = ["KEEPALIVE_EVENT", "ChatOutput", "CompletionOutput", "error_body"]
+
+KEEPALIVE_EVENT = ": keepalive\n\n"
 
 
 class ChatOutput:
@@ -52,8 +54,6 @@ class ChatOutput:
             async for delta, logprobs, update in self._deltas():
                 if not delta.is_empty or logprobs:
                     yield self._chunk_event(delta, logprobs=logprobs)
-                elif update.is_empty:
-                    yield ": keepalive\n\n"
 
                 if (end := update.end) is not None:
                     last = schema.ChatDelta()
@@ -206,10 +206,6 @@ class CompletionOutput:
         """The output as server-sent events; an error ends them with an error event."""
         try:
             async for update in self._engine_updates:
-                if update.is_empty:
-                    yield ": keepalive\n\n"
-                    continue
-
                 text = "".join(event.delta.content for event in update.events)
                 logprobs = self._logprobs(update.events)
                 # The schema has no null usage here, unlike chat chunks.
