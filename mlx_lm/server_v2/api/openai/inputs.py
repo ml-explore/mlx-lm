@@ -2,7 +2,6 @@
 
 import dataclasses
 import json
-import logging
 from typing import Any
 
 import pydantic
@@ -19,12 +18,9 @@ __all__ = [
     "check_model",
     "completion_params",
     "include_usage",
-    "log_request",
     "template_kwargs",
     "template_message",
 ]
-
-_logger = logging.getLogger(__name__)
 
 # The request fields that GenerationParams takes as they are.
 _PARAM_FIELDS = {
@@ -41,12 +37,6 @@ _PARAM_FIELDS = {
     "frequency_penalty",
     "frequency_context_size",
 }
-
-
-def log_request(body: schema.BaseRequest) -> None:
-    """Log the body at the DEBUG level: it holds the prompt."""
-    if _logger.isEnabledFor(logging.DEBUG):
-        _logger.debug("Request body: %s", body.model_dump_json(exclude_none=True))
 
 
 def check_chat(body: schema.ChatRequest) -> None:

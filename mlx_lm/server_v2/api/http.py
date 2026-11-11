@@ -18,6 +18,7 @@ __all__ = [
     "ErrorRoute",
     "answer_http_error",
     "event_stream",
+    "log_request",
     "while_connected",
 ]
 
@@ -137,6 +138,12 @@ async def answer_http_error(
     error = APIError.from_exception(e)
     body = route_class.error_body(error)
     return error.to_response(body)
+
+
+def log_request(body: pydantic.BaseModel) -> None:
+    """Log the body at the DEBUG level: it holds the prompt."""
+    if _logger.isEnabledFor(logging.DEBUG):
+        _logger.debug("Request body: %s", body.model_dump_json(exclude_none=True))
 
 
 def event_stream(
