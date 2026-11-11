@@ -29,7 +29,6 @@ class ChatOutput:
         tokenizer: tokenizer_utils.TokenizerWrapper,
         engine_updates: AsyncIterator[protocol.Update],
         include_usage: bool,
-        parallel_tool_calls: bool,
     ):
         self._head = {
             "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -40,7 +39,6 @@ class ChatOutput:
         self._parser = parser
         self._tokenizer = tokenizer
         self._engine_updates = engine_updates
-        self._parallel_tool_calls = parallel_tool_calls
         self._num_tool_calls = 0
         self._include_usage = include_usage
 
@@ -134,10 +132,6 @@ class ChatOutput:
                 reasoning += event.delta.reasoning
                 calls += event_calls
                 logprobs += _token_logprobs(self._tokenizer, event.logprobs)
-
-            if not self._parallel_tool_calls:
-                # Only the first call of the response.
-                calls = calls[:1] if self._num_tool_calls == 0 else []
 
             openai_calls = [
                 _tool_call(c, index=self._num_tool_calls + i)

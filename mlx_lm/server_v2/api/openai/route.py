@@ -49,7 +49,9 @@ async def chat_completions(
     engine_request = await http.while_connected(req, build_request)
 
     parser = tool_call.ToolCallParser(
-        state.tokenizer, tools=tools if parse_tool_calls else None
+        state.tokenizer,
+        tools=tools if parse_tool_calls else None,
+        parallel_tool_calls=body.parallel_tool_calls is not False,
     )
     handle = state.engine.submit(engine_request)
     chat = outputs.ChatOutput(
@@ -58,7 +60,6 @@ async def chat_completions(
         tokenizer=state.tokenizer,
         engine_updates=state.engine.updates(handle),
         include_usage=inputs.include_usage(body),
-        parallel_tool_calls=body.parallel_tool_calls is not False,
     )
 
     keepalive = state.config.keepalive

@@ -46,18 +46,21 @@ class ToolCall:
 
 
 class ToolCallParser:
-    """Parse the tool calls of the engine's text deltas."""
+    """Parse the tool calls of one reply's text deltas."""
 
     def __init__(
         self,
         tokenizer: tokenizer_utils.TokenizerWrapper,
         *,
         tools: list[dict[str, Any]] | None = None,
+        parallel_tool_calls: bool = True,
     ):
         self._parser = tokenizer.tool_parser
         self._start = tokenizer.tool_call_start or ""
         self._end = tokenizer.tool_call_end or ""
         self._tool_definitions = tools
+        self._parallel_tool_calls = parallel_tool_calls
+        self._num_tool_calls = 0
 
     def parse(self, delta: TextStateMachine.Delta) -> tuple[str, list[ToolCall]]:
         """The content and the parsed tool calls of ``delta``."""
@@ -82,6 +85,10 @@ class ToolCallParser:
                 )
                 content += self._start + text + self._end
 
+        if not self._parallel_tool_calls:
+            # Only the first call of the reply.
+            calls = calls[:1] if self._num_tool_calls == 0 else []
+        self._num_tool_calls += len(calls)
         return content, calls
 
 
