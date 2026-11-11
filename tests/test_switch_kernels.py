@@ -49,12 +49,13 @@ class TestSwitchKernels(unittest.TestCase):
             for act in (SwiGLU(), GeGLU()):
                 glu = quantized_glu(D, F, E, act)
                 for dtype in (mx.bfloat16, mx.float16):
+                    glu.set_dtype(dtype)
                     for T in (1, 2, 3, 8, 17):
                         x = mx.random.normal((1, T, D)).astype(dtype)
                         idx = mx.argsort(mx.random.uniform(shape=(1, T, E)), axis=-1)[
                             ..., :k
                         ]
-                        if T * k / E > switch_kernels.max_load(D, F):
+                        if not switch_kernels.supported_load(T * k / E, D, F):
                             continue
                         y = switch_kernels.switch_glu(glu, x, idx)
                         self.assertIsNotNone(y)
@@ -66,6 +67,7 @@ class TestSwitchKernels(unittest.TestCase):
     def test_gradient_matches_generic_path(self):
         mx.random.seed(1)
         glu = quantized_glu(256, 384, 16)
+        glu.set_dtype(mx.bfloat16)
         x = mx.random.normal((1, 3, 256)).astype(mx.bfloat16)
         idx = mx.argsort(mx.random.uniform(shape=(1, 3, 16)), axis=-1)[..., :4]
         loss = lambda x: glu(x, idx).astype(mx.float32).sum()
@@ -86,11 +88,37 @@ class TestSwitchKernels(unittest.TestCase):
         idx = mx.zeros((1, 2, 4), mx.uint32)
         self.assertIsNone(switch_kernels.switch_glu(glu, x, idx))
         glu = quantized_glu(256, 384, 16)
+        # scales are fp32 here: the generic path would return fp32
+        self.assertIsNone(switch_kernels.switch_glu(glu, x, idx))
+        glu.set_dtype(mx.bfloat16)
+        self.assertIsNotNone(switch_kernels.switch_glu(glu, x, idx))
         self.assertIsNone(switch_kernels.switch_glu(glu, x.astype(mx.float32), idx))
         many = mx.zeros((1, 512, 4), mx.uint32)
         self.assertIsNone(
             switch_kernels.switch_glu(glu, mx.zeros((1, 512, 256), mx.bfloat16), many)
         )
+        # more experts per token than the T = 1 threadgroup allows
+        self.assertIsNone(
+            switch_kernels.switch_glu(glu, x, mx.zeros((1, 2, 9), mx.uint32))
+        )
+
+    def test_no_tokens(self):
+        glu = quantized_glu(256, 384, 16)
+        glu.set_dtype(mx.bfloat16)
+        x, idx = mx.zeros((1, 0, 256), mx.bfloat16), mx.zeros((1, 0, 4), mx.uint32)
+        self.assertEqual(glu(x, idx).shape, (1, 0, 4, 256))
+
+    def test_nax_gpu_keeps_gather_qmm_rhs(self):
+        glu = quantized_glu(256, 384, 16)
+        glu.set_dtype(mx.bfloat16)
+        x = lambda T: mx.zeros((1, T, 256), mx.bfloat16)
+        idx = lambda T: mx.zeros((1, T, 4), mx.uint32)
+        nax, switch_kernels._nax = switch_kernels._nax, True
+        try:
+            self.assertIsNotNone(switch_kernels.switch_glu(glu, x(15), idx(15)))
+            self.assertIsNone(switch_kernels.switch_glu(glu, x(16), idx(16)))
+        finally:
+            switch_kernels._nax = nax
 
 
 if __name__ == "__main__":

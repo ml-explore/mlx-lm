@@ -562,9 +562,24 @@ def _make_op(act):
 _ops = {0: _make_op(0), 1: _make_op(1)}
 
 
-def max_load(D, F):
-    """Average tokens per expert (T*k/E) up to which these kernels beat gather_qmm (M4 Pro measurement)."""
-    return 24 if D * F >= 3 << 19 else 8
+def _nax_gpu():
+    """M5 and later, where gather_qmm runs the NAX kernels from 4 tokens per expert."""
+    gen = mx.device_info().get("architecture", "")[-3:-1]
+    return gen.isdigit() and int(gen) >= 17
+
+
+_nax = _kernels is not None and _nax_gpu()
+
+
+def supported_load(load, D, F):
+    """Whether these kernels are used at `load` = average tokens per expert (T*k/E).
+
+    M4 Pro: the measured crossover against gather_qmm. M5 and later: gather_qmm runs the NAX kernels
+    from 4; these kernels were not measured against them, so there they only replace gather_qmv.
+    """
+    if _nax:
+        return load < 4
+    return load <= (24 if D * F >= 3 << 19 else 8)
 
 
 def switch_glu(glu, x, indices):
@@ -579,12 +594,13 @@ def switch_glu(glu, x, indices):
             getattr(p, "group_size", None),
             getattr(p, "mode", "affine"),
         )
-        if fmt != (4, 64, "affine") or "bias" in p:
+        if fmt != (4, 64, "affine") or "bias" in p or p.scales.dtype != x.dtype:
             return None
     k = indices.shape[-1]
     T = indices.size // k
-    E, F, D = glu.gate_proj.weight.shape[0], glu.gate_proj.weight.shape[1], x.shape[-1]
-    if T * k / E > max_load(D, F):
+    (E, F), D = glu.gate_proj.weight.shape[:2], x.shape[-1]
+    # k <= 8: the T = 1 down kernel uses a (32, k) threadgroup
+    if T == 0 or k > 8 or not supported_load(T * k / E, D, F):
         return None
     weights = [a for p in projs for a in (p.weight, p.scales, p.biases)]
     y = _ops[act](x.reshape(T, D), indices.reshape(T, k).astype(mx.uint32), *weights)
