@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import expert_routing, on_metal
 from .activations import SwigluOAI
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
@@ -163,16 +164,26 @@ class SparseMoeBlock(nn.Module):
 
         # The reference routes in the weight dtype and upcasts only the logits.
         gates = self.gate(x_flat)
-        scores = mx.sigmoid(gates.astype(mx.float32))
-        orig_scores = scores
-        scores = scores + self.e_score_correction_bias
-
         k = self.num_experts_per_tok
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores = (scores * self.routed_scaling_factor).astype(x_flat.dtype)
+        if not self.training and on_metal():
+            inds, scores = expert_routing(
+                gates,
+                self.e_score_correction_bias,
+                top_k=k,
+                multiplier=1.0,
+                score_eps=1e-20,
+                route_scale=self.routed_scaling_factor,
+            )
+            scores = scores.astype(x_flat.dtype)
+        else:
+            scores = mx.sigmoid(gates.astype(mx.float32))
+            orig_scores = scores
+            scores = scores + self.e_score_correction_bias
+            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            inds = mx.stop_gradient(inds)
+            scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+            scores = (scores * self.routed_scaling_factor).astype(x_flat.dtype)
 
         y = self.switch_mlp(x_flat, inds)
         y = (y * scores[..., None]).sum(axis=-2)

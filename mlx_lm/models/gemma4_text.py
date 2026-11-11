@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -131,15 +132,21 @@ class Router(nn.Module):
 
         expert_scores = self.proj(x)
 
-        top_k_indices = mx.argpartition(
-            expert_scores, kth=-self.config.top_k_experts, axis=-1
-        )
-        top_k_indices = mx.stop_gradient(
-            top_k_indices[..., -self.config.top_k_experts :]
-        )
+        if not self.training and on_metal():
+            # The softmax of the top k scores: the softmax renormalized over the top k.
+            top_k_indices, top_k_weights = softmax_topk(
+                expert_scores, top_k=self.config.top_k_experts, normalize=True
+            )
+        else:
+            top_k_indices = mx.argpartition(
+                expert_scores, kth=-self.config.top_k_experts, axis=-1
+            )
+            top_k_indices = mx.stop_gradient(
+                top_k_indices[..., -self.config.top_k_experts :]
+            )
 
-        top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
-        top_k_weights = mx.softmax(top_k_weights, axis=-1)
+            top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
+            top_k_weights = mx.softmax(top_k_weights, axis=-1)
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
 
         return top_k_indices, top_k_weights

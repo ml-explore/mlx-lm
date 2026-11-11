@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -126,8 +127,18 @@ class Step3p5MoEGate(nn.Module):
         self.router_bias = mx.zeros((self.n_routed_experts,))
 
     def __call__(self, x: mx.array):
+        gates = self.gate(x)
+        if not self.training and on_metal() and self.norm_topk_prob:
+            return expert_routing(
+                gates,
+                self.router_bias,
+                top_k=self.top_k,
+                multiplier=1.0,
+                score_eps=1e-20,
+                route_scale=self.routed_scaling_factor,
+            )
         return moe_gate_select(
-            self.gate(x),
+            gates,
             self.router_bias,
             self.top_k,
             self.routed_scaling_factor,

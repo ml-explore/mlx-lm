@@ -7,6 +7,7 @@ from typing import Any, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -239,9 +240,15 @@ class JambaSparseMoeBlock(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.router(x)
         k = self.num_experts_per_tok
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = mx.softmax(scores, axis=-1, precise=True)
+        if not self.training and on_metal():
+            # The softmax of the top k logits: the softmax renormalized over the top k.
+            inds, scores = softmax_topk(gates, top_k=k, normalize=True)
+        else:
+            inds = mx.stop_gradient(
+                mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k]
+            )
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            scores = mx.softmax(scores, axis=-1, precise=True)
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         return y

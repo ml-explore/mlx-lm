@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import expert_routing, on_metal
 from .base import (
     BaseModelArgs,
     create_attention_mask,
@@ -625,15 +626,34 @@ class KimiK3SparseMoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         scores = self.gate(x)
-        inds, weights = _group_expert_select(
-            scores,
-            self.e_score_correction_bias,
-            self.args.num_experts_per_token,
-            self.args.num_expert_group,
-            self.args.topk_group,
-            self.args.routed_scaling_factor,
-            self.args.moe_renormalize,
-        )
+        if (
+            not self.training
+            and on_metal()
+            and self.args.num_experts_per_token > 1
+            and self.args.moe_renormalize
+        ):
+            # _group_expert_select in one kernel.
+            inds, weights = expert_routing(
+                scores,
+                self.e_score_correction_bias,
+                top_k=self.args.num_experts_per_token,
+                multiplier=1.0,
+                score_eps=1e-20,
+                route_scale=self.args.routed_scaling_factor,
+                n_group=self.args.num_expert_group,
+                topk_group=self.args.topk_group,
+            )
+            weights = weights.astype(scores.dtype)
+        else:
+            inds, weights = _group_expert_select(
+                scores,
+                self.e_score_correction_bias,
+                self.args.num_experts_per_token,
+                self.args.num_expert_group,
+                self.args.topk_group,
+                self.args.routed_scaling_factor,
+                self.args.moe_renormalize,
+            )
         y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
         y = self.switch_mlp(y, inds)
         y = (y * weights[..., None]).sum(axis=-2)

@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
@@ -128,11 +129,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         x: mx.array,
     ):
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
-
-        k = self.top_k
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
+        if not self.training and on_metal():
+            inds, scores = softmax_topk(gates, top_k=self.top_k, normalize=False)
+        else:
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            k = self.top_k
+            inds = mx.stop_gradient(
+                mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k]
+            )
+            scores = mx.take_along_axis(gates, inds, axis=-1)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)

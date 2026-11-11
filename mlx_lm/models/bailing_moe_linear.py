@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -383,8 +384,29 @@ class Gate(nn.Module):
         self.score_function = args.score_function
 
     def __call__(self, x: mx.array) -> mx.array:
+        gates = self.gate_proj(x)
+        if (
+            not self.training
+            and on_metal()
+            and self.score_function == "sigmoid"
+            and self.expert_bias is not None
+            and self.top_k > 1
+            and self.norm_topk_prob
+        ):
+            # group_expert_select's routing in one kernel.
+            inds, scores = expert_routing(
+                gates,
+                self.expert_bias,
+                top_k=self.top_k,
+                multiplier=1.0,
+                score_eps=0.0,
+                route_scale=self.routed_scaling_factor,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
+            )
+            return inds, scores.astype(gates.dtype)
         return group_expert_select(
-            self.gate_proj(x),
+            gates,
             self.expert_bias,
             self.top_k,
             self.n_group,
