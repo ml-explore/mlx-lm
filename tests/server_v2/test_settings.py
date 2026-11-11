@@ -95,7 +95,7 @@ class TestSettings(unittest.TestCase):
             context_length=2, prompt_cache_size=0, prompt_cache_bytes=0
         )
         cases = [{"context_length": 1}, {"decode_concurrency": 0}]
-        for kwargs in cases + [{"prefill_step_size": 0}, {"keepalive": 0.0}]:
+        for kwargs in cases + [{"prefill_step_size": 0}]:
             with self.subTest(**kwargs), self.assertRaises(pydantic.ValidationError):
                 settings.EngineConfig(**kwargs)
 

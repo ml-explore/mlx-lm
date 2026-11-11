@@ -61,7 +61,8 @@ async def chat_completions(
         parallel_tool_calls=body.parallel_tool_calls is not False,
     )
 
-    return await _answer(req, chat, stream=body.stream is True)
+    keepalive = state.config.keepalive
+    return await _answer(req, chat, stream=body.stream is True, keepalive=keepalive)
 
 
 @router.post("/v1/completions")
@@ -89,7 +90,10 @@ async def completions(
         include_usage=inputs.include_usage(body),
     )
 
-    return await _answer(req, completion, stream=body.stream is True)
+    keepalive = state.config.keepalive
+    return await _answer(
+        req, completion, stream=body.stream is True, keepalive=keepalive
+    )
 
 
 @router.get("/v1/models")
@@ -109,10 +113,15 @@ async def _answer(
     output: outputs.ChatOutput | outputs.CompletionOutput,
     *,
     stream: bool,
+    keepalive: float,
 ) -> responses.Response:
     """The output as server-sent events, or as one JSON body."""
     if stream:
-        return http.event_stream(output.stream())
+        return http.event_stream(
+            output.stream(),
+            keepalive_event=outputs.KEEPALIVE_EVENT,
+            keepalive=keepalive,
+        )
     body = await http.while_connected(req, output.body())
     return responses.JSONResponse(body)
 

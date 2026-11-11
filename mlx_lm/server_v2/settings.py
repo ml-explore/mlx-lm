@@ -64,9 +64,6 @@ class EngineConfig:
     prompt_cache_size: int = pydantic.Field(10, ge=0)
     prompt_cache_bytes: int = pydantic.Field(1 << 63, ge=0)
 
-    # Seconds without an event before a request gets an idle response.
-    keepalive: float = pydantic.Field(15.0, gt=0.0)
-
 
 class ServerConfig(pydantic.BaseModel):
     """The served model, and the defaults of its requests."""
@@ -77,3 +74,5 @@ class ServerConfig(pydantic.BaseModel):
     default_params: GenerationParams = GenerationParams()
     template_kwargs: dict[str, Any] = pydantic.Field(default_factory=dict)
     stall_timeout: float = pydantic.Field(60.0, gt=0.0)
+    # Seconds without an event before a stream sends a keepalive.
+    keepalive: float = pydantic.Field(15.0, gt=0.0)

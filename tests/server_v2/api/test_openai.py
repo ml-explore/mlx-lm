@@ -312,7 +312,7 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
             "chat_template_kwargs": {"think": True},
         }
         completion = {"prompt": "One"}
-        for batches in [[events], [[e] for e in events], [events[:2], [], events[2:]]]:
+        for batches in [[events], [[e] for e in events], [events[:2], events[2:]]]:
             first = len(self.engine.requests)
             with mock.patch.object(
                 self.engine,
@@ -348,8 +348,6 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
                 for c in sse_events(text_stream)[:-1]
             ]
             self.assertEqual("".join(chunks), "Hi there.")
-            for response in (stream, text_stream):
-                self.assertEqual(response.text.count(": keepalive"), batches.count([]))
 
     async def test_tool_calls(self):
         call = '{"name": "f", "arguments": {"a": "\\u00e9"}}'

@@ -421,7 +421,7 @@ class TestEngine(unittest.IsolatedAsyncioTestCase):
                 await self.collect(late)
 
     async def test_stall_and_idle(self):
-        engine = await self.engine(keepalive=0.01)
+        engine = await self.engine()
         stuck, release = threading.Event(), threading.Event()
         step = engine._worker._step
 
@@ -436,7 +436,6 @@ class TestEngine(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(stuck.wait, timeout=60)
         # The loop is free while the step blocks, and it sees the stall.
         self.assertGreater(engine.seconds_since_step(), 0)
-        self.assertTrue((await anext(stream)).is_empty)
         release.set()
         engine._worker._step = step
         await self.collect(stream)

@@ -12,10 +12,8 @@ class TestProtocol(unittest.TestCase):
         tokens = protocol.TokensEvent(token_ids=(1,), delta=TextStateMachine.Delta())
         usage = protocol.Usage(prompt_tokens=1, cached_tokens=0, completion_tokens=1)
         end = protocol.FinishedEvent(reason=protocol.FinishReason.EOS, usage=usage)
-        self.assertTrue(protocol.Update.from_events([]).is_empty)
         update = protocol.Update.from_events([tokens, tokens])
         self.assertEqual(update, protocol.Update([tokens, tokens]))
-        self.assertFalse(update.is_empty)
         self.assertEqual(
             protocol.Update.from_events([tokens, end]),
             protocol.Update([tokens], end),
