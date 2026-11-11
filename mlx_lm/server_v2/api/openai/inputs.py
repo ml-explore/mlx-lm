@@ -78,7 +78,7 @@ def check_completion(body: schema.CompletionRequest) -> None:
         raise _unsupported("prompt", "Only a string prompt is supported.")
     if body.echo:
         raise _unsupported("echo", "echo is not supported.")
-    if body.suffix is not None:
+    if body.suffix:
         raise _unsupported("suffix", "suffix is not supported.")
     if body.best_of not in (None, 1):
         raise _unsupported("best_of", "Only best_of=1 is supported.")
