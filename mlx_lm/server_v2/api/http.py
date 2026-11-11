@@ -169,9 +169,10 @@ async def _with_keepalive(
             yield event
             next_event = asyncio.ensure_future(anext(events))
     finally:
-        # Cancel the request now, not when the GC frees the events.
+        # Cancel the request now, not when the GC frees the events. A running
+        # generator cannot close, so close the events once the cancel lands.
         next_event.cancel()
-        asyncio.ensure_future(events.aclose())
+        next_event.add_done_callback(lambda _: asyncio.ensure_future(events.aclose()))
 
 
 async def while_connected(req: fastapi.Request, awaitable: Awaitable[_T]) -> _T:

@@ -435,6 +435,8 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
 
     async def test_completion_params(self):
         body = {"prompt": "One", "max_tokens": 3, "logprobs": 2, "stop": "xy"}
+        # An empty suffix is no suffix.
+        body["suffix"] = ""
         response = await self.post("/v1/completions", {**body, "top_k": 7})
         self.assertEqual(response.status_code, 200)
         expected = settings.GenerationParams(
@@ -449,6 +451,7 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
             ({}, {"think": False}),
             (low, {"think": False, **low}),
             ({**low, "chat_template_kwargs": high}, {"think": False, **high}),
+            ({"chat_template_kwargs": {"think": True}}, {"think": True}),
         ]
         for body, expected in cases:
             with self.subTest(**body):
@@ -666,7 +669,7 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
             async def send(message: dict) -> None:
                 pass
 
-            await self.app(scope, receive, send)
+            await asyncio.wait_for(self.app(scope, receive, send), timeout=10)
             await asyncio.wait_for(engine.cancel_called.wait(), timeout=10)
             self.assertEqual(engine.cancelled, [0])
 

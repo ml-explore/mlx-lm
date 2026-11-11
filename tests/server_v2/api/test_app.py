@@ -178,7 +178,8 @@ class TestApp(unittest.IsolatedAsyncioTestCase):
 
         response = http.event_stream(events(), keepalive_event="k", keepalive=0.01)
         stream = response.body_iterator
-        self.assertEqual([await anext(stream) for _ in range(3)], ["a", "k", "k"])
+        sent = [await asyncio.wait_for(anext(stream), 10) for _ in range(3)]
+        self.assertEqual(sent, ["a", "k", "k"])
         await stream.aclose()
         await asyncio.wait_for(closed.wait(), timeout=10)
 
