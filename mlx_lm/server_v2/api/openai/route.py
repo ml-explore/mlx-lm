@@ -26,7 +26,7 @@ router = fastapi.APIRouter(route_class=OpenAIRoute)
 async def chat_completions(
     body: schema.ChatRequest, req: fastapi.Request, state: app.ServerStateDep
 ) -> responses.Response:
-    inputs.log_request(body)
+    http.log_request(body)
     inputs.check_model(body.model, served=state.config.model_id)
     inputs.check_chat(body)
 
@@ -72,7 +72,7 @@ async def completions(
     req: fastapi.Request,
     state: app.ServerStateDep,
 ) -> responses.Response:
-    inputs.log_request(body)
+    http.log_request(body)
     inputs.check_model(body.model, served=state.config.model_id)
     inputs.check_completion(body)
 
