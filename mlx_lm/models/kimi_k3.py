@@ -635,8 +635,7 @@ class KimiK3SparseMoE(nn.Module):
             self.args.moe_renormalize,
         )
         y = self.routed_expert_down_proj(x) if self.latent_size is not None else x
-        y = self.switch_mlp(y, inds)
-        y = (y * weights[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(y, inds, weights)
         shared = self.shared_experts(x) if self.shared_experts is not None else None
         if self.sharding_group is not None:
             if shared is not None:

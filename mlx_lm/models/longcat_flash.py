@@ -260,10 +260,9 @@ class LongcatFlashMoE(nn.Module):
         topk_indices = mx.where(mask, 0, topk_indices)
         regular_weights = mx.where(mask, 0.0, topk_weights)
 
-        regular_outputs = self.switch_mlp(hidden_states, topk_indices)
-
-        weighted_outputs = regular_outputs * regular_weights[..., None]
-        final_output = mx.sum(weighted_outputs, axis=-2)
+        final_output = self.switch_mlp.combine(
+            hidden_states, topk_indices, regular_weights
+        )
 
         if self.sharding_group is not None:
             final_output = mx.distributed.all_sum(

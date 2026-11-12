@@ -151,8 +151,7 @@ class SparseMoeBlock(nn.Module):
                 route_scale=1.0,
             )
 
-        y = self.switch_mlp(x, inds)
-        y = (y * weights[..., None]).sum(axis=-2).astype(y.dtype)
+        y = self.switch_mlp.combine(x, inds, weights).astype(x.dtype)
         y = y + self.shared_expert(x)
 
         if self.sharding_group is not None:

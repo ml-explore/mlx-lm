@@ -152,8 +152,7 @@ class BailingSparseMoE(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         indices, scores = self.gate(x)
-        routed = self.switch_mlp(x, indices)
-        routed = (routed * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        routed = self.switch_mlp.combine(x, indices, scores).astype(x.dtype)
         return routed + self.shared_experts(x)
 
 
