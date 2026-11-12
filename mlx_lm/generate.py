@@ -9,7 +9,18 @@ import sys
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Generator, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Generator,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    get_args,
+)
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -529,7 +540,7 @@ def speculative_generate_step(
     """
 
     y = prompt.astype(mx.uint32)
-    prev_tokens = None
+    prev_tokens = y[:-1] if logits_processors else None
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -657,7 +668,7 @@ def speculative_generate_step(
                         [mx.array(draft_tokens[-1:], mx.uint32), draft_y]
                     )
 
-                if prev_tokens is not None:
+                if prev_tokens is not None and num_draft > 0:
                     prev_tokens = prev_tokens[: -max(num_draft - n, 1)]
                 _rewind_cache(num_draft, n)
         finally:
@@ -863,23 +874,24 @@ def _normalize_logits_processors(logits_processors, *, n):
     return [tuple(lp) if lp else () for lp in logits_processors]
 
 
-def _build_trie(sequences):
+def _build_trie(sequences: Sequence[Any]) -> dict:
     """Build an Aho-Corasick trie from the provided sequences
 
-    See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm .
+    See https://en.wikipedia.org/wiki/Aho–Corasick_algorithm . Nodes keep their
+    depth in ``__depth__``.
     """
     trie = {}
     for idx, seq in enumerate(sequences):
         node = trie
         try:
-            for tok in seq:
-                node = node.setdefault(tok, {})
+            for depth, tok in enumerate(seq, 1):
+                node = node.setdefault(tok, {"__depth__": depth})
             if node is trie:
                 # An empty pattern would make the root match every token.
                 continue
             node["__match__"] = (tuple(seq), idx)
         except TypeError:
-            node = node.setdefault(seq, {})
+            node = node.setdefault(seq, {"__depth__": 1})
             node["__match__"] = ((seq,), idx)
 
     # BFS to set failure links and propagate matches.
@@ -892,7 +904,7 @@ def _build_trie(sequences):
     while queue:
         parent = queue.popleft()
         for key, child in parent.items():
-            if key in ("__fail__", "__match__"):
+            if key in ("__fail__", "__match__", "__depth__"):
                 continue
             queue.append(child)
             fail = parent["__fail__"]
@@ -937,155 +949,197 @@ class StopSequences:
         return self.Matcher(self._root)
 
 
+TextState = Literal["normal", "reasoning", "tool", "stop", "header"]
+
+
+def _check_state(state: str) -> None:
+    if state not in get_args(TextState):
+        raise ValueError(f"Unknown state {state!r}.")
+
+
 class TextStateMachine:
-    """A state machine that matches decoded text to track state transitions
-    (reasoning, tool calling) and strip the matched control sequences from the
-    output.
+    """Split streamed text into content, reasoning and tool calls.
 
-    Transitions are provided as state -> [(text, new_state)]. Matching on text
-    rather than token ids is robust to tokenization differences (e.g. a
-    marker's trailing ``>`` being merged with the following byte).
+    ``transitions`` maps a state to its ``(marker, next_state)`` pairs, where a
+    ``next_state`` of ``None`` returns to the previous state. Markers match on
+    text, so a marker split over tokens still matches.
 
-    The runtime state carries a buffer holding text that might be part of a
-    control sequence. Text is only emitted once it is known not to be part of
-    any match.
+    ``normal`` text is the content, ``reasoning`` text the reasoning and each
+    visit to ``tool`` one tool call. ``stop`` ends the text: the reader is
+    then ``stopped``. The text of ``header``, for the headers of a response
+    format, is dropped.
 
     Example:
 
         sm = TextStateMachine(
-            transitions={
+            {
                 "normal": [("<think>", "reasoning"), ("<tool_call>", "tool")],
                 "reasoning": [("</think>", "normal")],
                 "tool": [("</tool_call>", "normal")],
-            },
+            }
         )
-        state = sm.make_state(initial="normal")
+        reader = sm.reader(state="normal")
+        reader.feed("<think>Hmm.</think>Hi<tool_call>{}</tool_call>")
+        # Delta(content="Hi", reasoning="Hmm.", tool_calls=("{}",))
     """
 
-    def __init__(self, transitions=None):
-        self._states = {}
-        for src, edges in (transitions or {}).items():
-            strings, dst = zip(*edges) if edges else ([], [])
-            self._states[src] = (_build_trie(strings), dst)
+    @dataclass(frozen=True)
+    class Delta:
+        """New response text, as in a chat completion delta."""
 
-    def make_state(self, initial="normal"):
-        """Create a fresh runtime state (state_name, trie_node, states, buffer)."""
-        if initial not in self._states:
-            self._states[initial] = (_build_trie([]), [])
-        return (initial, self._states[initial][0], self._states, "")
+        content: str = ""
+        reasoning: str = ""
+        tool_calls: tuple[str, ...] = ()
 
-    @staticmethod
-    def split(state, text):
-        """Consume a chunk of decoded text.
-
-        Returns (new_state, segments) with one (state_name, text) per state
-        passed. Control sequences are stripped and possible partial matches
-        held back in the buffer. The last segment is the current state.
-        """
-        s, n, states, buf = state
-        # n has already read the buffer.
-        start = len(buf)
-        buf += text
-        trie = states[s][0]
-        segments = []
-        # buf[begin:consumed] is safe text of state s; buf[consumed:] pending.
-        begin = consumed = 0
-
-        for i in range(start, len(buf)):
-            ch = buf[i]
-            while ch not in n and n is not trie:
-                n = n["__fail__"]
-            if ch in n:
-                n = n[ch]
-
-            match = n.get("__match__")
-            if match is not None:
-                segments.append((s, buf[begin : i + 1 - len(match[0])]))
-                begin = consumed = i + 1
-                s = states[s][1][match[1]]
-                if s is None:
-                    segments.append((s, ""))
-                    return (s, None, states, buf[consumed:]), segments
-                trie = states[s][0]
-                n = trie
-            elif n is trie:
-                # At the root: no partial match in progress, everything is safe.
-                consumed = i + 1
-
-        segments.append((s, buf[begin:consumed]))
-        return (s, n, states, buf[consumed:]), segments
-
-    @staticmethod
-    def step(state, text):
-        """As split, but returns (new_state, emittable_text, current_state_name)."""
-        state, segments = TextStateMachine.split(state, text)
-        return state, "".join(t for _, t in segments), state[0]
-
-    @staticmethod
-    def flush(state):
-        """Emit the remaining buffer (use on finish_reason="length")."""
-        s, _, states, buf = state
-        trie = states[s][0] if s is not None else None
-        return (s, trie, states, ""), buf, s
-
-    @staticmethod
-    def discard(state):
-        """Drop the remaining buffer (use on finish_reason="stop")."""
-        s, _, states, _ = state
-        trie = states[s][0] if s is not None else None
-        return (s, trie, states, ""), s
-
-
-def make_stop_sequences(tokenizer, stop_words=None):
-    """Build StopSequences from EOS tokens and stop words."""
-    stop_sequences = [(t,) for t in tokenizer.eos_token_ids]
-    for w in stop_words or []:
-        stop_sequences.append(tuple(tokenizer.encode(w, add_special_tokens=False)))
-    return StopSequences(stop_sequences)
-
-
-def make_text_state_machine(tokenizer, stop_words=None):
-    """Build a TextStateMachine with reasoning/tool transitions and stop words.
-
-    Stop words are added as self-transitions in every state so they are
-    stripped from the output without changing state.
-    """
-    transitions = {}
-
-    if tokenizer.has_thinking:
-        transitions.setdefault("normal", []).append(
-            (tokenizer.think_start, "reasoning")
-        )
-        transitions["reasoning"] = [(tokenizer.think_end, "normal")]
-
-    if tokenizer.has_tool_calling:
-        # A response format that goes to "tool" decides where calls start.
-        targets = set()
-        for edges in tokenizer.response_transitions.values():
-            targets.update(dst for _, dst in edges)
-        if "tool" not in targets:
-            transitions.setdefault("normal", []).append(
-                (tokenizer.tool_call_start, "tool")
+        def __add__(self, other: "TextStateMachine.Delta") -> "TextStateMachine.Delta":
+            return TextStateMachine.Delta(
+                content=self.content + other.content,
+                reasoning=self.reasoning + other.reasoning,
+                tool_calls=self.tool_calls + other.tool_calls,
             )
+
+    class Reader:
+        """One stream's position in a :class:`TextStateMachine`."""
+
+        def __init__(self, machine: "TextStateMachine", *, state: TextState):
+            _check_state(state)
+            self._states = machine._states
+            self._held = ""
+            self._tool = ""
+            self._previous = state
+            self._enter(state)
+
+        @property
+        def stopped(self) -> bool:
+            return self._state == "stop"
+
+        def _enter(self, state: TextState) -> None:
+            self._state = state
+            self._root, self._next = self._states.get(state, ({}, []))
+            self._node = self._root
+
+        def _add(
+            self, delta: "TextStateMachine.Delta", text: str
+        ) -> "TextStateMachine.Delta":
+            if self._state == "normal":
+                return delta + TextStateMachine.Delta(content=text)
+            if self._state == "reasoning":
+                return delta + TextStateMachine.Delta(reasoning=text)
+            if self._state == "tool":
+                self._tool += text
+            # Text after a stop is dropped.
+            return delta
+
+        def _move(
+            self, delta: "TextStateMachine.Delta", state: TextState | None
+        ) -> "TextStateMachine.Delta":
+            """``None`` is the previous state. Leaving ``tool`` closes the call."""
+            if state is None:
+                state = self._previous
+            if state != self._state:
+                if self._state == "tool":
+                    delta = self._close_tool_call(delta)
+                self._previous = self._state
+            self._enter(state)
+            return delta
+
+        def _close_tool_call(
+            self, delta: "TextStateMachine.Delta"
+        ) -> "TextStateMachine.Delta":
+            tool_call = self._tool.strip()
+            self._tool = ""
+            if tool_call:
+                delta += TextStateMachine.Delta(tool_calls=(tool_call,))
+            return delta
+
+        def feed(self, text: str) -> "TextStateMachine.Delta":
+            """Read a chunk. Text that can still start a marker is held back."""
+            delta = TextStateMachine.Delta()
+            start = len(self._held)
+            text = self._held + text
+            begin = 0
+            for i in range(start, len(text)):
+                ch = text[i]
+                node = self._node
+                while ch not in node and node is not self._root:
+                    node = node["__fail__"]
+                self._node = node.get(ch, self._root)
+                match = self._node.get("__match__")
+                if match is not None:
+                    before = text[begin : i + 1 - len(match[0])]
+                    delta = self._add(delta, before)
+                    delta = self._move(delta, self._next[match[1]])
+                    begin = i + 1
+            end = len(text) - self._node.get("__depth__", 0)
+            delta = self._add(delta, text[begin:end])
+            self._held = text[end:]
+            return delta
+
+        def finish(self, text: str = "") -> "TextStateMachine.Delta":
+            """Read the last chunk, release the held text and close a tool call."""
+            delta = self.feed(text)
+            delta = self._add(delta, self._held)
+            self._held = ""
+            self._node = self._root
+            return self._close_tool_call(delta)
+
+    def __init__(
+        self, transitions: dict[TextState, Sequence[tuple[str, TextState | None]]]
+    ):
+        # Per state: its marker trie and next states.
+        self._states = {}
+        for state, edges in transitions.items():
+            _check_state(state)
+            for _, next_state in edges:
+                if next_state is not None:
+                    _check_state(next_state)
+            markers = [marker for marker, _ in edges]
+            self._states[state] = (_build_trie(markers), [dst for _, dst in edges])
+
+    def reader(self, *, state: TextState = "normal") -> "TextStateMachine.Reader":
+        """A fresh reader that starts in ``state``."""
+        return self.Reader(self, state=state)
+
+    @classmethod
+    def from_stop_words(cls, stop_words: Sequence[str]) -> "TextStateMachine":
+        """A TextStateMachine whose stop words end the text."""
+        return cls({"normal": [(w, "stop") for w in stop_words]})
+
+    @classmethod
+    def from_tokenizer(cls, tokenizer: TokenizerWrapper) -> "TextStateMachine":
+        """A TextStateMachine with the markers of a tokenizer."""
+        transitions = {}
+
         if tokenizer.has_thinking:
-            transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
-        transitions["tool"] = (
-            [(tokenizer.tool_call_end, "normal")] if tokenizer.tool_call_end else []
-        )
+            transitions.setdefault("normal", []).append(
+                (tokenizer.think_start, "reasoning")
+            )
+            transitions["reasoning"] = [(tokenizer.think_end, "normal")]
 
-    if tokenizer.structural_markers:
-        for w in tokenizer.structural_markers:
-            transitions.setdefault("normal", []).append((w, "normal"))
+        if tokenizer.has_tool_calling:
+            # A response format that goes to "tool" decides where calls start.
+            targets = set()
+            for edges in tokenizer.response_transitions.values():
+                targets.update(dst for _, dst in edges)
+            if "tool" not in targets:
+                transitions.setdefault("normal", []).append(
+                    (tokenizer.tool_call_start, "tool")
+                )
+            if tokenizer.has_thinking:
+                transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
+            # Back to the state the tool call started in.
+            transitions["tool"] = (
+                [(tokenizer.tool_call_end, None)] if tokenizer.tool_call_end else []
+            )
 
-    for state_name, edges in tokenizer.response_transitions.items():
-        transitions.setdefault(state_name, []).extend(edges)
+        if tokenizer.structural_markers:
+            for w in tokenizer.structural_markers:
+                transitions.setdefault("normal", []).append((w, "normal"))
 
-    if stop_words:
-        for state_name in set(transitions) | {"normal"}:
-            for w in stop_words:
-                transitions.setdefault(state_name, []).append((w, state_name))
+        for state, edges in tokenizer.response_transitions.items():
+            transitions.setdefault(state, []).extend(edges)
 
-    return TextStateMachine(transitions or None)
+        return cls(transitions)
 
 
 class PromptProcessingBatch:

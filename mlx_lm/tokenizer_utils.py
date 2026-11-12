@@ -268,6 +268,7 @@ def _infer_thinking(tokenizer):
         ("<think>", "</think>"),
         ("<longcat_think>", "</longcat_think>"),
         ("<|think:start|>", "<|think:end|>"),
+        ("[THINK]", "[/THINK]"),
     ]
 
     # Single token thinking modes
@@ -301,6 +302,17 @@ def _infer_thinking(tokenizer):
             tuple(tokenizer.encode(think_end, add_special_tokens=False)),
         )
 
+    # Text markers, for chat templates that write them without a vocab token.
+    if "<think>" in _chat_template_text(tokenizer):
+        think_start = "<think>"
+        think_end = "</think>"
+        return (
+            think_start,
+            think_end,
+            tuple(tokenizer.encode(think_start, add_special_tokens=False)),
+            tuple(tokenizer.encode(think_end, add_special_tokens=False)),
+        )
+
     return (None, None, None, None)
 
 
@@ -308,6 +320,14 @@ def _is_xtml_vocab(vocab):
     return all(
         t in vocab for t in ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
     )
+
+
+def _chat_template_text(tokenizer) -> str:
+    """The Jinja chat template, or an empty string."""
+    template = getattr(tokenizer, "chat_template", None)
+    if isinstance(template, dict):
+        template = template.get("default")
+    return template if isinstance(template, str) else ""
 
 
 def _infer_structural_markers(tokenizer):
@@ -332,6 +352,9 @@ def _infer_thinking_kwarg(tokenizer):
                 return "thinking", custom_renderer
         except (ValueError, TypeError):
             pass
+    template = _chat_template_text(tokenizer)
+    if " thinking is defined" in template and "enable_thinking" not in template:
+        return "thinking", custom_renderer
     return "enable_thinking", custom_renderer
 
 
