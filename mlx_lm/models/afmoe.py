@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -192,9 +193,7 @@ class AfmoeMoE(nn.Module):
             )
             self.shared_experts = MLP(args, intermediate_size=shared_intermediate_size)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        gates = self.router(x)
-
+    def _route(self, gates: mx.array):
         if self.score_func == "sigmoid":
             scores = mx.sigmoid(gates.astype(mx.float32))
         else:
@@ -230,6 +229,31 @@ class AfmoeMoE(nn.Module):
             selected_scores = selected_scores / denominator
 
         selected_scores = selected_scores * self.route_scale
+        return inds, selected_scores
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gates = self.router(x)
+        k = self.num_experts_per_tok
+        if (
+            not self.training
+            and on_metal()
+            and self.score_func == "sigmoid"
+            and self.route_norm
+            and k > 1
+        ):
+            # _route in one kernel.
+            inds, selected_scores = expert_routing(
+                gates,
+                self.expert_bias,
+                top_k=k,
+                multiplier=1.0,
+                score_eps=0.0,
+                route_scale=self.route_scale,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
+            )
+        else:
+            inds, selected_scores = self._route(gates)
 
         y = self.experts(x, inds)
         y = (y * selected_scores[..., None]).sum(axis=-2).astype(y.dtype)

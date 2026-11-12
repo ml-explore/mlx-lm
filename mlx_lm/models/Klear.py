@@ -6,6 +6,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
@@ -137,14 +138,25 @@ class KlearSparseMoeBlock(nn.Module):
         self.expert_bias = mx.zeros((self.num_experts,), dtype=mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        routing_weights = mx.sigmoid(self.gate(x).astype(mx.float32))
-        biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
+        gates = self.gate(x)
         k = self.top_k
-        inds = mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(routing_weights, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / mx.sum(scores, axis=-1, keepdims=True)
+        if not self.training and on_metal() and self.norm_topk_prob:
+            inds, scores = expert_routing(
+                gates,
+                self.expert_bias,
+                top_k=k,
+                multiplier=1.0,
+                score_eps=0.0,
+                route_scale=1.0,
+            )
+        else:
+            routing_weights = mx.sigmoid(gates.astype(mx.float32))
+            biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
+            inds = mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
+            inds = mx.stop_gradient(inds)
+            scores = mx.take_along_axis(routing_weights, inds, axis=-1)
+            if self.norm_topk_prob:
+                scores = scores / mx.sum(scores, axis=-1, keepdims=True)
         scores = scores.astype(x.dtype)
         expert_out = self.experts(x, inds)
         y_experts = (expert_out * scores[..., None]).sum(axis=-2)

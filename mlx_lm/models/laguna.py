@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -184,7 +185,22 @@ class MoEGate(nn.Module):
         raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
     def __call__(self, x):
-        logits = self.proj(x).astype(mx.float32)
+        logits = self.proj(x)
+        if (
+            not self.training
+            and on_metal()
+            and self.score_func == "sigmoid"
+            and self.softcap <= 0.0
+        ):
+            return expert_routing(
+                logits,
+                self.e_score_correction_bias,
+                top_k=self.top_k,
+                multiplier=1.0,
+                score_eps=0.0,
+                route_scale=1.0,
+            )
+        logits = logits.astype(mx.float32)
         if self.softcap > 0.0:
             logits = mx.tanh(logits / self.softcap) * self.softcap
 

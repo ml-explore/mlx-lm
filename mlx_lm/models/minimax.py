@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import expert_routing, on_metal
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
 
@@ -177,16 +178,24 @@ class MiniMaxSparseMoeBlock(nn.Module):
 
         gates = self.gate(x.astype(mx.float32))
 
-        scores = mx.sigmoid(gates)
-        orig_scores = scores
-        scores = scores + self.e_score_correction_bias
-
         k = self.num_experts_per_tok
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        if not self.training and on_metal():
+            inds, scores = expert_routing(
+                gates,
+                self.e_score_correction_bias,
+                top_k=k,
+                multiplier=1.0,
+                score_eps=1e-20,
+                route_scale=1.0,
+            )
+        else:
+            scores = mx.sigmoid(gates)
+            orig_scores = scores
+            scores = scores + self.e_score_correction_bias
+            inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+            inds = mx.stop_gradient(inds)
+            scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+            scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
         scores = scores.astype(x.dtype)
 
         y = self.switch_mlp(x, inds)

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -117,14 +118,16 @@ class MellumSparseMoeBlock(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
-
         k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores /= mx.sum(scores, axis=-1, keepdims=True)
+        if not self.training and on_metal():
+            inds, scores = softmax_topk(gates, top_k=k, normalize=self.norm_topk_prob)
+        else:
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = mx.stop_gradient(inds)
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if self.norm_topk_prob:
+                scores /= mx.sum(scores, axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)

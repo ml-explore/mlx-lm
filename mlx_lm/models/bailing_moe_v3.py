@@ -8,6 +8,7 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -128,6 +129,18 @@ class BailingGate(nn.Module):
 
     def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
         logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        if not self.training and on_metal():
+            return expert_routing(
+                logits,
+                self.expert_bias,
+                top_k=self.top_k,
+                multiplier=1.0,
+                score_eps=1e-20,
+                route_scale=self.routed_scaling_factor,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
+                masked_score=-float("inf"),
+            )
         return _group_expert_select(
             logits,
             self.expert_bias,
