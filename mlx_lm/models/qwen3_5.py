@@ -43,6 +43,9 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    # Explicit per-layer attention types (e.g. after attention-layer pruning).
+    # When present and long enough, overrides the full_attention_interval rule.
+    layer_types: Optional[List[str]] = None
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -209,7 +212,11 @@ class GatedDeltaNet(nn.Module):
 class DecoderLayer(nn.Module):
     def __init__(self, args: TextModelArgs, layer_idx: int):
         super().__init__()
-        self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
+        lt = args.layer_types
+        if lt is not None and layer_idx < len(lt):
+            self.is_linear = lt[layer_idx] != "full_attention"
+        else:
+            self.is_linear = (layer_idx + 1) % args.full_attention_interval != 0
         if self.is_linear:
             self.linear_attn = GatedDeltaNet(args)
         else:
@@ -249,7 +256,10 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
-        self.fa_idx = args.full_attention_interval - 1
+        self.fa_idx = next(
+            (i for i, l in enumerate(self.layers) if not l.is_linear),
+            args.full_attention_interval - 1,
+        )
 
     def pipeline(self, group, split=None):
         super().pipeline(group, split=split)
