@@ -164,7 +164,6 @@ def _switch_glu_combine_ref(switch_glu, x, inds, weights, act=nn.silu):
 
 
 # One config for the MoE blocks below: each reads the fields it needs.
-# One config for the MoE blocks below: each reads the fields it needs.
 _MOE_ARGS = SimpleNamespace(
     hidden_size=128,
     intermediate_size=64,
