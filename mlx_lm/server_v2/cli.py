@@ -7,6 +7,7 @@ import faulthandler
 import json
 import logging
 import pathlib
+import socket
 import sys
 from typing import Any
 
@@ -52,6 +53,13 @@ def main(argv: list[str] | None = None) -> None:
     except pydantic.ValidationError as e:
         error, *_ = e.errors()
         parser.error(f"{error['loc'][0]}: {error['msg']}")
+
+    # Before the load: a busy port must not wait for the model.
+    if group is None or group.rank() == 0:
+        try:
+            socket.create_server((args.host, args.port)).close()
+        except OSError as e:
+            parser.error(f"cannot listen on {args.host}:{args.port}: {e.strerror}")
 
     model, tokenizer, config, model_path = _load(args, group=group)
     default_params = _default_params(args, model_path)
