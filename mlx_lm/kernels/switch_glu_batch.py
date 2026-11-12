@@ -1,16 +1,16 @@
 # Copyright © 2026 Apple Inc.
 
-"""Metal kernels for quantized SwitchGLU at small batch (decode, batched decode, short verify steps).
+"""A quantized SwitchGLU for a few tokens, with the slots grouped by expert.
 
-For a few tokens per step, the generic path reads each (token, expert) slot's weights separately. Here:
-- T = 1: one simdgroup per expert row computes gate and up together, and the down projection is split over
-  (slot, row block) so all k experts are in flight at once.
-- T > 1: slots are grouped by expert into tiles of up to 8 and multiplied with simdgroup MMA, so each
-  expert's weights are read and dequantized once per tile instead of once per slot.
+The generic path reads the weights of each (token, expert) slot separately. Here the slots
+of a step are grouped by expert into tiles of up to 8 and multiplied with simdgroup
+matrices, so an expert's weights are read and dequantized once per tile instead of once
+per slot. Tiles of one or two slots use a GEMV.
 
-Supported: affine 4-bit, group size 64, no bias, bf16/fp16 activations, SwiGLU or tanh-GELU GLU.
-The output has the same per-slot shape as SwitchGLU, so model routing code is unchanged. Gradients use the
-gather_qmm path (custom_function vjp), so training through SwitchGLU keeps working.
+Takes affine 4-bit experts with group size 64 and no bias, activations in bf16 or fp16,
+and a SwiGLU or tanh-GELU GLU, for more than one token. The output has the per-slot
+shape of SwitchGLU, so the routing code of the models does not change. The gradient is
+that of the gather_qmm path, so training through SwitchGLU keeps working.
 """
 
 from functools import partial
@@ -80,65 +80,6 @@ inline uint ar_tile(const device uint* tl, uint p, thread uint* sl, uint VT) {
 }
 """
 
-GEMV_GATE_UP = """
-    uint lane = thread_index_in_simdgroup;
-    uint row0 = (thread_position_in_grid.x / 32) * R;
-    uint slot = thread_position_in_grid.y;
-    if (row0 >= F) return;
-    constexpr uint NW = D / 8, NG = D / GS;
-    uint e = idx[slot];
-    const device T* xr = x + (slot / K) * D;
-    size_t r0 = (size_t)e * F + row0;
-    float ag[R] = {0.f}, au[R] = {0.f};
-    float xs[32];
-    for (uint c = lane; c < NW / 4; c += 32) {
-        float xsum = load_x32(xr + c * 32, xs);
-        uint grp = (c * 32) / GS;
-        for (uint r = 0; r < R; ++r) {
-            size_t rr = r0 + r;
-            float dg = dot_q4x32(xs, ((const device uint4*)(gq + rr * NW))[c]);
-            float du = dot_q4x32(xs, ((const device uint4*)(uq + rr * NW))[c]);
-            ag[r] += float(gs[rr * NG + grp]) * dg + float(gb[rr * NG + grp]) * xsum;
-            au[r] += float(us[rr * NG + grp]) * du + float(ub[rr * NG + grp]) * xsum;
-        }
-    }
-    for (uint r = 0; r < R; ++r) {
-        float g = simd_sum(ag[r]), u = simd_sum(au[r]);
-        if (lane == 0) h[slot * F + row0 + r] = T(glu_act<ACT>(g) * u);
-    }
-"""
-
-GEMV_DOWN = """
-    // threadgroup = (32, K): simdgroup j computes the rows of slot t*K+j and writes y[slot].
-    constexpr uint RB = R * 32 / LPR;  // rows per simdgroup
-    uint lane = thread_index_in_simdgroup;
-    uint sub = lane % LPR;
-    uint j = thread_position_in_threadgroup.y;
-    uint rb0 = (thread_position_in_grid.x / 32) * RB;
-    uint row0 = rb0 + (lane / LPR) * R;
-    uint t = thread_position_in_grid.y / K;
-    uint slot = t * K + j;
-    bool ok = row0 < D;
-    constexpr uint NW = F / 8, NG = F / GS;
-    size_t r0 = (size_t)idx[slot] * D + (ok ? row0 : 0);
-    float acc[R] = {0.f};
-    float hs[32];
-    for (uint c = sub; ok && c < NW / 4; c += LPR) {
-        float hsum = load_x32(h + slot * F + c * 32, hs);
-        uint grp = (c * 32) / GS;
-        for (uint r = 0; r < R; ++r) {
-            size_t rr = r0 + r;
-            float d = dot_q4x32(hs, ((const device uint4*)(dq + rr * NW))[c]);
-            acc[r] += float(ds[rr * NG + grp]) * d + float(db[rr * NG + grp]) * hsum;
-        }
-    }
-    for (uint r = 0; r < R; ++r) {
-        float a = acc[r];
-        for (uint o = LPR / 2; o > 0; o >>= 1) a += simd_shuffle_xor(a, o);
-        if (sub == 0 && ok) y[slot * D + row0 + r] = T(a);
-    }
-"""
-
 MAP = """
     uint p = thread_position_in_grid.x;
     if (p >= TK) return;
@@ -162,7 +103,7 @@ TILE_GATE_UP = """
     uint n = tt[0];
     if (n == 0 || row0 >= NR) return;
     size_t ex = idx[tt[1]];
-    uint rw0 = row0 + ks * RS;  // small tiles: v31 per-slot GEMV, RS = 8 / SGK rows per simdgroup
+    uint rw0 = row0 + ks * RS;  // small tiles: a GEMV per slot, RS = 8 / SGK rows per simdgroup
     if (n == 2 && NSMALL >= 2) {   // 2-slot tile: scalar GEMV, weights decoded once for both tokens
         constexpr uint NWs = D / 8, NGs = D / GS;
         uint sa = tt[1], sb = tt[2];
@@ -278,7 +219,7 @@ TILE_DOWN = """
     uint n = tt[0];
     if (n == 0 || row0 >= NR) return;
     size_t ex = idx[tt[1]];
-    uint rw0 = row0 + ks * RS;  // small tiles: v31 per-slot GEMV, RS = 8 / SGK rows per simdgroup
+    uint rw0 = row0 + ks * RS;  // small tiles: a GEMV per slot, RS = 8 / SGK rows per simdgroup
     if (n == 2 && NSMALL >= 2) {   // 2-slot tile: LPR GEMV, weights decoded once for both slots
         constexpr uint NWs = F / 8, NGs = F / GS;
         constexpr uint RR = RS * LPR / 32;
@@ -308,7 +249,7 @@ TILE_DOWN = """
         constexpr uint NWs = F / 8, NGs = F / GS;
         for (uint t = 0; t < n; ++t) {
             uint slot = tt[1 + t];
-            // LPR lanes per row (v4 trick): 32 / LPR row groups of RR rows, all lanes busy when F/32 < 32
+            // LPR lanes per row: 32 / LPR row groups of RR rows, all lanes busy when F/32 < 32
             constexpr uint RR = RS * LPR / 32;
             uint sub = lane % LPR, rg = rw0 + (lane / LPR) * RR;
             float acc[RR] = {0.f}, hs[32];
@@ -372,16 +313,9 @@ TILE_DOWN = """
 """
 
 
-R_UP, R_DOWN, SG_PER_TG = (
-    1,
-    2,
-    4,
-)  # GEMV rows per simdgroup (gate/up, down), simdgroups per threadgroup
-VT, SGK_UP, NSMALL = (
-    8,
-    8,
-    2,
-)  # tile width, K-split simdgroups (gate/up), tiles <= NSMALL slots use GEMV
+# Tile width, simdgroups that share the 8 rows of a gate/up tile, rows per simdgroup in
+# the down GEMV, and the largest tile that uses a GEMV.
+VT, SGK_UP, R_DOWN, NSMALL = 8, 8, 2, 2
 
 
 def _make_kernels():
@@ -390,18 +324,6 @@ def _make_kernels():
     mk = partial(mx.fast.metal_kernel, header=HEADER)
     w = ["gq", "gs", "gb", "uq", "us", "ub"]
     return {
-        "gemv_gate_up": mk(
-            name="switch_glu_gemv_gate_up",
-            input_names=["x", *w, "idx"],
-            output_names=["h"],
-            source=GEMV_GATE_UP,
-        ),
-        "gemv_down": mk(
-            name="switch_glu_gemv_down",
-            input_names=["h", "dq", "ds", "db", "idx"],
-            output_names=["y"],
-            source=GEMV_DOWN,
-        ),
         "map": mx.fast.metal_kernel(
             name="switch_glu_tile_map",
             input_names=["idx"],
@@ -435,40 +357,12 @@ def _lanes_per_row(chunks, iters=3):
 
 
 def _forward(x, indices, weights, act):
-    """x: [T, D], indices: [T, k] -> per-slot expert outputs [T * k, D]."""
+    """x: [T, D], indices: [T, k] -> per-slot expert outputs [T * k, D], for T > 1."""
     gq, gs, gb, uq, us, ub, dq, ds, db = weights
     T, k = indices.shape
     F, D = gq.shape[1], dq.shape[1]
     w = [gq, gs, gb, uq, us, ub]
-    if T == 1:
-        base = [
-            ("T", x.dtype),
-            ("S", gs.dtype),
-            ("D", D),
-            ("F", F),
-            ("K", k),
-            ("GS", 64),
-            ("ACT", act),
-        ]
-        h = _kernels["gemv_gate_up"](
-            inputs=[x, *w, indices],
-            template=base + [("R", R_UP)],
-            grid=(32 * F // R_UP, k, 1),
-            threadgroup=(32 * SG_PER_TG, 1, 1),
-            output_shapes=[(k, F)],
-            output_dtypes=[x.dtype],
-        )[0]
-        lpr = _lanes_per_row(F // 32)
-        rb = R_DOWN * 32 // lpr
-        return _kernels["gemv_down"](
-            inputs=[h, dq, ds, db, indices],
-            template=base + [("R", R_DOWN), ("LPR", lpr)],
-            grid=(32 * (-(-D // rb)), k, 1),
-            threadgroup=(32, k, 1),
-            output_shapes=[(k, D)],
-            output_dtypes=[x.dtype],
-        )[0]
-    # T > 1: every slot is its own row (K = 1); the tile map groups rows by expert
+    # Every slot is its own row (K = 1); the tile map groups the rows by expert.
     n = T * k
     x = mx.broadcast_to(x[:, None], (T, k, D)).reshape(n, D)
     indices = indices.reshape(n)
@@ -582,8 +476,9 @@ def supported_load(load, D, F):
     return load <= (24 if D * F >= 3 << 19 else 8)
 
 
-def switch_glu(glu, x, indices):
-    """Per-slot output of SwitchGLU `glu` (as SwitchGLU.__call__), or None if this path does not apply."""
+def switch_glu_by_expert(glu, x, indices):
+    """The per-slot output of the SwitchGLU ``glu``, as ``SwitchGLU.__call__``, or None
+    where these kernels do not apply."""
     act = getattr(glu.activation, "metal_act", None)
     if _kernels is None or act is None or x.dtype not in (mx.bfloat16, mx.float16):
         return None
@@ -599,8 +494,8 @@ def switch_glu(glu, x, indices):
     k = indices.shape[-1]
     T = indices.size // k
     (E, F), D = glu.gate_proj.weight.shape[:2], x.shape[-1]
-    # k <= 8: the T = 1 down kernel uses a (32, k) threadgroup
-    if T == 0 or k > 8 or not supported_load(T * k / E, D, F):
+    # One token is left to the generic path. Measured with up to 8 experts per token.
+    if T < 2 or k > 8 or not supported_load(T * k / E, D, F):
         return None
     weights = [a for p in projs for a in (p.weight, p.scales, p.biases)]
     y = _ops[act](x.reshape(T, D), indices.reshape(T, k).astype(mx.uint32), *weights)
