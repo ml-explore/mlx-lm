@@ -5,6 +5,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import switch_glu_by_expert
 from .activations import swiglu
 
 
@@ -172,6 +173,9 @@ class SwitchLinear(nn.Module):
 
 
 class SwiGLU(nn.Module):
+    # The activation in the Metal kernels (kernels/switch_glu_batch.py): SiLU.
+    metal_act = 0
+
     def __init__(self):
         super().__init__()
 
@@ -196,6 +200,11 @@ class SwitchGLU(nn.Module):
         self.activation = activation
 
     def __call__(self, x, indices) -> mx.array:
+        # A few tokens of quantized experts: kernels that group the slots by expert.
+        y = switch_glu_by_expert(self, x, indices)
+        if y is not None:
+            return y
+
         x = mx.expand_dims(x, (-2, -3))
 
         # When we have many tokens, then sort them to make sure that the access

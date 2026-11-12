@@ -148,6 +148,9 @@ class Router(nn.Module):
 class GeGLU(nn.Module):
     """GELU-gated linear unit activation for SwitchGLU."""
 
+    # The activation in the Metal kernels (kernels/switch_glu_batch.py): tanh GELU.
+    metal_act = 1
+
     def __call__(self, x, gate):
         return geglu(gate, x)
 
