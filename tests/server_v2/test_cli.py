@@ -8,6 +8,7 @@ import io
 import json
 import logging
 import pathlib
+import socket
 import tempfile
 import unittest
 from unittest import mock
@@ -119,11 +120,14 @@ class TestCLI(unittest.TestCase):
 
     def test_bad_flags_exit_before_the_load(self):
         load = self.enterContext(mock.patch.object(cli, "_load"))
+        busy = self.enterContext(socket.create_server(("127.0.0.1", 0)))
+        busy_port = str(busy.getsockname()[1])
         cases = [
             (["--decode-concurrency", "0"], "decode_concurrency"),
             (["--max-tokens", "0"], "max_tokens"),
             (["--temp", "-1"], "temperature"),
             (["--top-p", "0"], "top_p"),
+            (["--port", busy_port], f"127.0.0.1:{busy_port}"),
         ]
         for flags, name in cases:
             stderr = io.StringIO()
@@ -146,6 +150,7 @@ class TestCLI(unittest.TestCase):
         load = self.enterContext(load)
         engine_class = self.enterContext(mock.patch.object(cli.core, "Engine"))
         server_class = self.enterContext(mock.patch.object(cli.uvicorn, "Server"))
+        self.enterContext(mock.patch.object(cli.socket, "create_server"))
         self.enterContext(mock.patch.object(asyncio, "run", interrupt))
         self.enterContext(mock.patch.object(logging, "basicConfig"))
         set_cache_limit = self.enterContext(mock.patch.object(mx, "set_cache_limit"))
