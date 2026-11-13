@@ -53,7 +53,7 @@ class RequestContentPart(pydantic.BaseModel):
 class RequestToolCallFunction(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(strict=True, extra="allow")
 
-    # The JSON text of an object, or the object.
+    name: str
     arguments: str | dict[str, Any] = ""
 
 
