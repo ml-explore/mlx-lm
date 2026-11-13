@@ -95,13 +95,22 @@ class TestCLI(unittest.TestCase):
                     params = cli._default_params(args, path)
                 self.assertEqual(params, settings.GenerationParams(temperature=0.2))
 
-    def test_config_value(self):
+    def test_context_length(self):
+        path = pathlib.Path(self.enterContext(tempfile.TemporaryDirectory()))
         key = "max_position_embeddings"
-        self.assertEqual(cli._config_value({key: 8, "text_config": {key: 9}}, key), 8)
-        self.assertEqual(
-            cli._config_value({key: None, "text_config": {key: 9}}, key), 9
-        )
-        self.assertIsNone(cli._config_value({}, key))
+        for config, expected in [
+            ({key: 8, "text_config": {key: 9}}, 8),
+            ({key: None, "text_config": {key: 9}}, 9),
+            # As in GPT-2.
+            ({"n_positions": 1024}, 1024),
+            ({}, None),
+        ]:
+            with self.subTest(config=config):
+                self.assertEqual(cli._context_length(config, path), expected)
+        # As in Gemma 3: the config has no key, the transformers default applies.
+        config = {"model_type": "gemma3", "text_config": {"model_type": "gemma3_text"}}
+        (path / "config.json").write_text(json.dumps(config))
+        self.assertEqual(cli._context_length(config, path), 131072)
 
     def test_chat_template_args(self):
         cases = [

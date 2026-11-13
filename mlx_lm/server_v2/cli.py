@@ -13,6 +13,7 @@ from typing import Any
 
 import mlx.core as mx
 import pydantic
+import transformers
 import uvicorn
 from fastapi.middleware import cors
 
@@ -65,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
     default_params = _default_params(args, model_path)
     _logger.info("Default parameters: %s", default_params)
 
-    context_length = _config_value(config, "max_position_embeddings")
+    context_length = _context_length(config, model_path)
     engine_config = dataclasses.replace(engine_config, context_length=context_length)
     mx.set_cache_limit(args.cache_limit)
     engine = core.Engine(model, tokenizer, config=engine_config, group=group)
@@ -196,13 +197,36 @@ def _engine_config(args: argparse.Namespace) -> settings.EngineConfig:
     )
 
 
-def _config_value(config: dict[str, Any], key: str) -> int | None:
-    """``key`` in the config, else in its text config (multimodal models)."""
-    if config.get(key) is not None:
-        return config[key]
-    if "text_config" in config:
-        return config["text_config"].get(key)
-    return None
+# The config keys of the context length, in the order of vLLM's list.
+_CONTEXT_KEYS = (
+    "max_position_embeddings",
+    "n_positions",
+    "max_seq_len",
+    "seq_length",
+    "max_sequence_length",
+    "max_seq_length",
+    "seq_len",
+)
+
+
+def _context_length(config: dict[str, Any], model_path: pathlib.Path) -> int | None:
+    """The context length of the config or its text config.
+
+    Without a key, the transformers default applies.
+    """
+    configs = (config, config.get("text_config") or {})
+    for key in _CONTEXT_KEYS:
+        for values in configs:
+            if (value := values.get(key)) is not None:
+                return value
+    try:
+        # Without remote code: else transformers asks whether to run it.
+        hf_config = transformers.AutoConfig.from_pretrained(
+            model_path, trust_remote_code=False
+        )
+    except Exception:
+        return None
+    return getattr(hf_config.get_text_config(), "max_position_embeddings", None)
 
 
 def _default_params(
