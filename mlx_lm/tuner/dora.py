@@ -18,7 +18,7 @@ class DoRALinear(nn.Module):
         # on linear and quantized linear
         output_dims, input_dims = linear.weight.shape
         if isinstance(linear, nn.QuantizedLinear):
-            input_dims *= 32 // linear.bits
+            input_dims = input_dims * 32 // linear.bits
         dora_lin = DoRALinear(
             input_dims=input_dims,
             output_dims=output_dims,

@@ -330,6 +330,25 @@ class TestDora(unittest.TestCase):
         self.assertEqual(dora_quant_lin.lora_b.shape, (r, out_dims))
         self.assertEqual(dora_quant_lin.m.shape, (out_dims,))
 
+    def test_dora_quantized_linear_bits(self):
+        x = mx.random.normal((2, 3, 128))
+        for bits in (2, 3, 4, 5, 6, 8):
+            with self.subTest(bits=bits):
+                linear = nn.QuantizedLinear(
+                    128, 64, bias=True, group_size=64, bits=bits
+                )
+                dora = DoRALinear.from_base(linear, r=4, dropout=0, scale=0.5)
+                self.assertEqual(dora.lora_a.shape, (128, 4))
+                self.assertEqual(dora.lora_b.shape, (4, 64))
+                self.assertEqual(dora.m.shape, (64,))
+                self.assertTrue(mx.allclose(dora(x), linear(x), atol=1e-5))
+
+                dora.lora_b = mx.random.normal(dora.lora_b.shape)
+                output = dora(x)
+                fused = dora.fuse(dequantize=True)
+                self.assertEqual(output.shape, (2, 3, 64))
+                self.assertTrue(mx.allclose(output, fused(x), atol=1e-5))
+
     def test_dora_to_linear(self):
         in_dims = 256
         out_dims = 256
