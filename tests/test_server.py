@@ -181,6 +181,13 @@ class TestTextStateMachine(unittest.TestCase):
             reader.feed("a<tool_call>b</tool_call>c</think>d"),
             TextStateMachine.Delta(content="d", reasoning="ac", tool_calls=("b",)),
         )
+        # Without tool calls, the markers stay text.
+        sm = TextStateMachine.from_tokenizer(tokenizer, tool_calls=False)
+        call = "<tool_call>b</tool_call>"
+        self.assertEqual(
+            sm.reader(state="reasoning").feed(f"a{call}</think>c{call}"),
+            TextStateMachine.Delta(content="c" + call, reasoning="a" + call),
+        )
 
     def test_tool_call_without_end_marker(self):
         tokenizer = SimpleNamespace(
@@ -211,6 +218,24 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine({"normal": [("<x>", "other")]})
         with self.assertRaises(ValueError):
             TextStateMachine({}).reader(state="other")
+
+    def test_stop_word(self):
+        reader = TextStateMachine.from_stop_words(["end", "##"]).reader()
+        self.assertEqual(reader.feed("a #"), TextStateMachine.Delta(content="a "))
+        self.assertIsNone(reader.stop_word)
+        self.assertEqual(reader.feed("# end"), TextStateMachine.Delta())
+        self.assertEqual((reader.stopped, reader.stop_word), (True, "##"))
+
+    def test_newlines_after_a_block(self):
+        transitions = {**TOOL_CALLS, "reasoning": [("</think>", "normal")]}
+        sm = TextStateMachine({**transitions, "header": [("|", "normal")]})
+        text = "a</think>\n\nb\n<tool_call>c</tool_call>\nd"
+        self.assertEqual(
+            sm.reader(state="reasoning").feed(text),
+            TextStateMachine.Delta(content="b\nd", reasoning="a", tool_calls=("c",)),
+        )
+        # A header is not a block.
+        self.assertEqual(sm.reader(state="header").feed("h|\nb").content, "\nb")
 
 
 class TestApplyStopWords(unittest.TestCase):
@@ -920,6 +945,9 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, None)
         self.assertEqual(t, [3, 4])
+
+        cache.insert_cache(model, [8], [MockCache("e")], nbytes=4)
+        self.assertEqual(cache.nbytes, 10)
 
 
 class TestMakeSampler(unittest.TestCase):
