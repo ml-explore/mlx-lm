@@ -7,16 +7,19 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.kernels import (
+    depth_attention,
     expert_routing,
     norm_add_norm,
     post_expert_norm_combine,
     pre_norm,
     qk_norm,
     qk_norm_rope,
+    relative_attention,
     rms_norm_sigmoid_gate,
     sparse_mla,
     sparse_mla_attention,
 )
+from mlx_lm.models.inkling2 import _attention_reference
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
 
@@ -164,6 +167,52 @@ class TestKernels(unittest.TestCase):
         self.assertEqual(inds.dtype, mx.uint32)
         self.assertTrue(mx.array_equal(inds, ref_inds))
         self._assert_close(weights, ref_weights, TOL[mx.float32])
+
+    def test_relative_attention(self):
+        mx.random.seed(3)
+        # B, Hq, Hkv, L, S, D, R, window, the first key of each row
+        cases = [
+            (1, 4, 2, 40, 40, 16, 8, 0, [0]),
+            (1, 4, 2, 40, 40, 16, 8, 8, [0]),
+            (2, 6, 2, 33, 70, 128, 32, 32, [5, -10]),
+        ]
+        for B, Hq, Hkv, L, S, D, R, window, key_start in cases:
+            q = (0.5 * mx.random.normal((B, Hq, L, D))).astype(mx.bfloat16)
+            k = (0.5 * mx.random.normal((B, Hkv, S, D))).astype(mx.bfloat16)
+            v = mx.random.normal((B, Hkv, S, D)).astype(mx.bfloat16)
+            rel = mx.random.normal((B, L, Hq, R)).astype(mx.bfloat16)
+            sinks = mx.random.normal((B, L, Hq)).astype(mx.bfloat16)
+            key_start = mx.array(key_start)
+            out = relative_attention(
+                q, k, v, rel, sinks, scale=D**-0.5, window=window, key_start=key_start
+            )
+            end = S - key_start
+            q_pos = (end - L)[:, None] + mx.arange(L)
+            ref = _attention_reference(
+                q,
+                k,
+                v,
+                rel,
+                sinks,
+                scale=D**-0.5,
+                window=window,
+                query_positions=q_pos,
+                key_positions=(end - S)[:, None] + mx.arange(S),
+            )
+            # Queries at negative positions are padding.
+            ref = mx.where((q_pos >= 0)[..., None, None], ref, out)
+            self._assert_close(out, ref, TOL[mx.bfloat16])
+
+    def test_depth_attention(self):
+        mx.random.seed(4)
+        for num_blocks, num_queries in ((1, 1), (4, 3), (8, 1)):
+            blocks = mx.random.normal((num_blocks, 2, 3, 1000))
+            partial = mx.random.normal((2, 3, 1000))
+            queries = 0.1 * mx.random.normal((num_queries, 1000))
+            out = depth_attention(blocks, partial, queries, scale=1000**-0.5)
+            x = mx.moveaxis(mx.concatenate([blocks, partial[None]]), 0, -2)
+            weights = mx.softmax((x @ queries.T) * 1000**-0.5, axis=-2, precise=True)
+            self._assert_close(out, weights.swapaxes(-1, -2) @ x, TOL[mx.float32])
 
     def test_post_expert_norm_combine(self):
         # fp32 only: in bf16 the kernel rounds after each expert.
