@@ -1764,9 +1764,18 @@ class APIHandler(BaseHTTPRequestHandler):
         self.request_id = f"cmpl-{uuid.uuid4()}"
         self.object_type = "text_completion"
         assert "prompt" in self.body, "Request did not contain a prompt"
+        prompt = self.body["prompt"]
+        # The OpenAI API also allows a list of strings; a single one is
+        # equivalent to the plain string form.
+        if isinstance(prompt, list) and len(prompt) == 1:
+            prompt = prompt[0]
+        if not isinstance(prompt, str):
+            raise ValueError(
+                "prompt must be a string or a list containing a single string"
+            )
         return CompletionRequest(
             "text",
-            self.body["prompt"],
+            prompt,
             [],
             None,
             None,
