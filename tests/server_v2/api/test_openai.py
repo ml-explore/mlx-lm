@@ -608,12 +608,15 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
         ]
         messages = [schema.RequestMessage.model_validate(m) for m in messages]
         self.assertEqual([inputs.template_message(m) for m in messages], expected)
+        function = inputs.template_message(messages[2])["tool_calls"][0]["function"]
+        self.assertEqual(list(function), ["name", "arguments"])
 
     async def test_bad_messages(self):
         tool_calls = [
             "x",
             ["x"],
             [{"id": "a"}],
+            [{"function": {"arguments": "{}"}}],
             [{"function": {"name": "f", "arguments": "{"}}],
             [{"function": {"name": "f", "arguments": "[" * 10**5}}],
             *[
