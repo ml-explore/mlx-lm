@@ -32,7 +32,10 @@ async def chat_completions(
 
     params = inputs.chat_params(body, defaults=state.config.default_params)
     tools = body.tools or None
-    kwargs = {**state.config.template_kwargs, **inputs.template_kwargs(body)}
+    kwargs = {
+        **state.config.template_kwargs,
+        **inputs.template_kwargs(body, tokenizer=state.tokenizer),
+    }
     # With tool_choice "none", the template still shows the tools, but calls stay text.
     parse_tool_calls = tools is not None and body.tool_choice != "none"
     messages = [inputs.template_message(m) for m in body.messages]

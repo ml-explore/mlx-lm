@@ -177,5 +177,5 @@ list contains the following fields:
 
 ### Experimental Server
 
-`mlx_lm.server_v2` is an experimental OpenAI-compatible server. See
-[SERVER_V2.md](SERVER_V2.md).
+`mlx_lm.server_v2` is an experimental OpenAI- and Anthropic-compatible server.
+See [SERVER_V2.md](SERVER_V2.md).

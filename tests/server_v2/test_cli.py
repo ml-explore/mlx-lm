@@ -194,6 +194,9 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(uvicorn_config.timeout_graceful_shutdown, 30)
         cors = uvicorn_config.app
         self.assertEqual(cors.allow_origins, ["http://a", "http://b"])
+        names = ("chat_completions", "messages")
+        paths = [cors.app.url_path_for(name) for name in names]
+        self.assertEqual(paths, ["/chat/completions", "/v1/messages"])
         config = cors.app.state.server.config
         self.assertEqual(
             (config.default_params.temperature, config.template_kwargs), (0.5, {"x": 1})

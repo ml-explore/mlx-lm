@@ -6,6 +6,7 @@ from typing import Any
 
 import pydantic
 
+from mlx_lm import tokenizer_utils
 from mlx_lm.server_v2 import settings
 from mlx_lm.server_v2.api import http
 from mlx_lm.server_v2.api.openai import schema
@@ -108,11 +109,17 @@ def completion_params(
     )
 
 
-def template_kwargs(body: schema.ChatRequest) -> dict[str, Any]:
-    """The chat template arguments of the request; chat_template_kwargs wins."""
+def template_kwargs(
+    body: schema.ChatRequest, *, tokenizer: tokenizer_utils.TokenizerWrapper
+) -> dict[str, Any]:
+    """The chat template arguments of the request; chat_template_kwargs wins.
+
+    An effort that the template refuses is left out: the template default applies.
+    """
     kwargs = {}
-    if body.reasoning_effort is not None:
-        kwargs["reasoning_effort"] = body.reasoning_effort
+    effort = body.reasoning_effort
+    if effort is not None and rendering.takes_reasoning_effort(tokenizer, effort):
+        kwargs["reasoning_effort"] = effort
     if body.chat_template_kwargs is not None:
         kwargs.update(body.chat_template_kwargs)
     return kwargs

@@ -12,13 +12,14 @@ from mlx_lm.generate import TextState
 from mlx_lm.server_v2 import settings
 from mlx_lm.server_v2.engine import errors, protocol
 
-__all__ = ["from_messages", "from_text", "reserved_kwargs"]
+__all__ = ["from_messages", "from_text", "reserved_kwargs", "takes_reasoning_effort"]
 
 _logger = logging.getLogger(__name__)
 
 # Some templates reject empty messages, e.g. Ministral 3.
 _PLACEHOLDER_USER = {"role": "user", "content": "."}
 _PLACEHOLDER_ASSISTANT = {"role": "assistant", "content": "."}
+_SYSTEM_MARKERS = ("mlx-lm first system marker", "mlx-lm later system marker")
 
 
 def reserved_kwargs(kwargs: Mapping[str, Any]) -> list[str]:
@@ -38,6 +39,28 @@ def reserved_kwargs(kwargs: Mapping[str, Any]) -> list[str]:
         "truncation",
     }
     return sorted(reserved & kwargs.keys())
+
+
+# Clients choose the effort, so the cache has a limit.
+@functools.lru_cache(maxsize=64)
+def takes_reasoning_effort(
+    tokenizer: tokenizer_utils.TokenizerWrapper, effort: str
+) -> bool:
+    """Whether the chat template takes ``effort`` as the reasoning effort.
+
+    Some templates refuse an effort they do not know, e.g. Qwen3.8 takes only
+    xhigh, medium and low.
+    """
+    try:
+        tokenizer.apply_chat_template(
+            [_PLACEHOLDER_USER],
+            reasoning_effort=effort,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+    except Exception:
+        return False
+    return True
 
 
 def from_text(
@@ -77,6 +100,11 @@ def from_messages(
         raise errors.InvalidRequestError(
             "The model has no tool call parser; use --tool-parser."
         )
+    system_turns = any(message["role"] == "system" for message in messages[1:])
+    if system_turns and not _shows_system_turns(tokenizer):
+        messages = _system_as_user(messages)
+    if not _takes_user_after_tool(tokenizer):
+        messages = _user_into_tool(messages)
 
     render_kwargs = {}
     if template_kwargs is not None:
@@ -103,6 +131,89 @@ def from_messages(
         text_state=_text_state(tokenizer, tokens),
         parse_tool_calls=parse_tool_calls,
     )
+
+
+@functools.cache
+def _shows_system_turns(tokenizer: tokenizer_utils.TokenizerWrapper) -> bool:
+    """Whether the chat template shows a system message after the first message.
+
+    Some templates refuse the message, some drop it without an error, and some
+    show only the last one. The probe has the shape of a Claude Code chat: some
+    templates refuse a system message only where it breaks the user/assistant order.
+    """
+    first, later = _SYSTEM_MARKERS
+    probe = [
+        {"role": "system", "content": first},
+        _PLACEHOLDER_USER,
+        {"role": "system", "content": later},
+        _PLACEHOLDER_ASSISTANT,
+        _PLACEHOLDER_USER,
+    ]
+    try:
+        text = tokenizer.apply_chat_template(
+            probe, tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        return False
+    return all(marker in text for marker in _SYSTEM_MARKERS)
+
+
+@functools.cache
+def _takes_user_after_tool(tokenizer: tokenizer_utils.TokenizerWrapper) -> bool:
+    """Whether the chat template takes a user message right after a tool result."""
+    # Mistral templates need 9-character ids, and gpt-oss a tool description.
+    call = {
+        "id": "a" * 9,
+        "type": "function",
+        "function": {"name": "f", "arguments": {}},
+    }
+    tool = {
+        "type": "function",
+        "function": {"name": "f", "description": ".", "parameters": {}},
+    }
+    probe = [
+        _PLACEHOLDER_USER,
+        {**_PLACEHOLDER_ASSISTANT, "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call["id"], "content": "."},
+        _PLACEHOLDER_USER,
+    ]
+    try:
+        tokenizer.apply_chat_template(
+            probe, tools=[tool], tokenize=False, add_generation_prompt=True
+        )
+    except Exception:
+        return False
+    return True
+
+
+def _system_as_user(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages with each system message after the first as user text.
+
+    Consecutive user messages become one, for templates that need the roles to
+    alternate.
+    """
+    result = []
+    for i, message in enumerate(messages):
+        if i > 0 and message["role"] == "system":
+            message = {**message, "role": "user"}
+        if message["role"] == "user" and result and result[-1]["role"] == "user":
+            content = f"{result[-1]['content']}\n\n{message['content']}"
+            result[-1] = {**result[-1], "content": content}
+        else:
+            result.append(message)
+    return result
+
+
+def _user_into_tool(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages with each user message right after a tool result joined to it."""
+    result = []
+    for message in messages:
+        if message["role"] == "user" and result and result[-1]["role"] == "tool":
+            content = f"{result[-1]['content']}\n\n{message['content']}"
+            result[-1] = {**result[-1], "content": content}
+        else:
+            result.append(message)
+    return result
 
 
 def _text_state(

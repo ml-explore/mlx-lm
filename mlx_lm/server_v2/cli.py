@@ -19,7 +19,7 @@ from fastapi.middleware import cors
 
 from mlx_lm import utils
 from mlx_lm.server_v2 import settings
-from mlx_lm.server_v2.api import app, openai
+from mlx_lm.server_v2.api import anthropic, app, openai
 from mlx_lm.server_v2.chat import rendering
 from mlx_lm.server_v2.engine import core
 
@@ -90,7 +90,7 @@ def main(argv: list[str] | None = None) -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Serve one model over an OpenAI-compatible API (experimental)."
+        description="Serve one model over OpenAI and Anthropic APIs (experimental)."
     )
     parser.add_argument("--model", required=True, help="Path or Hugging Face repo")
     parser.add_argument("--adapter-path", help="Path to trained adapter weights")
@@ -321,7 +321,7 @@ async def _run_engine_only(engine: core.Engine) -> None:
 
 def _run_server(args: argparse.Namespace, state: app.ServerState) -> None:
     """Serve HTTP until a shutdown signal or an engine failure."""
-    asgi_app = app.make_app(state, openai.router)
+    asgi_app = app.make_app(state, openai.router, anthropic.router)
     if args.allowed_origins:
         asgi_app = cors.CORSMiddleware(
             asgi_app,

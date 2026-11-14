@@ -464,6 +464,18 @@ class TestOpenAI(unittest.IsolatedAsyncioTestCase):
                     from_messages.call_args.kwargs["template_kwargs"], expected
                 )
 
+        # As in Qwen3.8: an effort the template refuses is left out.
+        template = (
+            "{% if reasoning_effort|default('low') != 'low' %}"
+            "{{ raise_exception('Unexpected reasoning effort.') }}"
+            "{% endif %}{{ messages[0].content }}"
+        )
+        self.serve(self.engine, helpers.load_tokenizer(chat_template=template))
+        response = await self.post(
+            "/v1/chat/completions", {"messages": MESSAGES, **high}
+        )
+        self.assertEqual(response.status_code, 200)
+
     async def test_bad_requests(self):
         self.serve(
             self.engine, default_params=settings.GenerationParams(temperature=0.5)
