@@ -2,7 +2,7 @@
 
 import copy
 import json
-from inspect import isfunction
+from inspect import isfunction, signature
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from transformers.utils.chat_template_utils import get_json_schema
@@ -94,7 +94,9 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     p_dsml_template = """<{dsml_token}parameter name="{key}" string="{is_str}">{value}</{dsml_token}parameter>"""
     P_dsml_strs = []
 
-    arguments = json.loads(tool_call["arguments"])
+    arguments = tool_call["arguments"]
+    if isinstance(arguments, str):
+        arguments = json.loads(arguments)
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(
@@ -336,6 +338,9 @@ def apply_chat_template(
         kwargs["thinking_mode"] = (
             "thinking" if kwargs.pop("enable_thinking") else "chat"
         )
+    # Ignore unused variables, as Jinja templates do.
+    params = signature(encode_messages).parameters
+    kwargs = {k: v for k, v in kwargs.items() if k in params}
     out = encode_messages(messages, **kwargs)
     if continue_final_message and add_generation_prompt:
         raise ValueError(
