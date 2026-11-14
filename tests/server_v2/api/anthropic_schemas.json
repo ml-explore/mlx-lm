@@ -1,0 +1,235 @@
+{
+ "source": "The response types of the anthropic Python SDK 2.8.0, as pydantic JSON schemas without descriptions, with only the blocks, deltas, errors and optional fields that the server sends. MIT License, Copyright (c) 2023 Anthropic, PBC.",
+ "components": {
+  "schemas": {
+   "APIErrorObject": {
+    "properties": {"message": {"type": "string"}, "type": {"const": "api_error", "type": "string"}},
+    "required": ["message", "type"],
+    "type": "object"
+   },
+   "Delta": {
+    "properties": {
+     "stop_reason": {
+      "anyOf": [
+       {
+        "enum": [
+         "end_turn",
+         "max_tokens",
+         "stop_sequence",
+         "tool_use",
+         "pause_turn",
+         "refusal",
+         "model_context_window_exceeded"
+        ],
+        "type": "string"
+       },
+       {"type": "null"}
+      ]
+     },
+     "stop_sequence": {"anyOf": [{"type": "string"}, {"type": "null"}]}
+    },
+    "type": "object"
+   },
+   "ErrorResponse": {
+    "properties": {
+     "error": {
+      "anyOf": [
+       {"$ref": "#/components/schemas/InvalidRequestError"},
+       {"$ref": "#/components/schemas/APIErrorObject"}
+      ]
+     },
+     "type": {"const": "error", "type": "string"}
+    },
+    "required": ["error", "type"],
+    "type": "object"
+   },
+   "InputJSONDelta": {
+    "properties": {
+     "partial_json": {"type": "string"},
+     "type": {"const": "input_json_delta", "type": "string"}
+    },
+    "required": ["partial_json", "type"],
+    "type": "object"
+   },
+   "InvalidRequestError": {
+    "properties": {
+     "message": {"type": "string"},
+     "type": {"const": "invalid_request_error", "type": "string"}
+    },
+    "required": ["message", "type"],
+    "type": "object"
+   },
+   "Message": {
+    "properties": {
+     "id": {"type": "string"},
+     "content": {
+      "items": {
+       "anyOf": [
+        {"$ref": "#/components/schemas/TextBlock"},
+        {"$ref": "#/components/schemas/ThinkingBlock"},
+        {"$ref": "#/components/schemas/ToolUseBlock"}
+       ]
+      },
+      "type": "array"
+     },
+     "model": {"type": "string"},
+     "role": {"const": "assistant", "type": "string"},
+     "stop_reason": {
+      "anyOf": [
+       {
+        "enum": [
+         "end_turn",
+         "max_tokens",
+         "stop_sequence",
+         "tool_use",
+         "pause_turn",
+         "refusal",
+         "model_context_window_exceeded"
+        ],
+        "type": "string"
+       },
+       {"type": "null"}
+      ]
+     },
+     "stop_sequence": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+     "type": {"const": "message", "type": "string"},
+     "usage": {"$ref": "#/components/schemas/Usage"}
+    },
+    "required": ["id", "content", "model", "role", "type", "usage"],
+    "type": "object"
+   },
+   "MessageDeltaUsage": {
+    "properties": {
+     "cache_creation_input_tokens": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+     "cache_read_input_tokens": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+     "input_tokens": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+     "output_tokens": {"type": "integer"}
+    },
+    "required": ["output_tokens"],
+    "type": "object"
+   },
+   "MessageTokensCount": {
+    "properties": {"input_tokens": {"type": "integer"}},
+    "required": ["input_tokens"],
+    "type": "object"
+   },
+   "RawContentBlockDeltaEvent": {
+    "properties": {
+     "delta": {
+      "anyOf": [
+       {"$ref": "#/components/schemas/TextDelta"},
+       {"$ref": "#/components/schemas/InputJSONDelta"},
+       {"$ref": "#/components/schemas/ThinkingDelta"}
+      ]
+     },
+     "index": {"type": "integer"},
+     "type": {"const": "content_block_delta", "type": "string"}
+    },
+    "required": ["delta", "index", "type"],
+    "type": "object"
+   },
+   "RawContentBlockStartEvent": {
+    "properties": {
+     "content_block": {
+      "anyOf": [
+       {"$ref": "#/components/schemas/TextBlock"},
+       {"$ref": "#/components/schemas/ThinkingBlock"},
+       {"$ref": "#/components/schemas/ToolUseBlock"}
+      ]
+     },
+     "index": {"type": "integer"},
+     "type": {"const": "content_block_start", "type": "string"}
+    },
+    "required": ["content_block", "index", "type"],
+    "type": "object"
+   },
+   "RawContentBlockStopEvent": {
+    "properties": {
+     "index": {"type": "integer"},
+     "type": {"const": "content_block_stop", "type": "string"}
+    },
+    "required": ["index", "type"],
+    "type": "object"
+   },
+   "RawMessageDeltaEvent": {
+    "properties": {
+     "delta": {"$ref": "#/components/schemas/Delta"},
+     "type": {"const": "message_delta", "type": "string"},
+     "usage": {"$ref": "#/components/schemas/MessageDeltaUsage"}
+    },
+    "required": ["delta", "type", "usage"],
+    "type": "object"
+   },
+   "RawMessageStartEvent": {
+    "properties": {
+     "message": {"$ref": "#/components/schemas/Message"},
+     "type": {"const": "message_start", "type": "string"}
+    },
+    "required": ["message", "type"],
+    "type": "object"
+   },
+   "RawMessageStopEvent": {
+    "properties": {"type": {"const": "message_stop", "type": "string"}},
+    "required": ["type"],
+    "type": "object"
+   },
+   "RawMessageStreamEvent": {
+    "anyOf": [
+     {"$ref": "#/components/schemas/RawMessageStartEvent"},
+     {"$ref": "#/components/schemas/RawMessageDeltaEvent"},
+     {"$ref": "#/components/schemas/RawMessageStopEvent"},
+     {"$ref": "#/components/schemas/RawContentBlockStartEvent"},
+     {"$ref": "#/components/schemas/RawContentBlockDeltaEvent"},
+     {"$ref": "#/components/schemas/RawContentBlockStopEvent"}
+    ]
+   },
+   "TextBlock": {
+    "properties": {"text": {"type": "string"}, "type": {"const": "text", "type": "string"}},
+    "required": ["text", "type"],
+    "type": "object"
+   },
+   "TextDelta": {
+    "properties": {"text": {"type": "string"}, "type": {"const": "text_delta", "type": "string"}},
+    "required": ["text", "type"],
+    "type": "object"
+   },
+   "ThinkingBlock": {
+    "properties": {
+     "signature": {"type": "string"},
+     "thinking": {"type": "string"},
+     "type": {"const": "thinking", "type": "string"}
+    },
+    "required": ["signature", "thinking", "type"],
+    "type": "object"
+   },
+   "ThinkingDelta": {
+    "properties": {
+     "thinking": {"type": "string"},
+     "type": {"const": "thinking_delta", "type": "string"}
+    },
+    "required": ["thinking", "type"],
+    "type": "object"
+   },
+   "ToolUseBlock": {
+    "properties": {
+     "id": {"type": "string"},
+     "input": {"type": "object"},
+     "name": {"type": "string"},
+     "type": {"const": "tool_use", "type": "string"}
+    },
+    "required": ["id", "input", "name", "type"],
+    "type": "object"
+   },
+   "Usage": {
+    "properties": {
+     "cache_creation_input_tokens": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+     "cache_read_input_tokens": {"anyOf": [{"type": "integer"}, {"type": "null"}]},
+     "input_tokens": {"type": "integer"},
+     "output_tokens": {"type": "integer"}
+    },
+    "required": ["input_tokens", "output_tokens"],
+    "type": "object"
+   }
+  }
+ }
+}

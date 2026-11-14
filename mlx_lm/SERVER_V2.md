@@ -4,12 +4,13 @@
 > The MLX LM server is not recommended for production as it only implements
 > basic security checks.
 
-`mlx_lm.server_v2` is an experimental OpenAI-compatible server, separate from
-`mlx_lm.server`. Its interface can change between releases. Start it with:
+`mlx_lm.server_v2` is an experimental OpenAI- and Anthropic-compatible server,
+separate from `mlx_lm.server`. Its interface can change between releases. Start
+it with:
 
 ```shell
 pip install "mlx-lm[server]"
-mlx_lm.server_v2 --model mlx-community/Mistral-7B-Instruct-v0.3-4bit
+mlx_lm.server_v2 --model mlx-community/Qwen3-4B-Instruct-2507-4bit
 ```
 
 It serves the model given with `--model` at `/v1/chat/completions`,
@@ -28,6 +29,10 @@ length.
 The decode batch pads each request to the longest one, so with long prompts,
 lower `--decode-concurrency` to use less memory. Paged attention, which does
 not pad, will be explored in the future.
+
+A system message after the first becomes user text if the chat template refuses
+or drops it. User text after a tool result joins that result if the template
+refuses it, as Mistral templates do.
 
 A request gets a 400 error if its prompt and `max_tokens` do not fit in the
 context length, if `n` is not 1, if a `/v1/completions` prompt is not a string,
@@ -53,3 +58,17 @@ These features of `mlx_lm.server` are not supported yet:
 - Models with a cache that cannot be batched
 - Models without a chat template (`role_mapping`)
 - `seed` with a temperature above 0
+
+## Anthropic Messages API
+
+The server also serves `/v1/messages` and `/v1/messages/count_tokens`, with
+errors in the Anthropic format. `thinking` and `output_config.effort` go to the
+chat template as `enable_thinking` and `reasoning_effort`. A request without
+`thinking` gets the template default, or no reasoning with
+`--chat-template-args '{"enable_thinking": false}'`. Images, documents, server
+tools, `tool_choice` `any` or `tool`, `output_config.format` and a last
+assistant message (prefill) are not supported. The request `model` is ignored.
+A `max_tokens` that does not fit is cut to the room left in the context.
+
+For Claude Code, set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`, any
+`ANTHROPIC_AUTH_TOKEN`, and `CLAUDE_CODE_DISABLE_STRUCTURED_OUTPUTS=1`.
