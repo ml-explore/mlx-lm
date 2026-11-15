@@ -1304,6 +1304,11 @@ class PromptProcessingBatch:
         """
         if any(len(t) > 1 for t in tokens):
             self.prompt([t[:-1] for t in tokens])
+        else:
+            # No prompt() call on this path, so nothing finalized the caches
+            # since they were last merged or extended.
+            for c in self.prompt_cache:
+                c.finalize()
         last_token = mx.array([t[-1] for t in tokens])
 
         generation = GenerationBatch(
