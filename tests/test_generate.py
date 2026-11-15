@@ -1148,6 +1148,7 @@ class TestBatchDecodeCaches(unittest.TestCase):
             # The second prompt joins the prompt batch in the same call that
             # moves the first one to generation.
             "prompt arrives during handoff": second_after(1, long_a, long_b),
+            "one token prompt joins decode": second_after(6, long_a, [15]),
         }
         for name, setup in scenarios.items():
             with self.subTest(name):
