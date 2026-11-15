@@ -15,11 +15,15 @@ class ModelArgs(BaseModelArgs):
     model_type: str = "gemma4"
     text_config: dict = None
     vocab_size: int = 262144
+    tie_word_embeddings: Optional[bool] = None
 
     def __post_init__(self):
         if self.text_config is None:
             self.text_config = {}
         self.text_config["vocab_size"] = self.vocab_size
+        # transformers ties the output head from the top-level flag.
+        if self.tie_word_embeddings is not None:
+            self.text_config["tie_word_embeddings"] = self.tie_word_embeddings
         self.text_config["num_attention_heads"] = self.text_config.get(
             "num_attention_heads", 8
         )
@@ -70,6 +74,9 @@ class Model(nn.Module):
                 continue
 
             if not starts_w_model:
+                # transformers keeps an untied output head at the top level.
+                if k.startswith("lm_head."):
+                    k = "language_model." + k
                 new_weights[k] = v
                 continue
 
