@@ -1,0 +1,71 @@
+# Copyright © 2023 Apple Inc.
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.models.dots1 import checkpoint
+from mlx_lm.models.dots1.config import ModelArgs
+from mlx_lm.models.dots1.layers import Dots1DecoderLayer
+
+__all__ = [
+    "Dots1Model",
+    "Model",
+]
+
+
+class Dots1Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
+        self.layers = [
+            Dots1DecoderLayer(args, layer_idx)
+            for layer_idx in range(args.num_hidden_layers)
+        ]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+    ) -> mx.array:
+        h = self.embed_tokens(inputs)
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
+
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, mask, c)
+
+        return self.norm(h)
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.model_type = args.model_type
+        self.model = Dots1Model(args)
+        if not args.tie_word_embeddings:
+            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        cache=None,
+    ):
+        out = self.model(inputs, cache)
+        if self.args.tie_word_embeddings:
+            out = self.model.embed_tokens.as_linear(out)
+        else:
+            out = self.lm_head(out)
+        return out
+
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
+    @property
+    def layers(self):
+        return self.model.layers

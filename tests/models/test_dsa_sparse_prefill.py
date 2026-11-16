@@ -6,8 +6,8 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_lm.layers import dsa
 from mlx_lm.models import deepseek_v32 as D
-from mlx_lm.models import dsa
 from mlx_lm.models import glm_moe_dsa as G
 from mlx_lm.models.cache import make_prompt_cache
 

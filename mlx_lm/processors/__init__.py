@@ -4,9 +4,10 @@
 
 from mlx import nn
 
+from ..utils import model_package
 from . import muse_spark
 
-# The processor of each model module.
+# The processor of each model package.
 PROCESSORS = {
     "muse_spark": muse_spark.Processor,
 }
@@ -16,7 +17,9 @@ def load_processor(model: nn.Module, config: dict) -> muse_spark.Processor | Non
     """The processor of a model, or None."""
     if not config.get("vision_config"):
         return None
-    model_module = type(model).__module__.rsplit(".", 1)[-1]
-    name = config.get("processor_type", model_module)
+    if "processor_type" in config:
+        name = config["processor_type"]
+    else:
+        name = model_package(config)
     processor = PROCESSORS.get(name)
     return processor.from_config(config) if processor else None

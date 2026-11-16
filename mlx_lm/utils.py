@@ -58,6 +58,10 @@ MODEL_REMAPPING = {
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
     "deepseek_v41_text": "deepseek_v41",
+    # Package names cannot have hyphens.
+    "lfm2-vl": "lfm2_vl",
+    "lille-130m": "lille_130m",
+    "nemotron-nas": "nemotron_nas",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -197,6 +201,19 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
+def model_package(config: dict) -> str:
+    """The package in ``mlx_lm.models`` of the model of a configuration."""
+    model_type = config["model_type"]
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            return remapped
+    return MODEL_REMAPPING.get(model_type, model_type)
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -207,17 +224,7 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"]
-    architectures = config.get("architectures") or ()
-    if isinstance(architectures, str):
-        architectures = (architectures,)
-    for architecture in architectures:
-        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
-        if remapped is not None:
-            model_type = remapped
-            break
-    else:
-        model_type = MODEL_REMAPPING.get(model_type, model_type)
+    model_type = model_package(config)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError as e:
@@ -636,12 +643,12 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
 
 
 def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
-    """The TOKENIZER_DEFAULTS of the model module, if any."""
+    """The TOKENIZER_DEFAULTS of the model package, if any."""
     try:
-        model_class, _ = _get_classes(load_config(model_path))
-    except (FileNotFoundError, KeyError, ValueError):
+        package = model_package(load_config(model_path))
+        module = importlib.import_module(f"mlx_lm.models.{package}")
+    except (FileNotFoundError, KeyError, ImportError):
         return None
-    module = importlib.import_module(model_class.__module__)
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 

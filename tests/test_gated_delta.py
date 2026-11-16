@@ -4,8 +4,8 @@ import unittest
 
 import mlx.core as mx
 
-import mlx_lm.models.gated_delta as gated_delta
-from mlx_lm.models.gated_delta import (
+import mlx_lm.layers.gated_delta as gated_delta
+from mlx_lm.layers.gated_delta import (
     gated_delta_kernel,
     gated_delta_kernel_unpacked,
     gated_delta_kernel_xtree,

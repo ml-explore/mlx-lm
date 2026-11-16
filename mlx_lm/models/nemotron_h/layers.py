@@ -1,0 +1,406 @@
+# Copyright © 2025 Apple Inc.
+
+from typing import Any, Optional
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from mlx_lm.layers.activations import swiglu
+from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.ssm import ssm_update
+from mlx_lm.layers.switch import SwitchMLP
+from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.nemotron_h.config import ModelArgs
+
+__all__ = [
+    "MambaRMSNormGated",
+    "MoEGate",
+    "NemotronHAttention",
+    "NemotronHBlock",
+    "NemotronHMLP",
+    "NemotronHMamba2Mixer",
+    "NemotronHMoE",
+    "group_expert_select",
+]
+
+
+class MambaRMSNormGated(nn.Module):
+    def __init__(self, hidden_size: int, eps: float, group_size: int):
+        super().__init__()
+        self.eps = eps
+        self.weight = mx.ones(hidden_size)
+        self.group_size = group_size
+
+    def __call__(self, x: mx.array, gate: mx.array = None) -> mx.array:
+        if gate is not None:
+            x = swiglu(gate, x)
+        x = mx.unflatten(x, axis=-1, shape=(-1, self.group_size))
+        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
+        return self.weight * x.flatten(-2)
+
+
+class NemotronHMamba2Mixer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.num_heads = args.mamba_num_heads
+        self.hidden_size = args.hidden_size
+        self.ssm_state_size = args.ssm_state_size
+        self.conv_kernel_size = args.conv_kernel
+        self.intermediate_size = args.mamba_num_heads * args.mamba_head_dim
+        self.n_groups = args.n_groups
+        self.head_dim = args.mamba_head_dim
+        self.time_step_limit = args.time_step_limit
+        self.heads_per_group = self.num_heads // self.n_groups
+
+        self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
+
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            kernel_size=args.conv_kernel,
+            padding=0,
+            groups=self.conv_dim,
+            bias=args.use_conv_bias,
+        )
+
+        projection_size = self.intermediate_size + self.conv_dim + self.num_heads
+        self.in_proj = nn.Linear(
+            self.hidden_size, projection_size, bias=args.mamba_proj_bias
+        )
+
+        self.dt_bias = mx.ones(self.num_heads)
+        self.A_log = mx.log(mx.arange(1, self.num_heads + 1, dtype=mx.float32))
+        self.D = mx.ones(self.num_heads)
+
+        group_size = self.intermediate_size // self.n_groups
+        self.norm = MambaRMSNormGated(
+            self.intermediate_size,
+            eps=args.layer_norm_epsilon,
+            group_size=group_size,
+        )
+        self.out_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
+        )
+
+    def _conv(
+        self,
+        conv_input: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
+    ) -> mx.array:
+        if mask is not None:
+            conv_input = mx.where(mask[..., None], conv_input, 0)
+
+        if cache is not None:
+            if cache[0] is None:
+                conv_state = mx.zeros(
+                    (conv_input.shape[0], self.conv_kernel_size - 1, self.conv_dim),
+                    dtype=conv_input.dtype,
+                )
+            else:
+                conv_state = cache[0]
+            padded_input = mx.concatenate([conv_state, conv_input], axis=1)
+            n_keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                t = padded_input.shape[1]
+                ends = mx.clip(cache.lengths, 0, t - n_keep)
+                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+                cache[0] = mx.take_along_axis(padded_input, positions, axis=1)
+            else:
+                cache[0] = padded_input[:, -n_keep:, :]
+        else:
+            padded_input = mx.pad(
+                conv_input, [(0, 0), (self.conv_kernel_size - 1, 0), (0, 0)]
+            )
+
+        conv_output = self.conv1d(padded_input)
+        return nn.silu(conv_output)
+
+    def _ssm(
+        self,
+        hidden_states: mx.array,
+        B: mx.array,
+        C: mx.array,
+        dt: mx.array,
+        cache: Optional[ArraysCache],
+        mask: Optional[mx.array],
+    ) -> mx.array:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        hidden_states = hidden_states.reshape(
+            batch_size, seq_len, self.num_heads, self.head_dim
+        )
+        B = B.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        C = C.reshape(batch_size, seq_len, self.n_groups, self.ssm_state_size)
+        if cache:
+            state = cache[1]
+        else:
+            state = None
+
+        y, state = ssm_update(
+            hidden_states,
+            self.A_log,
+            B,
+            C,
+            self.D.astype(hidden_states.dtype),
+            dt,
+            self.dt_bias,
+            state,
+            self.time_step_limit,
+            mask,
+        )
+        if cache:
+            cache[1] = state
+
+        return y.reshape(batch_size, seq_len, self.intermediate_size)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[ArraysCache] = None,
+    ) -> mx.array:
+
+        projected = self.in_proj(hidden_states)
+
+        gate, conv_input, dt = mx.split(
+            projected,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
+            axis=-1,
+        )
+        conv_output = self._conv(conv_input, cache, mask)
+        hidden_states_ssm, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
+        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
+        if cache:
+            cache.advance(y.shape[1])
+        y = self.norm(y, gate)
+        return self.out_proj(y)
+
+
+class NemotronHAttention(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.num_heads = args.num_attention_heads
+        self.head_dim = (
+            args.head_dim
+            if args.head_dim is not None
+            else (args.hidden_size // args.num_attention_heads)
+        )
+        self.num_key_value_heads = args.num_key_value_heads
+        self.scale = self.head_dim**-0.5
+
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_key_value_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[KVCache] = None,
+    ) -> mx.array:
+        B, L, D = x.shape
+
+        queries = self.q_proj(x).reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        keys = (
+            self.k_proj(x)
+            .reshape(B, L, self.num_key_value_heads, -1)
+            .transpose(0, 2, 1, 3)
+        )
+        values = (
+            self.v_proj(x)
+            .reshape(B, L, self.num_key_value_heads, -1)
+            .transpose(0, 2, 1, 3)
+        )
+
+        if cache is not None:
+            keys, values = cache.update_and_fetch(keys, values)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
+
+
+class NemotronHMLP(nn.Module):
+    def __init__(self, args: ModelArgs, intermediate_size=None):
+        super().__init__()
+        intermediate_size = intermediate_size or args.intermediate_size
+
+        self.up_proj = nn.Linear(
+            args.hidden_size, intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            intermediate_size, args.hidden_size, bias=args.mlp_bias
+        )
+
+    def __call__(self, x):
+        return self.down_proj(nn.relu2(self.up_proj(x)))
+
+
+@mx.compile
+def group_expert_select(
+    gates,
+    e_score_correction_bias,
+    top_k,
+    n_group,
+    topk_group,
+    routed_scaling_factor,
+    norm_topk_prob,
+):
+
+    orig_scores = scores = mx.sigmoid(gates.astype(mx.float32))
+    scores = scores + e_score_correction_bias
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
+
+    k = top_k
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+    if top_k > 1 and norm_topk_prob:
+        denominator = scores.sum(axis=-1, keepdims=True)
+        scores = scores / (denominator + 1e-20)
+    scores = scores * routed_scaling_factor
+
+    return inds, scores
+
+
+class MoEGate(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = config.norm_topk_prob
+        self.n_routed_experts = config.n_routed_experts
+        self.routed_scaling_factor = config.routed_scaling_factor
+        self.n_group = config.n_group
+        self.topk_group = config.topk_group
+        self.weight = mx.zeros((self.n_routed_experts, config.hidden_size))
+        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
+
+    def __call__(self, x):
+        return group_expert_select(
+            x @ self.weight.T,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
+
+
+class NemotronHMoE(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.moe_latent_size = config.moe_latent_size
+
+        # When latent projection is used, experts operate on the latent dim
+        expert_input_dim = (
+            config.moe_latent_size
+            if config.moe_latent_size is not None
+            else config.hidden_size
+        )
+        self.switch_mlp = SwitchMLP(
+            expert_input_dim,
+            config.moe_intermediate_size,
+            config.n_routed_experts,
+            activation=nn.ReLU2(),
+        )
+
+        self.gate = MoEGate(config)
+        if config.n_shared_experts is not None:
+            intermediate_size = config.moe_shared_expert_intermediate_size
+            self.shared_experts = NemotronHMLP(
+                config, intermediate_size=intermediate_size
+            )
+
+        # Latent projection layers for dimensionality reduction before/after experts
+        if config.moe_latent_size is not None:
+            self.fc1_latent_proj = nn.Linear(
+                config.hidden_size, config.moe_latent_size, bias=config.mlp_bias
+            )
+            self.fc2_latent_proj = nn.Linear(
+                config.moe_latent_size, config.hidden_size, bias=config.mlp_bias
+            )
+
+    def __call__(self, x):
+        residuals = x
+        inds, scores = self.gate(x)
+
+        if self.moe_latent_size is not None:
+            x = self.fc1_latent_proj(x)
+
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+
+        if self.moe_latent_size is not None:
+            y = self.fc2_latent_proj(y)
+
+        if self.config.n_shared_experts is not None:
+            y = y + self.shared_experts(residuals)
+
+        return y
+
+
+class NemotronHBlock(nn.Module):
+    def __init__(self, args: ModelArgs, block_type: str):
+        super().__init__()
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.layer_norm_epsilon)
+
+        self.block_type = block_type
+
+        if self.block_type == "M":
+            self.mixer = NemotronHMamba2Mixer(args)
+        elif self.block_type == "*":
+            self.mixer = NemotronHAttention(args)
+        elif self.block_type == "-":
+            self.mixer = NemotronHMLP(args)
+        elif self.block_type == "E":
+            self.mixer = NemotronHMoE(args)
+
+    def __call__(
+        self,
+        x,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ):
+        hidden_states = self.norm(x)
+        if self.block_type == "M" or self.block_type == "*":
+            hidden_states = self.mixer(hidden_states, mask=mask, cache=cache)
+        else:
+            hidden_states = self.mixer(hidden_states)
+
+        return x + hidden_states

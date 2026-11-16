@@ -558,7 +558,9 @@ class TestModels(unittest.TestCase):
         for projection in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "g_proj"):
             self.assertIsInstance(getattr(mla, projection), nn.Linear)
         for projection in ("embed_q", "unembed_out"):
-            self.assertIsInstance(getattr(mla, projection), bailing_moe_v3.MultiLinear)
+            self.assertIsInstance(
+                getattr(mla, projection), bailing_moe_v3.layers.MultiLinear
+            )
 
         base_scale = (args.qk_nope_head_dim + args.qk_rope_head_dim) ** -0.5
         self.assertAlmostEqual(model.layers[3].attention.scale, base_scale)
@@ -801,7 +803,6 @@ class TestModels(unittest.TestCase):
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
 
-    @unittest.skip("requires ai2-olmo")
     def test_olmo(self):
         from mlx_lm.models import olmo
 
@@ -1200,7 +1201,9 @@ class TestModels(unittest.TestCase):
         biases = -1.5 * scales
         signs = mx.where(mx.random.bernoulli(0.5, (width,), key=k3), 1.0, -1.0)
         dense = mx.dequantize(weight, scales, biases, group_size=128, bits=2)
-        dense = phq.hadamard_rotate(dense.astype(mx.float32), 512, signs, inverse=True)
+        dense = phq.layers.hadamard_rotate(
+            dense.astype(mx.float32), 512, signs, inverse=True
+        )
         packed = {"weight": weight, "scales": scales, "biases": biases, "signs": signs}
         return packed, dense
 
@@ -1208,7 +1211,7 @@ class TestModels(unittest.TestCase):
         from mlx_lm.models import prism_hadamard_qwen35 as phq
 
         packed, dense = self._prism_hadamard_packed(192, 1024, 0)
-        layer = phq.HadamardQuantizedLinear(1024, 192, 512)
+        layer = phq.layers.HadamardQuantizedLinear(1024, 192, 512)
         layer.update(packed)
         x = mx.random.normal((3, 5, 1024), key=mx.random.key(1)).astype(mx.float16)
         self.assertTrue(
@@ -1216,7 +1219,7 @@ class TestModels(unittest.TestCase):
         )
 
         packed, table = self._prism_hadamard_packed(64, 512, 2)
-        embed = phq.HadamardQuantizedEmbedding(512, 64, 512)
+        embed = phq.layers.HadamardQuantizedEmbedding(512, 64, 512)
         embed.update(packed)
         ids = mx.array([[0, 5, 63], [7, 7, 1]])
         self.assertTrue(mx.allclose(embed(ids), table[ids], atol=1e-2))
@@ -1228,9 +1231,9 @@ class TestModels(unittest.TestCase):
         )
 
         with self.assertRaises(ValueError):
-            phq.HadamardQuantizedLinear(1024, 64, 384)
+            phq.layers.HadamardQuantizedLinear(1024, 64, 384)
         with self.assertRaises(ValueError):
-            phq.HadamardQuantizedLinear(768, 64, 512)
+            phq.layers.HadamardQuantizedLinear(768, 64, 512)
 
     def test_prism_hadamard_qwen35_matches_qwen3_5(self):
         import json
@@ -1311,7 +1314,7 @@ class TestModels(unittest.TestCase):
             config = {
                 "model_type": "prism_hadamard_qwen35",
                 "schema_version": schema,
-                "tensor_namespace": phq._NAMESPACES[schema],
+                "tensor_namespace": phq.config._NAMESPACES[schema],
                 "gdn_activation_layout": "grouped",
                 "quantization": {"bits": 2, "group_size": 128, "mode": "affine"},
                 "modules": modules,
@@ -1329,7 +1332,7 @@ class TestModels(unittest.TestCase):
                     model, _ = load_model(Path(d))
                 self.assertIsInstance(model, phq.Model)
                 n_packed = sum(
-                    isinstance(m, phq.HadamardQuantizedLinear)
+                    isinstance(m, phq.layers.HadamardQuantizedLinear)
                     for _, m in model.named_modules()
                 )
                 self.assertEqual(n_packed, len(config["modules"]))
@@ -1717,7 +1720,7 @@ class TestModels(unittest.TestCase):
         hidden = mx.random.uniform(shape=(1, 3, args.hidden_size))
         next_hidden = mx.random.uniform(shape=(1, 1, args.hidden_size))
 
-        full_attention = plamo3.Attention(args, layer_idx=1)
+        full_attention = plamo3.layers.Attention(args, layer_idx=1)
         full_rope = CountingRoPE(full_attention.rope)
         full_attention.rope = full_rope
         full_cache = KVCache()
@@ -1733,7 +1736,7 @@ class TestModels(unittest.TestCase):
             ],
         )
 
-        sliding_attention = plamo3.Attention(args, layer_idx=0)
+        sliding_attention = plamo3.layers.Attention(args, layer_idx=0)
         sliding_rope = CountingRoPE(sliding_attention.rope)
         sliding_attention.rope = sliding_rope
         sliding_cache = RotatingKVCache(max_size=args.window_size + 1)
@@ -1762,8 +1765,8 @@ class TestModels(unittest.TestCase):
             initial_context_length=4096,
             max_position_embeddings=262144,
         )
-        full = plamo3.Attention(args, layer_idx=1)
-        local = plamo3.Attention(args, layer_idx=0)
+        full = plamo3.layers.Attention(args, layer_idx=1)
+        local = plamo3.layers.Attention(args, layer_idx=0)
 
         dims = args.head_dim
         freq = args.rope_theta ** (np.arange(0, dims, 2, dtype=np.float32) / dims)
@@ -2133,7 +2136,7 @@ class TestModels(unittest.TestCase):
             intermediate_size=8,
             time_step_rank=2,
         )
-        block = mamba.MambaBlock(args)
+        block = mamba.layers.MambaBlock(args)
 
         x = mx.ones((1, args.intermediate_size))
         A = -mx.ones((args.intermediate_size, args.state_size))
@@ -2678,16 +2681,16 @@ class TestModels(unittest.TestCase):
         ref.load_weights(list(ref.sanitize(ref_weights).items()))
         # fp8 projections that read the same input are fused, others are not.
         layer = model.layers[0]
-        self.assertIsInstance(layer.self_attn.qkv_proj, ministral3.Fp8Linear)
+        self.assertIsInstance(layer.self_attn.qkv_proj, ministral3.layers.Fp8Linear)
         self.assertEqual(
             layer.self_attn.qkv_proj.output_scale.shape, ((H + 2 * KV) * D,)
         )
-        self.assertIsInstance(layer.mlp, ministral3.FusedGLU)
-        self.assertIsInstance(layer.mlp.gate_up_proj, ministral3.Fp8Linear)
-        self.assertIsInstance(layer.mlp.down_proj, ministral3.Fp8Linear)
+        self.assertIsInstance(layer.mlp, ministral3.layers.FusedGLU)
+        self.assertIsInstance(layer.mlp.gate_up_proj, ministral3.layers.Fp8Linear)
+        self.assertIsInstance(layer.mlp.down_proj, ministral3.layers.Fp8Linear)
         self.assertIsInstance(model.language_model.lm_head, nn.Linear)
         self.assertIn("q_proj", ref.layers[0].self_attn)
-        self.assertIsInstance(ref.layers[0].mlp, ministral3.MLP)
+        self.assertIsInstance(ref.layers[0].mlp, ministral3.layers.MLP)
 
         # Each rank of a fused projection gets its part of q, k and v, with
         # the matching rows of the per-row scale.
@@ -2706,7 +2709,7 @@ class TestModels(unittest.TestCase):
         full = mx.split(layer.self_attn.qkv_proj(h_in), split, axis=-1)
         shards = [
             mx.split(
-                ministral3._shard_linear(
+                ministral3.model._shard_linear(
                     copy.deepcopy(layer.self_attn.qkv_proj),
                     "all-to-sharded",
                     FakeGroup(r),
@@ -2728,7 +2731,8 @@ class TestModels(unittest.TestCase):
                 # Each sharded fp8 layer keeps its output scale.
                 model.language_model.shard(mx.distributed.init())
                 self.assertIsInstance(
-                    model.layers[0].self_attn.o_proj, ministral3.Fp8ShardedToAllLinear
+                    model.layers[0].self_attn.o_proj,
+                    ministral3.layers.Fp8ShardedToAllLinear,
                 )
                 # Each rank computes a slice of the vocabulary.
                 lm = model.language_model
@@ -2901,7 +2905,7 @@ class TestModels(unittest.TestCase):
             vocab_size=4,
             num_kv_shared_layers=0,
         )
-        model = gemma4_text.Gemma4TextModel(args)
+        model = gemma4_text.model.Gemma4TextModel(args)
         model.embed_tokens.weight = mx.ones((4, 32), dtype=mx.float32)
         model.embed_tokens = model.embed_tokens.to_quantized(group_size=32, bits=8)
 
@@ -3147,10 +3151,10 @@ class TestModels(unittest.TestCase):
 
         # Near ties share the weight, other picks get 1.
         gates = mx.array([[3.0, 1.0, 0.0, -1.0], [3.0, 2.99, 0.0, -1.0]])
-        inds, scores = phimoe.sparsemixer(gates, top_k=2, jitter_eps=0.01)
+        inds, scores = phimoe.layers.sparsemixer(gates, top_k=2, jitter_eps=0.01)
         self.assertEqual(inds.tolist(), [[0, 1], [0, 1]])
         self.assertTrue(mx.allclose(scores, mx.array([[1.0, 1.0], [0.5025, 1.0]])))
-        loss = lambda g: phimoe.sparsemixer(g, top_k=2, jitter_eps=0.01)[1].sum()
+        loss = lambda g: phimoe.layers.sparsemixer(g, top_k=2, jitter_eps=0.01)[1].sum()
         mx.eval(mx.grad(loss)(gates))
 
         args = phimoe.ModelArgs(

@@ -21,8 +21,10 @@ class TestDeepseekV41(unittest.TestCase):
         )
         for shape in ((1, 5, 8), (1, 5, 2, 8)):
             x = mx.random.normal(shape)
-            y = deepseek_v41._apply_rope(x, rope, rope_dim=4, offset=4, scale=2.0)
-            y = deepseek_v41._apply_rope(
+            y = deepseek_v41.layers._apply_rope(
+                x, rope, rope_dim=4, offset=4, scale=2.0
+            )
+            y = deepseek_v41.layers._apply_rope(
                 y, rope, rope_dim=4, offset=4, scale=2.0, inverse=True
             )
             self.assertTrue(mx.allclose(y, x, atol=1e-5))

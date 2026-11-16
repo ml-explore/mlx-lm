@@ -57,7 +57,9 @@ class TestAWQ(unittest.TestCase):
         model = ministral3.Model(ministral3.ModelArgs.from_dict(ministral3_config()))
         attn = model.model.layers[0].self_attn
         x = mx.random.normal((1, 5, 64))
-        expected = ministral3._get_llama_4_attn_scale(5, 0, 0.5, 512).astype(x.dtype)
+        expected = ministral3.layers._get_llama_4_attn_scale(5, 0, 0.5, 512).astype(
+            x.dtype
+        )
         self.assertTrue(mx.allclose(attn(x), attn(x, expected), atol=1e-6).item())
 
     def test_ministral3_awq_quantize(self):
