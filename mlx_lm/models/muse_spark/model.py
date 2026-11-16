@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import shard_linear
 from mlx_lm.kernels import pre_norm
 from mlx_lm.layers.distributed import gather_last_axis
 from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.multimodal import splice
 from mlx_lm.layers.pipeline import PipelineMixin
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.muse_spark import checkpoint
@@ -54,25 +55,6 @@ def shard_experts_inplace(
             parts.append(chunk)
         updates[name] = mx.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
     module.update(updates)
-
-
-def _splice_vision_embeddings(
-    residual: mx.array,
-    input_ids: mx.array,
-    *,
-    vision_embeds: mx.array,
-    patch_token_id: int,
-) -> mx.array:
-    """Put the rows of vision_embeds, in order, at the patch tokens."""
-    # A shape check only, so no host sync.
-    if vision_embeds.shape[0] == 0:
-        return residual
-    mask = input_ids == patch_token_id
-    # The row of each masked token: the number of masked tokens before it.
-    idx = mx.cumsum(mask.flatten()).reshape(mask.shape) - 1
-    idx = mx.clip(idx, 0, vision_embeds.shape[0] - 1)
-    rows = vision_embeds[idx].astype(residual.dtype)
-    return mx.where(mask[..., None], rows, residual)
 
 
 class MuseSparkTextModel(PipelineMixin, nn.Module):
@@ -227,11 +209,11 @@ class Model(nn.Module):
         h = self.model.language_model.embed(inputs)
         # The vision rows take the dtype of the text embeddings.
         if pixel_values is not None:
-            h = _splice_vision_embeddings(
+            h = splice(
                 h,
                 inputs,
-                vision_embeds=self.encode_image(pixel_values),
-                patch_token_id=self.args.image_token_id,
+                rows=self.encode_image(pixel_values),
+                token_id=self.args.image_token_id,
             )
         return h
 
