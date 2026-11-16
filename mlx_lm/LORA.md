@@ -1,6 +1,6 @@
 # Fine-Tuning with LoRA or QLoRA
 
-You can use use the `mlx-lm` package to fine-tune an LLM with low rank
+You can use the `mlx-lm` package to fine-tune an LLM with low rank
 adaptation (LoRA) for a target task.[^lora] The example also supports quantized
 LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
 
@@ -26,7 +26,7 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
 
 ## Run
 
-First, make sure you have the training dependenices installed:
+First, make sure you have the training dependencies installed:
 
 ```shell
 pip install "mlx-lm[train]"
@@ -196,7 +196,7 @@ data formats. Here are examples of these formats:
 `chat`:
 
 ```jsonl
-{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello."}, {"role": "assistant", "content": "How can I assistant you today."}]}
+{"messages": [{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": "Hello."}, {"role": "assistant", "content": "How can I assist you today."}]}
 ```
 
 `tools`:
@@ -302,7 +302,7 @@ pip install datasets
 
 If the Hugging Face dataset is already in a supported format, you can specify
 it on the command line. For example, pass `--data mlx-community/wikisql` to
-train on the pre-formatted WikiwSQL data.
+train on the pre-formatted WikiSQL data.
 
 Otherwise, provide a mapping of keys in the dataset to the features MLX LM
 expects. Use a YAML config to specify the Hugging Face dataset arguments. For
@@ -355,7 +355,7 @@ You are a helpful assistant.<|im_end|>
 <|im_start|>user
 Hello.<|im_end|>
 <|im_start|>assistant
-How can I assistant you today.<|im_end|>
+How can I assist you today.<|im_end|>
 ```
 
 If you are unsure of the format to use, the `chat` or `completions` are good to

@@ -106,7 +106,7 @@ Use `mlx_lm.awq` to run AWQ on a given model. For example:
 mlx_lm.awq --model Qwen/Qwen3-0.6B
 ```
 
-The script can take anywhere form a few minutes to several hours to run
+The script can take anywhere from a few minutes to several hours to run
 depending on the model size and the number of samples.
 
 Some important options, along with their default values, are:
