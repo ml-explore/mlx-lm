@@ -45,6 +45,7 @@ class ModelArgs(BaseModelArgs):
     top_k_experts: Optional[int] = None
     moe_intermediate_size: Optional[int] = None
     layer_types: Optional[List[str]] = None
+    per_layer_config: Optional[Dict[str, Any]] = None
     tie_word_embeddings: bool = True
 
     def __post_init__(self):
@@ -68,6 +69,28 @@ class ModelArgs(BaseModelArgs):
             self.layer_types = (pattern * (self.num_hidden_layers // len(pattern) + 1))[
                 : self.num_hidden_layers
             ]
+        if isinstance(self.per_layer_config, dict) and self.per_layer_config:
+            full_indices = [
+                i
+                for i, lt in enumerate(self.layer_types)
+                if lt == "full_attention"
+            ]
+            if full_indices:
+                head_dims = set()
+                kv_heads = set()
+                for idx in full_indices:
+                    entry = self.per_layer_config.get(
+                        f"{idx:02d}"
+                    ) or self.per_layer_config.get(str(idx))
+                    if isinstance(entry, dict):
+                        if isinstance(entry.get("head_dim"), int):
+                            head_dims.add(entry["head_dim"])
+                        if isinstance(entry.get("num_key_value_heads"), int):
+                            kv_heads.add(entry["num_key_value_heads"])
+                if len(head_dims) == 1:
+                    self.global_head_dim = next(iter(head_dims))
+                if self.num_global_key_value_heads is None and len(kv_heads) == 1:
+                    self.num_global_key_value_heads = next(iter(kv_heads))
 
 
 class RMSNormNoScale(nn.Module):
@@ -184,20 +207,33 @@ class Attention(nn.Module):
         self.is_sliding = self.layer_type == "sliding_attention"
         self.has_kv = layer_idx < config.num_hidden_layers - config.num_kv_shared_layers
 
-        self.head_dim = (
-            config.global_head_dim
-            if self.layer_type == "full_attention"
-            and hasattr(config, "global_head_dim")
-            and config.global_head_dim
-            else config.head_dim
-        )
+        layer_cfg = None
+        if isinstance(getattr(config, "per_layer_config", None), dict):
+            layer_cfg = config.per_layer_config.get(
+                f"{layer_idx:02d}"
+            ) or config.per_layer_config.get(str(layer_idx))
+
+        if isinstance(layer_cfg, dict) and isinstance(layer_cfg.get("head_dim"), int):
+            self.head_dim = layer_cfg["head_dim"]
+        else:
+            self.head_dim = (
+                config.global_head_dim
+                if self.layer_type == "full_attention"
+                and hasattr(config, "global_head_dim")
+                and config.global_head_dim
+                else config.head_dim
+            )
 
         dim = config.hidden_size
         self.n_heads = config.num_attention_heads
 
         # K-eq-V for full attention layers (26B/31B models)
         self.use_k_eq_v = config.attention_k_eq_v and not self.is_sliding
-        if self.use_k_eq_v and config.num_global_key_value_heads is not None:
+        if isinstance(layer_cfg, dict) and isinstance(
+            layer_cfg.get("num_key_value_heads"), int
+        ):
+            self.n_kv_heads = layer_cfg["num_key_value_heads"]
+        elif not self.is_sliding and config.num_global_key_value_heads is not None:
             self.n_kv_heads = config.num_global_key_value_heads
         else:
             self.n_kv_heads = config.num_key_value_heads
@@ -433,6 +469,9 @@ class Gemma4TextModel(nn.Module):
             self.per_layer_projection_norm = None
 
         # Arrange for shared KVs
+        self.first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
+        )
         self.previous_kvs = list(range(len(self.layers)))
         if config.num_kv_shared_layers > 0:
             N = len(self.layers)
@@ -522,6 +561,7 @@ class Gemma4TextModel(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        logits_to_keep: Optional[int] = None,
     ):
         # Make the initial hidden state
         if input_embeddings is None:
@@ -561,6 +601,32 @@ class Gemma4TextModel(nn.Module):
                 per_layer_inputs,
             )
         ):
+            if (
+                logits_to_keep is not None
+                and logits_to_keep > 0
+                and self.config.num_kv_shared_layers > 0
+                and idx == self.first_kv_shared_layer_idx
+                and h.shape[1] > logits_to_keep
+            ):
+                trimmed_prefix = h.shape[1] - logits_to_keep
+                h = h[:, -logits_to_keep:, :]
+                for j in range(idx, len(per_layer_inputs)):
+                    if per_layer_inputs[j] is not None:
+                        per_layer_inputs[j] = per_layer_inputs[j][:, -logits_to_keep:, :]
+                per_layer_input = per_layer_inputs[idx]
+                for j in range(idx, len(masks)):
+                    if (
+                        isinstance(masks[j], mx.array)
+                        and masks[j].ndim >= 2
+                        and masks[j].shape[-2] > logits_to_keep
+                    ):
+                        masks[j] = masks[j][..., -logits_to_keep:, :]
+                mask = masks[idx]
+                for j in range(idx):
+                    prev_kvs, prev_off = intermediates[j]
+                    if prev_kvs is not None and prev_off is not None:
+                        intermediates[j] = (prev_kvs, prev_off + trimmed_prefix)
+
             kvs, offset = intermediates[prev_idx]
 
             h, kvs, offset = layer(
@@ -573,6 +639,13 @@ class Gemma4TextModel(nn.Module):
             )
 
             intermediates[idx] = (kvs, offset)
+
+        if (
+            logits_to_keep is not None
+            and logits_to_keep > 0
+            and h.shape[1] > logits_to_keep
+        ):
+            h = h[:, -logits_to_keep:, :]
 
         return self.norm(h)
 
@@ -594,12 +667,14 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
         per_layer_inputs: Optional[mx.array] = None,
+        logits_to_keep: Optional[int] = None,
     ):
         out = self.model(
             inputs,
             cache=cache,
             input_embeddings=input_embeddings,
             per_layer_inputs=per_layer_inputs,
+            logits_to_keep=logits_to_keep,
         )
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
@@ -628,7 +703,12 @@ class Model(nn.Module):
             # KV-shared layers reuse K/V from earlier layers — drop their projections
             if any(
                 s in k
-                for s in (".self_attn.k_proj", ".self_attn.v_proj", ".self_attn.k_norm")
+                for s in (
+                    ".self_attn.k_proj",
+                    ".self_attn.v_proj",
+                    ".self_attn.k_norm",
+                    ".self_attn.v_norm",
+                )
             ):
                 try:
                     layer_idx = int(k.split("layers.")[1].split(".")[0])
@@ -637,16 +717,18 @@ class Model(nn.Module):
                 except (IndexError, ValueError):
                     pass
 
-            if k.endswith(".experts.gate_up_proj"):
-                base = k.removesuffix(".gate_up_proj")
+            if ".experts.gate_up_proj" in k:
+                base, _, suffix = k.partition(".experts.gate_up_proj")
+                suffix = suffix.lstrip(".") or "weight"
                 gate, up = map(mx.contiguous, mx.split(v, 2, axis=-2))
-                sanitized[f"{base}.switch_glu.gate_proj.weight"] = gate
-                sanitized[f"{base}.switch_glu.up_proj.weight"] = up
+                sanitized[f"{base}.experts.switch_glu.gate_proj.{suffix}"] = gate
+                sanitized[f"{base}.experts.switch_glu.up_proj.{suffix}"] = up
                 continue
 
-            if k.endswith(".experts.down_proj"):
-                base = k.removesuffix(".down_proj")
-                sanitized[f"{base}.switch_glu.down_proj.weight"] = v
+            if ".experts.down_proj" in k:
+                base, _, suffix = k.partition(".experts.down_proj")
+                suffix = suffix.lstrip(".") or "weight"
+                sanitized[f"{base}.experts.switch_glu.down_proj.{suffix}"] = v
                 continue
 
             sanitized[k] = v
