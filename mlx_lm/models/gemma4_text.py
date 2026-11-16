@@ -6,9 +6,11 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -157,6 +159,7 @@ class Experts(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
+        self.sharding_group = None
 
         self.switch_glu = SwitchGLU(
             input_dims=config.hidden_size,
@@ -172,7 +175,10 @@ class Experts(nn.Module):
         w = mx.expand_dims(top_k_weights, -1)
         y = self.switch_glu(x, top_k_indices)
 
-        return (w * y).sum(-2)
+        e = (w * y).sum(-2)
+        if self.sharding_group is not None:
+            e = mx.distributed.all_sum(e, group=self.sharding_group)
+        return e
 
 
 class Attention(nn.Module):
@@ -391,7 +397,7 @@ class DecoderLayer(nn.Module):
         return h, shared_kv, offset
 
 
-class Gemma4TextModel(nn.Module):
+class Gemma4TextModel(PipelineMixin, nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.config = config
@@ -442,6 +448,13 @@ class Gemma4TextModel(nn.Module):
                 kvs_by_type[self.layers[i].layer_type] = i
             for j in range(M, N):
                 self.previous_kvs[j] = kvs_by_type[self.layers[j].layer_type]
+
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split)
+        for j in range(self.start_idx, self.end_idx):
+            src = self.previous_kvs[j]
+            if src != j and not (self.start_idx <= src < self.end_idx):
+                raise ValueError("Split cannot cut into KV shared layer")
 
     def _get_per_layer_inputs(
         self,
@@ -505,7 +518,7 @@ class Gemma4TextModel(nn.Module):
     def _make_masks(self, h, cache):
         mask = {}
         masks = []
-        for l, c in zip(self.layers, cache):
+        for l, c in zip(self.pipeline_layers, cache):
             if l.layer_type not in mask:
                 if l.layer_type == "full_attention":
                     mask["full_attention"] = create_attention_mask(h, c)
@@ -529,6 +542,9 @@ class Gemma4TextModel(nn.Module):
         h = input_embeddings
         h = h * self.embed_scale
 
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+
         # Get the extra inputs per layer if we have per layer embeddings
         if self.hidden_size_per_layer_input:
             if per_layer_inputs is None:
@@ -536,30 +552,40 @@ class Gemma4TextModel(nn.Module):
             per_layer_inputs = self._project_per_layer_inputs(h, per_layer_inputs)
         if per_layer_inputs is not None:
             per_layer_inputs = [
-                per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
+                per_layer_inputs[:, :, i, :]
+                for i in range(
+                    self.start_idx, self.start_idx + len(self.pipeline_layers)
+                )
             ]
         else:
-            per_layer_inputs = [None] * len(self.layers)
+            per_layer_inputs = [None] * len(self.pipeline_layers)
 
         # Make the kv cache list, be sure to append None for all the shared kv
         # layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(self.pipeline_layers)
         else:
-            cache = cache + [None] * (len(self.layers) - len(cache))
+            cache = cache + [None] * (len(self.pipeline_layers) - len(cache))
+
+        masks = self._make_masks(h, cache)
+
+        # Receive from the previous process in the pipeline
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, (pipeline_rank + 1))
+
+        intermediates = [(None, None)] * len(self.layers)
 
         # Apply each layer. We save all intermediate kvs and offset and grab
         # the previous one for the shared kv layers.
-        masks = self._make_masks(h, cache)
-        intermediates = [(None, None)] * len(self.layers)
         for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
             zip(
-                self.layers,
+                self.pipeline_layers,
                 cache,
                 masks,
-                self.previous_kvs,
+                self.previous_kvs[self.start_idx : self.end_idx],
                 per_layer_inputs,
-            )
+            ),
+            self.start_idx,
         ):
             kvs, offset = intermediates[prev_idx]
 
@@ -574,6 +600,15 @@ class Gemma4TextModel(nn.Module):
 
             intermediates[idx] = (kvs, offset)
 
+        # Send to the next process in the pipeline
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, (pipeline_rank - 1) % pipeline_size)
+            if cache[-1] is not None:
+                cache[-1].keys = mx.depends(cache[-1].keys, h)
+
+        # Broadcast h while keeping it in the graph
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[: h.shape[0]]
         return self.norm(h)
 
 
@@ -662,9 +697,68 @@ class Model(nn.Module):
 
         return predicate
 
+    def shard(self, group=None):
+        group = group or mx.distributed.init()
+        N = group.size()
+        checks = {
+            "num_attention_heads": self.args.num_attention_heads,
+            "num_key_value_heads": self.args.num_key_value_heads,
+            "intermediate_size": self.args.intermediate_size,
+        }
+        if self.args.attention_k_eq_v and self.args.num_global_key_value_heads:
+            checks["num_global_key_value_heads"] = self.args.num_global_key_value_heads
+        if self.args.enable_moe_block:
+            checks["moe_intermediate_size"] = self.args.moe_intermediate_size
+        for name, value in checks.items():
+            if value % N != 0:
+                raise ValueError(f"{name}={value} must be divisible by {N}")
+        for layer in self.model.layers:
+            # Shard the self attention
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+            if layer.self_attn.has_kv:
+                layer.self_attn.k_proj = shard_linear(
+                    layer.self_attn.k_proj, "all-to-sharded", group=group
+                )
+            if layer.self_attn.has_kv and not layer.self_attn.use_k_eq_v:
+                layer.self_attn.v_proj = shard_linear(
+                    layer.self_attn.v_proj, "all-to-sharded", group=group
+                )
+            layer.self_attn.o_proj = shard_linear(
+                layer.self_attn.o_proj, "sharded-to-all", group=group
+            )
+            layer.self_attn.n_heads //= N
+            layer.self_attn.n_kv_heads //= N
+
+            # Shard the dense MLP layers
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
+
+            # Shard the MoE. Shard in place since the MoE should be responsible
+            # for aggregating the results. The router stays replicated.
+            if layer.enable_moe:
+                layer.experts.sharding_group = group
+                shard_inplace(
+                    layer.experts.switch_glu.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.experts.switch_glu.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.experts.switch_glu.up_proj, "all-to-sharded", group=group
+                )
+
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     @property
     def head_dim(self):
@@ -677,7 +771,8 @@ class Model(nn.Module):
     def make_cache(self):
         first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
         caches = []
-        for i in range(first_kv_shared):
+        end_idx = min(self.model.end_idx or first_kv_shared, first_kv_shared)
+        for i in range(self.model.start_idx, end_idx):
             if self.args.layer_types[i] == "full_attention":
                 caches.append(KVCache())
             else:

@@ -5,8 +5,15 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models import (
+    gemma4,
+    gemma4_text,
+    muse_spark,
+    qwen2,
+    qwen3_moe,
+    qwen3_next,
+)
+from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.pipeline import PipelineMixin
 from mlx_lm.utils import quantize_model
 
@@ -44,6 +51,46 @@ class Group:
 
     def size(self):
         return self._size
+
+
+def gemma4_text_config(**overrides):
+    # Layers 2 and 5 are full attention, the others are sliding attention.
+    config = {
+        "model_type": "gemma4_text",
+        "hidden_size": 64,
+        "num_hidden_layers": 6,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "global_head_dim": 32,
+        "vocab_size": 128,
+        "vocab_size_per_layer_input": 128,
+        "num_kv_shared_layers": 0,
+        "hidden_size_per_layer_input": 0,
+        "sliding_window": 8,
+        "sliding_window_pattern": 3,
+    }
+    config.update(overrides)
+    return config
+
+
+def make_gemma4_text(**overrides):
+    mx.random.seed(0)
+    args = gemma4_text.ModelArgs.from_dict(gemma4_text_config(**overrides))
+    model = gemma4_text.Model(args)
+    mx.eval(model.parameters())
+    return model
+
+
+GEMMA4_KV_SHARED = {"num_kv_shared_layers": 2, "hidden_size_per_layer_input": 16}
+
+GEMMA4_MOE = {
+    "enable_moe_block": True,
+    "num_experts": 4,
+    "top_k_experts": 2,
+    "moe_intermediate_size": 32,
+}
 
 
 class Stage(PipelineMixin):
@@ -297,6 +344,161 @@ class TestModelParallel(unittest.TestCase):
                 model.shard()
                 for e, out in zip(expected, run()):
                     self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
+
+    def test_gemma4_pipeline_layers_and_cache(self):
+        # Rank 0 runs the last layers. KV shared layers (4, 5) have no cache.
+        cases = [
+            ({}, None, {0: [3, 4, 5], 1: [0, 1, 2]}, {0: 3, 1: 3}),
+            (GEMMA4_KV_SHARED, [4, 2], {0: [2, 3, 4, 5], 1: [0, 1]}, {0: 2, 1: 2}),
+            (GEMMA4_KV_SHARED, [5, 1], {0: [1, 2, 3, 4, 5], 1: [0]}, {0: 3, 1: 1}),
+        ]
+        for overrides, split, layers, caches in cases:
+            for rank in (0, 1):
+                with self.subTest(overrides=overrides, split=split, rank=rank):
+                    model = make_gemma4_text(**overrides)
+                    model.model.pipeline(Group(rank, 2), split=split)
+                    local = model.model.pipeline_layers
+                    self.assertEqual(
+                        [l.self_attn.layer_idx for l in local], layers[rank]
+                    )
+                    cache = model.make_cache()
+                    self.assertEqual(len(cache), caches[rank])
+                    for c, l in zip(cache, local):
+                        expected = (
+                            KVCache
+                            if l.layer_type == "full_attention"
+                            else RotatingKVCache
+                        )
+                        self.assertIsInstance(c, expected)
+
+    def test_gemma4_pipeline_split_rejection(self):
+        # Layers 4 and 5 read the KV of layers 3 and 2, so a split must keep
+        # each shared layer on the rank of its source.
+        for split in ([3, 3], [2, 4], [1, 5]):
+            with self.subTest(split=split):
+                model = make_gemma4_text(**GEMMA4_KV_SHARED)
+                with self.assertRaisesRegex(ValueError, "KV shared"):
+                    model.model.pipeline(Group(0, 2), split=split)
+        for split in ([4, 2], [5, 1]):
+            with self.subTest(split=split):
+                model = make_gemma4_text(**GEMMA4_KV_SHARED)
+                model.model.pipeline(Group(0, 2), split=split)
+
+        # Without KV sharing every split is valid.
+        for split in ([3, 3], [1, 5]):
+            with self.subTest(split=split, shared=False):
+                make_gemma4_text().model.pipeline(Group(0, 2), split=split)
+
+    def test_gemma4_pipeline(self):
+        for name, overrides in (("plain", {}), ("kv_shared", GEMMA4_KV_SHARED)):
+            with self.subTest(name):
+                model = make_gemma4_text(**overrides)
+                x = mx.random.randint(0, 128, shape=(2, 7))
+                expected = model(x)
+                # A group of one does no send or recv.
+                model.model.pipeline(mx.distributed.init())
+                out = model(x)
+                self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+
+    def test_gemma4_wrapper_pipeline(self):
+        config = {
+            "model_type": "gemma4",
+            "vocab_size": 128,
+            "text_config": gemma4_text_config(),
+        }
+        args = gemma4.ModelArgs.from_dict(config)
+        model = gemma4.Model(args)
+        self.assertIs(model.model, model.language_model.model)
+        self.assertEqual(len(model.layers), 6)
+        for rank, expected in ((0, [3, 4, 5]), (1, [0, 1, 2])):
+            with self.subTest(rank=rank):
+                model = gemma4.Model(args)
+                model.model.pipeline(Group(rank, 2))
+                # Only the local layers are visible after pipeline().
+                self.assertEqual(
+                    [l.self_attn.layer_idx for l in model.layers], expected
+                )
+                self.assertIs(model.model, model.language_model.model)
+                self.assertEqual(len(model.make_cache()), 3)
+
+    def test_gemma4_shard(self):
+        test_configs = {
+            "plain": {},
+            "kv_shared": GEMMA4_KV_SHARED,
+            "k_eq_v": {"attention_k_eq_v": True, "num_global_key_value_heads": 2},
+            "moe": GEMMA4_MOE,
+        }
+        for name, overrides in test_configs.items():
+            with self.subTest(name):
+                model = make_gemma4_text(**overrides)
+                x = mx.random.randint(0, 128, shape=(2, 7))
+                expected = model(x)
+                if name == "moe":
+                    gate = model.model.layers[0].experts.switch_glu.gate_proj
+                    shape = gate.weight.shape
+                model.shard()
+                out = model(x)
+                self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+                if name == "moe":
+                    for layer in model.model.layers:
+                        self.assertIsNotNone(layer.experts.sharding_group)
+                    gate = model.model.layers[0].experts.switch_glu.gate_proj
+                    # A group of one keeps all experts and all columns.
+                    self.assertEqual(gate.weight.shape, shape)
+
+    def test_gemma4_wrapper_shard(self):
+        config = {
+            "model_type": "gemma4",
+            "vocab_size": 128,
+            "text_config": gemma4_text_config(**GEMMA4_MOE),
+        }
+        model = gemma4.Model(gemma4.ModelArgs.from_dict(config))
+        x = mx.random.randint(0, 128, shape=(2, 7))
+        expected = model(x)
+        model.shard()
+        self.assertTrue(mx.allclose(expected, model(x), rtol=1e-3, atol=1e-3))
+        self.assertIsNotNone(model.layers[0].experts.sharding_group)
+
+    def test_gemma4_shard_divisibility(self):
+        # The base fields divide by 3, so each case fails on one field only.
+        base = {
+            "num_attention_heads": 6,
+            "num_key_value_heads": 6,
+            "intermediate_size": 96,
+        }
+        k_eq_v = {"attention_k_eq_v": True, "num_global_key_value_heads": 3}
+        failing = [
+            ("num_attention_heads", {"num_attention_heads": 4}),
+            ("num_key_value_heads", {"num_key_value_heads": 2}),
+            ("intermediate_size", {"intermediate_size": 128}),
+            (
+                "num_global_key_value_heads",
+                {**k_eq_v, "num_global_key_value_heads": 2},
+            ),
+            ("moe_intermediate_size", {**GEMMA4_MOE, "moe_intermediate_size": 32}),
+        ]
+        for field, overrides in failing:
+            with self.subTest(field=field):
+                model = make_gemma4_text(**{**base, **overrides})
+                with self.assertRaisesRegex(ValueError, rf"\b{field}="):
+                    model.shard(Group(0, 3))
+
+        # Fields that the model does not use are not checked.
+        passing = [
+            ("valid", {}),
+            ("valid k_eq_v", k_eq_v),
+            ("valid moe", {**GEMMA4_MOE, "moe_intermediate_size": 33}),
+            ("moe off, size set", {"moe_intermediate_size": 32}),
+            ("moe off, size None", {"moe_intermediate_size": None}),
+            (
+                "k_eq_v off",
+                {"attention_k_eq_v": False, "num_global_key_value_heads": 2},
+            ),
+        ]
+        for name, overrides in passing:
+            with self.subTest(name):
+                model = make_gemma4_text(**{**base, **overrides})
+                model.shard(Group(0, 3))
 
     def test_pipeline_layer_assignment(self):
         def assignment(num_layers, size, split=None):
