@@ -8,6 +8,7 @@ from mlx.nn.layers.distributed import sum_gradients
 
 from mlx_lm.layers.activations import SwigluOAI
 from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.layers.switch import SwitchGLU
 from mlx_lm.models.minimax_m3_vl.config import TextArgs
@@ -16,22 +17,8 @@ __all__ = [
     "Attention",
     "DecoderLayer",
     "DenseMLP",
-    "GemmaRMSNorm",
     "SparseMoeBlock",
 ]
-
-
-class GemmaRMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-6):
-        super().__init__()
-        self.weight = mx.zeros((dims,))
-        self.eps = eps
-
-    def _extra_repr(self) -> str:
-        return f"{self.weight.shape[0]}, eps={self.eps}"
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, weight=1.0 + self.weight, eps=self.eps)
 
 
 class DenseMLP(nn.Module):
@@ -113,7 +100,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = args.num_key_value_heads
         self.head_dim = args.head_dim
         self.scale = self.head_dim**-0.5
-        NormClass = GemmaRMSNorm if args.use_gemma_norm else nn.RMSNorm
+        NormClass = ZeroCenteredRMSNorm if args.use_gemma_norm else nn.RMSNorm
 
         self.q_proj = nn.Linear(
             args.hidden_size, self.num_attention_heads * self.head_dim, bias=False
@@ -291,7 +278,7 @@ class DecoderLayer(nn.Module):
                 activation=activation,
             )
 
-        NormClass = GemmaRMSNorm if args.use_gemma_norm else nn.RMSNorm
+        NormClass = ZeroCenteredRMSNorm if args.use_gemma_norm else nn.RMSNorm
         self.input_layernorm = NormClass(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = NormClass(
             args.hidden_size, eps=args.rms_norm_eps

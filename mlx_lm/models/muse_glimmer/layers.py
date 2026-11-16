@@ -4,26 +4,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.models.muse_glimmer.config import ModelArgs
 
 __all__ = [
     "Attention",
-    "CenteredRMSNorm",
     "DecoderLayer",
     "MLP",
 ]
-
-
-class CenteredRMSNorm(nn.Module):
-    """RMSNorm with a zero-centered scale: out = norm(x) * (1 + weight)."""
-
-    def __init__(self, dim: int, eps: float):
-        super().__init__()
-        self.weight = mx.zeros((dim,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
 
 
 class Attention(nn.Module):
@@ -99,15 +87,17 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Attention(args, layer_idx)
         self.mlp = MLP(args)
-        self.input_layernorm = CenteredRMSNorm(args.hidden_size, args.rms_norm_eps)
-        self.post_attention_layernorm = CenteredRMSNorm(
-            args.hidden_size, args.post_norm_eps
+        self.input_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = CenteredRMSNorm(
-            args.hidden_size, args.rms_norm_eps
+        self.post_attention_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.post_norm_eps
         )
-        self.post_feedforward_layernorm = CenteredRMSNorm(
-            args.hidden_size, args.post_norm_eps
+        self.pre_feedforward_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_feedforward_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.post_norm_eps
         )
 
     def __call__(self, x: mx.array, mask=None, cache=None) -> mx.array:

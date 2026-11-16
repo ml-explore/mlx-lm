@@ -6,10 +6,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.gemma3_text import checkpoint
 from mlx_lm.models.gemma3_text.config import ModelArgs
-from mlx_lm.models.gemma3_text.layers import RMSNorm, TransformerBlock
+from mlx_lm.models.gemma3_text.layers import TransformerBlock
 
 __all__ = [
     "Gemma3Model",
@@ -31,7 +32,7 @@ class Gemma3Model(nn.Module):
             TransformerBlock(args=args, layer_idx=layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,

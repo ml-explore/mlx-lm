@@ -5,24 +5,14 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.models.gemma2.config import ModelArgs
 
 __all__ = [
     "Attention",
     "MLP",
-    "RMSNorm",
     "TransformerBlock",
 ]
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x):
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
 
 
 class Attention(nn.Module):
@@ -114,14 +104,18 @@ class TransformerBlock(nn.Module):
         self.hidden_size = args.hidden_size
         self.self_attn = Attention(args)
         self.mlp = MLP(args.hidden_size, args.intermediate_size)
-        self.input_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.pre_feedforward_layernorm = RMSNorm(
+        self.input_layernorm = ZeroCenteredRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.post_feedforward_layernorm = RMSNorm(
+        self.pre_feedforward_layernorm = ZeroCenteredRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
-        self.post_attention_layernorm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_feedforward_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_attention_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
         self.args = args
 
     def __call__(

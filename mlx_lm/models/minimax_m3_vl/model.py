@@ -7,11 +7,12 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.layers.pipeline import PipelineMixin
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.minimax_m3_vl import checkpoint
 from mlx_lm.models.minimax_m3_vl.config import ModelArgs, TextArgs
-from mlx_lm.models.minimax_m3_vl.layers import DecoderLayer, GemmaRMSNorm
+from mlx_lm.models.minimax_m3_vl.layers import DecoderLayer
 
 __all__ = [
     "LanguageModel",
@@ -25,7 +26,7 @@ class TextModel(PipelineMixin, nn.Module):
         super().__init__()
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [DecoderLayer(args, i) for i in range(args.num_hidden_layers)]
-        NormClass = GemmaRMSNorm if args.use_gemma_norm else nn.RMSNorm
+        NormClass = ZeroCenteredRMSNorm if args.use_gemma_norm else nn.RMSNorm
         self.norm = NormClass(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(

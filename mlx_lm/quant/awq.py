@@ -10,6 +10,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_map_with_path
 from tqdm import tqdm
 
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.switch_layers import SwitchLinear
 from mlx_lm.quant.utils import load_data
@@ -259,7 +260,7 @@ def apply_scale(prev_op, layers, scales):
             prev_op.bias = prev_op.bias / scales
         for layer in layers:
             layer.weight = layer.weight * scales
-    elif prev_op.__class__.__name__ == "RMSNorm":  # For gemma models
+    elif isinstance(prev_op, ZeroCenteredRMSNorm):
         dt = prev_op.weight.dtype
         prev_op.weight = (
             (1.0 + prev_op.weight.astype(mx.float32)) / scales - 1.0

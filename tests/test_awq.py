@@ -3,10 +3,12 @@
 import unittest
 
 import mlx.core as mx
+import mlx.nn as nn
 from mlx.utils import tree_flatten
 
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.models import ministral3, mistral3
-from mlx_lm.quant.awq import AWQ_MODEL_CONFIGS, awq_quantize
+from mlx_lm.quant.awq import AWQ_MODEL_CONFIGS, apply_scale, awq_quantize
 
 VOCAB_SIZE = 128
 
@@ -103,6 +105,16 @@ class TestAWQ(unittest.TestCase):
             "lm_head.scales",
         ]:
             self.assertIn(prefix + key, keys)
+
+    def test_apply_scale_to_zero_centered_norm(self):
+        mx.random.seed(0)
+        norm = ZeroCenteredRMSNorm(8, eps=1e-6)
+        norm.weight = 0.1 * mx.random.normal((8,))
+        linear = nn.Linear(8, 4, bias=False)
+        x = mx.random.normal((3, 8))
+        expected = linear(norm(x))
+        apply_scale(norm, [linear], mx.random.uniform(0.5, 2.0, (8,)))
+        self.assertTrue(mx.allclose(linear(norm(x)), expected, atol=1e-5))
 
 
 if __name__ == "__main__":

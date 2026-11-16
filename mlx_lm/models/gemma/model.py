@@ -4,8 +4,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.models.gemma.config import ModelArgs
-from mlx_lm.models.gemma.layers import RMSNorm, TransformerBlock
+from mlx_lm.models.gemma.layers import TransformerBlock
 
 __all__ = [
     "GemmaModel",
@@ -24,7 +25,7 @@ class GemmaModel(nn.Module):
         self.layers = [
             TransformerBlock(args=args) for _ in range(args.num_hidden_layers)
         ]
-        self.norm = RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
     def __call__(
         self,

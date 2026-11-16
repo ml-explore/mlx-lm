@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from mlx_lm.layers.attention import scaled_dot_product_attention
 from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 
 __all__ = [
     "Conv1d",
@@ -15,21 +16,10 @@ __all__ = [
     "LocalAttentionBlock",
     "MLPBlock",
     "RGLRU",
-    "RMSNorm",
     "RecurrentBlock",
     "ResidualBlock",
     "rnn_scan",
 ]
-
-
-class RMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x):
-        return mx.fast.rms_norm(x, 1.0 + self.weight, self.eps)
 
 
 def rnn_scan(x, a, h0):
@@ -303,7 +293,7 @@ class ResidualBlock(nn.Module):
         self.lru_width = lru_width
         self.conv1d_temporal_width = conv1d_temporal_width
 
-        self.temporal_pre_norm = RMSNorm(width)
+        self.temporal_pre_norm = ZeroCenteredRMSNorm(width, eps=1e-5)
         if self.temporal_block_type == "recurrent":
             self.temporal_block = RecurrentBlock(
                 width=self.width,
@@ -319,7 +309,7 @@ class ResidualBlock(nn.Module):
                 window_size=self.attention_window_size,
             )
 
-        self.channel_pre_norm = RMSNorm(width)
+        self.channel_pre_norm = ZeroCenteredRMSNorm(width, eps=1e-5)
         self.mlp_block = MLPBlock(
             width=self.width,
             expanded_width=self.mlp_expanded_width,
@@ -370,7 +360,9 @@ class Griffin(nn.Module):
             )
             for i in range(config.num_hidden_layers)
         ]
-        self.final_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.final_norm = ZeroCenteredRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
         self.window_size = config.attention_window_size
         self.swa_idx = block_types.index("attention")
 
