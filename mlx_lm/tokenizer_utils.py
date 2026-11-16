@@ -399,6 +399,7 @@ class TokenizerWrapper:
             or has_custom_renderer
         )
         self._tool_parser = tool_parser
+        self._prepare_messages = None
         self._tool_call_start = tool_call_start
         self._tool_call_end = tool_call_end
         self._tool_call_start_tokens = None
@@ -416,6 +417,9 @@ class TokenizerWrapper:
             kwargs[self._thinking_kwarg] = kwargs.pop("enable_thinking")
         if self._thinking_kwarg not in kwargs:
             kwargs[self._thinking_kwarg] = self.has_thinking
+
+        if self._prepare_messages is not None and args and isinstance(args[0], list):
+            self._prepare_messages(args[0])
 
         if self._chat_template is not None:
             out = self._chat_template(*args, **kwargs)
@@ -683,6 +687,11 @@ def _infer_tool_parser(tokenizer):
             return "muse_spark"
         elif "<tool_call>" in chat_template and "tool_call.name" in chat_template:
             return "json_tools"
+        elif (
+            "Valid channels: analysis, commentary, final" in chat_template
+            and "<|channel|>" in tokenizer.get_vocab()
+        ):
+            return "harmony"
 
     # No template match, so fall back to the vocab. LFM2.5 conversions for
     # example have the tool-call tokens but do not name them in the template.
@@ -738,6 +747,7 @@ def load(
 
     chat_template = None
     response_format = None
+    prepare_messages = None
 
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, **(tokenizer_config_extra or {})
@@ -748,18 +758,23 @@ def load(
     chat_template_type = tokenizer_config.get(
         "chat_template_type", defaults.get("chat_template_type")
     )
-    if chat_template_type:
-        module = importlib.import_module(f"mlx_lm.chat_templates.{chat_template_type}")
-        # A template in the checkpoint replaces only the default template.
-        if "chat_template_type" in tokenizer_config or tokenizer.chat_template is None:
-            chat_template = module.apply_chat_template
-        response_format = getattr(module, "RESPONSE_FORMAT", None)
-
     tool_parser_type = tokenizer_config.get(
         "tool_parser_type", defaults.get("tool_parser_type")
     )
     if tool_parser_type is None:
         tool_parser_type = _infer_tool_parser(tokenizer)
+    # Harmony's response format and history rewrite live next to the parser.
+    # The checkpoint keeps its own chat template.
+    if chat_template_type is None and tool_parser_type == "harmony":
+        chat_template_type = "harmony"
+
+    if chat_template_type:
+        module = importlib.import_module(f"mlx_lm.chat_templates.{chat_template_type}")
+        # A template in the checkpoint replaces only the default template.
+        if "chat_template_type" in tokenizer_config or tokenizer.chat_template is None:
+            chat_template = getattr(module, "apply_chat_template", None)
+        response_format = getattr(module, "RESPONSE_FORMAT", None)
+        prepare_messages = getattr(module, "prepare_messages", None)
 
     if tool_parser_type is not None:
         tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
@@ -772,7 +787,16 @@ def load(
         tool_call_start = None
         tool_call_end = None
 
-    return TokenizerWrapper(
+    # <|call|> ends a tool turn. <|return|> is already the tokenizer eos.
+    # <|end|> only ends a channel, so generation continues into the next one.
+    if tool_parser_type == "harmony":
+        call_id = tokenizer.convert_tokens_to_ids("<|call|>")
+        if isinstance(call_id, int) and call_id != tokenizer.unk_token_id:
+            eos_token_ids = list(eos_token_ids or [])
+            if call_id not in eos_token_ids:
+                eos_token_ids.append(call_id)
+
+    wrapper = TokenizerWrapper(
         tokenizer,
         detokenizer_class,
         eos_token_ids=eos_token_ids,
@@ -782,6 +806,8 @@ def load(
         tool_call_end=tool_call_end,
         response_format=response_format,
     )
+    wrapper._prepare_messages = prepare_messages
+    return wrapper
 
 
 def no_bos_or_eos(sequence: List, bos: int, eos: int) -> List:

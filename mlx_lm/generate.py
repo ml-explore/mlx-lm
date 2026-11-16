@@ -553,7 +553,7 @@ def speculative_generate_step(
     if not can_trim_prompt_cache(model_cache):
         types = {type(c).__name__ for c in model_cache if not c.is_trimmable()}
         raise ValueError(
-            f"Speculative decoding requires a trimmable prompt cache " f"(got {types})."
+            f"Speculative decoding requires a trimmable prompt cache (got {types})."
         )
 
     sampler = sampler or greedy_sampler
@@ -1127,10 +1127,13 @@ class TextStateMachine:
                 )
             if tokenizer.has_thinking:
                 transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
-            # Back to the state the tool call started in.
-            transitions["tool"] = (
-                [(tokenizer.tool_call_end, None)] if tokenizer.tool_call_end else []
-            )
+            # A response format with its own tool edges names the endings
+            # (harmony closes on <|call|> and <|end|>). Otherwise one end
+            # marker returns to the state the call started in.
+            if "tool" not in tokenizer.response_transitions:
+                transitions["tool"] = (
+                    [(tokenizer.tool_call_end, None)] if tokenizer.tool_call_end else []
+                )
 
         if tokenizer.structural_markers:
             for w in tokenizer.structural_markers:
