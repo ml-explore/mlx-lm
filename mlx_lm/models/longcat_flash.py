@@ -1,3 +1,5 @@
+# Copyright © 2025 Apple Inc.
+
 import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
@@ -217,6 +219,7 @@ class LongcatFlashTopkRouter(nn.Module):
         topk_indices = mx.argpartition(corrected_scores, kth=-self.top_k, axis=-1)[
             ..., -self.top_k :
         ]
+        topk_indices = mx.stop_gradient(topk_indices)
         topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
 
         if self.norm_topk_prob:
@@ -391,7 +394,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         for l in range(self.args.num_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [

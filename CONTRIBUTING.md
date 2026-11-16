@@ -53,6 +53,7 @@ tests](https://github.com/ml-explore/mlx-lm/blob/main/tests/test_models.py).
 You can run the tests with:
 
 ```shell
+pip install -e ".[test]"
 python -m unittest discover tests/
 ```
 

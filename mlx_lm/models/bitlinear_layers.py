@@ -2,7 +2,6 @@
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.quantized import QuantizedLinear
 from mlx.utils import tree_flatten, tree_unflatten
 
 

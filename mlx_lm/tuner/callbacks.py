@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import os
+from typing import Optional
 
 try:
     import wandb
@@ -107,10 +108,10 @@ SUPPORT_CALLBACK = {
 
 
 def get_reporting_callbacks(
-    report_to: str = None,
-    project_name: str = None,
-    log_dir: str = None,
-    config: str = None,
+    report_to: Optional[str] = None,
+    project_name: Optional[str] = None,
+    log_dir: Optional[str] = None,
+    config: Optional[str] = None,
 ):
     if report_to is None or report_to == "":
         return None

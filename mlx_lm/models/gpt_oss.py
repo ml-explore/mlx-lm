@@ -2,13 +2,13 @@
 
 import math
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from .activations import SwigluOAI
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
@@ -39,32 +39,10 @@ def mlx_topk(a, k, axis=-1):
     """MLX equivalent of torch.topk"""
     partitioned_indices = mx.argpartition(a, kth=-k, axis=axis)
     # Extract only the top k indices (last k elements after partition)
-    top_k_indices = partitioned_indices[..., -k:]
+    top_k_indices = mx.stop_gradient(partitioned_indices[..., -k:])
     # Get the corresponding values
     top_k_values = mx.take_along_axis(a, top_k_indices, axis=axis)
     return top_k_values, top_k_indices
-
-
-@partial(mx.compile, shapeless=True)
-def swiglu(x_linear, x_glu, alpha: float = 1.702, limit: float = 7.0):
-    # Clamp the input values
-    x_glu = mx.clip(x_glu, a_min=None, a_max=limit)
-    x_linear = mx.clip(x_linear, a_min=-limit, a_max=limit)
-
-    glu_scaled = alpha * x_glu
-    sig = mx.sigmoid(glu_scaled)
-
-    out_glu = x_glu * sig
-    # Note we add an extra bias of 1 to the linear layer
-    return out_glu * (x_linear + 1)
-
-
-class SwiGLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, x, gate):
-        return swiglu(x, gate)
 
 
 class AttentionBlock(nn.Module):
@@ -106,7 +84,6 @@ class AttentionBlock(nn.Module):
     def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
         B, L, _ = x.shape
         D = self.head_dim
-        Hk = self.num_key_value_heads
 
         q = self.q_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
         k = self.k_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
@@ -139,7 +116,7 @@ class MLPBlock(nn.Module):
             input_dims=config.hidden_size,
             hidden_dims=config.intermediate_size,
             num_experts=config.num_local_experts,
-            activation=SwiGLU(),
+            activation=SwigluOAI(),
             bias=True,
         )
         self.router = nn.Linear(config.hidden_size, config.num_local_experts, bias=True)

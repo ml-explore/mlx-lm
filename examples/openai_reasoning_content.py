@@ -1,3 +1,5 @@
+# Copyright © 2026 Apple Inc.
+
 from openai import OpenAI
 
 client = OpenAI(

@@ -30,6 +30,26 @@ To see a full list of options run:
 mlx_lm.server --help
 ```
 
+### KV Cache Quantization
+
+Use `--kv-bits` to quantize the KV cache and save memory on long-context
+generations:
+
+```shell
+mlx_lm.server --model <path_to_model_or_hf_repo> --kv-bits 4 --prefill-step-size 512
+```
+
+Attention on a quantized cache is not fused, so it keeps a score matrix of
+`prefill_step_size x context_length`. Decrease `--prefill-step-size`, or the
+matrix can be larger than the memory that the quantized cache saves.
+
+Use `--kv-group-size` for the group size and `--quantized-kv-start` for the
+token position at which quantization starts (default `5000`).
+
+> [!NOTE]
+> A quantized KV cache does not support batching. The server processes requests
+> one at a time when you set `--kv-bits`.
+
 You can make a request to the model by running:
 
 ```shell
@@ -50,8 +70,9 @@ curl localhost:8080/v1/chat/completions \
 - `role_mapping`: (Optional) A dictionary to customize the role prefixes in
   the generated prompt. If not provided, the default mappings are used.
 
-- `stop`: (Optional) An array of strings or a single string. These are
-  sequences of tokens on which the generation should stop.
+- `stop`: (Optional) An array of strings or a single string. The generation
+  stops when one of these strings appears in the generated text, reasoning and
+  tool calls included. The string is not returned.
 
 - `max_tokens`: (Optional) An integer specifying the maximum number of tokens
   to generate. Defaults to `512`.

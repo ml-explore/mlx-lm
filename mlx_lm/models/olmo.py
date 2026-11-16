@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import sys
 from dataclasses import dataclass
@@ -11,7 +11,7 @@ from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask
 
 try:
-    import hf_olmo
+    import hf_olmo  # noqa: F401  # availability probe
 except ImportError:
     print("To run olmo install ai2-olmo: pip install ai2-olmo")
     sys.exit(1)

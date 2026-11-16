@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Union
@@ -224,7 +224,12 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            if path.endswith("block_sparse_moe.router.layer"):
+            if (
+                path.endswith("block_sparse_moe.router.layer")
+                or path.endswith("self_attn.o_proj")
+                or path.endswith("mlp.down_proj")
+                or path == "lm_head"
+            ):
                 return {"group_size": 64, "bits": 8}
             return True
 

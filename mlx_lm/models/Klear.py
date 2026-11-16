@@ -141,6 +141,7 @@ class KlearSparseMoeBlock(nn.Module):
         biased_weights = routing_weights + self.expert_bias.reshape((1, 1, -1))
         k = self.top_k
         inds = mx.argpartition(-biased_weights, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(routing_weights, inds, axis=-1)
         if self.norm_topk_prob:
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)
@@ -228,10 +229,13 @@ class Model(nn.Module):
         return self.lm_head(out)
 
     def sanitize(self, weights):
-        if "model.layers.0.mlp.experts.0.gate_proj.weight" not in weights:
-            return weights
-
-        for l in range(self.args.num_hidden_layers):
+        moe_layers = sorted(
+            int(k.split(".")[2])
+            for k in weights
+            if k.startswith("model.layers.")
+            and k.endswith(".mlp.experts.0.gate_proj.weight")
+        )
+        for l in moe_layers:
             prefix = f"model.layers.{l}.mlp.experts"
             for name in ["gate_proj", "up_proj", "down_proj"]:
                 stacked = [

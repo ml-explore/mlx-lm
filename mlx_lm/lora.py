@@ -1,9 +1,10 @@
+# Copyright © 2024 Apple Inc.
+
 import argparse
 import math
 import os
 import re
 import types
-import warnings
 from pathlib import Path
 
 import mlx.core as mx
@@ -279,6 +280,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        clear_cache_threshold=args.clear_cache_threshold,
     )
 
     # Initialize the selected optimizer

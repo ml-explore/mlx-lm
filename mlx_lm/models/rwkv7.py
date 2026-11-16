@@ -48,7 +48,7 @@ def _wkv7_step_ops(r, w, k, v, a, b, state):
 def _make_wkv7_kernel():
     if not mx.metal.is_available():
         return None
-    source = f"""
+    source = """
         auto n = thread_position_in_grid.z;
         auto b_idx = n / H;
         auto h_idx = n % H;
@@ -71,30 +71,30 @@ def _make_wkv7_kernel():
         auto o_state = state_out + (n * D + dv_idx) * D;
 
         float state[n_per_t];
-        for (int i = 0; i < n_per_t; ++i) {{
+        for (int i = 0; i < n_per_t; ++i) {
           auto s_idx = n_per_t * dk_idx + i;
           state[i] = static_cast<float>(i_state[s_idx]);
-        }}
+        }
 
-        for (int t = 0; t < T; ++t) {{
+        for (int t = 0; t < T; ++t) {
           float sa = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {{
+          for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
             sa += state[i] * a_[s_idx];
             state[i] = state[i] * w_[s_idx];
-          }}
+          }
           sa = simd_sum(sa);
 
           float out = 0.0f;
-          for (int i = 0; i < n_per_t; ++i) {{
+          for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
             state[i] = state[i] + k_[s_idx] * v_[dv_idx] + sa * b_[s_idx];
             out += state[i] * r_[s_idx];
-          }}
+          }
           out = simd_sum(out);
-          if (thread_index_in_simdgroup == 0) {{
+          if (thread_index_in_simdgroup == 0) {
             y[dv_idx] = static_cast<InT>(out);
-          }}
+          }
 
           // Increment data pointers to next time step
           r_ += H * D;
@@ -104,11 +104,11 @@ def _make_wkv7_kernel():
           a_ += H * D;
           b_ += H * D;
           y  += H * D;
-        }}
-        for (int i = 0; i < n_per_t; ++i) {{
+        }
+        for (int i = 0; i < n_per_t; ++i) {
           auto s_idx = n_per_t * dk_idx + i;
           o_state[s_idx] = static_cast<InT>(state[i]);
-        }}
+        }
     """
     inputs = ["r", "w", "k", "v", "a", "b", "state_in", "T"]
     return mx.fast.metal_kernel(
@@ -436,7 +436,7 @@ class Model(nn.Module):
         return self.model.layers
 
     def sanitize(self, weights):
-        for k, v in weights.items():
+        for k in weights:
             if "k_k" in k or "k_a" in k or "g_norm" in k:
                 weights[k] = weights[k].reshape(
                     self.args.hidden_size // self.args.head_dim, self.args.head_dim

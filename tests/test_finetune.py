@@ -1,11 +1,11 @@
 # Copyright © 2024 Apple Inc.
 
 import math
-import sys
+import tempfile
+import types
 import unittest
 from contextlib import contextmanager
-from io import StringIO
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, patch
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -284,7 +284,6 @@ class TestDora(unittest.TestCase):
         )
 
         # Recomputes m when changing Linear
-        inital_m = dora_lin.m
         lin = nn.Linear(10, 10)
         dora_lin.set_linear(lin)
         self.assertTrue(mx.allclose(dora_lin.m, mx.linalg.norm(lin.weight, axis=1)))
@@ -499,6 +498,37 @@ class TestScheduleConfig(unittest.TestCase):
             comm_group=ANY,
         )
         self.assertEqual(mock_default_loss.call_count, 3)
+
+
+class TestTrainModel(unittest.TestCase):
+    def test_clear_cache_threshold_reaches_trainer(self):
+        from mlx_lm.models import llama
+
+        model = llama.Model(
+            llama.ModelArgs(
+                model_type="llama",
+                hidden_size=64,
+                num_hidden_layers=2,
+                intermediate_size=128,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=100,
+            )
+        )
+        with tempfile.TemporaryDirectory() as adapter_path:
+            args = types.SimpleNamespace(
+                **{
+                    **lora.CONFIG_DEFAULTS,
+                    "num_layers": 2,
+                    "adapter_path": adapter_path,
+                    "clear_cache_threshold": 1 << 30,
+                }
+            )
+            with patch("mlx_lm.lora.train") as mock_train:
+                lora.train_model(args, model, [], [])
+
+        training_args = mock_train.call_args.kwargs["args"]
+        self.assertEqual(training_args.clear_cache_threshold, 1 << 30)
 
 
 if __name__ == "__main__":

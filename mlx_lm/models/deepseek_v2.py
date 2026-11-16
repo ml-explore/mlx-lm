@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023 Apple Inc.
 
 import math
 from dataclasses import dataclass
@@ -247,7 +247,10 @@ class DeepseekV2Attention(nn.Module):
 
 class DeepseekV2MLP(nn.Module):
     def __init__(
-        self, config: ModelArgs, hidden_size: int = None, intermediate_size: int = None
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
     ):
         super().__init__()
         self.config = config
@@ -288,6 +291,7 @@ class MoEGate(nn.Module):
             group_scores = scores.max(axis=-1, keepdims=True)
             k = self.n_group - self.topk_group
             group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+            group_idx = mx.stop_gradient(group_idx)
             scores = mx.put_along_axis(
                 scores, group_idx, mx.array(0.0, scores.dtype), axis=-2
             )
@@ -295,6 +299,7 @@ class MoEGate(nn.Module):
 
         k = self.top_k
         inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
         scores = mx.take_along_axis(scores, inds, axis=-1)
         scores = scores * self.routed_scaling_factor
 
@@ -430,7 +435,7 @@ class Model(nn.Module):
     def sanitize(self, weights):
         for l in range(self.args.num_hidden_layers):
             prefix = f"model.layers.{l}"
-            for n, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
+            for _, m in [("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj")]:
                 for k in ["weight", "scales", "biases"]:
                     if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
                         to_join = [
