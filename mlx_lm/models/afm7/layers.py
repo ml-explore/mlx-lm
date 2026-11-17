@@ -26,6 +26,23 @@ __all__ = [
 ]
 
 
+class MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        dim = args.hidden_dim
+        hidden_dim = int(dim * args.hidden_dim_scale_factor)
+
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        g = self.gate_proj(x)
+        x = self.up_proj(x)
+        return self.down_proj(swiglu(g, x))
+
+
 class FusedLoRALinear(nn.Module):
     def __init__(
         self,
@@ -47,6 +64,13 @@ class FusedLoRALinear(nn.Module):
             for _ in output_dims
         ]
         self.lora_b = [mx.zeros((r, od)) for od in output_dims]
+
+    def __call__(self, x):
+        dt = x.dtype
+        y = self.linear(x)
+        x = self.dropout(x)
+        z = [(x @ a) @ b for a, b in zip(self.lora_a, self.lora_b)]
+        return tuple(yi + (self.scale * zi).astype(dt) for yi, zi in zip(y, z))
 
     def fuse(self, dequantize: bool = False):
         linear = self.linear
@@ -82,13 +106,6 @@ class FusedLoRALinear(nn.Module):
 
         return fused_linear
 
-    def __call__(self, x):
-        dt = x.dtype
-        y = self.linear(x)
-        x = self.dropout(x)
-        z = [(x @ a) @ b for a, b in zip(self.lora_a, self.lora_b)]
-        return tuple(yi + (self.scale * zi).astype(dt) for yi, zi in zip(y, z))
-
 
 class FusedQuantizedLinear(nn.QuantizedLinear):
     def __init__(self, input_dims, output_dims, group_size: int = 64, bits: int = 4):
@@ -98,6 +115,10 @@ class FusedQuantizedLinear(nn.QuantizedLinear):
             input_dims, output_dims, bias=False, group_size=group_size, bits=bits
         )
 
+    def __call__(self, x):
+        x = super().__call__(x)
+        return x.split(self.indices, axis=-1)
+
     @property
     def input_dims(self):
         return self.scales.shape[-1] * self.group_size
@@ -106,10 +127,6 @@ class FusedQuantizedLinear(nn.QuantizedLinear):
     def output_dims(self):
         indices = [0] + self.indices + [self.weight.shape[0]]
         return [indices[i] - indices[i - 1] for i in range(1, len(indices))]
-
-    def __call__(self, x):
-        x = super().__call__(x)
-        return x.split(self.indices, axis=-1)
 
     def to_lora(self, r: int = 8, dropout: float = 0.0, scale: float = 20.0):
         lora_lin = FusedLoRALinear(self.input_dims, self.output_dims, r, dropout, scale)
@@ -123,6 +140,10 @@ class FusedLinear(nn.Linear):
         self.indices = indices
         super().__init__(input_dims, output_dims, bias=False)
 
+    def __call__(self, x):
+        x = super().__call__(x)
+        return x.split(self.indices, axis=-1)
+
     @property
     def input_dims(self):
         return self.weight.shape[-1]
@@ -131,10 +152,6 @@ class FusedLinear(nn.Linear):
     def output_dims(self):
         indices = [0] + self.indices + [self.weight.shape[0]]
         return [indices[i] - indices[i - 1] for i in range(1, len(indices))]
-
-    def __call__(self, x):
-        x = super().__call__(x)
-        return x.split(self.indices, axis=-1)
 
     def to_quantized(self, group_size: int = 64, bits: int = 4):
         input_dims = self.input_dims
@@ -219,6 +236,29 @@ class Attention(nn.Module):
         return self.out_proj(output)
 
 
+class TransformerBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.self_attn = Attention(args)
+        self.mlp = MLP(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_dim, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_dim, eps=args.rms_norm_eps
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        r = self.mlp(self.post_attention_layernorm(h))
+        out = h + r
+        return out
+
+
 class KVReuseAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -257,46 +297,6 @@ class KVReuseAttention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.out_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-
-        dim = args.hidden_dim
-        hidden_dim = int(dim * args.hidden_dim_scale_factor)
-
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        g = self.gate_proj(x)
-        x = self.up_proj(x)
-        return self.down_proj(swiglu(g, x))
-
-
-class TransformerBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.self_attn = Attention(args)
-        self.mlp = MLP(args)
-        self.input_layernorm = nn.RMSNorm(args.hidden_dim, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_dim, eps=args.rms_norm_eps
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
-        h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
-        out = h + r
-        return out
 
 
 class KVReuseTransformerBlock(nn.Module):

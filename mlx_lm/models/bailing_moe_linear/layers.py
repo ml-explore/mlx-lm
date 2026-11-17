@@ -25,54 +25,6 @@ __all__ = [
 ]
 
 
-def recurrent_gla(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    scale: float,
-    h: Optional[mx.array] = None,
-) -> mx.array:
-    """
-    Recurrence per (b, h):
-        h_t = h_{t-1} * exp(g_t)
-        h_t = h_t + k_t^T @ v_t
-        y_t = (q_t @ h_t) * scale
-    Returns y with shape [B, H, T, Dv].
-    """
-    B, Hq, L, K = q.shape
-
-    outputs = []
-    exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
-    q = q * scale
-    for t in range(L):
-        q_t = q[:, :, t : t + 1]
-        k_t = k[:, :, t : t + 1]
-        v_t = v[:, :, t : t + 1]
-        h_up = k_t.transpose(0, 1, 3, 2) @ v_t
-        if h is not None:
-            h = h * exp_g + h_up
-        else:
-            h = h_up
-        o_t = q_t @ h
-        outputs.append(o_t)
-
-    return mx.concatenate(outputs, axis=2), h
-
-
-class GroupRMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5, groups: int = 1):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.groups = groups
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
-        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
-        return self.weight * mx.flatten(x, -2)
-
-
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -172,6 +124,54 @@ class Attention(nn.Module):
         return self.dense(output)
 
 
+class GroupRMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-5, groups: int = 1):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.groups = groups
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
+        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
+        return self.weight * mx.flatten(x, -2)
+
+
+def recurrent_gla(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    scale: float,
+    h: Optional[mx.array] = None,
+) -> mx.array:
+    """
+    Recurrence per (b, h):
+        h_t = h_{t-1} * exp(g_t)
+        h_t = h_t + k_t^T @ v_t
+        y_t = (q_t @ h_t) * scale
+    Returns y with shape [B, H, T, Dv].
+    """
+    B, Hq, L, K = q.shape
+
+    outputs = []
+    exp_g = mx.exp(g)[:, None, None].astype(q.dtype)
+    q = q * scale
+    for t in range(L):
+        q_t = q[:, :, t : t + 1]
+        k_t = k[:, :, t : t + 1]
+        v_t = v[:, :, t : t + 1]
+        h_up = k_t.transpose(0, 1, 3, 2) @ v_t
+        if h is not None:
+            h = h * exp_g + h_up
+        else:
+            h = h_up
+        o_t = q_t @ h
+        outputs.append(o_t)
+
+    return mx.concatenate(outputs, axis=2), h
+
+
 class LinearAttention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -218,24 +218,6 @@ class LinearAttention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
         )
         self._slope = self._get_slopes()
-
-    def _get_slopes(self) -> mx.array:
-        n = self.num_attention_heads
-
-        def power_of_2_slopes(n):
-            return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
-
-        if math.log2(n).is_integer():
-            slopes = power_of_2_slopes(n)
-        else:
-            p = 2 ** math.floor(math.log2(n))
-            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][: n - p]
-
-        slopes = mx.array(slopes, dtype=mx.float32)
-        denom = max(1, self.num_hidden_layers - 1)
-        layer_pos = max(0, self.layer_idx - 1)
-        layer_factor = 1 - (layer_pos / denom) + 1e-5
-        return -slopes * layer_factor
 
     def __call__(
         self,
@@ -286,6 +268,24 @@ class LinearAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
+
+    def _get_slopes(self) -> mx.array:
+        n = self.num_attention_heads
+
+        def power_of_2_slopes(n):
+            return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
+
+        if math.log2(n).is_integer():
+            slopes = power_of_2_slopes(n)
+        else:
+            p = 2 ** math.floor(math.log2(n))
+            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][: n - p]
+
+        slopes = mx.array(slopes, dtype=mx.float32)
+        denom = max(1, self.num_hidden_layers - 1)
+        layer_pos = max(0, self.layer_idx - 1)
+        layer_factor = 1 - (layer_pos / denom) + 1e-5
+        return -slopes * layer_factor
 
 
 def group_expert_select(

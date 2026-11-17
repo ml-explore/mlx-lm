@@ -58,14 +58,6 @@ class Model(nn.Module):
                 config.hidden_size, self.vocab_size, bias=False
             )
 
-    def sanitize(self, weights: dict[Any, Any]) -> dict[Any, Any]:
-        return checkpoint.sanitize(self, weights)
-
-    def make_cache(self):
-        # TODO use RotatingKVCache is not full_attn
-        # full_attn = self.layer_idx in self.config.full_attention_idx
-        return [ArraysCache(size=2) if l.is_mamba else KVCache() for l in self.layers]
-
     def __call__(self, inputs: mx.array, cache=None) -> mx.array:
         outputs = self.model(
             inputs=inputs,
@@ -78,6 +70,14 @@ class Model(nn.Module):
 
         return logits
 
+    def sanitize(self, weights: dict[Any, Any]) -> dict[Any, Any]:
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers.layers
+
+    def make_cache(self):
+        # TODO use RotatingKVCache is not full_attn
+        # full_attn = self.layer_idx in self.config.full_attention_idx
+        return [ArraysCache(size=2) if l.is_mamba else KVCache() for l in self.layers]

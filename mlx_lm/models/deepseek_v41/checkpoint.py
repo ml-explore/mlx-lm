@@ -15,9 +15,6 @@ _DROP_PREFIXES = ("vision.", "aligner.", "image_", "mtp.")
 _EXPERT_KEY = r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)"
 
 
-_EXPERT_PROJ = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
-
-
 def _rename(key: str) -> str:
     """Map one DeepSeek checkpoint name to its MLX name."""
     if key == "head.weight":
@@ -56,6 +53,9 @@ def _repack(weight: mx.array, scale: mx.array) -> tuple[mx.array, mx.array]:
         # fp8 keeps one scale per 32x32 tile, MLX one per output row.
         scale = mx.repeat(scale, 32, axis=-2)[..., : weight.shape[-2], :]
     return weight.view(mx.uint32), scale
+
+
+_EXPERT_PROJ = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}
 
 
 def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:

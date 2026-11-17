@@ -19,6 +19,46 @@ __all__ = [
 ]
 
 
+_BLOCK_SUM_ONCE_HEADER = """
+template <int TG>
+inline float block_sum_once(float v, threadgroup float* buf, uint lane, uint sg) {
+    v = simd_sum(v);
+    if (TG > 32) {
+        if (lane == 0) {
+            buf[sg] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        v = simd_sum(lane < TG / 32 ? buf[lane] : 0.0f);
+    }
+    return v;
+}
+"""
+
+
+_HEAD = """
+    constexpr int R = (D + TG - 1) / TG;
+    threadgroup float buf[2][32];
+    uint t = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    size_t base = size_t(threadgroup_position_in_grid.x) * D;
+"""
+
+# The pre-norm of the stream values in v, with their sum of squares in sum_sq.
+_PRE_NORM = """
+    rstd = metal::precise::rsqrt(block_sum_once<TG>(sum_sq, buf[1], lane, sg) / D + pre_eps);
+    for (int i = 0; i < R; i++) {
+        int d = t + i * TG;
+        if (d < D) {
+            normed[base + d] = static_cast<T>(v[i] * rstd * pw[i]);
+        }
+    }
+"""
+
+
+_NORM_ADD_INPUTS = ["branch", "stream", "alpha", "beta", "post_w", "post_eps"]
+
+
 # The q and k head norms and the q scale, in one kernel.
 
 # One SIMD group per head. q and k are the first two parts of each qkvg row.
@@ -241,41 +281,44 @@ def rms_norm_sigmoid_gate(x: mx.array, gate: mx.array, *, eps: float) -> mx.arra
     )[0]
 
 
-_BLOCK_SUM_ONCE_HEADER = """
-template <int TG>
-inline float block_sum_once(float v, threadgroup float* buf, uint lane, uint sg) {
-    v = simd_sum(v);
-    if (TG > 32) {
-        if (lane == 0) {
-            buf[sg] = v;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        v = simd_sum(lane < TG / 32 ? buf[lane] : 0.0f);
-    }
-    return v;
-}
-"""
-
-
-_HEAD = """
-    constexpr int R = (D + TG - 1) / TG;
-    threadgroup float buf[2][32];
-    uint t = thread_position_in_threadgroup.x;
-    uint lane = thread_index_in_simdgroup;
-    uint sg = simdgroup_index_in_threadgroup;
-    size_t base = size_t(threadgroup_position_in_grid.x) * D;
-"""
-
-# The pre-norm of the stream values in v, with their sum of squares in sum_sq.
-_PRE_NORM = """
-    rstd = metal::precise::rsqrt(block_sum_once<TG>(sum_sq, buf[1], lane, sg) / D + pre_eps);
+# Only the pre-norm, with the same sums as in norm_add_norm.
+_PRE_NORM_ONLY = _HEAD + """
+    float v[R], pw[R];
+    float sum_sq = 0.0f;
     for (int i = 0; i < R; i++) {
         int d = t + i * TG;
+        v[i] = pw[i] = 0.0f;
         if (d < D) {
-            normed[base + d] = static_cast<T>(v[i] * rstd * pw[i]);
+            v[i] = stream[base + d];
+            pw[i] = pre_w[d];
         }
+        sum_sq += v[i] * v[i];
     }
-"""
+    float rstd;
+""" + _PRE_NORM
+
+_pre_norm_kernel = mx.fast.metal_kernel(
+    name="norm_add_norm_pre_norm",
+    input_names=["stream", "pre_w", "pre_eps"],
+    output_names=["normed"],
+    source=_PRE_NORM_ONLY,
+    header=_BLOCK_SUM_ONCE_HEADER,
+)
+
+
+def pre_norm(stream: mx.array, norm: nn.RMSNorm, *, dtype: mx.Dtype) -> mx.array:
+    """Pre-norm the fp32 stream with norm, as norm_add_norm does.
+    For a stream from norm_add_norm, the values are equal to its normed sum."""
+    D = stream.shape[-1]
+    tg = row_threads(D)
+    return _pre_norm_kernel(
+        inputs=[stream, norm.weight, scalar(norm.eps)],
+        template=[("T", dtype), ("D", D), ("TG", tg)],
+        grid=(stream.size // D * tg, 1, 1),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[stream.shape],
+        output_dtypes=[dtype],
+    )[0]
 
 
 def _source(pre_norm: bool) -> str:
@@ -324,33 +367,6 @@ def _source(pre_norm: bool) -> str:
     return source
 
 
-# Only the pre-norm, with the same sums as in norm_add_norm.
-_PRE_NORM_ONLY = _HEAD + """
-    float v[R], pw[R];
-    float sum_sq = 0.0f;
-    for (int i = 0; i < R; i++) {
-        int d = t + i * TG;
-        v[i] = pw[i] = 0.0f;
-        if (d < D) {
-            v[i] = stream[base + d];
-            pw[i] = pre_w[d];
-        }
-        sum_sq += v[i] * v[i];
-    }
-    float rstd;
-""" + _PRE_NORM
-
-
-_NORM_ADD_INPUTS = ["branch", "stream", "alpha", "beta", "post_w", "post_eps"]
-
-_norm_add_norm_kernel = mx.fast.metal_kernel(
-    name="norm_add_norm",
-    input_names=_NORM_ADD_INPUTS + ["pre_w", "pre_eps"],
-    output_names=["new_stream", "normed"],
-    source=_source(pre_norm=True),
-    header=_BLOCK_SUM_ONCE_HEADER,
-)
-
 _norm_add_kernel = mx.fast.metal_kernel(
     name="norm_add",
     input_names=_NORM_ADD_INPUTS,
@@ -359,11 +375,11 @@ _norm_add_kernel = mx.fast.metal_kernel(
     header=_BLOCK_SUM_ONCE_HEADER,
 )
 
-_pre_norm_kernel = mx.fast.metal_kernel(
-    name="norm_add_norm_pre_norm",
-    input_names=["stream", "pre_w", "pre_eps"],
-    output_names=["normed"],
-    source=_PRE_NORM_ONLY,
+_norm_add_norm_kernel = mx.fast.metal_kernel(
+    name="norm_add_norm",
+    input_names=_NORM_ADD_INPUTS + ["pre_w", "pre_eps"],
+    output_names=["new_stream", "normed"],
+    source=_source(pre_norm=True),
     header=_BLOCK_SUM_ONCE_HEADER,
 )
 
@@ -417,21 +433,6 @@ def norm_add_norm(
         **kwargs,
     )
     return new_stream, normed
-
-
-def pre_norm(stream: mx.array, norm: nn.RMSNorm, *, dtype: mx.Dtype) -> mx.array:
-    """Pre-norm the fp32 stream with norm, as norm_add_norm does.
-    For a stream from norm_add_norm, the values are equal to its normed sum."""
-    D = stream.shape[-1]
-    tg = row_threads(D)
-    return _pre_norm_kernel(
-        inputs=[stream, norm.weight, scalar(norm.eps)],
-        template=[("T", dtype), ("D", D), ("TG", tg)],
-        grid=(stream.size // D * tg, 1, 1),
-        threadgroup=(tg, 1, 1),
-        output_shapes=[stream.shape],
-        output_dtypes=[dtype],
-    )[0]
 
 
 # This kernel inputs [tokens * k, D]:

@@ -71,6 +71,33 @@ class Mamba2Block(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.use_bias
         )
 
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[ArraysCache] = None,
+    ) -> mx.array:
+        projected = self.in_proj(hidden_states)
+        gate, conv_input, dt = mx.split(
+            projected,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
+            axis=-1,
+        )
+        conv_output = self._conv(conv_input, cache, mask)
+        hidden_states, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
+        y = self._ssm(hidden_states, B, C, dt, cache, mask=mask)
+        if cache:
+            cache.advance(y.shape[1])
+        y = self.norm(y, gate)
+        return self.out_proj(y)
+
     def _conv(
         self,
         conv_input: mx.array,
@@ -141,33 +168,6 @@ class Mamba2Block(nn.Module):
         if cache:
             cache[1] = state
         return y.reshape(batch_size, seq_len, self.intermediate_size)
-
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        mask: Optional[mx.array],
-        cache: Optional[ArraysCache] = None,
-    ) -> mx.array:
-        projected = self.in_proj(hidden_states)
-        gate, conv_input, dt = mx.split(
-            projected,
-            [self.intermediate_size, self.intermediate_size + self.conv_dim],
-            axis=-1,
-        )
-        conv_output = self._conv(conv_input, cache, mask)
-        hidden_states, B, C = mx.split(
-            conv_output,
-            [
-                self.intermediate_size,
-                self.intermediate_size + self.n_groups * self.ssm_state_size,
-            ],
-            axis=-1,
-        )
-        y = self._ssm(hidden_states, B, C, dt, cache, mask=mask)
-        if cache:
-            cache.advance(y.shape[1])
-        y = self.norm(y, gate)
-        return self.out_proj(y)
 
 
 class ResidualBlock(nn.Module):

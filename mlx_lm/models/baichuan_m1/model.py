@@ -73,6 +73,17 @@ class Model(nn.Module):
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
+    def __call__(self, inputs: mx.array, cache: Any = None) -> mx.array:
+        outputs = self.model(inputs, cache)
+        return self.lm_head(outputs)
+
+    def sanitize(self, weights: dict) -> dict:
+        return checkpoint.sanitize(self, weights)
+
+    @property
+    def layers(self) -> List[nn.Module]:
+        return self.model.layers
+
     def make_cache(self) -> List[Any]:
         caches = []
         for i in range(len(self.model.layers)):
@@ -84,14 +95,3 @@ class Model(nn.Module):
                 kv_cache = KVCache()
             caches.append(CacheList(conv_cache, kv_cache))
         return caches
-
-    def sanitize(self, weights: dict) -> dict:
-        return checkpoint.sanitize(self, weights)
-
-    def __call__(self, inputs: mx.array, cache: Any = None) -> mx.array:
-        outputs = self.model(inputs, cache)
-        return self.lm_head(outputs)
-
-    @property
-    def layers(self) -> List[nn.Module]:
-        return self.model.layers

@@ -9,16 +9,6 @@ __all__ = [
 ]
 
 
-@mx.compile
-def _attn_res_combine_reference(raw, inv_rms, partial_sum, w_eff, eps):
-    pf = partial_sum.astype(mx.float32)
-    p_logit = (pf @ w_eff) * mx.rsqrt((pf * pf).mean(axis=-1) + eps)
-    logits = mx.concatenate([(raw.astype(mx.float32) @ w_eff) * inv_rms, p_logit[None]])
-    p = mx.softmax(logits, axis=0, precise=True)
-    out = (p[:-1, ..., None] * raw).sum(axis=0) + p[-1, ..., None] * partial_sum
-    return out.astype(partial_sum.dtype)
-
-
 _ATTN_RES_SOURCE = """
     constexpr int NACC = K + 2;
     constexpr int NSIMD = THREADS / 32;
@@ -106,10 +96,20 @@ _attn_res_kernel = (
 )
 
 
+_attn_res_eps_cache: Dict[float, mx.array] = {}
+
+
 _ATTN_RES_THREADS = 512
 
 
-_attn_res_eps_cache: Dict[float, mx.array] = {}
+@mx.compile
+def _attn_res_combine_reference(raw, inv_rms, partial_sum, w_eff, eps):
+    pf = partial_sum.astype(mx.float32)
+    p_logit = (pf @ w_eff) * mx.rsqrt((pf * pf).mean(axis=-1) + eps)
+    logits = mx.concatenate([(raw.astype(mx.float32) @ w_eff) * inv_rms, p_logit[None]])
+    p = mx.softmax(logits, axis=0, precise=True)
+    out = (p[:-1, ..., None] * raw).sum(axis=0) + p[-1, ..., None] * partial_sum
+    return out.astype(partial_sum.dtype)
 
 
 def attn_res_combine(

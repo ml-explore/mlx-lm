@@ -30,16 +30,6 @@ class GearRMSNorm(nn.Module):
         return mx.fast.rms_norm(x, weight, self.eps)
 
 
-def _activation(name: str):
-    if name in {"gelu_pytorch_tanh", "gelu_new", "gelu_fast"}:
-        return nn.gelu_approx
-    if name == "gelu":
-        return nn.gelu
-    if name in {"silu", "swish"}:
-        return nn.silu
-    raise ValueError(f"Unsupported Gear activation: {name}")
-
-
 def _repeat_kv(x: mx.array, repeats: int) -> mx.array:
     if repeats == 1:
         return x
@@ -77,19 +67,6 @@ def _softcap_attention(
 
     scores = mx.softmax(scores, axis=-1, precise=True)
     return scores @ values
-
-
-class MLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-        self.hidden_activation = args.hidden_activation
-
-    def __call__(self, x: mx.array) -> mx.array:
-        act_fn = _activation(self.hidden_activation)
-        return self.down_proj(act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class Attention(nn.Module):
@@ -218,6 +195,32 @@ class ConvKVGatedMixer(nn.Module):
         self.q_norm = GearRMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.k_norm = GearRMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[ArraysCache] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+        x = self._apply_mask(x, mask)
+
+        query = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+        key = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+        value = self.v_proj(x)
+
+        query = self.q_norm(query).reshape(B, L, -1)
+        key = self.k_norm(key).reshape(B, L, -1)
+
+        key = self._conv(key, self.key_conv, cache, cache_idx=0)
+        value = self._conv(value, self.value_conv, cache, cache_idx=1)
+        if cache is not None:
+            cache.advance(L)
+
+        key = self._expand_kv(key)
+        value = self._expand_kv(value)
+
+        return self.o_proj(mx.sigmoid(query * key) * value)
+
     def _apply_mask(self, x: mx.array, mask: Optional[mx.array]) -> mx.array:
         if mask is None:
             return x
@@ -265,31 +268,28 @@ class ConvKVGatedMixer(nn.Module):
         )
         return x.reshape(B, L, self.n_heads * self.head_dim)
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[ArraysCache] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
-        x = self._apply_mask(x, mask)
 
-        query = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
-        key = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
-        value = self.v_proj(x)
+def _activation(name: str):
+    if name in {"gelu_pytorch_tanh", "gelu_new", "gelu_fast"}:
+        return nn.gelu_approx
+    if name == "gelu":
+        return nn.gelu
+    if name in {"silu", "swish"}:
+        return nn.silu
+    raise ValueError(f"Unsupported Gear activation: {name}")
 
-        query = self.q_norm(query).reshape(B, L, -1)
-        key = self.k_norm(key).reshape(B, L, -1)
 
-        key = self._conv(key, self.key_conv, cache, cache_idx=0)
-        value = self._conv(value, self.value_conv, cache, cache_idx=1)
-        if cache is not None:
-            cache.advance(L)
+class MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+        self.hidden_activation = args.hidden_activation
 
-        key = self._expand_kv(key)
-        value = self._expand_kv(value)
-
-        return self.o_proj(mx.sigmoid(query * key) * value)
+    def __call__(self, x: mx.array) -> mx.array:
+        act_fn = _activation(self.hidden_activation)
+        return self.down_proj(act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class DecoderLayer(nn.Module):

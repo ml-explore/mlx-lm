@@ -71,21 +71,14 @@ class Model(nn.Module):
             else nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         )
 
-    @property
-    def layers(self):
-        return self.model.layers
-
     def __call__(self, inputs: mx.array, cache: Any | None = None) -> mx.array:
         hidden = self.model(inputs, cache)
         if self.lm_head is None:
             return self.model.word_embeddings.as_linear(hidden)
         return self.lm_head(hidden)
 
-    def make_cache(self):
-        return [
-            ArraysCache(size=4) if layer.is_linear else KVCache()
-            for layer in self.layers
-        ]
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
 
     @property
     def quant_predicate(self):
@@ -110,5 +103,12 @@ class Model(nn.Module):
 
         return predicate
 
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        return [
+            ArraysCache(size=4) if layer.is_linear else KVCache()
+            for layer in self.layers
+        ]

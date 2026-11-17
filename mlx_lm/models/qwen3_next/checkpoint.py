@@ -18,6 +18,16 @@ _ZERO_CENTERED_NORMS = (
 )
 
 
+def _upgrade_mlx_layout(weights):
+    """A checkpoint that mlx-lm converted with the experts under switch_mlp and the
+    norms storing 1 + weight."""
+    upgraded = {}
+    for k, v in weights.items():
+        k = k.replace(".switch_mlp.", ".experts.")
+        upgraded[k] = v - 1.0 if k.endswith(_ZERO_CENTERED_NORMS) else v
+    return upgraded
+
+
 def sanitize(model, weights):
     if any(".switch_mlp." in k for k in weights):
         weights = _upgrade_mlx_layout(weights)
@@ -40,13 +50,3 @@ def sanitize(model, weights):
         if "conv1d.weight" in k and v.shape[-1] != 1:
             weights[k] = v.moveaxis(2, 1)
     return weights
-
-
-def _upgrade_mlx_layout(weights):
-    """A checkpoint that mlx-lm converted with the experts under switch_mlp and the
-    norms storing 1 + weight."""
-    upgraded = {}
-    for k, v in weights.items():
-        k = k.replace(".switch_mlp.", ".experts.")
-        upgraded[k] = v - 1.0 if k.endswith(_ZERO_CENTERED_NORMS) else v
-    return upgraded

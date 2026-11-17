@@ -20,6 +20,24 @@ __all__ = [
 ]
 
 
+class FalconH1MLP(nn.Module):
+
+    def __init__(self, args):
+        super().__init__()
+
+        hidden_size = args.hidden_size
+        intermediate_size = args.intermediate_size
+
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
+
+    def __call__(self, x):
+        y = swiglu(self.gate_proj(x), self.up_proj(x))
+        y = self.down_proj(y)
+        return y
+
+
 class FalconH1RMSNormGated(nn.Module):
     def __init__(self, hidden_size, eps=1e-6, n_groups=1, norm_before_gate=True):
         super().__init__()
@@ -39,69 +57,6 @@ class FalconH1RMSNormGated(nn.Module):
         if self.norm_before_gate and gate is not None:
             hidden_states = swiglu(gate, hidden_states)
         return hidden_states
-
-
-class FalconH1Attention(nn.Module):
-
-    def __init__(self, args):
-        super().__init__()
-
-        self.hidden_size = args.hidden_size
-        self.num_heads = args.num_attention_heads
-        self.num_kv_heads = args.num_key_value_heads
-        self.head_dim = args.head_dim
-        self.scale = self.head_dim**-0.5
-
-        self.q_proj = nn.Linear(
-            self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.v_proj = nn.Linear(
-            self.hidden_size,
-            self.num_kv_heads * self.head_dim,
-            bias=args.attention_bias,
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
-        )
-
-        self.rope = initialize_rope(
-            self.head_dim,
-            args.rope_theta,
-            args.rope_traditional,
-            args.rope_scaling,
-            args.max_position_embeddings,
-        )
-
-    def __call__(self, x, mask=None, cache=None):
-        B, L, _ = x.shape
-
-        queries = self.q_proj(x)
-        keys = self.k_proj(x)
-        values = self.v_proj(x)
-
-        queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
-        keys = keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
-        values = values.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
-
-        if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
-            keys, values = cache.update_and_fetch(keys, values)
-        else:
-            queries = self.rope(queries)
-            keys = self.rope(keys)
-
-        output = scaled_dot_product_attention(
-            queries, keys, values, mask=mask, scale=self.scale, cache=cache
-        )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-
-        return self.o_proj(output)
 
 
 class FalconH1Mixer(nn.Module):
@@ -160,6 +115,37 @@ class FalconH1Mixer(nn.Module):
         self.out_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=args.projectors_bias
         )
+
+    def __call__(self, input_states, cache=None, mask: Optional[mx.array] = None):
+        projected_states = self.in_proj(input_states)
+
+        gate, conv_input, dt = mx.split(
+            projected_states,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
+            axis=-1,
+        )
+
+        conv_output = self._conv(conv_input, cache, mask)
+
+        hidden_states, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
+
+        y = self._ssm(hidden_states, B, C, dt, cache, mask=mask)
+        if cache:
+            cache.advance(y.shape[1])
+
+        if self.mamba_rms_norm:
+            y = self.norm(y, gate)
+        else:
+            y = swiglu(gate, y)
+
+        return self.out_proj(y)
 
     def _conv(
         self,
@@ -232,54 +218,68 @@ class FalconH1Mixer(nn.Module):
             cache[1] = state
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
-    def __call__(self, input_states, cache=None, mask: Optional[mx.array] = None):
-        projected_states = self.in_proj(input_states)
 
-        gate, conv_input, dt = mx.split(
-            projected_states,
-            [self.intermediate_size, self.intermediate_size + self.conv_dim],
-            axis=-1,
-        )
-
-        conv_output = self._conv(conv_input, cache, mask)
-
-        hidden_states, B, C = mx.split(
-            conv_output,
-            [
-                self.intermediate_size,
-                self.intermediate_size + self.n_groups * self.ssm_state_size,
-            ],
-            axis=-1,
-        )
-
-        y = self._ssm(hidden_states, B, C, dt, cache, mask=mask)
-        if cache:
-            cache.advance(y.shape[1])
-
-        if self.mamba_rms_norm:
-            y = self.norm(y, gate)
-        else:
-            y = swiglu(gate, y)
-
-        return self.out_proj(y)
-
-
-class FalconH1MLP(nn.Module):
+class FalconH1Attention(nn.Module):
 
     def __init__(self, args):
         super().__init__()
 
-        hidden_size = args.hidden_size
-        intermediate_size = args.intermediate_size
+        self.hidden_size = args.hidden_size
+        self.num_heads = args.num_attention_heads
+        self.num_kv_heads = args.num_key_value_heads
+        self.head_dim = args.head_dim
+        self.scale = self.head_dim**-0.5
 
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=args.mlp_bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=args.mlp_bias)
+        self.q_proj = nn.Linear(
+            self.hidden_size, self.num_heads * self.head_dim, bias=args.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            self.hidden_size,
+            self.num_kv_heads * self.head_dim,
+            bias=args.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            self.num_heads * self.head_dim, self.hidden_size, bias=args.attention_bias
+        )
 
-    def __call__(self, x):
-        y = swiglu(self.gate_proj(x), self.up_proj(x))
-        y = self.down_proj(y)
-        return y
+        self.rope = initialize_rope(
+            self.head_dim,
+            args.rope_theta,
+            args.rope_traditional,
+            args.rope_scaling,
+            args.max_position_embeddings,
+        )
+
+    def __call__(self, x, mask=None, cache=None):
+        B, L, _ = x.shape
+
+        queries = self.q_proj(x)
+        keys = self.k_proj(x)
+        values = self.v_proj(x)
+
+        queries = queries.reshape(B, L, self.num_heads, -1).transpose(0, 2, 1, 3)
+        keys = keys.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
+        values = values.reshape(B, L, self.num_kv_heads, -1).transpose(0, 2, 1, 3)
+
+        if cache is not None:
+            queries = self.rope(queries, offset=cache.offset)
+            keys = self.rope(keys, offset=cache.offset)
+            keys, values = cache.update_and_fetch(keys, values)
+        else:
+            queries = self.rope(queries)
+            keys = self.rope(keys)
+
+        output = scaled_dot_product_attention(
+            queries, keys, values, mask=mask, scale=self.scale, cache=cache
+        )
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+
+        return self.o_proj(output)
 
 
 class FalconH1DecoderLayer(nn.Module):

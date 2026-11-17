@@ -77,6 +77,35 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
 
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[ArraysCache] = None,
+    ) -> mx.array:
+
+        projected = self.in_proj(hidden_states)
+
+        gate, conv_input, dt = mx.split(
+            projected,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
+            axis=-1,
+        )
+        conv_output = self._conv(conv_input, cache, mask)
+        hidden_states_ssm, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
+        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
+        if cache:
+            cache.advance(y.shape[1])
+        y = self.norm(y, gate)
+        return self.out_proj(y)
+
     def _conv(
         self,
         conv_input: mx.array,
@@ -151,35 +180,6 @@ class GraniteMoeHybridMamba2Mixer(nn.Module):
 
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        mask: Optional[mx.array],
-        cache: Optional[ArraysCache] = None,
-    ) -> mx.array:
-
-        projected = self.in_proj(hidden_states)
-
-        gate, conv_input, dt = mx.split(
-            projected,
-            [self.intermediate_size, self.intermediate_size + self.conv_dim],
-            axis=-1,
-        )
-        conv_output = self._conv(conv_input, cache, mask)
-        hidden_states_ssm, B, C = mx.split(
-            conv_output,
-            [
-                self.intermediate_size,
-                self.intermediate_size + self.n_groups * self.ssm_state_size,
-            ],
-            axis=-1,
-        )
-        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
-        if cache:
-            cache.advance(y.shape[1])
-        y = self.norm(y, gate)
-        return self.out_proj(y)
-
 
 class GraniteMoeHybridAttention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -245,6 +245,21 @@ class GraniteMoeHybridAttention(nn.Module):
         return self.o_proj(output)
 
 
+class GraniteMoeHybridSharedMLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.input_linear = nn.Linear(
+            args.hidden_size, args.shared_intermediate_size * 2, bias=False
+        )
+        self.output_linear = nn.Linear(
+            args.shared_intermediate_size, args.hidden_size, bias=False
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate, up = mx.split(self.input_linear(x), 2, axis=-1)
+        return self.output_linear(swiglu(gate, up))
+
+
 class GraniteMoeHybridTopKGating(nn.Module):
     def __init__(self, input_size: int, num_experts: int, top_k: int):
         super().__init__()
@@ -282,21 +297,6 @@ class GraniteMoeHybridMoE(nn.Module):
         token_ids, gates = self.router(x)
         y = self.switch_mlp(x, token_ids)
         return (y * gates[..., None]).sum(axis=-2)
-
-
-class GraniteMoeHybridSharedMLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.input_linear = nn.Linear(
-            args.hidden_size, args.shared_intermediate_size * 2, bias=False
-        )
-        self.output_linear = nn.Linear(
-            args.shared_intermediate_size, args.hidden_size, bias=False
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        gate, up = mx.split(self.input_linear(x), 2, axis=-1)
-        return self.output_linear(swiglu(gate, up))
 
 
 class GraniteMoeHybridMLP(nn.Module):

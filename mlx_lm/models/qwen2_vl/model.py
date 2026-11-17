@@ -46,12 +46,12 @@ class Model(nn.Module):
             return language_model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
-    @property
-    def layers(self):
-        return self.model.language_model.layers
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         shard_layers(self.layers, group or mx.distributed.init())
+
+    @property
+    def layers(self):
+        return self.model.language_model.layers

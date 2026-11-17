@@ -89,6 +89,18 @@ class Model(nn.Module):
 
         return out / self.logits_scaling
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if self.args.use_moe and path.endswith("router.layer"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
     @property
     def layers(self):
         return self.model.layers
@@ -101,15 +113,3 @@ class Model(nn.Module):
             elif layer.layer_type == "attention":
                 caches.append(KVCache())
         return caches
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
-
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            if self.args.use_moe and path.endswith("router.layer"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate

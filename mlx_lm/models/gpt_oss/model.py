@@ -72,6 +72,15 @@ class Model(nn.Module):
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("router"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
+
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
@@ -116,15 +125,6 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.layers
-
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith("router"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
 
     def make_cache(self):
         caches = []

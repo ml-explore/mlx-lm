@@ -35,18 +35,6 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
-    def pipeline(self, group, split=None):
-        super().pipeline(group, split=split)
-        self.ssm_idx = None
-        self.fa_idx = None
-        for e, l in enumerate(self.pipeline_layers):
-            if self.ssm_idx is None and l.is_linear:
-                self.ssm_idx = e
-            elif self.fa_idx is None and not l.is_linear:
-                self.fa_idx = e
-            if self.ssm_idx is not None and self.fa_idx is not None:
-                break
-
     def __call__(
         self,
         inputs: mx.array,
@@ -97,6 +85,18 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
             ]
 
         return self.norm(hidden_states)
+
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
+        self.ssm_idx = None
+        self.fa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.ssm_idx is None and l.is_linear:
+                self.ssm_idx = e
+            elif self.fa_idx is None and not l.is_linear:
+                self.fa_idx = e
+            if self.ssm_idx is not None and self.fa_idx is not None:
+                break
 
 
 class Qwen3_5Model(nn.Module):
@@ -150,15 +150,29 @@ class Model(nn.Module):
             out = gather_last_axis(out, self.sharding_group)
         return out
 
-    @property
-    def layers(self):
-        return self.model.language_model.pipeline_layers
-
-    def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
+
+    @property
+    def cast_predicate(self):
+        def predicate(path: str):
+            if path.endswith("A_log"):
+                return False
+            return True
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        if self.args.text.num_experts <= 0:
+            return None
+
+        def predicate(path, _):
+            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     def shard(self, group=None):
         group = group or mx.distributed.init()
@@ -284,22 +298,8 @@ class Model(nn.Module):
                 shard_inplace(layer.mlp.experts.up_proj, "all-to-sharded", group=group)
 
     @property
-    def quant_predicate(self):
-        if self.args.text.num_experts <= 0:
-            return None
+    def layers(self):
+        return self.model.language_model.pipeline_layers
 
-        def predicate(path, _):
-            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
-
-    @property
-    def cast_predicate(self):
-        def predicate(path: str):
-            if path.endswith("A_log"):
-                return False
-            return True
-
-        return predicate
+    def make_cache(self):
+        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]

@@ -61,9 +61,9 @@ class Model(nn.Module):
         else:
             return self.lm_head(out)
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)

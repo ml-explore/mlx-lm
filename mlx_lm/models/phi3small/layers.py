@@ -19,27 +19,6 @@ __all__ = [
 ]
 
 
-@partial(mx.compile, shapeless=True)
-def gegelu_impl(a_gelu, a_linear, limit):
-    a_gelu = mx.where(
-        mx.isinf(a_gelu),
-        a_gelu,
-        mx.clip(a_gelu, a_min=None, a_max=limit),
-    )
-    a_linear = mx.where(
-        mx.isinf(a_linear),
-        a_linear,
-        mx.clip(a_linear, a_min=-limit, a_max=limit),
-    )
-    out_gelu = a_gelu * mx.sigmoid(1.702 * a_gelu)
-    return out_gelu * (a_linear + 1.0)
-
-
-def gegelu(x, limit):
-    a_gelu, a_linear = x[..., ::2], x[..., 1::2]
-    return gegelu_impl(a_gelu, a_linear, limit)
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx):
         super().__init__()
@@ -81,66 +60,6 @@ class Attention(nn.Module):
         else:
             self.block_sparse = False
 
-    def _block_sparse_mask(self, q_len, kv_len):
-        vert_stride = self.blocksparse_vert_stride
-        local_blocks = self.blocksparse_num_local_blocks
-        block_size = self.blocksparse_block_size
-        n_heads = self.n_heads
-
-        kv_blocks = (kv_len + block_size - 1) // block_size
-        q_blocks = (q_len + block_size - 1) // block_size
-        q_pos = mx.arange(kv_blocks - q_blocks, kv_blocks)[None, :, None]
-        k_pos = mx.arange(kv_blocks)[None, None]
-
-        mask_vert_strided = (
-            mx.arange(kv_blocks)[None, :] + mx.arange(1, n_heads + 1)[:, None]
-        ) % vert_stride
-        mask_vert_strided = (mask_vert_strided == 0)[:, None, :]
-
-        block_mask = (q_pos >= k_pos) & (
-            (q_pos - k_pos < local_blocks) | mask_vert_strided
-        )
-        block_mask = block_mask.reshape(
-            self.n_kv_heads, self.n_q_per_kv, *block_mask.shape[-2:]
-        )
-        dense_mask = mx.repeat(
-            mx.repeat(block_mask, block_size, axis=-1), block_size, axis=-2
-        )
-        return block_mask, dense_mask[..., -q_len:, :kv_len]
-
-    def _block_sparse_attention(self, queries, keys, values, scale, mask):
-        queries = scale * queries
-        B = queries.shape[0]
-        L = queries.shape[2]
-        queries = mx.reshape(queries, (B, self.n_kv_heads, self.n_q_per_kv, L, -1))
-        keys = mx.expand_dims(keys, 2)
-        values = mx.expand_dims(values, 2)
-
-        # TODO get rid of dense mask if we have a fill value
-        block_mask, dense_mask = self._block_sparse_mask(L, keys.shape[-2])
-        scores = queries @ mx.swapaxes(keys, -1, -2)
-        # TODO, uncomment when faster
-        # scores = mx.block_masked_mm(
-        #   queries,
-        #   mx.swapaxes(keys, -1, -2),
-        #   mask_out=block_mask,
-        #   block_size=self.blocksparse_block_size,
-        # )
-
-        if mask is not None:
-            scores = scores + mask
-        scores = scores + mx.where(
-            dense_mask, mx.array(0, scores.dtype), mx.array(-float("inf"), scores.dtype)
-        )
-        scores = mx.softmax(scores, axis=-1, precise=True)
-
-        output = scores @ values
-        # TODO, uncomment when faster
-        # output = mx.block_masked_mm(
-        #    scores, values, mask_lhs=block_mask, block_size=self.blocksparse_block_size
-        # )
-        return mx.reshape(output, (B, self.n_heads, L, -1))
-
     def __call__(
         self,
         x: mx.array,
@@ -178,6 +97,87 @@ class Attention(nn.Module):
             )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.dense(output)
+
+    def _block_sparse_attention(self, queries, keys, values, scale, mask):
+        queries = scale * queries
+        B = queries.shape[0]
+        L = queries.shape[2]
+        queries = mx.reshape(queries, (B, self.n_kv_heads, self.n_q_per_kv, L, -1))
+        keys = mx.expand_dims(keys, 2)
+        values = mx.expand_dims(values, 2)
+
+        # TODO get rid of dense mask if we have a fill value
+        block_mask, dense_mask = self._block_sparse_mask(L, keys.shape[-2])
+        scores = queries @ mx.swapaxes(keys, -1, -2)
+        # TODO, uncomment when faster
+        # scores = mx.block_masked_mm(
+        #   queries,
+        #   mx.swapaxes(keys, -1, -2),
+        #   mask_out=block_mask,
+        #   block_size=self.blocksparse_block_size,
+        # )
+
+        if mask is not None:
+            scores = scores + mask
+        scores = scores + mx.where(
+            dense_mask, mx.array(0, scores.dtype), mx.array(-float("inf"), scores.dtype)
+        )
+        scores = mx.softmax(scores, axis=-1, precise=True)
+
+        output = scores @ values
+        # TODO, uncomment when faster
+        # output = mx.block_masked_mm(
+        #    scores, values, mask_lhs=block_mask, block_size=self.blocksparse_block_size
+        # )
+        return mx.reshape(output, (B, self.n_heads, L, -1))
+
+    def _block_sparse_mask(self, q_len, kv_len):
+        vert_stride = self.blocksparse_vert_stride
+        local_blocks = self.blocksparse_num_local_blocks
+        block_size = self.blocksparse_block_size
+        n_heads = self.n_heads
+
+        kv_blocks = (kv_len + block_size - 1) // block_size
+        q_blocks = (q_len + block_size - 1) // block_size
+        q_pos = mx.arange(kv_blocks - q_blocks, kv_blocks)[None, :, None]
+        k_pos = mx.arange(kv_blocks)[None, None]
+
+        mask_vert_strided = (
+            mx.arange(kv_blocks)[None, :] + mx.arange(1, n_heads + 1)[:, None]
+        ) % vert_stride
+        mask_vert_strided = (mask_vert_strided == 0)[:, None, :]
+
+        block_mask = (q_pos >= k_pos) & (
+            (q_pos - k_pos < local_blocks) | mask_vert_strided
+        )
+        block_mask = block_mask.reshape(
+            self.n_kv_heads, self.n_q_per_kv, *block_mask.shape[-2:]
+        )
+        dense_mask = mx.repeat(
+            mx.repeat(block_mask, block_size, axis=-1), block_size, axis=-2
+        )
+        return block_mask, dense_mask[..., -q_len:, :kv_len]
+
+
+@partial(mx.compile, shapeless=True)
+def gegelu_impl(a_gelu, a_linear, limit):
+    a_gelu = mx.where(
+        mx.isinf(a_gelu),
+        a_gelu,
+        mx.clip(a_gelu, a_min=None, a_max=limit),
+    )
+    a_linear = mx.where(
+        mx.isinf(a_linear),
+        a_linear,
+        mx.clip(a_linear, a_min=-limit, a_max=limit),
+    )
+    out_gelu = a_gelu * mx.sigmoid(1.702 * a_gelu)
+    return out_gelu * (a_linear + 1.0)
+
+
+def gegelu(x, limit):
+    a_gelu, a_linear = x[..., ::2], x[..., 1::2]
+    return gegelu_impl(a_gelu, a_linear, limit)
 
 
 class MLP(nn.Module):

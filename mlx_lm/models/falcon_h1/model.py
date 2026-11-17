@@ -93,12 +93,12 @@ class Model(nn.Module):
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
+    @property
+    def layers(self):
+        return self.model.layers
+
     def make_cache(self):
         return [
             CacheList(ArraysCache(size=2), KVCache())
             for _ in range(self.args.num_hidden_layers)
         ]
-
-    @property
-    def layers(self):
-        return self.model.layers

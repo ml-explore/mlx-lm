@@ -61,25 +61,25 @@ class Model(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
-    @property
-    def layers(self):
-        return self.model.layers
-
-    @property
-    def quant_predicate(self):
-        return LongcatFlashLM.quant_predicate.fget(self)
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
 
     @property
     def cast_predicate(self):
         return LongcatFlashLM.cast_predicate.fget(self)
 
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
+    @property
+    def quant_predicate(self):
+        return LongcatFlashLM.quant_predicate.fget(self)
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        LongcatFlashLM.shard(self, group)
+
+    @property
+    def layers(self):
+        return self.model.layers
 
     def make_cache(self):
         return [ArraysCache(size=1)] + [
             CacheList(KVCache(), KVCache()) for _ in self.model.layers
         ]
-
-    def shard(self, group: Optional[mx.distributed.Group] = None):
-        LongcatFlashLM.shard(self, group)

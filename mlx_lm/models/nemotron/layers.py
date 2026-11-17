@@ -18,18 +18,6 @@ __all__ = [
 ]
 
 
-@partial(mx.compile, shapeless=True)
-def relu_squared(x):
-    return nn.relu(x).square()
-
-
-class NemotronLayerNorm1P(nn.LayerNorm):
-    def __call__(self, x):
-        weight = self.weight + 1 if "weight" in self else None
-        bias = self.bias if "bias" in self else None
-        return mx.fast.layer_norm(x, weight, bias, self.eps)
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -92,6 +80,11 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
+@partial(mx.compile, shapeless=True)
+def relu_squared(x):
+    return nn.relu(x).square()
+
+
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -105,6 +98,13 @@ class MLP(nn.Module):
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(relu_squared(self.up_proj(x)))
+
+
+class NemotronLayerNorm1P(nn.LayerNorm):
+    def __call__(self, x):
+        weight = self.weight + 1 if "weight" in self else None
+        bias = self.bias if "bias" in self else None
+        return mx.fast.layer_norm(x, weight, bias, self.eps)
 
 
 class TransformerBlock(nn.Module):

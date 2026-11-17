@@ -51,11 +51,11 @@ class ShardedRMSNorm(nn.Module):
         self.group = group
         self.eps = eps
 
-    def _extra_repr(self):
-        return f"{self.weight.shape[0] * self.group.size()}, eps={self.eps}"
-
     def __call__(self, x):
         return sharded_rms_norm(self.group)(x, self["weight"], self.eps)
+
+    def _extra_repr(self):
+        return f"{self.weight.shape[0] * self.group.size()}, eps={self.eps}"
 
     @classmethod
     def from_rms_norm(

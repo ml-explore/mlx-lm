@@ -22,22 +22,16 @@ __all__ = [
 ]
 
 
-class RMSNorm(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-        offset: float = 1.0,
-    ) -> None:
-        super().__init__()
-        self.weight = mx.zeros(hidden_size)
-        self.variance_epsilon = eps
-        self.offset = offset
+def is_mamba(config: ModelArgs, i: int) -> bool:
+    if not config.mamba_enabled:
+        return False
+    assert config.mamba_step > 1
+    assert i < config.num_hidden_layers
 
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        return mx.fast.rms_norm(
-            hidden_states, self.weight + self.offset, self.variance_epsilon
-        )
+    if config.num_hidden_layers <= (config.mamba_step // 2):
+        # use attention in last layer
+        return i != config.num_hidden_layers - 1
+    return (i % config.mamba_step) != (config.mamba_step // 2)
 
 
 class Mamba(nn.Module):
@@ -82,6 +76,52 @@ class Mamba(nn.Module):
         self.C_norm_weight = mx.ones(self.d_state)
 
         self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array] = None,
+        cache=None,
+    ):
+        bsize, length, _ = hidden_states.shape
+
+        zx = self.in_proj(hidden_states)
+        zx = zx.reshape(bsize, length, self.num_heads, -1)
+        # z: (bsize, length, num_heads, hidden_size_per_head)
+        # x: (bsize, length, num_heads, hidden_size_per_head)
+        z, x = mx.split(
+            zx,
+            [
+                self.hidden_size_per_head,
+            ],
+            axis=-1,
+        )
+
+        x = x.reshape(bsize, -1, self.num_heads * self.hidden_size_per_head)
+        x = self._conv(x, cache, mask)
+
+        BCdt = self.bcdt_proj(x)
+        B, C, dt = mx.split(BCdt, [self.d_state, self.d_state * 2], axis=-1)
+
+        dt = mx.fast.rms_norm(dt, self.dt_norm_weight, self.config.rms_norm_eps)
+        B = mx.fast.rms_norm(B, self.B_norm_weight, self.config.rms_norm_eps)
+        C = mx.fast.rms_norm(C, self.C_norm_weight, self.config.rms_norm_eps)
+
+        # (bsize, length, num_heads)
+        dt = self.dt_proj(dt)
+        out = self._ssm(
+            x,
+            B,
+            C,
+            dt,
+            cache,
+            mask,
+        )
+        if cache:
+            cache.advance(out.shape[1])
+
+        out = swiglu(z.flatten(-2), out)
+        return self.out_proj(out)
 
     def _conv(
         self,
@@ -156,52 +196,6 @@ class Mamba(nn.Module):
         if cache:
             cache[1] = state
         return y.reshape(batch_size, seq_len, self.intermediate_size)
-
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        mask: Optional[mx.array] = None,
-        cache=None,
-    ):
-        bsize, length, _ = hidden_states.shape
-
-        zx = self.in_proj(hidden_states)
-        zx = zx.reshape(bsize, length, self.num_heads, -1)
-        # z: (bsize, length, num_heads, hidden_size_per_head)
-        # x: (bsize, length, num_heads, hidden_size_per_head)
-        z, x = mx.split(
-            zx,
-            [
-                self.hidden_size_per_head,
-            ],
-            axis=-1,
-        )
-
-        x = x.reshape(bsize, -1, self.num_heads * self.hidden_size_per_head)
-        x = self._conv(x, cache, mask)
-
-        BCdt = self.bcdt_proj(x)
-        B, C, dt = mx.split(BCdt, [self.d_state, self.d_state * 2], axis=-1)
-
-        dt = mx.fast.rms_norm(dt, self.dt_norm_weight, self.config.rms_norm_eps)
-        B = mx.fast.rms_norm(B, self.B_norm_weight, self.config.rms_norm_eps)
-        C = mx.fast.rms_norm(C, self.C_norm_weight, self.config.rms_norm_eps)
-
-        # (bsize, length, num_heads)
-        dt = self.dt_proj(dt)
-        out = self._ssm(
-            x,
-            B,
-            C,
-            dt,
-            cache,
-            mask,
-        )
-        if cache:
-            cache.advance(out.shape[1])
-
-        out = swiglu(z.flatten(-2), out)
-        return self.out_proj(out)
 
 
 class Attention(nn.Module):
@@ -293,6 +287,24 @@ class MLP(nn.Module):
         return self.down_proj(swiglu(hs[0], hs[1]))
 
 
+class RMSNorm(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        offset: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.weight = mx.zeros(hidden_size)
+        self.variance_epsilon = eps
+        self.offset = offset
+
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        return mx.fast.rms_norm(
+            hidden_states, self.weight + self.offset, self.variance_epsilon
+        )
+
+
 class PlamoDecoderLayer(nn.Module):
     def __init__(self, config: ModelArgs, is_mamba: bool) -> None:
         super().__init__()
@@ -345,18 +357,6 @@ class PlamoDecoderLayer(nn.Module):
         # Residual
         hidden_states_mlp = self.post_mlp_norm(hidden_states_mlp)
         return residual + hidden_states_mlp
-
-
-def is_mamba(config: ModelArgs, i: int) -> bool:
-    if not config.mamba_enabled:
-        return False
-    assert config.mamba_step > 1
-    assert i < config.num_hidden_layers
-
-    if config.num_hidden_layers <= (config.mamba_step // 2):
-        # use attention in last layer
-        return i != config.num_hidden_layers - 1
-    return (i % config.mamba_step) != (config.mamba_step // 2)
 
 
 class PlamoDecoder(nn.Module):

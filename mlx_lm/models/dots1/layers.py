@@ -21,6 +21,34 @@ __all__ = [
 ]
 
 
+class Dots1MLP(nn.Module):
+    def __init__(
+        self,
+        args: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+
+        self.hidden_size = args.hidden_size if hidden_size is None else hidden_size
+        self.intermediate_size = (
+            args.intermediate_size if intermediate_size is None else intermediate_size
+        )
+
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=args.mlp_bias
+        )
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
 class Dots1Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -138,34 +166,6 @@ class Dots1TopkRouter(nn.Module):
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
-
-
-class Dots1MLP(nn.Module):
-    def __init__(
-        self,
-        args: ModelArgs,
-        hidden_size: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-    ):
-        super().__init__()
-
-        self.hidden_size = args.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            args.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
-        )
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=args.mlp_bias
-        )
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Dots1MoE(nn.Module):

@@ -25,11 +25,6 @@ def _compute_gate(query: mx.array, weight: mx.array, bias: mx.array) -> mx.array
     return mx.sigmoid(gate_logits)
 
 
-@partial(mx.compile, shapeless=True)
-def _silu_mul(gate: mx.array, up: mx.array) -> mx.array:
-    return nn.silu(gate) * up
-
-
 class LoopGateProjection(nn.Module):
     def __init__(self, num_heads: int, head_dim: int):
         super().__init__()
@@ -89,6 +84,11 @@ class Attention(nn.Module):
         return scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
+
+
+@partial(mx.compile, shapeless=True)
+def _silu_mul(gate: mx.array, up: mx.array) -> mx.array:
+    return nn.silu(gate) * up
 
 
 class MLP(nn.Module):

@@ -71,9 +71,9 @@ class Model(nn.Module):
         out = self.model.embedding.as_linear(out)
         return out
 
-    def make_cache(self):
-        return [KVCache() for _ in range(len(self.model.layers))]
-
     @property
     def layers(self):
         return self.model.layers + self.model.kv_reuse_layers
+
+    def make_cache(self):
+        return [KVCache() for _ in range(len(self.model.layers))]

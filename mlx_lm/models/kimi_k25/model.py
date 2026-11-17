@@ -59,16 +59,16 @@ class Model(nn.Module):
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
-    def shard(self, group: Optional[mx.distributed.Group] = None):
-        shard_layers(self.model.language_model.layers, group or mx.distributed.init())
-
-    @property
-    def layers(self):
-        return self.model.language_model.pipeline_layers
-
     @property
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    def shard(self, group: Optional[mx.distributed.Group] = None):
+        shard_layers(self.model.language_model.layers, group or mx.distributed.init())
+
+    @property
+    def layers(self):
+        return self.model.language_model.pipeline_layers

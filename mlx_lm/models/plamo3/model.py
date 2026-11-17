@@ -55,19 +55,6 @@ class Model(nn.Module):
                 config.hidden_size, self.vocab_size, bias=False
             )
 
-    def sanitize(self, weights: dict[Any, Any]) -> dict[Any, Any]:
-        return checkpoint.sanitize(self, weights)
-
-    def make_cache(self):
-        caches = []
-        for layer in self.layers:
-            if layer.full_attn:
-                c = KVCache()
-            else:
-                c = RotatingKVCache(max_size=self.config.attention_window_size)
-            caches.append(c)
-        return caches
-
     def __call__(
         self,
         inputs: mx.array,
@@ -79,6 +66,19 @@ class Model(nn.Module):
             return self.model.embed_tokens.as_linear(outputs)
         return self.lm_head(outputs)
 
+    def sanitize(self, weights: dict[Any, Any]) -> dict[Any, Any]:
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers.layers
+
+    def make_cache(self):
+        caches = []
+        for layer in self.layers:
+            if layer.full_attn:
+                c = KVCache()
+            else:
+                c = RotatingKVCache(max_size=self.config.attention_window_size)
+            caches.append(c)
+        return caches

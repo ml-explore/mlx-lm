@@ -28,9 +28,9 @@ class Model(nn.Module):
         out = self.transformer(inputs, cache)
         return self.lm_head(out)
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.transformer.blocks
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)

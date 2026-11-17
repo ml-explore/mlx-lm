@@ -17,21 +17,6 @@ __all__ = [
 ]
 
 
-class ApertusMLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.up_proj = nn.Linear(
-            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
-        )
-        self.act_fn = XieLU()
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(self.act_fn(self.up_proj(x)))
-
-
 class ApertusAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -96,6 +81,21 @@ class ApertusAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+
+
+class ApertusMLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.up_proj = nn.Linear(
+            args.hidden_size, args.intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            args.intermediate_size, args.hidden_size, bias=args.mlp_bias
+        )
+        self.act_fn = XieLU()
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(self.act_fn(self.up_proj(x)))
 
 
 class ApertusDecoderLayer(nn.Module):

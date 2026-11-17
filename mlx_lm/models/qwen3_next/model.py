@@ -34,13 +34,6 @@ class Qwen3NextModel(PipelineMixin, nn.Module):
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
-    def pipeline(self, group, split=None):
-        super().pipeline(group, split=split)
-        # A rank always holds at least one layer, so at most one index is None.
-        layers = self.pipeline_layers
-        self.ssm_idx = next((e for e, l in enumerate(layers) if l.is_linear), None)
-        self.fa_idx = next((e for e, l in enumerate(layers) if not l.is_linear), None)
-
     def __call__(
         self,
         inputs: mx.array,
@@ -89,6 +82,13 @@ class Qwen3NextModel(PipelineMixin, nn.Module):
 
         return self.norm(hidden_states)
 
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
+        # A rank always holds at least one layer, so at most one index is None.
+        layers = self.pipeline_layers
+        self.ssm_idx = next((e for e, l in enumerate(layers) if l.is_linear), None)
+        self.fa_idx = next((e for e, l in enumerate(layers) if not l.is_linear), None)
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -111,13 +111,6 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
-    @property
-    def layers(self):
-        return self.model.pipeline_layers
-
-    def make_cache(self):
-        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
@@ -129,3 +122,10 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.pipeline_layers
+
+    def make_cache(self):
+        return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]

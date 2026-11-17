@@ -23,6 +23,11 @@ __all__ = [
 ]
 
 
+@partial(mx.compile, shapeless=True)
+def geglu(gate, x):
+    return nn.gelu_approx(gate) * x
+
+
 class RMSNormNoScale(nn.Module):
     """RMSNorm without learnable scale."""
 
@@ -32,90 +37,6 @@ class RMSNormNoScale(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return mx.fast.rms_norm(x, None, self.eps)
-
-
-@partial(mx.compile, shapeless=True)
-def geglu(gate, x):
-    return nn.gelu_approx(gate) * x
-
-
-class MLP(nn.Module):
-    def __init__(self, config: ModelArgs, layer_idx: int = 0):
-        super().__init__()
-        first_kv_shared_layer_idx = (
-            config.num_hidden_layers - config.num_kv_shared_layers
-        )
-        is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
-        use_double_wide = config.use_double_wide_mlp and is_kv_shared_layer
-        intermediate_size = config.intermediate_size * (2 if use_double_wide else 1)
-
-        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
-        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(geglu(self.gate_proj(x), self.up_proj(x)))
-
-
-class Router(nn.Module):
-    """Expert router: norm -> scale -> project -> top-k -> renormalize."""
-
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.config = config
-        self.eps = config.rms_norm_eps
-        self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
-        self.scale = mx.ones((config.hidden_size,))
-        self.per_expert_scale = mx.ones((config.num_experts,))
-        self._root_size = config.hidden_size**-0.5
-
-    def __call__(self, x: mx.array):
-        x = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
-
-        expert_scores = self.proj(x)
-
-        top_k_indices = mx.argpartition(
-            expert_scores, kth=-self.config.top_k_experts, axis=-1
-        )
-        top_k_indices = mx.stop_gradient(
-            top_k_indices[..., -self.config.top_k_experts :]
-        )
-
-        top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
-        top_k_weights = mx.softmax(top_k_weights, axis=-1)
-        top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
-
-        return top_k_indices, top_k_weights
-
-
-class GeGLU(nn.Module):
-    """GELU-gated linear unit activation for SwitchGLU."""
-
-    def __call__(self, x, gate):
-        return geglu(gate, x)
-
-
-class Experts(nn.Module):
-    """Sparse MoE using SwitchGLU with gather_mm."""
-
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-
-        self.switch_glu = SwitchGLU(
-            input_dims=config.hidden_size,
-            hidden_dims=config.moe_intermediate_size,
-            num_experts=config.num_experts,
-            activation=GeGLU(),
-            bias=False,
-        )
-
-    def __call__(
-        self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
-    ) -> mx.array:
-        w = mx.expand_dims(top_k_weights, -1)
-        y = self.switch_glu(x, top_k_indices)
-
-        return (w * y).sum(-2)
 
 
 class Attention(nn.Module):
@@ -219,6 +140,85 @@ class Attention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(output), (keys, values), offset
+
+
+class MLP(nn.Module):
+    def __init__(self, config: ModelArgs, layer_idx: int = 0):
+        super().__init__()
+        first_kv_shared_layer_idx = (
+            config.num_hidden_layers - config.num_kv_shared_layers
+        )
+        is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        use_double_wide = config.use_double_wide_mlp and is_kv_shared_layer
+        intermediate_size = config.intermediate_size * (2 if use_double_wide else 1)
+
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(geglu(self.gate_proj(x), self.up_proj(x)))
+
+
+class Router(nn.Module):
+    """Expert router: norm -> scale -> project -> top-k -> renormalize."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.config = config
+        self.eps = config.rms_norm_eps
+        self.proj = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.scale = mx.ones((config.hidden_size,))
+        self.per_expert_scale = mx.ones((config.num_experts,))
+        self._root_size = config.hidden_size**-0.5
+
+    def __call__(self, x: mx.array):
+        x = mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)
+
+        expert_scores = self.proj(x)
+
+        top_k_indices = mx.argpartition(
+            expert_scores, kth=-self.config.top_k_experts, axis=-1
+        )
+        top_k_indices = mx.stop_gradient(
+            top_k_indices[..., -self.config.top_k_experts :]
+        )
+
+        top_k_weights = mx.take_along_axis(expert_scores, top_k_indices, axis=-1)
+        top_k_weights = mx.softmax(top_k_weights, axis=-1)
+        top_k_weights = top_k_weights * self.per_expert_scale[top_k_indices]
+
+        return top_k_indices, top_k_weights
+
+
+class GeGLU(nn.Module):
+    """GELU-gated linear unit activation for SwitchGLU."""
+
+    def __call__(self, x, gate):
+        return geglu(gate, x)
+
+
+class Experts(nn.Module):
+    """Sparse MoE using SwitchGLU with gather_mm."""
+
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+
+        self.switch_glu = SwitchGLU(
+            input_dims=config.hidden_size,
+            hidden_dims=config.moe_intermediate_size,
+            num_experts=config.num_experts,
+            activation=GeGLU(),
+            bias=False,
+        )
+
+    def __call__(
+        self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
+    ) -> mx.array:
+        w = mx.expand_dims(top_k_weights, -1)
+        y = self.switch_glu(x, top_k_indices)
+
+        return (w * y).sum(-2)
 
 
 class DecoderLayer(nn.Module):

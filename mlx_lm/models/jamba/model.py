@@ -72,21 +72,8 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
-    def make_cache(self):
-        caches = []
-        for layer in self.model.layers:
-            if layer.is_attn:
-                caches.append(KVCache())
-            else:
-                caches.append(ArraysCache(size=2))
-        return caches
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
-
-    @property
-    def layers(self):
-        return self.model.layers
 
     @property
     def quant_predicate(self):
@@ -96,3 +83,16 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        caches = []
+        for layer in self.model.layers:
+            if layer.is_attn:
+                caches.append(KVCache())
+            else:
+                caches.append(ArraysCache(size=2))
+        return caches

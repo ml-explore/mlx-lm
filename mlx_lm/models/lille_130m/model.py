@@ -28,9 +28,9 @@ class Model(nn.Module):
     ) -> mx.array:
         return self.transformer(inputs, cache=cache)
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.transformer.layers
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)

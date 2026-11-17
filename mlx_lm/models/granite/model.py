@@ -68,10 +68,6 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out / self.logits_scaling
 
-    @property
-    def layers(self):
-        return self.model.layers
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
@@ -90,3 +86,7 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers

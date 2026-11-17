@@ -32,12 +32,12 @@ class Model(nn.Module):
             logits = mx.tanh(logits / c) * c
         return logits
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
 
     def make_cache(self):
         cache = []

@@ -13,24 +13,6 @@ __all__ = [
 ]
 
 
-def norm_gain(weight: mx.array) -> mx.array:
-    return (1.0 + weight.astype(mx.float32)).astype(mx.bfloat16)
-
-
-def interleave_rope_rows(w: mx.array, head_dim: int) -> mx.array:
-    """Hugging Face orders the q and k rows of a head for RoPE pairs (i, i +
-    head_dim / 2). The model pairs neighbor rows (2i, 2i + 1)."""
-    shape = w.shape
-    w = w.reshape(-1, 2, head_dim // 2, *shape[1:])
-    return mx.swapaxes(w, 1, 2).reshape(shape)
-
-
-_UNUSED_QUANT_TENSORS = (
-    "mlp.experts.gate_up_proj_input_scale",
-    "mlp.experts.down_proj_input_scale",
-)
-
-
 # Norm weights the checkpoint stores centered at zero; sanitize stores the gain.
 _ZERO_CENTERED_NORMS = (
     "input_layernorm.weight",
@@ -41,6 +23,10 @@ _ZERO_CENTERED_NORMS = (
 )
 
 
+def norm_gain(weight: mx.array) -> mx.array:
+    return (1.0 + weight.astype(mx.float32)).astype(mx.bfloat16)
+
+
 _NVFP4_E2M1_MAX = 6.0
 
 
@@ -48,6 +34,20 @@ _NVFP4_E4M3_MAX = 448.0
 
 
 _NVFP4_SCALE_2_TO_GLOBAL = _NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX
+
+
+_UNUSED_QUANT_TENSORS = (
+    "mlp.experts.gate_up_proj_input_scale",
+    "mlp.experts.down_proj_input_scale",
+)
+
+
+def interleave_rope_rows(w: mx.array, head_dim: int) -> mx.array:
+    """Hugging Face orders the q and k rows of a head for RoPE pairs (i, i +
+    head_dim / 2). The model pairs neighbor rows (2i, 2i + 1)."""
+    shape = w.shape
+    w = w.reshape(-1, 2, head_dim // 2, *shape[1:])
+    return mx.swapaxes(w, 1, 2).reshape(shape)
 
 
 def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:

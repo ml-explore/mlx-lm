@@ -20,6 +20,25 @@ __all__ = [
 ]
 
 
+class MLP(nn.Module):
+    def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
+        super().__init__()
+
+        dim = args.hidden_size
+        hidden_dim = (
+            intermediate_size
+            if intermediate_size is not None
+            else args.intermediate_size
+        )
+
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, is_local_attention: bool = False):
         super().__init__()
@@ -107,25 +126,6 @@ class Attention(nn.Module):
         output = output * gate
 
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
-        super().__init__()
-
-        dim = args.hidden_size
-        hidden_dim = (
-            intermediate_size
-            if intermediate_size is not None
-            else args.intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class MoERouter(nn.Module):

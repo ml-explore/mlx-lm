@@ -62,10 +62,6 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
-    @property
-    def layers(self):
-        return self.model.layers
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
@@ -75,3 +71,7 @@ class Model(nn.Module):
             return "e_score_correction_bias" not in k and "mlp.gate.weight" not in k
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers

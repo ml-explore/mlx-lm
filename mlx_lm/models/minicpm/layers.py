@@ -17,17 +17,6 @@ __all__ = [
 ]
 
 
-class MLP(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-
-    def __call__(self, x):
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -95,6 +84,17 @@ class Attention(nn.Module):
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
         return self.o_proj(attn_output)
+
+
+class MLP(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+    def __call__(self, x):
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class DecoderLayer(nn.Module):

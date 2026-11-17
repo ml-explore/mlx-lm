@@ -16,6 +16,22 @@ _ZERO_CENTERED_NORMS = (
 )
 
 
+def _upgrade_mlx_layout(weights):
+    """A checkpoint that mlx-lm or mlx-vlm converted with the language model under
+    language_model, the experts under switch_mlp and the norms storing 1 + weight."""
+    upgraded = {}
+    for k, v in weights.items():
+        if k.startswith("vision_tower."):
+            continue
+        if k.startswith("language_model.model."):
+            k = "model.language_model." + k.removeprefix("language_model.model.")
+        else:
+            k = k.removeprefix("language_model.")
+        k = k.replace(".switch_mlp.", ".experts.")
+        upgraded[k] = v - 1.0 if k.endswith(_ZERO_CENTERED_NORMS) else v
+    return upgraded
+
+
 def sanitize(model, weights):
     if any(k.startswith("language_model.") for k in weights):
         weights = _upgrade_mlx_layout(weights)
@@ -38,19 +54,3 @@ def sanitize(model, weights):
         elif k.endswith(".experts.down_proj"):
             weights[f"{k}.weight"] = weights.pop(k)
     return weights
-
-
-def _upgrade_mlx_layout(weights):
-    """A checkpoint that mlx-lm or mlx-vlm converted with the language model under
-    language_model, the experts under switch_mlp and the norms storing 1 + weight."""
-    upgraded = {}
-    for k, v in weights.items():
-        if k.startswith("vision_tower."):
-            continue
-        if k.startswith("language_model.model."):
-            k = "model.language_model." + k.removeprefix("language_model.model.")
-        else:
-            k = k.removeprefix("language_model.")
-        k = k.replace(".switch_mlp.", ".experts.")
-        upgraded[k] = v - 1.0 if k.endswith(_ZERO_CENTERED_NORMS) else v
-    return upgraded

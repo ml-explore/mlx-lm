@@ -162,12 +162,12 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
-    @property
-    def layers(self):
-        return self.model.pipeline_layers
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         shard_layers(self.model.layers, group or mx.distributed.init())
+
+    @property
+    def layers(self):
+        return self.model.pipeline_layers

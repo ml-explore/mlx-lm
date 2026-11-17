@@ -23,13 +23,6 @@ __all__ = [
 ]
 
 
-@partial(mx.compile, shapeless=True)
-def aggregate_expert_outputs(expert_outputs, scores):
-    return (
-        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
-    )
-
-
 class BailingMoeMLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -203,6 +196,13 @@ class BailingMoeGate(nn.Module):
             self.norm_topk_prob,
             self.score_function,
         )
+
+
+@partial(mx.compile, shapeless=True)
+def aggregate_expert_outputs(expert_outputs, scores):
+    return (
+        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
+    )
 
 
 class BailingMoeSparseMoeBlock(nn.Module):

@@ -36,9 +36,6 @@ class DynamicNTKScalingRoPE(nn.Module):
         self.traditional = traditional
         self.scale = scale
 
-    def extra_repr(self):
-        return f"{self.dims}, traditional={self.traditional}, max_position_embeddings={self.max_position_embeddings}, scaling_factor={self.scaling_factor}"
-
     def __call__(self, x, offset: int = 0):
         seq_len = x.shape[1] + offset
         if seq_len > self.max_position_embeddings:
@@ -56,6 +53,9 @@ class DynamicNTKScalingRoPE(nn.Module):
             scale=self.scale,
             offset=offset,
         )
+
+    def extra_repr(self):
+        return f"{self.dims}, traditional={self.traditional}, max_position_embeddings={self.max_position_embeddings}, scaling_factor={self.scaling_factor}"
 
 
 class Attention(nn.Module):

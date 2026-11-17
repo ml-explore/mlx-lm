@@ -89,26 +89,11 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
-    def layers(self):
-        return self.model.layers
-
-    @property
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k
 
         return predicate
-
-    def make_cache(self):
-        caches = []
-        for layer in self.layers:
-            if layer.is_sliding_window:
-                caches.append(
-                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
-                )
-            else:
-                caches.append(KVCache())
-        return caches
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -165,3 +150,18 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        caches = []
+        for layer in self.layers:
+            if layer.is_sliding_window:
+                caches.append(
+                    RotatingKVCache(max_size=self.args.sliding_window, keep=0)
+                )
+            else:
+                caches.append(KVCache())
+        return caches

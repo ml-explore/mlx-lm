@@ -21,6 +21,17 @@ __all__ = [
 ]
 
 
+class MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
 class RMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6):
         super().__init__()
@@ -82,29 +93,6 @@ class GatedDeltaNet(nn.Module):
 
         self.o_norm = RMSNormGated(self.head_v_dim, eps=args.layer_norm_epsilon)
 
-    def _apply_conv1d(
-        self,
-        x: mx.array,
-        conv: nn.Conv1d,
-        conv_state: Optional[mx.array],
-        cache_slot: Optional[Any],
-        slot_idx: int,
-    ) -> mx.array:
-        B, S, D = x.shape
-        n_keep = self.conv_kernel_size - 1
-
-        if conv_state is not None:
-            padded = mx.concatenate([conv_state, x], axis=1)
-        else:
-            padded = mx.concatenate(
-                [mx.zeros((B, n_keep, D), dtype=x.dtype), x], axis=1
-            )
-
-        if cache_slot is not None:
-            cache_slot[slot_idx] = mx.contiguous(padded[:, -n_keep:, :])
-
-        return nn.silu(conv(padded))
-
     def __call__(
         self,
         x: mx.array,
@@ -157,6 +145,50 @@ class GatedDeltaNet(nn.Module):
         out = out.reshape(B, S, -1)
 
         return self.o_proj(out)
+
+    def _apply_conv1d(
+        self,
+        x: mx.array,
+        conv: nn.Conv1d,
+        conv_state: Optional[mx.array],
+        cache_slot: Optional[Any],
+        slot_idx: int,
+    ) -> mx.array:
+        B, S, D = x.shape
+        n_keep = self.conv_kernel_size - 1
+
+        if conv_state is not None:
+            padded = mx.concatenate([conv_state, x], axis=1)
+        else:
+            padded = mx.concatenate(
+                [mx.zeros((B, n_keep, D), dtype=x.dtype), x], axis=1
+            )
+
+        if cache_slot is not None:
+            cache_slot[slot_idx] = mx.contiguous(padded[:, -n_keep:, :])
+
+        return nn.silu(conv(padded))
+
+
+class LinearAttentionDecoderLayer(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.linear_attn = GatedDeltaNet(args)
+        self.mlp = MLP(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        h = x + self.linear_attn(self.input_layernorm(x), mask=mask, cache=cache)
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
 
 
 class Attention(nn.Module):
@@ -229,38 +261,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class MLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
-
-
-class LinearAttentionDecoderLayer(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.linear_attn = GatedDeltaNet(args)
-        self.mlp = MLP(args)
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            args.hidden_size, eps=args.rms_norm_eps
-        )
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        h = x + self.linear_attn(self.input_layernorm(x), mask=mask, cache=cache)
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
 
 
 class FullAttentionDecoderLayer(nn.Module):

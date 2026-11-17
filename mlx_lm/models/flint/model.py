@@ -86,6 +86,13 @@ class Model(nn.Module):
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            return not path.endswith("mlp.gate")
+
+        return predicate
+
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
@@ -132,10 +139,3 @@ class Model(nn.Module):
             )
             for layer in self.layers
         ]
-
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            return not path.endswith("mlp.gate")
-
-        return predicate

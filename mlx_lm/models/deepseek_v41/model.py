@@ -23,16 +23,6 @@ __all__ = [
 ]
 
 
-def _window_indices(*, previous: int, length: int, window: int) -> mx.array:
-    """The window rows each query attends to, -1 for none. The window holds
-    the previous rows, then the new ones."""
-    width = min(window, previous + length)
-    end = previous + mx.arange(length)
-    start = mx.maximum(end - window + 1, 0)
-    indices = start[:, None] + mx.arange(width)[None, :]
-    return mx.where(indices > end[:, None], -1, indices)
-
-
 def _shared_reads(args: ModelArgs, layer: int) -> dict[str, int]:
     """The shared state a layer reads, as {key: layer that writes it}."""
     ratios = args.compress_ratios
@@ -54,17 +44,6 @@ def _shared_reads(args: ModelArgs, layer: int) -> dict[str, int]:
     return {key: source for key, source in reads.items() if source is not None}
 
 
-def _crossing(args: ModelArgs, boundary: int) -> dict[str, int]:
-    """The shared state that layers from `boundary` on read from layers before
-    it, as {key: layer that writes it}."""
-    crossing = {}
-    for layer in range(boundary, args.num_hidden_layers):
-        for key, source in _shared_reads(args, layer).items():
-            if source < boundary:
-                crossing[key] = source
-    return crossing
-
-
 def _entries(args: ModelArgs, source: Optional[int], position: int) -> int:
     """The compressed entries of kv source `source` after `position` tokens."""
     return position // args.compress_ratios[source] if source is not None else 0
@@ -77,6 +56,16 @@ def _index_keys(args: ModelArgs, layer: int, position: int) -> int:
 
 # The shared state that grows each step, kept in the LayerCache field of that name.
 _CACHE_FIELDS = ("compress_kv", "index_k")
+
+
+def _window_indices(*, previous: int, length: int, window: int) -> mx.array:
+    """The window rows each query attends to, -1 for none. The window holds
+    the previous rows, then the new ones."""
+    width = min(window, previous + length)
+    end = previous + mx.arange(length)
+    start = mx.maximum(end - window + 1, 0)
+    indices = start[:, None] + mx.arange(width)[None, :]
+    return mx.where(indices > end[:, None], -1, indices)
 
 
 def _layout(
@@ -125,17 +114,6 @@ def _nbytes(shape: tuple[int, ...], dtype: mx.Dtype) -> int:
     return (size + _ALIGN - 1) // _ALIGN * _ALIGN
 
 
-def _pack(parts: list[mx.array]) -> mx.array:
-    """The bytes of all parts in one array: two sends can run in a different
-    order than the two receives on the other rank."""
-    data = []
-    for part in parts:
-        flat = part.view(mx.uint8).reshape(-1)
-        pad = _nbytes(part.shape, part.dtype) - flat.size
-        data.append(mx.pad(flat, (0, pad)) if pad else flat)
-    return mx.concatenate(data)
-
-
 def _unpack(
     packed: mx.array, layout: list[tuple[str, tuple[int, ...], mx.Dtype]]
 ) -> dict[str, mx.array]:
@@ -148,6 +126,28 @@ def _unpack(
     return parts
 
 
+def _pack(parts: list[mx.array]) -> mx.array:
+    """The bytes of all parts in one array: two sends can run in a different
+    order than the two receives on the other rank."""
+    data = []
+    for part in parts:
+        flat = part.view(mx.uint8).reshape(-1)
+        pad = _nbytes(part.shape, part.dtype) - flat.size
+        data.append(mx.pad(flat, (0, pad)) if pad else flat)
+    return mx.concatenate(data)
+
+
+def _crossing(args: ModelArgs, boundary: int) -> dict[str, int]:
+    """The shared state that layers from `boundary` on read from layers before
+    it, as {key: layer that writes it}."""
+    crossing = {}
+    for layer in range(boundary, args.num_hidden_layers):
+        for key, source in _shared_reads(args, layer).items():
+            if source < boundary:
+                crossing[key] = source
+    return crossing
+
+
 class TextModel(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -156,12 +156,51 @@ class TextModel(PipelineMixin, nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.args = args
 
-    def pipeline(
-        self, group: mx.distributed.Group, split: Optional[list[int]] = None
-    ) -> None:
-        super().pipeline(group, split)
-        self._shared_in = _crossing(self.args, self.start_idx)
-        self._shared_out = _crossing(self.args, self.end_idx)
+    def __call__(
+        self, inputs: mx.array, cache: Optional[list[LayerCache]] = None
+    ) -> mx.array:
+        h = self.embed_tokens(inputs)
+        batch, length, _ = h.shape
+        layers = self.pipeline_layers
+        cache = cache or self.make_cache()
+        start_pos = cache[0].offset
+        # Every layer's window holds the same rows, so all use the same indices.
+        previous = 0 if cache[0].window is None else cache[0].window.shape[1]
+        window_idx = _window_indices(
+            previous=previous, length=length, window=self.args.sliding_window
+        )
+        window_idx = mx.broadcast_to(window_idx, (batch, *window_idx.shape))
+
+        streams = mx.broadcast_to(
+            h[:, :, None, :], (batch, length, self.args.hc_mult, self.args.hidden_size)
+        )
+        pre_mix = mx.zeros((batch, length, self.args.hc_mult), dtype=mx.float32)
+        pre_mix[..., 0] = 1.0
+        rank, size = self.pipeline_rank, self.pipeline_size
+        shared = {}
+        if rank < size - 1:
+            streams, pre_mix = self._receive(streams, start_pos, cache[0], shared)
+
+        for layer, layer_cache in zip(layers, cache, strict=True):
+            streams, pre_mix = layer(
+                streams,
+                pre_mix,
+                start_pos=start_pos,
+                window_idx=window_idx,
+                cache=layer_cache,
+                shared=shared,
+            )
+
+        if rank > 0:
+            sent = self._send(streams, pre_mix, start_pos, shared)
+            streams, pre_mix = mx.depends([streams, pre_mix], sent)
+            # Prefill only evaluates the cache, which must still send.
+            cache[-1].window = mx.depends(cache[-1].window, sent)
+        out = _collapse(streams, pre_mix)
+        if size > 1:
+            # Rank 0 runs the last layers, and every rank needs its output.
+            out = mx.distributed.all_gather(out)[:batch]
+        return self.norm(out)
 
     def make_cache(self) -> list[LayerCache]:
         return [LayerCache(self.args.sliding_window) for _ in self.pipeline_layers]
@@ -230,51 +269,12 @@ class TextModel(PipelineMixin, nn.Module):
             parts.append(part)
         return mx.distributed.send(_pack(parts), self.pipeline_rank - 1)
 
-    def __call__(
-        self, inputs: mx.array, cache: Optional[list[LayerCache]] = None
-    ) -> mx.array:
-        h = self.embed_tokens(inputs)
-        batch, length, _ = h.shape
-        layers = self.pipeline_layers
-        cache = cache or self.make_cache()
-        start_pos = cache[0].offset
-        # Every layer's window holds the same rows, so all use the same indices.
-        previous = 0 if cache[0].window is None else cache[0].window.shape[1]
-        window_idx = _window_indices(
-            previous=previous, length=length, window=self.args.sliding_window
-        )
-        window_idx = mx.broadcast_to(window_idx, (batch, *window_idx.shape))
-
-        streams = mx.broadcast_to(
-            h[:, :, None, :], (batch, length, self.args.hc_mult, self.args.hidden_size)
-        )
-        pre_mix = mx.zeros((batch, length, self.args.hc_mult), dtype=mx.float32)
-        pre_mix[..., 0] = 1.0
-        rank, size = self.pipeline_rank, self.pipeline_size
-        shared = {}
-        if rank < size - 1:
-            streams, pre_mix = self._receive(streams, start_pos, cache[0], shared)
-
-        for layer, layer_cache in zip(layers, cache, strict=True):
-            streams, pre_mix = layer(
-                streams,
-                pre_mix,
-                start_pos=start_pos,
-                window_idx=window_idx,
-                cache=layer_cache,
-                shared=shared,
-            )
-
-        if rank > 0:
-            sent = self._send(streams, pre_mix, start_pos, shared)
-            streams, pre_mix = mx.depends([streams, pre_mix], sent)
-            # Prefill only evaluates the cache, which must still send.
-            cache[-1].window = mx.depends(cache[-1].window, sent)
-        out = _collapse(streams, pre_mix)
-        if size > 1:
-            # Rank 0 runs the last layers, and every rank needs its output.
-            out = mx.distributed.all_gather(out)[:batch]
-        return self.norm(out)
+    def pipeline(
+        self, group: mx.distributed.Group, split: Optional[list[int]] = None
+    ) -> None:
+        super().pipeline(group, split)
+        self._shared_in = _crossing(self.args, self.start_idx)
+        self._shared_out = _crossing(self.args, self.end_idx)
 
 
 class Model(nn.Module):
@@ -290,12 +290,24 @@ class Model(nn.Module):
     ) -> mx.array:
         return self.lm_head(self.model(inputs, cache))
 
-    @property
-    def layers(self) -> list[DecoderLayer]:
-        return self.model.pipeline_layers
+    def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
+        return checkpoint.sanitize(self, weights)
 
-    def make_cache(self) -> list[LayerCache]:
-        return self.model.make_cache()
+    @property
+    def cast_predicate(self) -> Callable[[str], bool]:
+        # The reference runtime keeps these in float32.
+        keep = (
+            "attn_hc.",
+            "ffn_hc.",
+            "sinks",
+            "e_score_correction_bias",
+            "compressor.",
+        )
+
+        def predicate(k: str) -> bool:
+            return not any(s in k for s in keep)
+
+        return predicate
 
     def shard(self, group: Optional[mx.distributed.Group] = None) -> None:
         group = group or mx.distributed.init()
@@ -323,21 +335,9 @@ class Model(nn.Module):
                 shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
                 shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
 
-    def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
-        return checkpoint.sanitize(self, weights)
-
     @property
-    def cast_predicate(self) -> Callable[[str], bool]:
-        # The reference runtime keeps these in float32.
-        keep = (
-            "attn_hc.",
-            "ffn_hc.",
-            "sinks",
-            "e_score_correction_bias",
-            "compressor.",
-        )
+    def layers(self) -> list[DecoderLayer]:
+        return self.model.pipeline_layers
 
-        def predicate(k: str) -> bool:
-            return not any(s in k for s in keep)
-
-        return predicate
+    def make_cache(self) -> list[LayerCache]:
+        return self.model.make_cache()

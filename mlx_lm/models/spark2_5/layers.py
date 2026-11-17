@@ -145,10 +145,6 @@ class TransformerBlock(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
 
-    @property
-    def is_sliding(self) -> bool:
-        return self.self_attn.is_sliding
-
     def __call__(
         self,
         x: mx.array,
@@ -159,3 +155,7 @@ class TransformerBlock(nn.Module):
         hidden_states = x + attention_output
         mlp_output = self.mlp(self.post_attention_layernorm(hidden_states))
         return hidden_states + mlp_output
+
+    @property
+    def is_sliding(self) -> bool:
+        return self.self_attn.is_sliding

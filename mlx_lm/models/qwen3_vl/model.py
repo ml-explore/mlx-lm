@@ -53,12 +53,14 @@ class Model(nn.Module):
             return language_model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
-    @property
-    def layers(self):
-        return self.model.language_model.layers
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
+
+    @property
+    def quant_predicate(self):
+        if isinstance(self.args.text, Qwen3MoeArgs):
+            return moe_quant_predicate
+        return None
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -68,7 +70,5 @@ class Model(nn.Module):
             shard_qwen3_layers(self.layers, group)
 
     @property
-    def quant_predicate(self):
-        if isinstance(self.args.text, Qwen3MoeArgs):
-            return moe_quant_predicate
-        return None
+    def layers(self):
+        return self.model.language_model.layers

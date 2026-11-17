@@ -25,15 +25,6 @@ __all__ = [
 ]
 
 
-def _is_kda_layer(
-    layer_index: int, layer_group_size: int, num_hidden_layers: int
-) -> bool:
-    return not (
-        (layer_index + 1) % layer_group_size == 0
-        or layer_index >= num_hidden_layers // layer_group_size * layer_group_size
-    )
-
-
 class BailingMLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: int):
         super().__init__()
@@ -45,75 +36,132 @@ class BailingMLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
-def _group_expert_select(
-    logits: mx.array,
-    expert_bias: mx.array,
-    top_k: int,
-    n_group: int,
-    topk_group: int,
-    routed_scaling_factor: float,
-) -> tuple[mx.array, mx.array]:
-    scores = mx.sigmoid(logits.astype(mx.float32))
-    routing_scores = scores + expert_bias
-    routing_scores = mx.unflatten(routing_scores, axis=-1, shape=(n_group, -1))
-    group_scores = mx.topk(routing_scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-    groups_to_mask = n_group - topk_group
-    group_idx = mx.argpartition(group_scores, kth=groups_to_mask - 1, axis=-2)[
-        ..., :groups_to_mask, :
-    ]
-    routing_scores = mx.put_along_axis(
-        routing_scores,
-        mx.stop_gradient(group_idx),
-        mx.array(float("-inf")),
-        axis=-2,
+def _is_kda_layer(
+    layer_index: int, layer_group_size: int, num_hidden_layers: int
+) -> bool:
+    return not (
+        (layer_index + 1) % layer_group_size == 0
+        or layer_index >= num_hidden_layers // layer_group_size * layer_group_size
     )
-    routing_scores = mx.flatten(routing_scores, -2, -1)
-    indices = mx.argpartition(-routing_scores, kth=top_k - 1, axis=-1)[..., :top_k]
-    indices = mx.stop_gradient(indices)
-    selected = mx.take_along_axis(scores, indices, axis=-1)
-    selected = selected / (selected.sum(axis=-1, keepdims=True) + 1e-20)
-    return indices, selected * routed_scaling_factor
 
 
-class BailingGate(nn.Module):
+class BailingKDA(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        self.top_k = args.num_experts_per_tok
-        self.n_group = args.n_group
-        self.topk_group = args.topk_group
-        self.routed_scaling_factor = args.routed_scaling_factor
-        self.weight = mx.zeros((args.num_experts, args.hidden_size))
-        self.expert_bias = mx.zeros((args.num_experts,))
+        if not args.no_kda_lora:
+            raise ValueError("Bailing V3 MLX currently requires no_kda_lora=true")
+        if not args.kda_safe_gate:
+            raise ValueError("Bailing V3 MLX currently requires kda_safe_gate=true")
+        self.num_heads = args.num_attention_heads
+        self.head_dim = args.head_dim
+        self.projection_size = self.num_heads * self.head_dim
+        self.conv_kernel_size = args.short_conv_kernel_size
+        self.lower_bound = args.kda_lower_bound
+        self.rms_norm_eps = args.rms_norm_eps
 
-    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
-        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
-        return _group_expert_select(
-            logits,
-            self.expert_bias,
-            self.top_k,
-            self.n_group,
-            self.topk_group,
-            self.routed_scaling_factor,
+        self.q_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.k_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.v_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.q_conv1d = nn.Conv1d(
+            self.projection_size,
+            self.projection_size,
+            self.conv_kernel_size,
+            groups=self.projection_size,
+            bias=False,
+            padding=0,
         )
-
-
-class BailingSparseMoE(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.gate = BailingGate(args)
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.moe_intermediate_size,
-            args.num_experts,
+        self.k_conv1d = nn.Conv1d(
+            self.projection_size,
+            self.projection_size,
+            self.conv_kernel_size,
+            groups=self.projection_size,
+            bias=False,
+            padding=0,
         )
-        shared_size = args.moe_shared_expert_intermediate_size * args.num_shared_experts
-        self.shared_experts = BailingMLP(args, shared_size)
+        self.v_conv1d = nn.Conv1d(
+            self.projection_size,
+            self.projection_size,
+            self.conv_kernel_size,
+            groups=self.projection_size,
+            bias=False,
+            padding=0,
+        )
+        self.A_log = mx.zeros((self.num_heads,), dtype=mx.float32)
+        self.f_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.dt_bias = mx.zeros((self.projection_size,), dtype=mx.float32)
+        self.b_proj = nn.Linear(args.hidden_size, self.num_heads, bias=False)
+        self.g_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
+        self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.o_proj = nn.Linear(self.projection_size, args.hidden_size, bias=False)
 
-    def __call__(self, x: mx.array) -> mx.array:
-        indices, scores = self.gate(x)
-        routed = self.switch_mlp(x, indices)
-        routed = (routed * scores[..., None]).sum(axis=-2).astype(x.dtype)
-        return routed + self.shared_experts(x)
+    def __call__(
+        self,
+        x: mx.array,
+        mask: mx.array | None = None,
+        cache: ArraysCache | None = None,
+    ) -> mx.array:
+        batch, length, _ = x.shape
+        q = self._causal_conv(self.q_proj(x), self.q_conv1d, cache, 0, mask)
+        k = self._causal_conv(self.k_proj(x), self.k_conv1d, cache, 1, mask)
+        v = self._causal_conv(self.v_proj(x), self.v_conv1d, cache, 2, mask)
+        q = q.reshape(batch, length, self.num_heads, self.head_dim)
+        k = k.reshape(batch, length, self.num_heads, self.head_dim)
+        v = v.reshape(batch, length, self.num_heads, self.head_dim)
+
+        q, k = normalize_qk(q, k, inv_scale=self.head_dim**-0.5, eps=1e-6)
+
+        raw_gate = self.f_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
+        state = None if cache is None else cache[3]
+        output, state = gated_delta_update(
+            q,
+            k,
+            v,
+            raw_gate,
+            self.b_proj(x).astype(mx.float32),
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=state,
+            mask=mask,
+            use_kernel=not self.training,
+            lower_bound=self.lower_bound,
+        )
+        if cache is not None:
+            cache[3] = state
+            cache.advance(length)
+
+        output_gate = self.g_proj(x).reshape(
+            batch, length, self.num_heads, self.head_dim
+        )
+        output = self.o_norm(output)
+        output = output * mx.sigmoid(output_gate.astype(mx.float32)).astype(
+            output.dtype
+        )
+        return self.o_proj(output.reshape(batch, length, -1))
+
+    def _causal_conv(
+        self,
+        x: mx.array,
+        conv: nn.Conv1d,
+        cache: ArraysCache | None,
+        cache_index: int,
+        mask: mx.array | None,
+    ) -> mx.array:
+        batch, length, dim = x.shape
+        if mask is not None:
+            x = mx.where(mask[..., None], x, 0)
+        previous = None if cache is None else cache[cache_index]
+        if previous is None:
+            previous = mx.zeros((batch, self.conv_kernel_size - 1, dim), dtype=x.dtype)
+        conv_input = mx.concatenate([previous, x], axis=1)
+        if cache is not None:
+            keep = self.conv_kernel_size - 1
+            if cache.lengths is not None:
+                ends = mx.clip(cache.lengths, 0, length)
+                positions = (ends[:, None] + mx.arange(keep))[..., None]
+                cache[cache_index] = mx.take_along_axis(conv_input, positions, axis=1)
+            else:
+                cache[cache_index] = mx.contiguous(conv_input[:, -keep:, :])
+        return nn.silu(conv(conv_input))
 
 
 class BailingMLA(nn.Module):
@@ -235,123 +283,75 @@ class BailingMLA(nn.Module):
         return self.dense(output.reshape(batch, length, -1))
 
 
-class BailingKDA(nn.Module):
+def _group_expert_select(
+    logits: mx.array,
+    expert_bias: mx.array,
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+) -> tuple[mx.array, mx.array]:
+    scores = mx.sigmoid(logits.astype(mx.float32))
+    routing_scores = scores + expert_bias
+    routing_scores = mx.unflatten(routing_scores, axis=-1, shape=(n_group, -1))
+    group_scores = mx.topk(routing_scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+    groups_to_mask = n_group - topk_group
+    group_idx = mx.argpartition(group_scores, kth=groups_to_mask - 1, axis=-2)[
+        ..., :groups_to_mask, :
+    ]
+    routing_scores = mx.put_along_axis(
+        routing_scores,
+        mx.stop_gradient(group_idx),
+        mx.array(float("-inf")),
+        axis=-2,
+    )
+    routing_scores = mx.flatten(routing_scores, -2, -1)
+    indices = mx.argpartition(-routing_scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    indices = mx.stop_gradient(indices)
+    selected = mx.take_along_axis(scores, indices, axis=-1)
+    selected = selected / (selected.sum(axis=-1, keepdims=True) + 1e-20)
+    return indices, selected * routed_scaling_factor
+
+
+class BailingGate(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
-        if not args.no_kda_lora:
-            raise ValueError("Bailing V3 MLX currently requires no_kda_lora=true")
-        if not args.kda_safe_gate:
-            raise ValueError("Bailing V3 MLX currently requires kda_safe_gate=true")
-        self.num_heads = args.num_attention_heads
-        self.head_dim = args.head_dim
-        self.projection_size = self.num_heads * self.head_dim
-        self.conv_kernel_size = args.short_conv_kernel_size
-        self.lower_bound = args.kda_lower_bound
-        self.rms_norm_eps = args.rms_norm_eps
+        self.top_k = args.num_experts_per_tok
+        self.n_group = args.n_group
+        self.topk_group = args.topk_group
+        self.routed_scaling_factor = args.routed_scaling_factor
+        self.weight = mx.zeros((args.num_experts, args.hidden_size))
+        self.expert_bias = mx.zeros((args.num_experts,))
 
-        self.q_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
-        self.k_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
-        self.v_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
-        self.q_conv1d = nn.Conv1d(
-            self.projection_size,
-            self.projection_size,
-            self.conv_kernel_size,
-            groups=self.projection_size,
-            bias=False,
-            padding=0,
+    def __call__(self, x: mx.array) -> tuple[mx.array, mx.array]:
+        logits = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        return _group_expert_select(
+            logits,
+            self.expert_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
         )
-        self.k_conv1d = nn.Conv1d(
-            self.projection_size,
-            self.projection_size,
-            self.conv_kernel_size,
-            groups=self.projection_size,
-            bias=False,
-            padding=0,
-        )
-        self.v_conv1d = nn.Conv1d(
-            self.projection_size,
-            self.projection_size,
-            self.conv_kernel_size,
-            groups=self.projection_size,
-            bias=False,
-            padding=0,
-        )
-        self.A_log = mx.zeros((self.num_heads,), dtype=mx.float32)
-        self.f_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
-        self.dt_bias = mx.zeros((self.projection_size,), dtype=mx.float32)
-        self.b_proj = nn.Linear(args.hidden_size, self.num_heads, bias=False)
-        self.g_proj = nn.Linear(args.hidden_size, self.projection_size, bias=False)
-        self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.o_proj = nn.Linear(self.projection_size, args.hidden_size, bias=False)
 
-    def _causal_conv(
-        self,
-        x: mx.array,
-        conv: nn.Conv1d,
-        cache: ArraysCache | None,
-        cache_index: int,
-        mask: mx.array | None,
-    ) -> mx.array:
-        batch, length, dim = x.shape
-        if mask is not None:
-            x = mx.where(mask[..., None], x, 0)
-        previous = None if cache is None else cache[cache_index]
-        if previous is None:
-            previous = mx.zeros((batch, self.conv_kernel_size - 1, dim), dtype=x.dtype)
-        conv_input = mx.concatenate([previous, x], axis=1)
-        if cache is not None:
-            keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, length)
-                positions = (ends[:, None] + mx.arange(keep))[..., None]
-                cache[cache_index] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[cache_index] = mx.contiguous(conv_input[:, -keep:, :])
-        return nn.silu(conv(conv_input))
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: mx.array | None = None,
-        cache: ArraysCache | None = None,
-    ) -> mx.array:
-        batch, length, _ = x.shape
-        q = self._causal_conv(self.q_proj(x), self.q_conv1d, cache, 0, mask)
-        k = self._causal_conv(self.k_proj(x), self.k_conv1d, cache, 1, mask)
-        v = self._causal_conv(self.v_proj(x), self.v_conv1d, cache, 2, mask)
-        q = q.reshape(batch, length, self.num_heads, self.head_dim)
-        k = k.reshape(batch, length, self.num_heads, self.head_dim)
-        v = v.reshape(batch, length, self.num_heads, self.head_dim)
-
-        q, k = normalize_qk(q, k, inv_scale=self.head_dim**-0.5, eps=1e-6)
-
-        raw_gate = self.f_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
-        state = None if cache is None else cache[3]
-        output, state = gated_delta_update(
-            q,
-            k,
-            v,
-            raw_gate,
-            self.b_proj(x).astype(mx.float32),
-            self.A_log.reshape(self.num_heads, 1),
-            self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=state,
-            mask=mask,
-            use_kernel=not self.training,
-            lower_bound=self.lower_bound,
+class BailingSparseMoE(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate = BailingGate(args)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.num_experts,
         )
-        if cache is not None:
-            cache[3] = state
-            cache.advance(length)
+        shared_size = args.moe_shared_expert_intermediate_size * args.num_shared_experts
+        self.shared_experts = BailingMLP(args, shared_size)
 
-        output_gate = self.g_proj(x).reshape(
-            batch, length, self.num_heads, self.head_dim
-        )
-        output = self.o_norm(output)
-        output = output * mx.sigmoid(output_gate.astype(mx.float32)).astype(
-            output.dtype
-        )
-        return self.o_proj(output.reshape(batch, length, -1))
+    def __call__(self, x: mx.array) -> mx.array:
+        indices, scores = self.gate(x)
+        routed = self.switch_mlp(x, indices)
+        routed = (routed * scores[..., None]).sum(axis=-2).astype(x.dtype)
+        return routed + self.shared_experts(x)
 
 
 class BailingDecoderLayer(nn.Module):

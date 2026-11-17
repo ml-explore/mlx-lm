@@ -41,6 +41,20 @@ class TransformerBlock(nn.Module):
 
         self.args = args
 
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.attend(self.att_norm(x), mask, cache)
+        h = x + r
+
+        x1, x2 = mx.split(self.ff_proj(self.ff_norm(h)), 2, axis=-1)
+
+        out = h + self.ff_out(swiglu(x2, x1))
+        return out
+
     def attend(
         self,
         x: mx.array,
@@ -69,20 +83,6 @@ class TransformerBlock(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.attn_out(output)
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        r = self.attend(self.att_norm(x), mask, cache)
-        h = x + r
-
-        x1, x2 = mx.split(self.ff_proj(self.ff_norm(h)), 2, axis=-1)
-
-        out = h + self.ff_out(swiglu(x2, x1))
-        return out
 
 
 class Transformer(nn.Module):

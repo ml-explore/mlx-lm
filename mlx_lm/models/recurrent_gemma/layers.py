@@ -21,6 +21,31 @@ __all__ = [
 ]
 
 
+class Conv1d(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int,
+    ):
+        super().__init__()
+        self.weight = mx.zeros((channels, kernel_size, 1))
+        self.bias = mx.zeros((channels,))
+
+    def __call__(self, x, cache=None):
+        B, L, C = x.shape
+        groups, K, _ = self.weight.shape
+
+        if cache is not None:
+            x = mx.concatenate([cache, x], axis=1)
+        else:
+            x = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
+
+        y = mx.conv_general(x, self.weight, groups=groups)
+        y = y + self.bias
+
+        return y, x[:, -K + 1 :, :]
+
+
 def rnn_scan(x, a, h0):
     assert x.ndim == 3
     assert a.shape == x.shape[-a.ndim :]
@@ -49,31 +74,6 @@ def rnn_scan(x, a, h0):
             y[:, t] = h_t
 
     return y, h_t
-
-
-class Conv1d(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int,
-    ):
-        super().__init__()
-        self.weight = mx.zeros((channels, kernel_size, 1))
-        self.bias = mx.zeros((channels,))
-
-    def __call__(self, x, cache=None):
-        B, L, C = x.shape
-        groups, K, _ = self.weight.shape
-
-        if cache is not None:
-            x = mx.concatenate([cache, x], axis=1)
-        else:
-            x = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
-
-        y = mx.conv_general(x, self.weight, groups=groups)
-        y = y + self.bias
-
-        return y, x[:, -K + 1 :, :]
 
 
 class RGLRU(nn.Module):

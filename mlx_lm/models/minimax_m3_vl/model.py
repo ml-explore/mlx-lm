@@ -106,19 +106,27 @@ class Model(nn.Module):
             return language_model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
-    def make_cache(self) -> List[Any]:
-        # Only sparse layers have indexer keys; an unused KVCache breaks .state.
-        return [
-            (
-                CacheList(KVCache(), KVCache())
-                if layer.self_attn.is_sparse_attn
-                else CacheList(KVCache())
-            )
-            for layer in self.layers
-        ]
-
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return checkpoint.sanitize(self, weights)
+
+    @property
+    def cast_predicate(self) -> Callable[[str], bool]:
+        def predicate(k):
+            # Keep the router in float32 as the original
+            return (
+                "e_score_correction_bias" not in k and "block_sparse_moe.gate." not in k
+            )
+
+        return predicate
+
+    @property
+    def quant_predicate(self) -> Callable[[str, nn.Module], Any]:
+        def predicate(path, _):
+            if path.endswith("block_sparse_moe.gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -170,21 +178,13 @@ class Model(nn.Module):
     def layers(self) -> List[nn.Module]:
         return self.model.language_model.pipeline_layers
 
-    @property
-    def cast_predicate(self) -> Callable[[str], bool]:
-        def predicate(k):
-            # Keep the router in float32 as the original
-            return (
-                "e_score_correction_bias" not in k and "block_sparse_moe.gate." not in k
+    def make_cache(self) -> List[Any]:
+        # Only sparse layers have indexer keys; an unused KVCache breaks .state.
+        return [
+            (
+                CacheList(KVCache(), KVCache())
+                if layer.self_attn.is_sparse_attn
+                else CacheList(KVCache())
             )
-
-        return predicate
-
-    @property
-    def quant_predicate(self) -> Callable[[str, nn.Module], Any]:
-        def predicate(path, _):
-            if path.endswith("block_sparse_moe.gate"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
+            for layer in self.layers
+        ]

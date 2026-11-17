@@ -14,6 +14,10 @@ __all__ = [
 ]
 
 
+# Only the language model runs here.
+_ENCODERS = ("vision_tower", "vision_model", "multi_modal_projector", "mm_projector")
+
+
 def sanitize_language_model(
     language_model, weights: Dict[str, mx.array], prefix: str
 ) -> Dict[str, mx.array]:
@@ -179,10 +183,6 @@ def sanitize_language_model(
             weights[f"{ap}.unembed_out.weight"] = wv
 
     return weights
-
-
-# Only the language model runs here.
-_ENCODERS = ("vision_tower", "vision_model", "multi_modal_projector", "mm_projector")
 
 
 def sanitize(model, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:

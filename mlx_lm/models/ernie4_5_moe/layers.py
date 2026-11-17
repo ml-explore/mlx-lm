@@ -19,6 +19,17 @@ __all__ = [
 ]
 
 
+class Ernie4_5_MLP(nn.Module):
+    def __init__(self, dim, hidden_dim, use_bias=False):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=use_bias)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -69,17 +80,6 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class Ernie4_5_MLP(nn.Module):
-    def __init__(self, dim, hidden_dim, use_bias=False):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=use_bias)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=use_bias)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Ernie4_5_MoeMLP(nn.Module):

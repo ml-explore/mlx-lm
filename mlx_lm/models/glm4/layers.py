@@ -16,20 +16,6 @@ __all__ = [
 ]
 
 
-class Glm4MLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.gate_up_proj = nn.Linear(
-            args.hidden_size, 2 * args.intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        x = self.gate_up_proj(x)
-        gate, up_states = mx.split(x, 2, axis=-1)
-        return self.down_proj(swiglu(gate, up_states))
-
-
 class Glm4Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -90,6 +76,20 @@ class Glm4Attention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+
+
+class Glm4MLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(
+            args.hidden_size, 2 * args.intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        x = self.gate_up_proj(x)
+        gate, up_states = mx.split(x, 2, axis=-1)
+        return self.down_proj(swiglu(gate, up_states))
 
 
 class Glm4DecoderLayer(nn.Module):

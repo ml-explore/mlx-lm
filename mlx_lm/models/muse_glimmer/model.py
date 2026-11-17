@@ -26,18 +26,6 @@ class MuseGlimmerTextModel(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.window = args.sliding_window
 
-    def _masks(self, h, cache):
-        made, out = {}, []
-        for layer, c in zip(self.layers, cache):
-            t = layer.self_attn.layer_type
-            if t not in made:
-                if t == "sliding_attention":
-                    made[t] = create_attention_mask(h, c, window_size=self.window)
-                else:
-                    made[t] = create_attention_mask(h, c)
-            out.append(made[t])
-        return out
-
     def __call__(self, inputs: mx.array, cache=None):
         h = self.embed_tokens(inputs)
         # Scaleless RMSNorm on the embeddings (not Gemma's sqrt scaling).
@@ -50,6 +38,18 @@ class MuseGlimmerTextModel(nn.Module):
         for layer, c, mask in zip(self.layers, cache, masks):
             h = layer(h, mask, c)
         return self.norm(h)
+
+    def _masks(self, h, cache):
+        made, out = {}, []
+        for layer, c in zip(self.layers, cache):
+            t = layer.self_attn.layer_type
+            if t not in made:
+                if t == "sliding_attention":
+                    made[t] = create_attention_mask(h, c, window_size=self.window)
+                else:
+                    made[t] = create_attention_mask(h, c)
+            out.append(made[t])
+        return out
 
 
 class MuseGlimmerModel(nn.Module):
@@ -88,14 +88,6 @@ class Model(nn.Module):
     def layers(self):
         return self.model.language_model.layers
 
-    @property
-    def head_dim(self):
-        return self.args.head_dim
-
-    @property
-    def n_kv_heads(self):
-        return self.args.num_key_value_heads
-
     def make_cache(self):
         caches = []
         for lt in self.args.layer_types:
@@ -106,3 +98,11 @@ class Model(nn.Module):
             else:
                 caches.append(KVCache())
         return caches
+
+    @property
+    def head_dim(self):
+        return self.args.head_dim
+
+    @property
+    def n_kv_heads(self):
+        return self.args.num_key_value_heads

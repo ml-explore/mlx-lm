@@ -58,19 +58,6 @@ class Attention(nn.Module):
         self.conv_k = mx.zeros((1, 1, self.num_kv_heads, 1, self.conv_window))
         self.conv_v = mx.zeros((1, 1, self.num_kv_heads, 1, self.conv_window))
 
-    def _custom_convolution(self, u, weights, state=None):
-        B, H, L, D = u.shape
-        weights = weights.reshape((1, H, self.conv_window, 1, 1))
-        w0 = weights[:, :, 0]
-        w1 = weights[:, :, 1]
-        if state is None:
-            state = mx.zeros((B, H, 1, D), u.dtype)
-        if L > 1:
-            u_prev = mx.concatenate([state, u[:, :, :-1]], axis=2)
-        else:
-            u_prev = state
-        return u_prev * w0 + u * w1
-
     def __call__(
         self, x: mx.array, mask: mx.array = None, cache: Any = None
     ) -> mx.array:
@@ -111,6 +98,19 @@ class Attention(nn.Module):
         )
         out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(out)
+
+    def _custom_convolution(self, u, weights, state=None):
+        B, H, L, D = u.shape
+        weights = weights.reshape((1, H, self.conv_window, 1, 1))
+        w0 = weights[:, :, 0]
+        w1 = weights[:, :, 1]
+        if state is None:
+            state = mx.zeros((B, H, 1, D), u.dtype)
+        if L > 1:
+            u_prev = mx.concatenate([state, u[:, :, :-1]], axis=2)
+        else:
+            u_prev = state
+        return u_prev * w0 + u * w1
 
 
 class MLP(nn.Module):

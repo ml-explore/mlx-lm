@@ -23,6 +23,29 @@ __all__ = [
 ]
 
 
+class DeepseekV3MLP(nn.Module):
+    def __init__(
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
+        self.intermediate_size = (
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
+
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def __call__(self, x):
+        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        return down_proj
+
+
 class DeepseekV3Attention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -140,29 +163,6 @@ class DeepseekV3Attention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class DeepseekV3MLP(nn.Module):
-    def __init__(
-        self,
-        config: ModelArgs,
-        hidden_size: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-        return down_proj
 
 
 @mx.compile

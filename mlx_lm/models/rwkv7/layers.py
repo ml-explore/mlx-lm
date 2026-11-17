@@ -26,17 +26,15 @@ def addcmul(x, y, z):
     return x + y * z
 
 
-@partial(mx.compile, shapeless=True)
-def l2_norm(x):
-    return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), 1e-7)
-
-
-@mx.compile
-def _wkv7_step_ops(r, w, k, v, a, b, state):
-    sab = (state @ a[..., None]) @ b[..., None, :]
-    state = state * w[:, :, None, :] + v[..., None] @ k[..., None, :] + sab
-    y = state @ r[..., None]
-    return y, state
+class TokenShift(nn.Module):
+    def __call__(self, x, state):
+        B, L, D = x.shape
+        if state is None:
+            state = mx.zeros((B, 1, D), x.dtype)
+        if L == 1:
+            return state
+        else:
+            return mx.concatenate([state, x[:, :-1, :]], axis=1)
 
 
 class LayerNormPerHead(nn.Module):
@@ -86,38 +84,17 @@ class LoRA(nn.Module):
         return self.lora[2](self.lora[1](self.lora[0](x)))
 
 
-class TokenShift(nn.Module):
-    def __call__(self, x, state):
-        B, L, D = x.shape
-        if state is None:
-            state = mx.zeros((B, 1, D), x.dtype)
-        if L == 1:
-            return state
-        else:
-            return mx.concatenate([state, x[:, :-1, :]], axis=1)
+@partial(mx.compile, shapeless=True)
+def l2_norm(x):
+    return x / mx.maximum(mx.linalg.norm(x, axis=-1, keepdims=True), 1e-7)
 
 
-class Rwkv7ChannelMixing(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-
-        hidden_dim = args.hidden_size
-        intermediate_size = args.intermediate_size
-
-        self.key = nn.Linear(hidden_dim, intermediate_size, bias=False)
-        self.value = nn.Linear(intermediate_size, hidden_dim, bias=False)
-
-        self.x_k = mx.zeros((hidden_dim))
-
-        self.token_shift = TokenShift()
-
-    def __call__(self, x, cache) -> mx.array:
-        state = cache[2] if cache is not None else None
-        x_prev = self.token_shift(x, state)
-        xx = addcmul(x, x_prev - x, self.x_k)
-        if cache is not None:
-            cache[2] = x[:, -1:, :]
-        return self.value(nn.relu2(self.key(xx)))
+@mx.compile
+def _wkv7_step_ops(r, w, k, v, a, b, state):
+    sab = (state @ a[..., None]) @ b[..., None, :]
+    state = state * w[:, :, None, :] + v[..., None] @ k[..., None, :] + sab
+    y = state @ r[..., None]
+    return y, state
 
 
 class Rwkv7TimeMixing(nn.Module):
@@ -183,26 +160,6 @@ class Rwkv7TimeMixing(nn.Module):
             bias=False,
         )
 
-    def _wkv7(self, r, w, k, v, a, b, state):
-        B, L, _, _ = r.shape
-        if state is None:
-            state = mx.zeros(
-                (B, self.num_heads, self.head_dim, self.head_dim), dtype=r.dtype
-            )
-
-        if mx.default_device() == mx.gpu and mx.metal.is_available():
-            return wkv7_kernel(r, w, k, v, a, b, state)
-        else:
-            ys = []
-            for t in range(L):
-                y, state = _wkv7_step_ops(
-                    r[:, t], w[:, t], k[:, t], v[:, t], a[:, t], b[:, t], state
-                )
-                ys.append(y)
-
-            y = mx.stack(ys, axis=1).astype(r.dtype)
-            return y, state
-
     def __call__(self, x, v_first, cache):
         if cache is None:
             token_shift_cache, state_cache = None, None
@@ -257,6 +214,49 @@ class Rwkv7TimeMixing(nn.Module):
 
         out = self.o_proj(out * gate)
         return out, v_first
+
+    def _wkv7(self, r, w, k, v, a, b, state):
+        B, L, _, _ = r.shape
+        if state is None:
+            state = mx.zeros(
+                (B, self.num_heads, self.head_dim, self.head_dim), dtype=r.dtype
+            )
+
+        if mx.default_device() == mx.gpu and mx.metal.is_available():
+            return wkv7_kernel(r, w, k, v, a, b, state)
+        else:
+            ys = []
+            for t in range(L):
+                y, state = _wkv7_step_ops(
+                    r[:, t], w[:, t], k[:, t], v[:, t], a[:, t], b[:, t], state
+                )
+                ys.append(y)
+
+            y = mx.stack(ys, axis=1).astype(r.dtype)
+            return y, state
+
+
+class Rwkv7ChannelMixing(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+
+        hidden_dim = args.hidden_size
+        intermediate_size = args.intermediate_size
+
+        self.key = nn.Linear(hidden_dim, intermediate_size, bias=False)
+        self.value = nn.Linear(intermediate_size, hidden_dim, bias=False)
+
+        self.x_k = mx.zeros((hidden_dim))
+
+        self.token_shift = TokenShift()
+
+    def __call__(self, x, cache) -> mx.array:
+        state = cache[2] if cache is not None else None
+        x_prev = self.token_shift(x, state)
+        xx = addcmul(x, x_prev - x, self.x_k)
+        if cache is not None:
+            cache[2] = x[:, -1:, :]
+        return self.value(nn.relu2(self.key(xx)))
 
 
 class Rwkv7Layer(nn.Module):

@@ -24,6 +24,15 @@ def rms_norm(x: mx.array, eps: float) -> mx.array:
     return mx.fast.rms_norm(x, None, eps)
 
 
+class WeightGain(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.w_g = mx.ones((1,))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x * self.w_g.astype(x.dtype)
+
+
 class HeadGain(nn.Module):
     def __init__(self, n_head: int):
         super().__init__()
@@ -32,24 +41,6 @@ class HeadGain(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         # x: (B, H, L, D)
         return x * self.head_g.astype(x.dtype).reshape(1, -1, 1, 1)
-
-
-class ActGain(nn.Module):
-    def __init__(self, init_value: float = 1.0):
-        super().__init__()
-        self.a_g = mx.full((1,), init_value)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return x * self.a_g.astype(x.dtype)
-
-
-class WeightGain(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.w_g = mx.ones((1,))
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return x * self.w_g.astype(x.dtype)
 
 
 class Attention(nn.Module):
@@ -74,17 +65,6 @@ class Attention(nn.Module):
         self._rope_freqs = -(
             args.rope_theta
             ** (mx.arange(0, self.head_dim, 2, dtype=mx.float32) / self.head_dim)
-        )
-
-    def _rope(self, x, offset):
-        return mx.fast.rope(
-            x,
-            dims=self.head_dim,
-            traditional=False,
-            base=None,
-            scale=1.0,
-            offset=offset,
-            freqs=self._rope_freqs,
         )
 
     def __call__(
@@ -121,6 +101,26 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.attn_resid(output)
+
+    def _rope(self, x, offset):
+        return mx.fast.rope(
+            x,
+            dims=self.head_dim,
+            traditional=False,
+            base=None,
+            scale=1.0,
+            offset=offset,
+            freqs=self._rope_freqs,
+        )
+
+
+class ActGain(nn.Module):
+    def __init__(self, init_value: float = 1.0):
+        super().__init__()
+        self.a_g = mx.full((1,), init_value)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return x * self.a_g.astype(x.dtype)
 
 
 class MLP(nn.Module):

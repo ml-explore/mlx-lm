@@ -26,46 +26,6 @@ __all__ = [
 ]
 
 
-@mx.compile
-def _group_expert_select(
-    gates: mx.array,
-    bias: Optional[mx.array],
-    top_k: int,
-    n_group: int,
-    topk_group: int,
-    routed_scaling_factor: float,
-    renormalize: bool,
-) -> Tuple[mx.array, mx.array]:
-    in_type = gates.dtype
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    orig_scores = scores
-    if bias is not None:
-        scores = scores + bias.astype(scores.dtype)
-
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores,
-            mx.stop_gradient(group_idx),
-            mx.array(0.0, dtype=scores.dtype),
-            axis=-2,
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
-    inds = mx.stop_gradient(inds)
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-
-    if top_k > 1 and renormalize:
-        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
-        scores = scores / denominator
-
-    return inds, (scores * routed_scaling_factor).astype(in_type)
-
-
 @partial(mx.compile, shapeless=True)
 def _situ(x, gate, beta, linear_beta):
     dtype = x.dtype
@@ -75,16 +35,6 @@ def _situ(x, gate, beta, linear_beta):
     if linear_beta is not None:
         x = linear_beta * mx.tanh(x / linear_beta)
     return (a * x).astype(dtype)
-
-
-class SiTU(nn.Module):
-    def __init__(self, beta: float = 1.0, linear_beta: Optional[float] = None):
-        super().__init__()
-        self.beta = beta
-        self.linear_beta = linear_beta
-
-    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
-        return _situ(x, gate, self.beta, self.linear_beta)
 
 
 class KimiK3MLP(nn.Module):
@@ -120,20 +70,6 @@ class ResidualBlocks:
         else:
             self.raw = mx.concatenate([self.raw, r])
             self.inv_rms = mx.concatenate([self.inv_rms, n])
-
-
-def _attn_res_mix(
-    blocks: ResidualBlocks,
-    partial_sum: mx.array,
-    w_eff: mx.array,
-    eps: float,
-    use_kernel: bool = True,
-) -> mx.array:
-    if blocks.raw is None:
-        return partial_sum
-    return attn_res_combine(
-        blocks.raw, blocks.inv_rms, partial_sum, w_eff, eps, use_kernel=use_kernel
-    )
 
 
 class KimiK3DeltaAttention(nn.Module):
@@ -172,47 +108,6 @@ class KimiK3DeltaAttention(nn.Module):
         self.o_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
         self.o_proj = nn.Linear(self.projection_dim, hidden, bias=False)
         self._step = None
-
-    def _decode_core(self, x, conv_state, ssm_state):
-        B = x.shape[0]
-        P = self.projection_dim
-        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, None, None)
-
-        q = qkv[..., :P].reshape(B, 1, self.num_heads, self.head_dim)
-        k = qkv[..., P : 2 * P].reshape(B, 1, self.num_heads, self.head_dim)
-        v = qkv[..., 2 * P :].reshape(B, 1, self.num_heads, self.head_dim)
-
-        q, k = normalize_qk(q, k, inv_scale=self.scale, eps=1e-6)
-
-        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
-            B, 1, self.num_heads, self.head_dim
-        )
-        b_logits = self.b_proj(x).reshape(B, 1, self.num_heads)
-
-        out, ssm_state = gated_delta_update(
-            q,
-            k,
-            v,
-            a_logits,
-            b_logits,
-            self.A_log.reshape(self.num_heads, 1),
-            self.dt_bias.reshape(self.num_heads, self.head_dim),
-            state=ssm_state,
-            mask=None,
-            use_kernel=True,
-            lower_bound=self.lower_bound,
-        )
-
-        if self.use_full_rank_gate:
-            gate = self.g_proj(x)
-        else:
-            gate = self.g_b_proj(self.g_a_proj(x))
-        gate = gate.reshape(B, 1, self.num_heads, self.head_dim)
-        out = (
-            self.o_norm(out.reshape(B, 1, self.num_heads, self.head_dim))
-            * mx.sigmoid(gate)
-        ).reshape(B, 1, -1)
-        return self.o_proj(out), conv_state, ssm_state
 
     def __call__(
         self,
@@ -302,6 +197,47 @@ class KimiK3DeltaAttention(nn.Module):
             * mx.sigmoid(gate)
         ).reshape(B, T, -1)
         return self.o_proj(out)
+
+    def _decode_core(self, x, conv_state, ssm_state):
+        B = x.shape[0]
+        P = self.projection_dim
+        qkv, conv_state = self.qkv_conv(self.qkv_proj(x), conv_state, None, None)
+
+        q = qkv[..., :P].reshape(B, 1, self.num_heads, self.head_dim)
+        k = qkv[..., P : 2 * P].reshape(B, 1, self.num_heads, self.head_dim)
+        v = qkv[..., 2 * P :].reshape(B, 1, self.num_heads, self.head_dim)
+
+        q, k = normalize_qk(q, k, inv_scale=self.scale, eps=1e-6)
+
+        a_logits = self.f_b_proj(self.f_a_proj(x)).reshape(
+            B, 1, self.num_heads, self.head_dim
+        )
+        b_logits = self.b_proj(x).reshape(B, 1, self.num_heads)
+
+        out, ssm_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a_logits,
+            b_logits,
+            self.A_log.reshape(self.num_heads, 1),
+            self.dt_bias.reshape(self.num_heads, self.head_dim),
+            state=ssm_state,
+            mask=None,
+            use_kernel=True,
+            lower_bound=self.lower_bound,
+        )
+
+        if self.use_full_rank_gate:
+            gate = self.g_proj(x)
+        else:
+            gate = self.g_b_proj(self.g_a_proj(x))
+        gate = gate.reshape(B, 1, self.num_heads, self.head_dim)
+        out = (
+            self.o_norm(out.reshape(B, 1, self.num_heads, self.head_dim))
+            * mx.sigmoid(gate)
+        ).reshape(B, 1, -1)
+        return self.o_proj(out), conv_state, ssm_state
 
 
 class KimiK3MLAAttention(nn.Module):
@@ -399,6 +335,56 @@ class KimiK3MLAAttention(nn.Module):
         return self.o_proj(output)
 
 
+class SiTU(nn.Module):
+    def __init__(self, beta: float = 1.0, linear_beta: Optional[float] = None):
+        super().__init__()
+        self.beta = beta
+        self.linear_beta = linear_beta
+
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return _situ(x, gate, self.beta, self.linear_beta)
+
+
+@mx.compile
+def _group_expert_select(
+    gates: mx.array,
+    bias: Optional[mx.array],
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    renormalize: bool,
+) -> Tuple[mx.array, mx.array]:
+    in_type = gates.dtype
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    orig_scores = scores
+    if bias is not None:
+        scores = scores + bias.astype(scores.dtype)
+
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores,
+            mx.stop_gradient(group_idx),
+            mx.array(0.0, dtype=scores.dtype),
+            axis=-2,
+        )
+        scores = mx.flatten(scores, -2, -1)
+
+    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+
+    if top_k > 1 and renormalize:
+        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
+        scores = scores / denominator
+
+    return inds, (scores * routed_scaling_factor).astype(in_type)
+
+
 class KimiK3SparseMoE(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -475,6 +461,20 @@ class KimiK3SparseMoE(nn.Module):
         if shared is not None:
             y = y + shared
         return y
+
+
+def _attn_res_mix(
+    blocks: ResidualBlocks,
+    partial_sum: mx.array,
+    w_eff: mx.array,
+    eps: float,
+    use_kernel: bool = True,
+) -> mx.array:
+    if blocks.raw is None:
+        return partial_sum
+    return attn_res_combine(
+        blocks.raw, blocks.inv_rms, partial_sum, w_eff, eps, use_kernel=use_kernel
+    )
 
 
 class KimiK3DecoderLayer(nn.Module):

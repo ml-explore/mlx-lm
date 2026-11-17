@@ -20,6 +20,17 @@ __all__ = [
 ]
 
 
+class MLP(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
 def _layer_rope(args: ModelArgs, layer_type: str):
     """Build the RoPE module for a given layer type.
 
@@ -119,17 +130,6 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
-class MLP(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class MoEGate(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -140,13 +140,6 @@ class MoEGate(nn.Module):
         # A Linear, not a bare matrix, so a quantized router can load.
         self.proj = nn.Linear(args.hidden_size, args.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((args.num_experts,))
-
-    def _routing_scores(self, logits: mx.array) -> mx.array:
-        if self.score_func == "sigmoid":
-            return mx.sigmoid(logits)
-        if self.score_func == "sqrtsoftplus":
-            return mx.sqrt(nn.softplus(logits))
-        raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
     def __call__(self, x):
         logits = self.proj(x).astype(mx.float32)
@@ -162,6 +155,13 @@ class MoEGate(nn.Module):
         weights = mx.take_along_axis(scores, inds, axis=-1)
         weights = weights / weights.sum(axis=-1, keepdims=True)
         return inds, weights
+
+    def _routing_scores(self, logits: mx.array) -> mx.array:
+        if self.score_func == "sigmoid":
+            return mx.sigmoid(logits)
+        if self.score_func == "sqrtsoftplus":
+            return mx.sqrt(nn.softplus(logits))
+        raise ValueError(f"Unknown moe_router_score_func: {self.score_func!r}")
 
 
 class MoE(nn.Module):

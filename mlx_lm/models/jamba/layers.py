@@ -20,17 +20,6 @@ __all__ = [
 ]
 
 
-class JambaMLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
 class JambaAttention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -132,6 +121,38 @@ class JambaMambaMixer(nn.Module):
         self.b_layernorm = nn.RMSNorm(self.ssm_state_size, eps=args.rms_norm_eps)
         self.c_layernorm = nn.RMSNorm(self.ssm_state_size, eps=args.rms_norm_eps)
 
+    def __call__(self, x, cache):
+        if cache is None:
+            conv_state, ssm_state = None, None
+        else:
+            conv_state, ssm_state = cache[0], cache[1]
+
+        output, (conv_state, ssm_state) = self._process_sequence(
+            x, conv_state, ssm_state
+        )
+
+        if cache is not None:
+            cache[0] = conv_state
+            cache[1] = ssm_state
+
+        return output
+
+    def _process_sequence(self, x, conv_state, ssm_state):
+        xz = self.in_proj(x)
+        x, z = xz.split(indices_or_sections=2, axis=-1)
+        K = self.conv_kernel_size
+        if conv_state is not None:
+            x_full = mx.concatenate([conv_state, x], axis=1)
+        else:
+            x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
+        conv_out = self.conv1d(x_full)
+        conv_state = x_full[:, -(K - 1) :, :]
+        x = nn.silu(conv_out)
+        A = -mx.exp(self.A_log)
+        y, ssm_state = self.ssm_step(x, A, ssm_state)
+        z = self.out_proj(swiglu(z, y))
+        return z, (conv_state, ssm_state)
+
     def ssm_step(self, x, A, state=None):
         T = x.shape[1]
         D = self.D
@@ -155,38 +176,6 @@ class JambaMambaMixer(nn.Module):
         y = y + D * x
         return y, new_state[:, -1]
 
-    def _process_sequence(self, x, conv_state, ssm_state):
-        xz = self.in_proj(x)
-        x, z = xz.split(indices_or_sections=2, axis=-1)
-        K = self.conv_kernel_size
-        if conv_state is not None:
-            x_full = mx.concatenate([conv_state, x], axis=1)
-        else:
-            x_full = mx.pad(x, [(0, 0), (K - 1, 0), (0, 0)])
-        conv_out = self.conv1d(x_full)
-        conv_state = x_full[:, -(K - 1) :, :]
-        x = nn.silu(conv_out)
-        A = -mx.exp(self.A_log)
-        y, ssm_state = self.ssm_step(x, A, ssm_state)
-        z = self.out_proj(swiglu(z, y))
-        return z, (conv_state, ssm_state)
-
-    def __call__(self, x, cache):
-        if cache is None:
-            conv_state, ssm_state = None, None
-        else:
-            conv_state, ssm_state = cache[0], cache[1]
-
-        output, (conv_state, ssm_state) = self._process_sequence(
-            x, conv_state, ssm_state
-        )
-
-        if cache is not None:
-            cache[0] = conv_state
-            cache[1] = ssm_state
-
-        return output
-
 
 class JambaSparseMoeBlock(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -207,6 +196,17 @@ class JambaSparseMoeBlock(nn.Module):
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
         return y
+
+
+class JambaMLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(args.hidden_size, args.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(args.intermediate_size, args.hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class JambaDecoderLayer(nn.Module):

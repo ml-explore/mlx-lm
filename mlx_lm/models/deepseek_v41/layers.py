@@ -50,98 +50,6 @@ def _apply_rope(
     return mx.concatenate([head, tail.astype(x.dtype)], axis=-1)
 
 
-# The reference also rounds fp8/fp4 matmul inputs to fp8; skipping it is more precise.
-def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
-    """Round-trip FP8 e4m3 with power-of-two block scales."""
-    if x.shape[-1] % block_size:
-        return x
-    dtype = x.dtype
-    shape = x.shape
-    blocks = x.astype(mx.float32).reshape(*shape[:-1], -1, block_size)
-    amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), 1e-4)
-    exponent = mx.ceil(mx.log2(amax / 448.0))
-    scale = mx.power(2.0, exponent)
-    quantized = mx.clip(blocks / scale, -448.0, 448.0)
-    return (
-        (mx.from_fp8(mx.to_fp8(quantized), mx.float32) * scale)
-        .reshape(shape)
-        .astype(dtype)
-    )
-
-
-_FP4_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
-
-
-def _round_fp4(x: mx.array) -> mx.array:
-    mag = mx.abs(x)
-    idx = mx.zeros(mag.shape, dtype=mx.int32)
-    for threshold in (0.25, 1.25, 2.5, 5.0):
-        idx = idx + (mag > threshold).astype(mx.int32)
-    for threshold in (0.75, 1.75, 3.5):
-        idx = idx + (mag >= threshold).astype(mx.int32)
-    return mx.sign(x) * _FP4_LUT[idx]
-
-
-def _fake_quant_fp4(
-    x: mx.array, *, block_size: int, e4m3_scale: bool = False
-) -> mx.array:
-    if x.shape[-1] % block_size:
-        return x
-    dtype = x.dtype
-    shape = x.shape
-    blocks = x.astype(mx.float32).reshape(*shape[:-1], -1, block_size)
-    floor = 6.0 * 2.0**-9 if e4m3_scale else 6.0 * 2.0**-126
-    amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), floor)
-    if e4m3_scale:
-        scale = mx.from_fp8(mx.to_fp8(amax / 6.0), mx.float32)
-    else:
-        scale = mx.power(2.0, mx.ceil(mx.log2(amax / 6.0)))
-    q = _round_fp4(mx.clip(blocks / scale, -6.0, 6.0)) * scale
-    return q.reshape(shape).astype(dtype)
-
-
-class HyperConnection(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.hc = args.hc_mult
-        self.iters = args.hc_sinkhorn_iters
-        self.hc_eps = args.hc_eps
-        self.norm_eps = args.rms_norm_eps
-        # The leading underscores keep these out of the parameters.
-        self._eps = mx.array([args.hc_eps], dtype=mx.float32)
-        # The scale of each mix column: pre, post, then comb.
-        self._scale_ids = mx.array([0] * self.hc + [1] * self.hc + [2] * self.hc**2)
-        mix = (2 + self.hc) * self.hc
-        self.fn = mx.zeros((mix, self.hc * args.hidden_size), dtype=mx.float32)
-        self.base = mx.zeros((mix,), dtype=mx.float32)
-        self.scale = mx.ones((3,), dtype=mx.float32)
-
-    def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array, mx.array]:
-        # The reference normalizes in float32.
-        flat = streams.reshape(*streams.shape[:2], -1).astype(mx.float32)
-        flat = mx.fast.rms_norm(flat, weight=None, eps=self.norm_eps)
-        mix = (flat @ self.fn.T) * self.scale[self._scale_ids] + self.base
-        pre, post, comb = mx.split(mix, [self.hc, 2 * self.hc], axis=-1)
-        pre = mx.sigmoid(pre) + self.hc_eps
-        post = 2.0 * mx.sigmoid(post)
-        comb = comb.reshape(*comb.shape[:-1], self.hc, self.hc)
-        comb = mx.softmax(comb, axis=-1) + self.hc_eps
-        return pre, post, sinkhorn(comb, iters=self.iters, eps=self._eps)
-
-
-def _collapse(streams: mx.array, mix: mx.array) -> mx.array:
-    out = mx.sum(mix[..., None] * streams.astype(mx.float32), axis=2)
-    return out.astype(streams.dtype)
-
-
-def _expand(
-    x: mx.array, residual: mx.array, post: mx.array, comb: mx.array
-) -> mx.array:
-    mixed = mx.sum(comb[..., None] * residual[..., :, None, :], axis=2)
-    out = post[..., None] * x[..., None, :] + mixed
-    return out.astype(residual.dtype)
-
-
 def _append(cached: Optional[mx.array], new: mx.array) -> mx.array:
     if cached is None:
         return new
@@ -199,6 +107,23 @@ class LayerCache:
         return sum(a.nbytes for a in arrays if a is not None)
 
 
+class DeepseekV41SwiGLU(nn.Module):
+    """DeepSeek-V4.1's clamped SwiGLU activation."""
+
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, up: mx.array, gate: mx.array) -> mx.array:
+        dtype = up.dtype
+        gate = gate.astype(mx.float32)
+        up = up.astype(mx.float32)
+        if self.limit > 0:
+            gate = mx.minimum(gate, self.limit)
+            up = mx.clip(up, -self.limit, self.limit)
+        return swiglu(gate, up).astype(dtype)
+
+
 class Compressor(nn.Module):
     def __init__(self, args: ModelArgs, layer_id: int):
         super().__init__()
@@ -235,43 +160,35 @@ class Compressor(nn.Module):
         return self.kv_norm(latent.astype(x.dtype)), first
 
 
-def _gather_rows(values: mx.array, indices: mx.array) -> mx.array:
-    batch, length, dim = values.shape
-    safe = mx.maximum(indices, 0)
-    base = (mx.arange(batch, dtype=mx.int32) * length).reshape(batch, 1, 1)
-    flat = values.reshape(batch * length, dim)
-    return flat[(safe + base).reshape(-1)].reshape(*indices.shape, dim)
+_FP4_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
 
 
-def _sparse_attention(
-    q: mx.array,
-    kvs: list[mx.array],
-    indices: list[mx.array],
-    *,
-    sinks: mx.array,
-    scale: float,
+def _round_fp4(x: mx.array) -> mx.array:
+    mag = mx.abs(x)
+    idx = mx.zeros(mag.shape, dtype=mx.int32)
+    for threshold in (0.25, 1.25, 2.5, 5.0):
+        idx = idx + (mag > threshold).astype(mx.int32)
+    for threshold in (0.75, 1.75, 3.5):
+        idx = idx + (mag >= threshold).astype(mx.int32)
+    return mx.sign(x) * _FP4_LUT[idx]
+
+
+def _fake_quant_fp4(
+    x: mx.array, *, block_size: int, e4m3_scale: bool = False
 ) -> mx.array:
-    """Attend each query to the rows its indices pick from each KV array.
-
-    q is [B, S, H, D], each KV array [B, K, D] and its indices [B, S, k].
-    An index of -1 picks nothing.
-    """
-    batch, length, heads, dim = q.shape
-    rows = [_gather_rows(kv, idx) for kv, idx in zip(kvs, indices, strict=True)]
-    # Each query has its own keys, so each query is one batch entry.
-    keys = mx.concatenate(rows, axis=2).reshape(batch * length, 1, -1, dim)
-    keys = keys.astype(mx.float32)
-    mask = mx.concatenate(indices, axis=-1) >= 0
-    # SDPA rounds the scores to the input dtype at this head size, so use fp32.
-    out = mx.fast.scaled_dot_product_attention(
-        q.reshape(batch * length, heads, 1, dim).astype(mx.float32),
-        keys,
-        keys,
-        scale=scale,
-        mask=mask.reshape(batch * length, 1, 1, -1),
-        sinks=sinks.astype(mx.float32),
-    )
-    return out.reshape(batch, length, heads, dim).astype(q.dtype)
+    if x.shape[-1] % block_size:
+        return x
+    dtype = x.dtype
+    shape = x.shape
+    blocks = x.astype(mx.float32).reshape(*shape[:-1], -1, block_size)
+    floor = 6.0 * 2.0**-9 if e4m3_scale else 6.0 * 2.0**-126
+    amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), floor)
+    if e4m3_scale:
+        scale = mx.from_fp8(mx.to_fp8(amax / 6.0), mx.float32)
+    else:
+        scale = mx.power(2.0, mx.ceil(mx.log2(amax / 6.0)))
+    q = _round_fp4(mx.clip(blocks / scale, -6.0, 6.0)) * scale
+    return q.reshape(shape).astype(dtype)
 
 
 class Indexer(nn.Module):
@@ -350,6 +267,64 @@ class Indexer(nn.Module):
         k = min(self.index_topk, index_k.shape[1])
         chosen = mx.argpartition(-scores, k - 1, axis=-1)[..., :k].astype(mx.int32)
         return mx.where(chosen < lens[None], chosen, -1), candidates
+
+
+# The reference also rounds fp8/fp4 matmul inputs to fp8; skipping it is more precise.
+def _fake_quant_fp8(x: mx.array, block_size: int = 32) -> mx.array:
+    """Round-trip FP8 e4m3 with power-of-two block scales."""
+    if x.shape[-1] % block_size:
+        return x
+    dtype = x.dtype
+    shape = x.shape
+    blocks = x.astype(mx.float32).reshape(*shape[:-1], -1, block_size)
+    amax = mx.maximum(mx.max(mx.abs(blocks), axis=-1, keepdims=True), 1e-4)
+    exponent = mx.ceil(mx.log2(amax / 448.0))
+    scale = mx.power(2.0, exponent)
+    quantized = mx.clip(blocks / scale, -448.0, 448.0)
+    return (
+        (mx.from_fp8(mx.to_fp8(quantized), mx.float32) * scale)
+        .reshape(shape)
+        .astype(dtype)
+    )
+
+
+def _gather_rows(values: mx.array, indices: mx.array) -> mx.array:
+    batch, length, dim = values.shape
+    safe = mx.maximum(indices, 0)
+    base = (mx.arange(batch, dtype=mx.int32) * length).reshape(batch, 1, 1)
+    flat = values.reshape(batch * length, dim)
+    return flat[(safe + base).reshape(-1)].reshape(*indices.shape, dim)
+
+
+def _sparse_attention(
+    q: mx.array,
+    kvs: list[mx.array],
+    indices: list[mx.array],
+    *,
+    sinks: mx.array,
+    scale: float,
+) -> mx.array:
+    """Attend each query to the rows its indices pick from each KV array.
+
+    q is [B, S, H, D], each KV array [B, K, D] and its indices [B, S, k].
+    An index of -1 picks nothing.
+    """
+    batch, length, heads, dim = q.shape
+    rows = [_gather_rows(kv, idx) for kv, idx in zip(kvs, indices, strict=True)]
+    # Each query has its own keys, so each query is one batch entry.
+    keys = mx.concatenate(rows, axis=2).reshape(batch * length, 1, -1, dim)
+    keys = keys.astype(mx.float32)
+    mask = mx.concatenate(indices, axis=-1) >= 0
+    # SDPA rounds the scores to the input dtype at this head size, so use fp32.
+    out = mx.fast.scaled_dot_product_attention(
+        q.reshape(batch * length, heads, 1, dim).astype(mx.float32),
+        keys,
+        keys,
+        scale=scale,
+        mask=mask.reshape(batch * length, 1, 1, -1),
+        sinks=sinks.astype(mx.float32),
+    )
+    return out.reshape(batch, length, heads, dim).astype(q.dtype)
 
 
 class Attention(nn.Module):
@@ -497,43 +472,6 @@ class Attention(nn.Module):
             shared["index_k"] = cache.index_k
 
 
-class DeepseekV41SwiGLU(nn.Module):
-    """DeepSeek-V4.1's clamped SwiGLU activation."""
-
-    def __init__(self, limit: float):
-        super().__init__()
-        self.limit = limit
-
-    def __call__(self, up: mx.array, gate: mx.array) -> mx.array:
-        dtype = up.dtype
-        gate = gate.astype(mx.float32)
-        up = up.astype(mx.float32)
-        if self.limit > 0:
-            gate = mx.minimum(gate, self.limit)
-            up = mx.clip(up, -self.limit, self.limit)
-        return swiglu(gate, up).astype(dtype)
-
-
-class SharedMLP(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.gate_proj = nn.Linear(
-            args.hidden_size, args.moe_intermediate_size, bias=False
-        )
-        self.up_proj = nn.Linear(
-            args.hidden_size, args.moe_intermediate_size, bias=False
-        )
-        self.down_proj = nn.Linear(
-            args.moe_intermediate_size, args.hidden_size, bias=False
-        )
-        self.activation = DeepseekV41SwiGLU(args.swiglu_limit)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        gate = self.gate_proj(x)
-        up = self.up_proj(x)
-        return self.down_proj(self.activation(up, gate).astype(x.dtype))
-
-
 class Router(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -583,6 +521,26 @@ class Experts(nn.Module):
         )
 
 
+class SharedMLP(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.gate_proj = nn.Linear(
+            args.hidden_size, args.moe_intermediate_size, bias=False
+        )
+        self.up_proj = nn.Linear(
+            args.hidden_size, args.moe_intermediate_size, bias=False
+        )
+        self.down_proj = nn.Linear(
+            args.moe_intermediate_size, args.hidden_size, bias=False
+        )
+        self.activation = DeepseekV41SwiGLU(args.swiglu_limit)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        return self.down_proj(self.activation(up, gate).astype(x.dtype))
+
+
 class MoE(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -603,6 +561,48 @@ class MoE(nn.Module):
         if self.sharding_group is not None:
             out = mx.distributed.all_sum(out, group=self.sharding_group)
         return out.reshape(shape).astype(x.dtype)
+
+
+class HyperConnection(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.hc = args.hc_mult
+        self.iters = args.hc_sinkhorn_iters
+        self.hc_eps = args.hc_eps
+        self.norm_eps = args.rms_norm_eps
+        # The leading underscores keep these out of the parameters.
+        self._eps = mx.array([args.hc_eps], dtype=mx.float32)
+        # The scale of each mix column: pre, post, then comb.
+        self._scale_ids = mx.array([0] * self.hc + [1] * self.hc + [2] * self.hc**2)
+        mix = (2 + self.hc) * self.hc
+        self.fn = mx.zeros((mix, self.hc * args.hidden_size), dtype=mx.float32)
+        self.base = mx.zeros((mix,), dtype=mx.float32)
+        self.scale = mx.ones((3,), dtype=mx.float32)
+
+    def __call__(self, streams: mx.array) -> tuple[mx.array, mx.array, mx.array]:
+        # The reference normalizes in float32.
+        flat = streams.reshape(*streams.shape[:2], -1).astype(mx.float32)
+        flat = mx.fast.rms_norm(flat, weight=None, eps=self.norm_eps)
+        mix = (flat @ self.fn.T) * self.scale[self._scale_ids] + self.base
+        pre, post, comb = mx.split(mix, [self.hc, 2 * self.hc], axis=-1)
+        pre = mx.sigmoid(pre) + self.hc_eps
+        post = 2.0 * mx.sigmoid(post)
+        comb = comb.reshape(*comb.shape[:-1], self.hc, self.hc)
+        comb = mx.softmax(comb, axis=-1) + self.hc_eps
+        return pre, post, sinkhorn(comb, iters=self.iters, eps=self._eps)
+
+
+def _collapse(streams: mx.array, mix: mx.array) -> mx.array:
+    out = mx.sum(mix[..., None] * streams.astype(mx.float32), axis=2)
+    return out.astype(streams.dtype)
+
+
+def _expand(
+    x: mx.array, residual: mx.array, post: mx.array, comb: mx.array
+) -> mx.array:
+    mixed = mx.sum(comb[..., None] * residual[..., :, None, :], axis=2)
+    out = post[..., None] * x[..., None, :] + mixed
+    return out.astype(residual.dtype)
 
 
 class DecoderLayer(nn.Module):

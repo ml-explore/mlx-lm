@@ -22,6 +22,92 @@ __all__ = [
 ]
 
 
+class LongcatFlashTopkRouter(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.config = args
+        self.top_k = args.moe_topk
+        self.n_routed_experts = args.n_routed_experts + args.zero_expert_num
+        self.routed_scaling_factor = args.routed_scaling_factor
+        self.norm_topk_prob = args.norm_topk_prob
+        self.router_bias = args.router_bias
+
+        self.classifier = nn.Linear(
+            args.hidden_size, self.n_routed_experts, bias=self.router_bias
+        )
+        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
+
+    def __call__(self, hidden_states: mx.array) -> Tuple[mx.array, mx.array]:
+
+        dtype = hidden_states.dtype
+        router_logits = self.classifier(hidden_states)
+        scores = mx.softmax(router_logits, axis=-1)
+
+        corrected_scores = scores + self.e_score_correction_bias
+        topk_indices = mx.argpartition(corrected_scores, kth=-self.top_k, axis=-1)[
+            ..., -self.top_k :
+        ]
+        topk_indices = mx.stop_gradient(topk_indices)
+        topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
+
+        if self.norm_topk_prob:
+            denominator = mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
+            topk_weights = topk_weights / denominator
+
+        topk_weights = topk_weights * self.routed_scaling_factor
+
+        return topk_indices, topk_weights.astype(dtype)
+
+
+class LongcatFlashMoE(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.config = args
+        self.num_experts_per_tok = args.moe_topk
+        self.n_routed_experts = args.n_routed_experts
+        self.zero_expert_num = args.zero_expert_num
+        self.zero_expert_type = args.zero_expert_type
+
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.expert_ffn_hidden_size,
+            args.n_routed_experts,
+        )
+
+        self.router = LongcatFlashTopkRouter(args)
+        self.sharding_group = None
+
+    def __call__(self, hidden_states):
+        if self.sharding_group is not None:
+            hidden_states = sum_gradients(self.sharding_group)(hidden_states)
+
+        topk_indices, topk_weights = self.router(hidden_states)
+
+        # Process all regular experts at once
+        mask = topk_indices >= self.n_routed_experts
+        topk_indices = mx.where(mask, 0, topk_indices)
+        regular_weights = mx.where(mask, 0.0, topk_weights)
+
+        regular_outputs = self.switch_mlp(hidden_states, topk_indices)
+
+        weighted_outputs = regular_outputs * regular_weights[..., None]
+        final_output = mx.sum(weighted_outputs, axis=-2)
+
+        if self.sharding_group is not None:
+            final_output = mx.distributed.all_sum(
+                final_output, group=self.sharding_group
+            )
+
+        # Add identity expert contribution after all_sum to avoid summing it N times
+        assert self.zero_expert_type == "identity"
+        identity_weights_sum = mx.sum(
+            mx.where(mask, topk_weights, 0.0), axis=-1, keepdims=True
+        )
+        final_output = final_output + hidden_states * identity_weights_sum
+
+        return final_output
+
+
 class LongcatFlashMLA(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -167,92 +253,6 @@ class LongcatFlashMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
-class LongcatFlashTopkRouter(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.config = args
-        self.top_k = args.moe_topk
-        self.n_routed_experts = args.n_routed_experts + args.zero_expert_num
-        self.routed_scaling_factor = args.routed_scaling_factor
-        self.norm_topk_prob = args.norm_topk_prob
-        self.router_bias = args.router_bias
-
-        self.classifier = nn.Linear(
-            args.hidden_size, self.n_routed_experts, bias=self.router_bias
-        )
-        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
-
-    def __call__(self, hidden_states: mx.array) -> Tuple[mx.array, mx.array]:
-
-        dtype = hidden_states.dtype
-        router_logits = self.classifier(hidden_states)
-        scores = mx.softmax(router_logits, axis=-1)
-
-        corrected_scores = scores + self.e_score_correction_bias
-        topk_indices = mx.argpartition(corrected_scores, kth=-self.top_k, axis=-1)[
-            ..., -self.top_k :
-        ]
-        topk_indices = mx.stop_gradient(topk_indices)
-        topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
-
-        if self.norm_topk_prob:
-            denominator = mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-            topk_weights = topk_weights / denominator
-
-        topk_weights = topk_weights * self.routed_scaling_factor
-
-        return topk_indices, topk_weights.astype(dtype)
-
-
-class LongcatFlashMoE(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.config = args
-        self.num_experts_per_tok = args.moe_topk
-        self.n_routed_experts = args.n_routed_experts
-        self.zero_expert_num = args.zero_expert_num
-        self.zero_expert_type = args.zero_expert_type
-
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.expert_ffn_hidden_size,
-            args.n_routed_experts,
-        )
-
-        self.router = LongcatFlashTopkRouter(args)
-        self.sharding_group = None
-
-    def __call__(self, hidden_states):
-        if self.sharding_group is not None:
-            hidden_states = sum_gradients(self.sharding_group)(hidden_states)
-
-        topk_indices, topk_weights = self.router(hidden_states)
-
-        # Process all regular experts at once
-        mask = topk_indices >= self.n_routed_experts
-        topk_indices = mx.where(mask, 0, topk_indices)
-        regular_weights = mx.where(mask, 0.0, topk_weights)
-
-        regular_outputs = self.switch_mlp(hidden_states, topk_indices)
-
-        weighted_outputs = regular_outputs * regular_weights[..., None]
-        final_output = mx.sum(weighted_outputs, axis=-2)
-
-        if self.sharding_group is not None:
-            final_output = mx.distributed.all_sum(
-                final_output, group=self.sharding_group
-            )
-
-        # Add identity expert contribution after all_sum to avoid summing it N times
-        assert self.zero_expert_type == "identity"
-        identity_weights_sum = mx.sum(
-            mx.where(mask, topk_weights, 0.0), axis=-1, keepdims=True
-        )
-        final_output = final_output + hidden_states * identity_weights_sum
-
-        return final_output
 
 
 class LongcatFlashDecoderLayer(nn.Module):

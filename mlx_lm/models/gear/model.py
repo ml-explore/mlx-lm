@@ -38,12 +38,6 @@ class GearModel(nn.Module):
         self.swa_idx = self._first_layer_idx("sliding_attention")
         self.conv_idx = self._first_layer_idx("conv_mixer")
 
-    def _first_layer_idx(self, layer_type: str) -> Optional[int]:
-        try:
-            return self.layer_types.index(layer_type)
-        except ValueError:
-            return None
-
     def __call__(
         self,
         inputs: mx.array,
@@ -86,6 +80,12 @@ class GearModel(nn.Module):
             h = layer(h, mask=mask, cache=c)
 
         return self.norm(h)
+
+    def _first_layer_idx(self, layer_type: str) -> Optional[int]:
+        try:
+            return self.layer_types.index(layer_type)
+        except ValueError:
+            return None
 
 
 class Model(nn.Module):

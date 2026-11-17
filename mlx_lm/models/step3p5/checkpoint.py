@@ -13,6 +13,21 @@ _MLX_NAMES = (
 )
 
 
+def _upgrade_mlx_layout(weights):
+    """Older MLX conversions: the checkpoint's names, and the norms stored as
+    1 + weight."""
+    upgraded = {}
+    for k, v in weights.items():
+        for old, new in _MLX_NAMES:
+            if old in k:
+                k = k.replace(old, new)
+                break
+        if k.endswith(".weight") and "norm" in k:
+            v = v - 1
+        upgraded[k] = v
+    return upgraded
+
+
 def sanitize(model, weights):
     if any(".mlp.switch_mlp." in k for k in weights):
         weights = _upgrade_mlx_layout(weights)
@@ -28,18 +43,3 @@ def sanitize(model, weights):
                 continue
         sanitized[k] = v
     return sanitized
-
-
-def _upgrade_mlx_layout(weights):
-    """Older MLX conversions: the checkpoint's names, and the norms stored as
-    1 + weight."""
-    upgraded = {}
-    for k, v in weights.items():
-        for old, new in _MLX_NAMES:
-            if old in k:
-                k = k.replace(old, new)
-                break
-        if k.endswith(".weight") and "norm" in k:
-            v = v - 1
-        upgraded[k] = v
-    return upgraded

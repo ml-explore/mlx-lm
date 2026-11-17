@@ -17,27 +17,16 @@ __all__ = [
 ]
 
 
-def _find_multiple(n: int, k: int) -> int:
-    """Finds the smallest multiple of k greater than or equal to n."""
-    if n % k == 0:
-        return n
-    return n + k - (n % k)
+class LinearSubblockReplacement(nn.Module):
+    """A simple linear layer used to replace Attention or MLP blocks."""
 
+    def __init__(self, hidden_size: int, bias: bool):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, hidden_size, bias=bias)
 
-def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
-    """Calculates intermediate size based on multiplier, rounding up to multiple of 256."""
-    intermediate_size = int(2 * ffn_mult * n_embd / 3)
-    return _find_multiple(intermediate_size, 256)
-
-
-# Activation function mapping
-_ACT2FN = {
-    "silu": nn.silu,
-    "relu": nn.relu,
-    "gelu": nn.gelu,
-    "gelu_new": nn.gelu_approx,
-    "gelu_fast": nn.gelu_approx,
-}
+    def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
+        # Accepts potential extra args (like mask, cache) but ignores them
+        return self.linear(x)
 
 
 class Attention(nn.Module):
@@ -105,6 +94,29 @@ class Attention(nn.Module):
         return self.o_proj(output)
 
 
+def _find_multiple(n: int, k: int) -> int:
+    """Finds the smallest multiple of k greater than or equal to n."""
+    if n % k == 0:
+        return n
+    return n + k - (n % k)
+
+
+def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
+    """Calculates intermediate size based on multiplier, rounding up to multiple of 256."""
+    intermediate_size = int(2 * ffn_mult * n_embd / 3)
+    return _find_multiple(intermediate_size, 256)
+
+
+# Activation function mapping
+_ACT2FN = {
+    "silu": nn.silu,
+    "relu": nn.relu,
+    "gelu": nn.gelu,
+    "gelu_new": nn.gelu_approx,
+    "gelu_fast": nn.gelu_approx,
+}
+
+
 class MLP(nn.Module):
     """Standard Feed-Forward Network for layers that use it."""
 
@@ -126,18 +138,6 @@ class MLP(nn.Module):
     def __call__(self, x) -> mx.array:
         act_fn = _ACT2FN[self.act_fn]
         return self.down_proj(act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-
-class LinearSubblockReplacement(nn.Module):
-    """A simple linear layer used to replace Attention or MLP blocks."""
-
-    def __init__(self, hidden_size: int, bias: bool):
-        super().__init__()
-        self.linear = nn.Linear(hidden_size, hidden_size, bias=bias)
-
-    def __call__(self, x: mx.array, *args, **kwargs) -> mx.array:
-        # Accepts potential extra args (like mask, cache) but ignores them
-        return self.linear(x)
 
 
 class TransformerBlock(nn.Module):

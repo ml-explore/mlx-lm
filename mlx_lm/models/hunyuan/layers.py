@@ -20,10 +20,15 @@ __all__ = [
 ]
 
 
-def _int_or_list(arg, idx):
-    if isinstance(arg, list):
-        return arg[idx]
-    return arg
+class MLP(nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super().__init__()
+        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+    def __call__(self, x) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class DynamicNTKAlphaRoPE(nn.Module):
@@ -119,15 +124,10 @@ class Attention(nn.Module):
         return self.o_proj(output), kv_states
 
 
-class MLP(nn.Module):
-    def __init__(self, dim, hidden_dim):
-        super().__init__()
-        self.gate_proj = nn.Linear(dim, hidden_dim, bias=False)
-        self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
-        self.up_proj = nn.Linear(dim, hidden_dim, bias=False)
-
-    def __call__(self, x) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+def _int_or_list(arg, idx):
+    if isinstance(arg, list):
+        return arg[idx]
+    return arg
 
 
 class Gate(nn.Module):

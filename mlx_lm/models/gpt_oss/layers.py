@@ -20,17 +20,6 @@ __all__ = [
 ]
 
 
-# These operators emulate particular methods in torch that don't exist in MLX natively
-def mlx_topk(a, k, axis=-1):
-    """MLX equivalent of torch.topk"""
-    partitioned_indices = mx.argpartition(a, kth=-k, axis=axis)
-    # Extract only the top k indices (last k elements after partition)
-    top_k_indices = mx.stop_gradient(partitioned_indices[..., -k:])
-    # Get the corresponding values
-    top_k_values = mx.take_along_axis(a, top_k_indices, axis=axis)
-    return top_k_values, top_k_indices
-
-
 class AttentionBlock(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -88,6 +77,17 @@ class AttentionBlock(nn.Module):
         )
 
         return self.o_proj(v_hat.swapaxes(1, 2).reshape(B, L, -1))
+
+
+# These operators emulate particular methods in torch that don't exist in MLX natively
+def mlx_topk(a, k, axis=-1):
+    """MLX equivalent of torch.topk"""
+    partitioned_indices = mx.argpartition(a, kth=-k, axis=axis)
+    # Extract only the top k indices (last k elements after partition)
+    top_k_indices = mx.stop_gradient(partitioned_indices[..., -k:])
+    # Get the corresponding values
+    top_k_values = mx.take_along_axis(a, top_k_indices, axis=axis)
+    return top_k_values, top_k_indices
 
 
 class MLPBlock(nn.Module):

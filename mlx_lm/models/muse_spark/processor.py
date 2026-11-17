@@ -17,14 +17,7 @@ __all__ = [
     "Processor",
     "image_tokens",
 ]
-
-IMAGE_START = "<|image_start|>"
 IMAGE_PATCH = "<|patch|>"
-IMAGE_END = "<|image_end|>"
-
-
-def image_tokens(num_tokens: int) -> str:
-    return IMAGE_START + IMAGE_PATCH * num_tokens + IMAGE_END
 
 
 def _least_distortion_fit(
@@ -106,6 +99,14 @@ def _find_resize_target(
     grid = _least_distortion_fit(i_nph, i_npw, img_h=img_h, img_w=img_w, **bounds)
     nph, npw = grid or _least_distance_fit(i_nph, i_npw, **bounds)
     return (nph * patch_h, npw * patch_w), (nph, npw)
+
+
+IMAGE_START = "<|image_start|>"
+IMAGE_END = "<|image_end|>"
+
+
+def image_tokens(num_tokens: int) -> str:
+    return IMAGE_START + IMAGE_PATCH * num_tokens + IMAGE_END
 
 
 @dataclass(frozen=True)

@@ -40,167 +40,6 @@ class KimiMLP(nn.Module):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
-@mx.compile
-def _group_expert_select(
-    gates: mx.array,
-    bias: Optional[mx.array],
-    top_k: int,
-    n_group: int,
-    topk_group: int,
-    routed_scaling_factor: float,
-    renormalize: bool,
-    score_function: str,
-) -> Tuple[mx.array, mx.array]:
-    if score_function == "sigmoid":
-        scores = mx.sigmoid(gates)
-    elif score_function == "softmax":
-        scores = mx.softmax(gates, axis=-1, precise=True)
-    else:
-        raise ValueError(f"Unsupported MoE router activation '{score_function}'")
-
-    orig_scores = scores
-    if bias is not None:
-        scores = scores + bias.astype(scores.dtype)
-
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores,
-            mx.stop_gradient(group_idx),
-            mx.array(0.0, dtype=scores.dtype),
-            axis=-2,
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
-    inds = mx.stop_gradient(inds)
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-
-    if top_k > 1 and renormalize:
-        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
-        scores = scores / denominator
-
-    return inds, scores * routed_scaling_factor
-
-
-class KimiSparseMoE(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        hidden = args.hidden_size
-        experts = args.num_experts
-        if experts is None:
-            raise ValueError("num_experts must be specified for MoE layers")
-
-        self.gate = nn.Linear(hidden, experts, bias=False)
-        self.switch_mlp = SwitchGLU(hidden, args.moe_intermediate_size, experts)
-        self.e_score_correction_bias = mx.zeros((experts,), dtype=mx.float32)
-
-        if args.num_shared_experts:
-            shared_hidden = args.moe_intermediate_size * args.num_shared_experts
-            self.shared_experts = KimiMLP(args, intermediate_size=shared_hidden)
-        else:
-            self.shared_experts = None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        scores = self.gate(x)
-        inds, weights = _group_expert_select(
-            scores,
-            self.e_score_correction_bias,
-            self.args.num_experts_per_token,
-            self.args.num_expert_group,
-            self.args.topk_group,
-            self.args.routed_scaling_factor,
-            self.args.moe_renormalize,
-            self.args.moe_router_activation_func,
-        )
-        out = self.switch_mlp(x, inds)
-        out = (out * weights[..., None]).sum(axis=-2)
-        if self.shared_experts is not None:
-            out = out + self.shared_experts(x)
-        return out
-
-
-class KimiMLAAttention(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.num_heads = args.num_attention_heads
-        self.num_key_value_heads = args.num_key_value_heads
-        self.qk_nope_head_dim = args.qk_nope_head_dim or args.head_dim
-        self.qk_rope_head_dim = args.qk_rope_head_dim or 0
-        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-        self.v_head_dim = args.v_head_dim or args.head_dim
-        self.kv_lora_rank = args.kv_lora_rank
-        self.scale = self.q_head_dim**-0.5
-
-        hidden = args.hidden_size
-        self.q_proj = nn.Linear(hidden, self.num_heads * self.q_head_dim, bias=False)
-        self.kv_a_proj_with_mqa = nn.Linear(
-            hidden,
-            args.kv_lora_rank + self.qk_rope_head_dim,
-            bias=False,
-        )
-        self.kv_a_layernorm = nn.RMSNorm(args.kv_lora_rank, eps=args.rms_norm_eps)
-        self.embed_q = MultiLinear(
-            self.qk_nope_head_dim, args.kv_lora_rank, self.num_heads
-        )
-        self.unembed_out = MultiLinear(
-            args.kv_lora_rank, self.v_head_dim, self.num_heads
-        )
-        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
-
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[KVCache] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
-
-        q = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
-        q = q.transpose(0, 2, 1, 3)
-        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
-
-        compressed_kv = self.kv_a_proj_with_mqa(x)
-        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
-        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
-        kv_latent = self.kv_a_layernorm(compressed_kv)
-
-        kv_latent = mx.expand_dims(kv_latent, axis=1)
-
-        if cache is not None:
-            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
-
-        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
-        if mask is not None:
-            pe_scores = mx.where(
-                mask,
-                pe_scores,
-                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
-            )
-
-        if L == 1:
-            q_nope = self.embed_q(q_nope)
-            k = v = kv_latent
-        else:
-            k = self.embed_q(kv_latent, transpose=False)
-            v = self.unembed_out(kv_latent)
-
-        output = scaled_dot_product_attention(
-            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
-        )
-
-        if L == 1:
-            output = self.unembed_out(output)
-
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(output)
-
-
 class ShortConv1d(nn.Module):
     def __init__(self, channels: int, kernel_size: int):
         super().__init__()
@@ -350,6 +189,167 @@ class KimiDeltaAttention(nn.Module):
             * mx.sigmoid(gate)
         ).reshape(B, T, -1)
         return self.o_proj(out)
+
+
+class KimiMLAAttention(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        self.num_heads = args.num_attention_heads
+        self.num_key_value_heads = args.num_key_value_heads
+        self.qk_nope_head_dim = args.qk_nope_head_dim or args.head_dim
+        self.qk_rope_head_dim = args.qk_rope_head_dim or 0
+        self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+        self.v_head_dim = args.v_head_dim or args.head_dim
+        self.kv_lora_rank = args.kv_lora_rank
+        self.scale = self.q_head_dim**-0.5
+
+        hidden = args.hidden_size
+        self.q_proj = nn.Linear(hidden, self.num_heads * self.q_head_dim, bias=False)
+        self.kv_a_proj_with_mqa = nn.Linear(
+            hidden,
+            args.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+        )
+        self.kv_a_layernorm = nn.RMSNorm(args.kv_lora_rank, eps=args.rms_norm_eps)
+        self.embed_q = MultiLinear(
+            self.qk_nope_head_dim, args.kv_lora_rank, self.num_heads
+        )
+        self.unembed_out = MultiLinear(
+            args.kv_lora_rank, self.v_head_dim, self.num_heads
+        )
+        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden, bias=False)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[KVCache] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+
+        q = self.q_proj(x).reshape(B, L, self.num_heads, self.q_head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        q_nope, q_pe = mx.split(q, [self.qk_nope_head_dim], axis=-1)
+
+        compressed_kv = self.kv_a_proj_with_mqa(x)
+        compressed_kv, k_pe = mx.split(compressed_kv, [self.kv_lora_rank], axis=-1)
+        k_pe = k_pe.reshape(B, L, 1, self.qk_rope_head_dim).transpose(0, 2, 1, 3)
+        kv_latent = self.kv_a_layernorm(compressed_kv)
+
+        kv_latent = mx.expand_dims(kv_latent, axis=1)
+
+        if cache is not None:
+            kv_latent, k_pe = cache.update_and_fetch(kv_latent, k_pe)
+
+        pe_scores = (q_pe * self.scale) @ k_pe.swapaxes(-1, -2)
+        if mask is not None:
+            pe_scores = mx.where(
+                mask,
+                pe_scores,
+                mx.array(mx.finfo(pe_scores.dtype).min, pe_scores.dtype),
+            )
+
+        if L == 1:
+            q_nope = self.embed_q(q_nope)
+            k = v = kv_latent
+        else:
+            k = self.embed_q(kv_latent, transpose=False)
+            v = self.unembed_out(kv_latent)
+
+        output = scaled_dot_product_attention(
+            q_nope, k, v, cache=cache, scale=self.scale, mask=pe_scores
+        )
+
+        if L == 1:
+            output = self.unembed_out(output)
+
+        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(output)
+
+
+@mx.compile
+def _group_expert_select(
+    gates: mx.array,
+    bias: Optional[mx.array],
+    top_k: int,
+    n_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+    renormalize: bool,
+    score_function: str,
+) -> Tuple[mx.array, mx.array]:
+    if score_function == "sigmoid":
+        scores = mx.sigmoid(gates)
+    elif score_function == "softmax":
+        scores = mx.softmax(gates, axis=-1, precise=True)
+    else:
+        raise ValueError(f"Unsupported MoE router activation '{score_function}'")
+
+    orig_scores = scores
+    if bias is not None:
+        scores = scores + bias.astype(scores.dtype)
+
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores,
+            mx.stop_gradient(group_idx),
+            mx.array(0.0, dtype=scores.dtype),
+            axis=-2,
+        )
+        scores = mx.flatten(scores, -2, -1)
+
+    inds = mx.argpartition(-scores, kth=top_k - 1, axis=-1)[..., :top_k]
+    inds = mx.stop_gradient(inds)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+
+    if top_k > 1 and renormalize:
+        denominator = scores.sum(axis=-1, keepdims=True) + 1e-20
+        scores = scores / denominator
+
+    return inds, scores * routed_scaling_factor
+
+
+class KimiSparseMoE(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.args = args
+        hidden = args.hidden_size
+        experts = args.num_experts
+        if experts is None:
+            raise ValueError("num_experts must be specified for MoE layers")
+
+        self.gate = nn.Linear(hidden, experts, bias=False)
+        self.switch_mlp = SwitchGLU(hidden, args.moe_intermediate_size, experts)
+        self.e_score_correction_bias = mx.zeros((experts,), dtype=mx.float32)
+
+        if args.num_shared_experts:
+            shared_hidden = args.moe_intermediate_size * args.num_shared_experts
+            self.shared_experts = KimiMLP(args, intermediate_size=shared_hidden)
+        else:
+            self.shared_experts = None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        scores = self.gate(x)
+        inds, weights = _group_expert_select(
+            scores,
+            self.e_score_correction_bias,
+            self.args.num_experts_per_token,
+            self.args.num_expert_group,
+            self.args.topk_group,
+            self.args.routed_scaling_factor,
+            self.args.moe_renormalize,
+            self.args.moe_router_activation_func,
+        )
+        out = self.switch_mlp(x, inds)
+        out = (out * weights[..., None]).sum(axis=-2)
+        if self.shared_experts is not None:
+            out = out + self.shared_experts(x)
+        return out
 
 
 class KimiDecoderLayer(nn.Module):

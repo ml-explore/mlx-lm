@@ -84,20 +84,6 @@ class Model(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
-    @property
-    def layers(self):
-        return self.model.layers
-
-    def make_cache(self):
-        return [
-            (
-                RotatingKVCache(max_size=self.args.sliding_window)
-                if layer.is_sliding
-                else KVCache()
-            )
-            for layer in self.layers
-        ]
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
@@ -159,3 +145,17 @@ class Model(nn.Module):
                 layer.mlp.down_proj = shard_linear(
                     layer.mlp.down_proj, "sharded-to-all", group=group
                 )
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        return [
+            (
+                RotatingKVCache(max_size=self.args.sliding_window)
+                if layer.is_sliding
+                else KVCache()
+            )
+            for layer in self.layers
+        ]

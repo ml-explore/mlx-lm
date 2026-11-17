@@ -75,6 +75,10 @@ class Model(nn.Module):
         out = out * self.model.args.logit_scale
         return out
 
+    @property
+    def layers(self):
+        return self.model.layers
+
     def make_cache(self):
         caches = []
         for i in range(self.args.num_hidden_layers):
@@ -88,7 +92,3 @@ class Model(nn.Module):
                     RotatingKVCache(max_size=self.args.sliding_window, keep=0)
                 )
         return caches
-
-    @property
-    def layers(self):
-        return self.model.layers

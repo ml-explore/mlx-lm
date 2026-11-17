@@ -24,125 +24,6 @@ __all__ = [
 ]
 
 
-@mx.compile
-def _recurrent_gla_step(
-    q_t: mx.array,
-    k_t: mx.array,
-    v_t: mx.array,
-    h: mx.array,
-    exp_g: mx.array,
-) -> Tuple[mx.array, mx.array]:
-    h = h * exp_g + k_t.transpose(0, 1, 3, 2) @ v_t
-    return (q_t @ h).astype(q_t.dtype), h
-
-
-def recurrent_gla(
-    q: mx.array,
-    k: mx.array,
-    v: mx.array,
-    g: mx.array,
-    *,
-    scale: float,
-    h: Optional[mx.array] = None,
-    mask: Optional[mx.array] = None,
-    chunk: int = 128,
-) -> Tuple[mx.array, mx.array]:
-    """
-    Lightning-attention recurrence ``h_t = h_{t-1} exp(g) + k_t^T v_t``,
-    ``y_t = q_t h_t``, with ``g`` a per-head decay constant over time.
-
-    Past one step it runs chunked. With ``r_t`` the number of valid positions up
-    to ``t``, unrolling gives
-
-        y_t = sum_{s <= t} exp(g (r_t - r_s)) (q_t . k_s) v_s + exp(g r_t) q_t h_0
-
-    so each block of ``C`` steps is one decay-weighted causal attention plus one
-    state carry, both matmuls.
-
-    Args:
-        mask (mx.array, optional): A ``[B, L]`` validity mask. Padded positions
-          contribute no ``k v^T`` and do not decay the state.
-    """
-    B, H, L, K = q.shape
-    V = v.shape[-1]
-    out_dtype = q.dtype
-    if h is None:
-        # Hold the state in float32, as the reference does.
-        h = mx.zeros((B, H, K, V), dtype=mx.float32)
-
-    if L == 1:
-        exp_g = mx.exp(g)[:, None, None].astype(h.dtype)
-        y, h_t = _recurrent_gla_step(q * scale, k, v, h, exp_g)
-        if mask is None:
-            return y, h_t
-        keep = mask[:, 0][:, None, None, None]
-        return mx.where(keep, y, 0), mx.where(keep, h_t, h)
-
-    # exp(|g| C / 2) must stay in float32 and |g| < 1, so 176 is the ceiling.
-    C = min(chunk, L, 128)
-    n_chunks = (L + C - 1) // C
-    pad = n_chunks * C - L
-
-    # Rank counts valid positions, so padding neither contributes nor decays.
-    if mask is None:
-        m = (mx.arange(n_chunks * C) < L).astype(mx.float32)[None]
-    else:
-        m = mx.pad(mask.astype(mx.float32), [(0, 0), (0, pad)])
-    if pad:
-        pad_width = [(0, 0), (0, 0), (0, pad), (0, 0)]
-        q = mx.pad(q, pad_width)
-        k = mx.pad(k, pad_width)
-        v = mx.pad(v, pad_width)
-
-    q = mx.unflatten(q, 2, (n_chunks, C))
-    k = mx.unflatten(k, 2, (n_chunks, C))
-    v = mx.unflatten(v, 2, (n_chunks, C)).astype(mx.float32)
-
-    m = mx.unflatten(m, 1, (n_chunks, C))[:, None]
-    rank = mx.cumsum(m, axis=-1)
-    total = rank[..., -1:]
-    gh = g.reshape(1, H, 1, 1)
-
-    # Centring the rank splits exp(g (r_i - r_j)) over i and j within float32.
-    centre = 0.5 * C
-    e = gh * (rank - centre)
-    eq = mx.exp(e) * scale * m
-    ek = mx.exp(-e) * m
-    q = q * eq[..., None]
-    k = k * ek[..., None]
-
-    # The strict upper triangle overflows to +-inf; `tril` selects, so it drops
-    # those instead of multiplying them into NaN.
-    scores = mx.tril(q @ k.swapaxes(-1, -2))
-    intra = scores @ v
-    carry = k.swapaxes(-1, -2) @ v
-    decay = mx.exp(gh * (total - centre))[..., None]
-    state_decay = mx.exp(gh * total)[..., None]
-
-    cross = []
-    for i in range(n_chunks):
-        cross.append(q[:, :, i] @ h)
-        h = state_decay[:, :, i] * h + carry[:, :, i] * decay[:, :, i]
-    cross = mx.stack(cross, axis=2)
-
-    cross_scale = mx.exp(g * centre).reshape(1, H, 1, 1, 1)
-    y = (intra + cross * cross_scale).astype(out_dtype)
-    return mx.flatten(y, 2, 3)[:, :, :L], h
-
-
-class GroupRMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5, groups: int = 1):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.groups = groups
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
-        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
-        return self.weight * mx.flatten(x, -2)
-
-
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -270,6 +151,125 @@ class MultiLatentAttention(nn.Module):
         return self.dense(output)
 
 
+class GroupRMSNorm(nn.Module):
+    def __init__(self, dims: int, eps: float = 1e-5, groups: int = 1):
+        super().__init__()
+        self.weight = mx.ones((dims,))
+        self.groups = groups
+        self.eps = eps
+
+    def __call__(self, x: mx.array) -> mx.array:
+        x = mx.unflatten(x, axis=-1, shape=(self.groups, -1))
+        x = mx.fast.rms_norm(x, weight=None, eps=self.eps)
+        return self.weight * mx.flatten(x, -2)
+
+
+@mx.compile
+def _recurrent_gla_step(
+    q_t: mx.array,
+    k_t: mx.array,
+    v_t: mx.array,
+    h: mx.array,
+    exp_g: mx.array,
+) -> Tuple[mx.array, mx.array]:
+    h = h * exp_g + k_t.transpose(0, 1, 3, 2) @ v_t
+    return (q_t @ h).astype(q_t.dtype), h
+
+
+def recurrent_gla(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    g: mx.array,
+    *,
+    scale: float,
+    h: Optional[mx.array] = None,
+    mask: Optional[mx.array] = None,
+    chunk: int = 128,
+) -> Tuple[mx.array, mx.array]:
+    """
+    Lightning-attention recurrence ``h_t = h_{t-1} exp(g) + k_t^T v_t``,
+    ``y_t = q_t h_t``, with ``g`` a per-head decay constant over time.
+
+    Past one step it runs chunked. With ``r_t`` the number of valid positions up
+    to ``t``, unrolling gives
+
+        y_t = sum_{s <= t} exp(g (r_t - r_s)) (q_t . k_s) v_s + exp(g r_t) q_t h_0
+
+    so each block of ``C`` steps is one decay-weighted causal attention plus one
+    state carry, both matmuls.
+
+    Args:
+        mask (mx.array, optional): A ``[B, L]`` validity mask. Padded positions
+          contribute no ``k v^T`` and do not decay the state.
+    """
+    B, H, L, K = q.shape
+    V = v.shape[-1]
+    out_dtype = q.dtype
+    if h is None:
+        # Hold the state in float32, as the reference does.
+        h = mx.zeros((B, H, K, V), dtype=mx.float32)
+
+    if L == 1:
+        exp_g = mx.exp(g)[:, None, None].astype(h.dtype)
+        y, h_t = _recurrent_gla_step(q * scale, k, v, h, exp_g)
+        if mask is None:
+            return y, h_t
+        keep = mask[:, 0][:, None, None, None]
+        return mx.where(keep, y, 0), mx.where(keep, h_t, h)
+
+    # exp(|g| C / 2) must stay in float32 and |g| < 1, so 176 is the ceiling.
+    C = min(chunk, L, 128)
+    n_chunks = (L + C - 1) // C
+    pad = n_chunks * C - L
+
+    # Rank counts valid positions, so padding neither contributes nor decays.
+    if mask is None:
+        m = (mx.arange(n_chunks * C) < L).astype(mx.float32)[None]
+    else:
+        m = mx.pad(mask.astype(mx.float32), [(0, 0), (0, pad)])
+    if pad:
+        pad_width = [(0, 0), (0, 0), (0, pad), (0, 0)]
+        q = mx.pad(q, pad_width)
+        k = mx.pad(k, pad_width)
+        v = mx.pad(v, pad_width)
+
+    q = mx.unflatten(q, 2, (n_chunks, C))
+    k = mx.unflatten(k, 2, (n_chunks, C))
+    v = mx.unflatten(v, 2, (n_chunks, C)).astype(mx.float32)
+
+    m = mx.unflatten(m, 1, (n_chunks, C))[:, None]
+    rank = mx.cumsum(m, axis=-1)
+    total = rank[..., -1:]
+    gh = g.reshape(1, H, 1, 1)
+
+    # Centring the rank splits exp(g (r_i - r_j)) over i and j within float32.
+    centre = 0.5 * C
+    e = gh * (rank - centre)
+    eq = mx.exp(e) * scale * m
+    ek = mx.exp(-e) * m
+    q = q * eq[..., None]
+    k = k * ek[..., None]
+
+    # The strict upper triangle overflows to +-inf; `tril` selects, so it drops
+    # those instead of multiplying them into NaN.
+    scores = mx.tril(q @ k.swapaxes(-1, -2))
+    intra = scores @ v
+    carry = k.swapaxes(-1, -2) @ v
+    decay = mx.exp(gh * (total - centre))[..., None]
+    state_decay = mx.exp(gh * total)[..., None]
+
+    cross = []
+    for i in range(n_chunks):
+        cross.append(q[:, :, i] @ h)
+        h = state_decay[:, :, i] * h + carry[:, :, i] * decay[:, :, i]
+    cross = mx.stack(cross, axis=2)
+
+    cross_scale = mx.exp(g * centre).reshape(1, H, 1, 1, 1)
+    y = (intra + cross * cross_scale).astype(out_dtype)
+    return mx.flatten(y, 2, 3)[:, :, :L], h
+
+
 class LinearAttention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -314,23 +314,6 @@ class LinearAttention(nn.Module):
             max_position_embeddings=args.max_position_embeddings,
         )
         self._slope = self._get_slopes()
-
-    def _get_slopes(self) -> mx.array:
-        n = self.num_attention_heads
-
-        def power_of_2_slopes(n):
-            return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
-
-        if math.log2(n).is_integer():
-            slopes = power_of_2_slopes(n)
-        else:
-            p = 2 ** math.floor(math.log2(n))
-            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][: n - p]
-
-        slopes = mx.array(slopes, dtype=mx.float32)
-        denom = max(1, self.num_hidden_layers - 1)
-        layer_factor = 1 - self.layer_idx / denom + 1e-5
-        return -slopes * layer_factor
 
     def __call__(
         self,
@@ -384,6 +367,23 @@ class LinearAttention(nn.Module):
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         output = self.g_norm(output) * mx.sigmoid(self.g_proj(x))
         return self.dense(output)
+
+    def _get_slopes(self) -> mx.array:
+        n = self.num_attention_heads
+
+        def power_of_2_slopes(n):
+            return [2 ** (-(2 ** -(math.log2(n) - 3)) * (i + 1)) for i in range(n)]
+
+        if math.log2(n).is_integer():
+            slopes = power_of_2_slopes(n)
+        else:
+            p = 2 ** math.floor(math.log2(n))
+            slopes = power_of_2_slopes(p) + power_of_2_slopes(2 * p)[::2][: n - p]
+
+        slopes = mx.array(slopes, dtype=mx.float32)
+        denom = max(1, self.num_hidden_layers - 1)
+        layer_factor = 1 - self.layer_idx / denom + 1e-5
+        return -slopes * layer_factor
 
 
 class Gate(nn.Module):

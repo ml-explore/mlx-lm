@@ -34,63 +34,6 @@ class DenseMLP(nn.Module):
         return self.down_proj(self.activation(x_up, x_gate))
 
 
-class SparseMoeBlock(nn.Module):
-    def __init__(self, args: TextArgs):
-        super().__init__()
-        self.num_experts_per_tok = args.num_experts_per_tok
-        self.routed_scaling_factor = args.routed_scaling_factor
-
-        self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
-        self.e_score_correction_bias = mx.zeros((args.num_local_experts,))
-
-        activation = SwigluOAI(alpha=args.swiglu_alpha, limit=args.swiglu_limit)
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.intermediate_size,
-            args.num_local_experts,
-            activation=activation,
-        )
-
-        self.shared_experts = DenseMLP(
-            args.hidden_size,
-            args.shared_intermediate_size,
-            activation=activation,
-        )
-
-        self.sharding_group = None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
-        ne = x.shape[:-1]
-        x_flat = x.reshape(-1, x.shape[-1])
-
-        shared_out = self.shared_experts(x_flat)
-
-        # The reference routes in the weight dtype and upcasts only the logits.
-        gates = self.gate(x_flat)
-        scores = mx.sigmoid(gates.astype(mx.float32))
-        orig_scores = scores
-        scores = scores + self.e_score_correction_bias
-
-        k = self.num_experts_per_tok
-        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
-        scores = (scores * self.routed_scaling_factor).astype(x_flat.dtype)
-
-        y = self.switch_mlp(x_flat, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
-        y = y + shared_out
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-
-        return y.reshape(*ne, -1)
-
-
 class Attention(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int):
         super().__init__()
@@ -151,6 +94,51 @@ class Attention(nn.Module):
                 scaling_config=args.rope_parameters,
                 max_position_embeddings=args.max_position_embeddings,
             )
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        B, L, _ = x.shape
+        kv_cache = cache[0] if cache is not None else None
+        offset = kv_cache.offset if kv_cache is not None else 0
+
+        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q = q.reshape(B, L, self.num_attention_heads, self.head_dim)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.reshape(B, L, self.num_key_value_heads, self.head_dim)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.reshape(B, L, self.num_key_value_heads, self.head_dim)
+        v = v.transpose(0, 2, 1, 3)
+
+        if self.use_qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+
+        # Select before the cache advances: it moves its offset array in place.
+        if self.is_sparse_attn:
+            mask = self._block_mask(
+                x, mask, offset, cache[1] if cache is not None else None
+            )
+        if kv_cache is not None:
+            k, v = kv_cache.update_and_fetch(k, v)
+            # Keep the indexer cache in the graph: below the block budget nothing
+            # consumes its keys, and nothing ever consumes its values.
+            # Metal buffers are exhausted on long generations.
+            if self.is_sparse_attn:
+                index_kv = [cache[1].keys, cache[1].values]
+                kv_cache.keys = mx.depends(kv_cache.keys, index_kv)
+
+        out = scaled_dot_product_attention(
+            q, k, v, cache=kv_cache, scale=self.scale, mask=mask
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        return self.o_proj(out)
 
     def _block_mask(
         self,
@@ -215,50 +203,62 @@ class Attention(nn.Module):
         # One selection per KV group, so widen it to every query head in the group.
         return mx.repeat(keep, self.num_attention_heads // H, axis=1)
 
-    def __call__(
-        self,
-        x: mx.array,
-        mask: Optional[mx.array] = None,
-        cache: Optional[Any] = None,
-    ) -> mx.array:
-        B, L, _ = x.shape
-        kv_cache = cache[0] if cache is not None else None
-        offset = kv_cache.offset if kv_cache is not None else 0
 
-        q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        q = q.reshape(B, L, self.num_attention_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)
-        k = k.reshape(B, L, self.num_key_value_heads, self.head_dim)
-        k = k.transpose(0, 2, 1, 3)
-        v = v.reshape(B, L, self.num_key_value_heads, self.head_dim)
-        v = v.transpose(0, 2, 1, 3)
+class SparseMoeBlock(nn.Module):
+    def __init__(self, args: TextArgs):
+        super().__init__()
+        self.num_experts_per_tok = args.num_experts_per_tok
+        self.routed_scaling_factor = args.routed_scaling_factor
 
-        if self.use_qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        self.gate = nn.Linear(args.hidden_size, args.num_local_experts, bias=False)
+        self.e_score_correction_bias = mx.zeros((args.num_local_experts,))
 
-        q = self.rope(q, offset=offset)
-        k = self.rope(k, offset=offset)
-
-        # Select before the cache advances: it moves its offset array in place.
-        if self.is_sparse_attn:
-            mask = self._block_mask(
-                x, mask, offset, cache[1] if cache is not None else None
-            )
-        if kv_cache is not None:
-            k, v = kv_cache.update_and_fetch(k, v)
-            # Keep the indexer cache in the graph: below the block budget nothing
-            # consumes its keys, and nothing ever consumes its values.
-            # Metal buffers are exhausted on long generations.
-            if self.is_sparse_attn:
-                index_kv = [cache[1].keys, cache[1].values]
-                kv_cache.keys = mx.depends(kv_cache.keys, index_kv)
-
-        out = scaled_dot_product_attention(
-            q, k, v, cache=kv_cache, scale=self.scale, mask=mask
+        activation = SwigluOAI(alpha=args.swiglu_alpha, limit=args.swiglu_limit)
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.intermediate_size,
+            args.num_local_experts,
+            activation=activation,
         )
-        out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
-        return self.o_proj(out)
+
+        self.shared_experts = DenseMLP(
+            args.hidden_size,
+            args.shared_intermediate_size,
+            activation=activation,
+        )
+
+        self.sharding_group = None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
+        ne = x.shape[:-1]
+        x_flat = x.reshape(-1, x.shape[-1])
+
+        shared_out = self.shared_experts(x_flat)
+
+        # The reference routes in the weight dtype and upcasts only the logits.
+        gates = self.gate(x_flat)
+        scores = mx.sigmoid(gates.astype(mx.float32))
+        orig_scores = scores
+        scores = scores + self.e_score_correction_bias
+
+        k = self.num_experts_per_tok
+        inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+        inds = mx.stop_gradient(inds)
+        scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+        scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
+        scores = (scores * self.routed_scaling_factor).astype(x_flat.dtype)
+
+        y = self.switch_mlp(x_flat, inds)
+        y = (y * scores[..., None]).sum(axis=-2)
+        y = y + shared_out
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y.reshape(*ne, -1)
 
 
 class DecoderLayer(nn.Module):

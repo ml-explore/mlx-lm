@@ -34,12 +34,12 @@ class Model(nn.Module):
 
         return logits
 
-    def make_cache(self):
-        return [ArraysCache(size=2) for _ in range(len(self.layers))]
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
 
     @property
     def layers(self):
         return self.backbone.layers
 
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
+    def make_cache(self):
+        return [ArraysCache(size=2) for _ in range(len(self.layers))]

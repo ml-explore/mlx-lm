@@ -55,30 +55,6 @@ class TextArgs(BaseModelArgs):
 
 
 @dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str
-    text_config: dict
-    vision_config: dict | None = None
-    # Image rows go at <|patch|>: the processor expands each <|patch|> of the
-    # prompt to the rows of one image.
-    image_token_id: int = 200092
-    out_hidden_size: int | None = None
-    projector_hidden_size: int | None = None
-
-    def __post_init__(self) -> None:
-        self.text = TextArgs.from_dict(self.text_config)
-        self.vision = None
-        if self.vision_config:
-            self.vision = VisionArgs.from_dict(self.vision_config)
-            if self.out_hidden_size is None:
-                self.out_hidden_size = (
-                    self.vision.hidden_size * self.vision.merge_size**2
-                )
-            if self.projector_hidden_size is None:
-                self.projector_hidden_size = self.out_hidden_size
-
-
-@dataclass
 class VisionArgs(BaseModelArgs):
     hidden_size: int = 1536
     intermediate_size: int = 8960
@@ -112,3 +88,27 @@ class VisionArgs(BaseModelArgs):
                 )
                 for i in range(self.num_hidden_layers)
             ]
+
+
+@dataclass
+class ModelArgs(BaseModelArgs):
+    model_type: str
+    text_config: dict
+    vision_config: dict | None = None
+    # Image rows go at <|patch|>: the processor expands each <|patch|> of the
+    # prompt to the rows of one image.
+    image_token_id: int = 200092
+    out_hidden_size: int | None = None
+    projector_hidden_size: int | None = None
+
+    def __post_init__(self) -> None:
+        self.text = TextArgs.from_dict(self.text_config)
+        self.vision = None
+        if self.vision_config:
+            self.vision = VisionArgs.from_dict(self.vision_config)
+            if self.out_hidden_size is None:
+                self.out_hidden_size = (
+                    self.vision.hidden_size * self.vision.merge_size**2
+                )
+            if self.projector_hidden_size is None:
+                self.projector_hidden_size = self.out_hidden_size

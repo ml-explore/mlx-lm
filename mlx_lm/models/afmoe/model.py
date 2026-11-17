@@ -97,20 +97,6 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
-    def layers(self):
-        return self.model.layers
-
-    def make_cache(self):
-        return [
-            (
-                RotatingKVCache(max_size=self.model.sliding_window)
-                if layer.use_sliding
-                else KVCache()
-            )
-            for layer in self.layers
-        ]
-
-    @property
     def cast_predicate(self):
         def predicate(k):
             return "expert_bias" not in k
@@ -125,3 +111,17 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        return [
+            (
+                RotatingKVCache(max_size=self.model.sliding_window)
+                if layer.use_sliding
+                else KVCache()
+            )
+            for layer in self.layers
+        ]

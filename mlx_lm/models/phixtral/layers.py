@@ -43,6 +43,15 @@ class ModelArgs:
         )
 
 
+class Embd(nn.Module):
+    def __init__(self, config: ModelArgs):
+        super().__init__()
+        self.wte = nn.Embedding(config.num_vocab, config.model_dim)
+
+    def __call__(self, x):
+        return self.wte(x)
+
+
 class RoPEAttention(nn.Module):
     def __init__(self, dims: int, num_heads: int, rotary_dim: int):
         super().__init__()
@@ -149,15 +158,6 @@ class TransformerDecoder(nn.Module):
         for layer, c in zip(self.h, cache):
             x = layer(x, mask, c)
         return x
-
-
-class Embd(nn.Module):
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.wte = nn.Embedding(config.num_vocab, config.model_dim)
-
-    def __call__(self, x):
-        return self.wte(x)
 
 
 class OutputHead(nn.Module):

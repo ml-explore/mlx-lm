@@ -78,18 +78,18 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate
+
+    @property
     def quant_predicate(self):
         def predicate(path, _):
             if path.endswith("mlp.gate.gate_proj"):
                 return {"group_size": 64, "bits": 8}
             return True
-
-        return predicate
-
-    @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "expert_bias" not in k
 
         return predicate
 

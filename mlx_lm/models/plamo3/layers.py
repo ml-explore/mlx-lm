@@ -40,6 +40,9 @@ class RMSNorm(nn.Module):
         self._scale = None
         self._scale_weight = None
 
+    def __call__(self, hidden_states: mx.array) -> mx.array:
+        return mx.fast.rms_norm(hidden_states, self.scale, self.variance_epsilon)
+
     @property
     def scale(self) -> mx.array:
         if self.offset == 0:
@@ -50,9 +53,6 @@ class RMSNorm(nn.Module):
             self._scale = self.weight + self.offset
             self._scale_weight = self.weight
         return self._scale
-
-    def __call__(self, hidden_states: mx.array) -> mx.array:
-        return mx.fast.rms_norm(hidden_states, self.scale, self.variance_epsilon)
 
 
 class Attention(nn.Module):

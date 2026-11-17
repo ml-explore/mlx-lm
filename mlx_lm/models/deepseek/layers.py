@@ -19,6 +19,25 @@ __all__ = [
 ]
 
 
+class DeepseekMLP(nn.Module):
+    def __init__(
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.hidden_size = hidden_size or config.hidden_size
+        self.intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+
+
 class DeepseekAttention(nn.Module):
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -91,25 +110,6 @@ class DeepseekAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class DeepseekMLP(nn.Module):
-    def __init__(
-        self,
-        config: ModelArgs,
-        hidden_size: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = hidden_size or config.hidden_size
-        self.intermediate_size = intermediate_size or config.intermediate_size
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class MoEGate(nn.Module):

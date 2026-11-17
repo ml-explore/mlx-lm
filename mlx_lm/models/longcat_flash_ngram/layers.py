@@ -34,42 +34,6 @@ class NgramEmbedding(nn.Module):
             self.post_projs.append(nn.Linear(emb_dim, args.hidden_size, bias=False))
         self._compute_vocab_mods()
 
-    def _compute_vocab_mods(self):
-        vocab_mods = {}
-        for i in range(2, self.n + 1):
-            for j in range(self.k):
-                index = (i - 2) * self.k + j
-                emb_vocab_dim = int(self.m + index * 2 + 1)
-                mods = []
-                power_mod = 1
-                for _ in range(i - 1):
-                    power_mod = (power_mod * self.vocab_size) % emb_vocab_dim
-                    mods.append(power_mod)
-                vocab_mods[(i, j)] = mods
-        self._vocab_mods = vocab_mods
-
-    def _shift_right(self, x: mx.array, n: int) -> mx.array:
-        if n <= 0:
-            return x
-        batch_size, seq_len = x.shape
-        if seq_len <= n:
-            return mx.zeros_like(x)
-        return mx.concatenate(
-            [mx.zeros((batch_size, n), dtype=x.dtype), x[..., :-n]], axis=-1
-        )
-
-    def _get_ngram_ids(
-        self,
-        input_ids: mx.array,
-        shifted_ids: Dict[int, mx.array],
-        vocab_mods: List[int],
-        ngram: int,
-    ) -> mx.array:
-        ngram_ids = input_ids
-        for k in range(2, ngram + 1):
-            ngram_ids = ngram_ids + shifted_ids[k] * vocab_mods[k - 2]
-        return ngram_ids
-
     def __call__(
         self,
         input_ids: mx.array,
@@ -108,3 +72,39 @@ class NgramEmbedding(nn.Module):
                 x = x + x_proj
 
         return x / (1 + self.k * (self.n - 1))
+
+    def _shift_right(self, x: mx.array, n: int) -> mx.array:
+        if n <= 0:
+            return x
+        batch_size, seq_len = x.shape
+        if seq_len <= n:
+            return mx.zeros_like(x)
+        return mx.concatenate(
+            [mx.zeros((batch_size, n), dtype=x.dtype), x[..., :-n]], axis=-1
+        )
+
+    def _get_ngram_ids(
+        self,
+        input_ids: mx.array,
+        shifted_ids: Dict[int, mx.array],
+        vocab_mods: List[int],
+        ngram: int,
+    ) -> mx.array:
+        ngram_ids = input_ids
+        for k in range(2, ngram + 1):
+            ngram_ids = ngram_ids + shifted_ids[k] * vocab_mods[k - 2]
+        return ngram_ids
+
+    def _compute_vocab_mods(self):
+        vocab_mods = {}
+        for i in range(2, self.n + 1):
+            for j in range(self.k):
+                index = (i - 2) * self.k + j
+                emb_vocab_dim = int(self.m + index * 2 + 1)
+                mods = []
+                power_mod = 1
+                for _ in range(i - 1):
+                    power_mod = (power_mod * self.vocab_size) % emb_vocab_dim
+                    mods.append(power_mod)
+                vocab_mods[(i, j)] = mods
+        self._vocab_mods = vocab_mods

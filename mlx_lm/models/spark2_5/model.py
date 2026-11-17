@@ -96,6 +96,18 @@ class Model(nn.Module):
             return self.model.embedding.as_linear(hidden_states)
         return self.lm_head(hidden_states)
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
+    @property
+    def quant_predicate(self):
+        # The head-gate is a tiny per-head gating projection; keeping it at
+        # source precision preserves the sigmoid gate values.
+        def predicate(path, _):
+            return not path.endswith("self_attn.g_proj")
+
+        return predicate
+
     @property
     def layers(self):
         return self.model.layers
@@ -109,15 +121,3 @@ class Model(nn.Module):
             )
             for layer in self.layers
         ]
-
-    @property
-    def quant_predicate(self):
-        # The head-gate is a tiny per-head gating projection; keeping it at
-        # source precision preserves the sigmoid gate values.
-        def predicate(path, _):
-            return not path.endswith("self_attn.g_proj")
-
-        return predicate
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)

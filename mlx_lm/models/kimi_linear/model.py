@@ -71,19 +71,6 @@ class Model(nn.Module):
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
-    @property
-    def layers(self):
-        return self.model.layers
-
-    def make_cache(self):
-        caches: List[Any] = []
-        for layer in self.layers:
-            if layer.is_linear:
-                caches.append(ArraysCache(size=4))
-            else:
-                caches.append(KVCache())
-        return caches
-
     def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
         return checkpoint.sanitize(self, weights)
 
@@ -106,3 +93,16 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        caches: List[Any] = []
+        for layer in self.layers:
+            if layer.is_linear:
+                caches.append(ArraysCache(size=4))
+            else:
+                caches.append(KVCache())
+        return caches

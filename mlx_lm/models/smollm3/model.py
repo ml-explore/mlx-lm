@@ -44,9 +44,9 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
+    def sanitize(self, weights: dict):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers
-
-    def sanitize(self, weights: dict):
-        return checkpoint.sanitize(self, weights)

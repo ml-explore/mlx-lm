@@ -85,6 +85,10 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
+    @property
+    def layers(self):
+        return self.model.layers
+
     def make_cache(self):
         return [
             (
@@ -94,7 +98,3 @@ class Model(nn.Module):
             )
             for l in self.layers
         ]
-
-    @property
-    def layers(self):
-        return self.model.layers

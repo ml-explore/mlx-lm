@@ -60,9 +60,15 @@ class Model(nn.Module):
         out = self.model(inputs, cache)
         return self.lm_head(out)
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
-    def layers(self):
-        return self.model.layers
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
 
     @property
     def quant_predicate(self):
@@ -72,19 +78,6 @@ class Model(nn.Module):
             return True
 
         return predicate
-
-    @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "e_score_correction_bias" not in k
-
-        return predicate
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
-
-    def make_cache(self):
-        return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -126,3 +119,10 @@ class Model(nn.Module):
             shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
             shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
             shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        return [CacheList(KVCache(), KVCache()) for _ in self.model.layers]

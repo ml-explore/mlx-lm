@@ -26,6 +26,35 @@ __all__ = [
 ]
 
 
+def yarn_get_mscale(scale=1, mscale=1):
+    if scale <= 1:
+        return 1.0
+    return 0.1 * mscale * math.log(scale) + 1.0
+
+
+class DeepseekV2MLP(nn.Module):
+    def __init__(
+        self,
+        config: ModelArgs,
+        hidden_size: Optional[int] = None,
+        intermediate_size: Optional[int] = None,
+    ):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
+        self.intermediate_size = (
+            config.intermediate_size if intermediate_size is None else intermediate_size
+        )
+
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+    def __call__(self, x):
+        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
+        return down_proj
+
+
 def yarn_find_correction_dim(
     num_rotations, dim, base=10000, max_position_embeddings=2048
 ):
@@ -44,12 +73,6 @@ def yarn_find_correction_range(
         yarn_find_correction_dim(high_rot, dim, base, max_position_embeddings)
     )
     return max(low, 0), min(high, dim - 1)
-
-
-def yarn_get_mscale(scale=1, mscale=1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 def yarn_linear_ramp_mask(min_val, max_val, dim):
@@ -224,29 +247,6 @@ class DeepseekV2Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class DeepseekV2MLP(nn.Module):
-    def __init__(
-        self,
-        config: ModelArgs,
-        hidden_size: Optional[int] = None,
-        intermediate_size: Optional[int] = None,
-    ):
-        super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = (
-            config.intermediate_size if intermediate_size is None else intermediate_size
-        )
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-    def __call__(self, x):
-        down_proj = self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-        return down_proj
 
 
 class MoEGate(nn.Module):

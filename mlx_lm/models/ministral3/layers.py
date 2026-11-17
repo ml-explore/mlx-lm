@@ -25,19 +25,6 @@ __all__ = [
 ]
 
 
-def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
-    if isinstance(offset, mx.array) and offset.ndim > 0:
-        offset = offset[:, None]
-
-    scaling = 1 + beta * mx.log(
-        1 + mx.floor((mx.arange(size) + offset) / max_position_embeddings)
-    )
-    if scaling.ndim == 2:
-        return scaling[:, None, :, None]
-    else:
-        return scaling[:, None]
-
-
 class Fp8Linear(nn.QuantizedLinear):
     """Linear on e4m3 weights, run as mxfp8 with unit group scales.
 
@@ -69,6 +56,32 @@ class Fp8ShardedToAllLinear(QuantizedShardedToAllLinear):
     def __call__(self, x):
         y = super().__call__(x)
         return (y * self.output_scale).astype(y.dtype)
+
+
+class FusedGLU(nn.Module):
+    """Gated MLP with gate_proj and up_proj fused into one projection."""
+
+    def __init__(self, input_dims: int, hidden_dims: int):
+        super().__init__()
+        self.gate_up_proj = nn.Linear(input_dims, 2 * hidden_dims, bias=False)
+        self.down_proj = nn.Linear(hidden_dims, input_dims, bias=False)
+
+    def __call__(self, x):
+        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
+        return self.down_proj(swiglu(gate, up))
+
+
+def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
+    if isinstance(offset, mx.array) and offset.ndim > 0:
+        offset = offset[:, None]
+
+    scaling = 1 + beta * mx.log(
+        1 + mx.floor((mx.arange(size) + offset) / max_position_embeddings)
+    )
+    if scaling.ndim == 2:
+        return scaling[:, None, :, None]
+    else:
+        return scaling[:, None]
 
 
 class Attention(nn.Module):
@@ -158,19 +171,6 @@ class MLP(nn.Module):
 
     def __call__(self, x) -> mx.array:
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
-class FusedGLU(nn.Module):
-    """Gated MLP with gate_proj and up_proj fused into one projection."""
-
-    def __init__(self, input_dims: int, hidden_dims: int):
-        super().__init__()
-        self.gate_up_proj = nn.Linear(input_dims, 2 * hidden_dims, bias=False)
-        self.down_proj = nn.Linear(hidden_dims, input_dims, bias=False)
-
-    def __call__(self, x):
-        gate, up = mx.split(self.gate_up_proj(x), 2, axis=-1)
-        return self.down_proj(swiglu(gate, up))
 
 
 class TransformerBlock(nn.Module):

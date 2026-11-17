@@ -36,12 +36,12 @@ class Model(nn.Module):
             logits = self.lm_head(hidden)
         return logits
 
-    def make_cache(self, batch_size: int = 1) -> list[ArraysCache]:
-        return [ArraysCache(size=2) for _ in range(self.args.num_hidden_layers)]
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
 
     @property
     def layers(self):
         return self.backbone.layers
 
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
+    def make_cache(self, batch_size: int = 1) -> list[ArraysCache]:
+        return [ArraysCache(size=2) for _ in range(self.args.num_hidden_layers)]

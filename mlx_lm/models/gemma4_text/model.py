@@ -22,11 +22,6 @@ __all__ = [
 
 
 @partial(mx.compile, shapeless=True)
-def logit_softcap(softcap, x):
-    return mx.tanh(x / softcap) * softcap
-
-
-@partial(mx.compile, shapeless=True)
 def _complete_square(x2, y2, xy):
     return x2 + mx.expand_dims(y2, -1) - 2 * xy
 
@@ -82,6 +77,66 @@ class Gemma4TextModel(nn.Module):
                 kvs_by_type[self.layers[i].layer_type] = i
             for j in range(M, N):
                 self.previous_kvs[j] = kvs_by_type[self.layers[j].layer_type]
+
+    def __call__(
+        self,
+        inputs: mx.array = None,
+        cache=None,
+        input_embeddings: Optional[mx.array] = None,
+        per_layer_inputs: Optional[mx.array] = None,
+    ):
+        # Make the initial hidden state
+        if input_embeddings is None:
+            input_embeddings = self.embed_tokens(inputs)
+        h = input_embeddings
+        h = h * self.embed_scale
+
+        # Get the extra inputs per layer if we have per layer embeddings
+        if self.hidden_size_per_layer_input:
+            if per_layer_inputs is None:
+                per_layer_inputs = self._get_per_layer_inputs(inputs, input_embeddings)
+            per_layer_inputs = self._project_per_layer_inputs(h, per_layer_inputs)
+        if per_layer_inputs is not None:
+            per_layer_inputs = [
+                per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
+            ]
+        else:
+            per_layer_inputs = [None] * len(self.layers)
+
+        # Make the kv cache list, be sure to append None for all the shared kv
+        # layers
+        if cache is None:
+            cache = [None] * len(self.layers)
+        else:
+            cache = cache + [None] * (len(self.layers) - len(cache))
+
+        # Apply each layer. We save all intermediate kvs and offset and grab
+        # the previous one for the shared kv layers.
+        masks = self._make_masks(h, cache)
+        intermediates = [(None, None)] * len(self.layers)
+        for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
+            zip(
+                self.layers,
+                cache,
+                masks,
+                self.previous_kvs,
+                per_layer_inputs,
+            )
+        ):
+            kvs, offset = intermediates[prev_idx]
+
+            h, kvs, offset = layer(
+                h,
+                mask,
+                c,
+                per_layer_input=per_layer_input,
+                shared_kv=kvs,
+                offset=offset,
+            )
+
+            intermediates[idx] = (kvs, offset)
+
+        return self.norm(h)
 
     def _get_per_layer_inputs(
         self,
@@ -156,65 +211,10 @@ class Gemma4TextModel(nn.Module):
             masks.append(mask[l.layer_type])
         return masks
 
-    def __call__(
-        self,
-        inputs: mx.array = None,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None,
-        per_layer_inputs: Optional[mx.array] = None,
-    ):
-        # Make the initial hidden state
-        if input_embeddings is None:
-            input_embeddings = self.embed_tokens(inputs)
-        h = input_embeddings
-        h = h * self.embed_scale
 
-        # Get the extra inputs per layer if we have per layer embeddings
-        if self.hidden_size_per_layer_input:
-            if per_layer_inputs is None:
-                per_layer_inputs = self._get_per_layer_inputs(inputs, input_embeddings)
-            per_layer_inputs = self._project_per_layer_inputs(h, per_layer_inputs)
-        if per_layer_inputs is not None:
-            per_layer_inputs = [
-                per_layer_inputs[:, :, i, :] for i, _ in enumerate(self.layers)
-            ]
-        else:
-            per_layer_inputs = [None] * len(self.layers)
-
-        # Make the kv cache list, be sure to append None for all the shared kv
-        # layers
-        if cache is None:
-            cache = [None] * len(self.layers)
-        else:
-            cache = cache + [None] * (len(self.layers) - len(cache))
-
-        # Apply each layer. We save all intermediate kvs and offset and grab
-        # the previous one for the shared kv layers.
-        masks = self._make_masks(h, cache)
-        intermediates = [(None, None)] * len(self.layers)
-        for idx, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
-            zip(
-                self.layers,
-                cache,
-                masks,
-                self.previous_kvs,
-                per_layer_inputs,
-            )
-        ):
-            kvs, offset = intermediates[prev_idx]
-
-            h, kvs, offset = layer(
-                h,
-                mask,
-                c,
-                per_layer_input=per_layer_input,
-                shared_kv=kvs,
-                offset=offset,
-            )
-
-            intermediates[idx] = (kvs, offset)
-
-        return self.norm(h)
+@partial(mx.compile, shapeless=True)
+def logit_softcap(softcap, x):
+    return mx.tanh(x / softcap) * softcap
 
 
 def moe_quant_predicate(path, _):
@@ -280,6 +280,9 @@ class Model(nn.Module):
     def layers(self):
         return self.model.layers
 
+    def make_cache(self):
+        return make_cache(self.args)
+
     @property
     def head_dim(self):
         return self.args.head_dim
@@ -287,6 +290,3 @@ class Model(nn.Module):
     @property
     def n_kv_heads(self):
         return self.args.num_key_value_heads
-
-    def make_cache(self):
-        return make_cache(self.args)

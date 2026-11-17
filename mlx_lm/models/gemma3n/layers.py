@@ -30,31 +30,6 @@ class RMSNoScale(nn.Module):
         return mx.fast.rms_norm(x, None, self.eps)
 
 
-class Gemma3nLaurelBlock(nn.Module):
-    """Learned Augmented Residual Layer"""
-
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.config = config
-
-        self.linear_left = nn.Linear(
-            self.config.hidden_size, self.config.laurel_rank, bias=False
-        )
-        self.linear_right = nn.Linear(
-            self.config.laurel_rank, self.config.hidden_size, bias=False
-        )
-        self.post_laurel_norm = nn.RMSNorm(
-            dims=self.config.hidden_size,
-            eps=self.config.rms_norm_eps,
-        )
-
-    def __call__(self, x: mx.array) -> mx.array:
-        laurel_x = self.linear_left(x)
-        laurel_x = self.linear_right(laurel_x)
-        normed_laurel_x = self.post_laurel_norm(laurel_x)
-        return x + normed_laurel_x
-
-
 class Gemma3nAttention(nn.Module):
     def __init__(self, config: TextConfig, layer_idx: int, is_kv_shared_layer: bool):
         super().__init__()
@@ -248,6 +223,31 @@ class Gemma3nAltUp(nn.Module):
         corrected += predictions
 
         return corrected.astype(activated.dtype)
+
+
+class Gemma3nLaurelBlock(nn.Module):
+    """Learned Augmented Residual Layer"""
+
+    def __init__(self, config: TextConfig):
+        super().__init__()
+        self.config = config
+
+        self.linear_left = nn.Linear(
+            self.config.hidden_size, self.config.laurel_rank, bias=False
+        )
+        self.linear_right = nn.Linear(
+            self.config.laurel_rank, self.config.hidden_size, bias=False
+        )
+        self.post_laurel_norm = nn.RMSNorm(
+            dims=self.config.hidden_size,
+            eps=self.config.rms_norm_eps,
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        laurel_x = self.linear_left(x)
+        laurel_x = self.linear_right(laurel_x)
+        normed_laurel_x = self.post_laurel_norm(laurel_x)
+        return x + normed_laurel_x
 
 
 class Gemma3nDecoderLayer(nn.Module):

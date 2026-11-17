@@ -81,6 +81,13 @@ class Model(nn.Module):
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k
+
+        return predicate
+
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
         N = group.size()
@@ -139,10 +146,3 @@ class Model(nn.Module):
     @property
     def layers(self):
         return self.model.pipeline_layers
-
-    @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "e_score_correction_bias" not in k
-
-        return predicate

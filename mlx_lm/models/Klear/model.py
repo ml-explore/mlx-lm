@@ -64,8 +64,11 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
-    def layers(self):
-        return self.model.layers
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate
 
     @property
     def quant_predicate(self):
@@ -77,8 +80,5 @@ class Model(nn.Module):
         return predicate
 
     @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "expert_bias" not in k
-
-        return predicate
+    def layers(self):
+        return self.model.layers

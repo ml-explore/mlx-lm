@@ -22,68 +22,6 @@ __all__ = [
 ]
 
 
-@mx.compile
-def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-):
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    orig_scores = scores
-    scores = scores + e_score_correction_bias
-
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    inds = mx.stop_gradient(inds)
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / (denominator + 1e-20)
-
-    scores = scores * routed_scaling_factor
-    return inds, scores
-
-
-class MoEGate(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.top_k = args.num_experts_per_tok
-        self.norm_topk_prob = args.norm_topk_prob
-        self.n_routed_experts = args.num_experts
-        self.routed_scaling_factor = args.routed_scaling_factor
-        self.n_group = args.n_group
-        self.topk_group = args.topk_group
-        self.weight = mx.zeros((self.n_routed_experts, args.hidden_size))
-        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
-        assert args.topk_method == "noaux_tc", "Unsupported topk method."
-
-    def __call__(self, x):
-        return group_expert_select(
-            x @ self.weight.T,
-            self.e_score_correction_bias,
-            self.top_k,
-            self.n_group,
-            self.topk_group,
-            self.routed_scaling_factor,
-            self.norm_topk_prob,
-        )
-
-
 class MLP(nn.Module):
     def __init__(self, args: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -95,44 +33,6 @@ class MLP(nn.Module):
 
     def __call__(self, x):
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
-class MoE(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.moe_intermediate_size,
-            args.num_experts,
-        )
-
-        self.gate = MoEGate(args)
-
-        self.shared_experts = (
-            MLP(
-                args,
-                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
-            )
-            if args.num_shared_experts is not None and args.num_shared_experts > 0
-            else None
-        )
-
-        self.sharding_group = None
-
-    def __call__(self, x):
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
-        inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
-        if self.shared_experts is not None:
-            y = y + self.shared_experts(x)
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-
-        return y
 
 
 class Attention(nn.Module):
@@ -206,6 +106,106 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
+
+
+@mx.compile
+def group_expert_select(
+    gates,
+    e_score_correction_bias,
+    top_k,
+    n_group,
+    topk_group,
+    routed_scaling_factor,
+    norm_topk_prob,
+):
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    orig_scores = scores
+    scores = scores + e_score_correction_bias
+
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
+
+    k = top_k
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+
+    if top_k > 1 and norm_topk_prob:
+        denominator = scores.sum(axis=-1, keepdims=True)
+        scores = scores / (denominator + 1e-20)
+
+    scores = scores * routed_scaling_factor
+    return inds, scores
+
+
+class MoEGate(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.top_k = args.num_experts_per_tok
+        self.norm_topk_prob = args.norm_topk_prob
+        self.n_routed_experts = args.num_experts
+        self.routed_scaling_factor = args.routed_scaling_factor
+        self.n_group = args.n_group
+        self.topk_group = args.topk_group
+        self.weight = mx.zeros((self.n_routed_experts, args.hidden_size))
+        self.e_score_correction_bias = mx.zeros((self.n_routed_experts,))
+        assert args.topk_method == "noaux_tc", "Unsupported topk method."
+
+    def __call__(self, x):
+        return group_expert_select(
+            x @ self.weight.T,
+            self.e_score_correction_bias,
+            self.top_k,
+            self.n_group,
+            self.topk_group,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
+
+
+class MoE(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.switch_mlp = SwitchGLU(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.num_experts,
+        )
+
+        self.gate = MoEGate(args)
+
+        self.shared_experts = (
+            MLP(
+                args,
+                intermediate_size=args.moe_intermediate_size * args.num_shared_experts,
+            )
+            if args.num_shared_experts is not None and args.num_shared_experts > 0
+            else None
+        )
+
+        self.sharding_group = None
+
+    def __call__(self, x):
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+
+        inds, scores = self.gate(x)
+        y = self.switch_mlp(x, inds)
+        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        if self.shared_experts is not None:
+            y = y + self.shared_experts(x)
+
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+
+        return y
 
 
 class DecoderLayer(nn.Module):

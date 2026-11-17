@@ -53,13 +53,6 @@ class Model(nn.Module):
 
         return logits
 
-    def make_cache(self):
-        return [ArraysCache(size=3) for _ in range(len(self.layers))]
-
-    @property
-    def layers(self):
-        return self.model.layers
-
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
@@ -71,3 +64,10 @@ class Model(nn.Module):
             return True
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers
+
+    def make_cache(self):
+        return [ArraysCache(size=3) for _ in range(len(self.layers))]

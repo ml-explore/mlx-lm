@@ -12,6 +12,18 @@ __all__ = [
 ]
 
 
+def _use_fp8_linears(module, weights, prefix):
+    """Swap the linear layers that have an fp8 output scale for Fp8Linear."""
+    fp8_modules = []
+    for p, m in module.named_modules():
+        if isinstance(m, nn.Linear) and f"{prefix}{p}.output_scale" in weights:
+            out_dims, in_dims = m.weight.shape
+            per_row = weights[f"{prefix}{p}.output_scale"].ndim == 1
+            fp8_modules.append((p, Fp8Linear(in_dims, out_dims, per_row)))
+    if fp8_modules:
+        module.update_modules(tree_unflatten(fp8_modules))
+
+
 def _fuse(weights, parts, fused):
     """Join the output rows of layers that read the same input.
 
@@ -53,18 +65,6 @@ def _fp8_as_mxfp8(weights):
             weights[f"{p}.scales"] = mx.full(
                 (*w.shape[:-1], w.shape[-1] // 32), 127, mx.uint8
             )
-
-
-def _use_fp8_linears(module, weights, prefix):
-    """Swap the linear layers that have an fp8 output scale for Fp8Linear."""
-    fp8_modules = []
-    for p, m in module.named_modules():
-        if isinstance(m, nn.Linear) and f"{prefix}{p}.output_scale" in weights:
-            out_dims, in_dims = m.weight.shape
-            per_row = weights[f"{prefix}{p}.output_scale"].ndim == 1
-            fp8_modules.append((p, Fp8Linear(in_dims, out_dims, per_row)))
-    if fp8_modules:
-        module.update_modules(tree_unflatten(fp8_modules))
 
 
 def sanitize_language_model(language_model, weights, prefix):

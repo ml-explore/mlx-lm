@@ -25,37 +25,6 @@ __all__ = [
 ]
 
 
-# TODO: mx.contiguous of a slice fails on arrays this large; copy in chunks.
-_MAX_COPY_ELEMENTS = 1 << 31
-
-
-def shard_experts_inplace(
-    module: nn.Module, sharding: str, group: mx.distributed.Group
-) -> None:
-    N, r = group.size(), group.rank()
-    updates = {}
-    for name, w in module.parameters().items():
-        if not isinstance(w, mx.array):
-            continue
-        if w.ndim < 3:
-            # we don't shard scales for the nvfp4 weights
-            continue
-        axis = w.ndim - 2 if sharding == "all-to-sharded" else w.ndim - 1
-        n = w.shape[axis] // N
-        lo, hi = r * n, (r + 1) * n
-        per_expert = w.size // w.shape[0]
-        step = max(1, _MAX_COPY_ELEMENTS // (2 * per_expert))
-        parts = []
-        for i in range(0, w.shape[0], step):
-            chunk = w[i : i + step]
-            chunk = chunk[:, lo:hi] if axis == 1 else chunk[..., lo:hi]
-            chunk = mx.contiguous(chunk)
-            mx.eval(chunk)
-            parts.append(chunk)
-        updates[name] = mx.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
-    module.update(updates)
-
-
 class MuseSparkTextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -71,20 +40,6 @@ class MuseSparkTextModel(PipelineMixin, nn.Module):
             for rope_theta, layer_type in zip(args.layer_rope_theta, args.layer_types)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-
-    @property
-    def fa_idx(self) -> int:
-        layers = self.pipeline_layers
-        return next((i for i, l in enumerate(layers) if not l.use_sliding), 0)
-
-    @property
-    def swa_idx(self) -> int | None:
-        layers = self.pipeline_layers
-        return next((i for i, l in enumerate(layers) if l.use_sliding), None)
-
-    def embed(self, inputs: mx.array) -> mx.array:
-        """The normalized token embeddings."""
-        return mx.fast.rms_norm(self.embed_tokens(inputs), None, self.args.rms_norm_eps)
 
     def __call__(
         self,
@@ -137,6 +92,20 @@ class MuseSparkTextModel(PipelineMixin, nn.Module):
         # The norm reads the fp32 stream.
         return self.norm(h).astype(mx.bfloat16)
 
+    def embed(self, inputs: mx.array) -> mx.array:
+        """The normalized token embeddings."""
+        return mx.fast.rms_norm(self.embed_tokens(inputs), None, self.args.rms_norm_eps)
+
+    @property
+    def fa_idx(self) -> int:
+        layers = self.pipeline_layers
+        return next((i for i, l in enumerate(layers) if not l.use_sliding), 0)
+
+    @property
+    def swa_idx(self) -> int | None:
+        layers = self.pipeline_layers
+        return next((i for i, l in enumerate(layers) if l.use_sliding), None)
+
 
 class MuseSparkModel(nn.Module):
     """The language model and the vision tower, named as in the checkpoint."""
@@ -171,6 +140,37 @@ class MuseSparkModel(nn.Module):
         self.language_model.pipeline(group, split)
 
 
+# TODO: mx.contiguous of a slice fails on arrays this large; copy in chunks.
+_MAX_COPY_ELEMENTS = 1 << 31
+
+
+def shard_experts_inplace(
+    module: nn.Module, sharding: str, group: mx.distributed.Group
+) -> None:
+    N, r = group.size(), group.rank()
+    updates = {}
+    for name, w in module.parameters().items():
+        if not isinstance(w, mx.array):
+            continue
+        if w.ndim < 3:
+            # we don't shard scales for the nvfp4 weights
+            continue
+        axis = w.ndim - 2 if sharding == "all-to-sharded" else w.ndim - 1
+        n = w.shape[axis] // N
+        lo, hi = r * n, (r + 1) * n
+        per_expert = w.size // w.shape[0]
+        step = max(1, _MAX_COPY_ELEMENTS // (2 * per_expert))
+        parts = []
+        for i in range(0, w.shape[0], step):
+            chunk = w[i : i + step]
+            chunk = chunk[:, lo:hi] if axis == 1 else chunk[..., lo:hi]
+            chunk = mx.contiguous(chunk)
+            mx.eval(chunk)
+            parts.append(chunk)
+        updates[name] = mx.concatenate(parts, axis=0) if len(parts) > 1 else parts[0]
+    module.update(updates)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -182,39 +182,6 @@ class Model(nn.Module):
         self.sharding_group = None
         if args.vision is not None:
             self.perception_emb_norm = WeightlessRMSNorm(eps=text.rms_norm_eps)
-
-    def encode_image(self, pixel_values: mx.array | list[mx.array]) -> mx.array:
-        """pixel_values: one image (num_channels, H, W), a list of images of
-        any size, or images of one size (num_images, num_channels, H, W)."""
-        if isinstance(pixel_values, mx.array) and pixel_values.ndim == 3:
-            pixel_values = [pixel_values]
-        assert len(pixel_values), "No images."
-        assert all(p.ndim == 3 for p in pixel_values), "Images must be (C, H, W)."
-        tower, adapter = self.model.vision_tower, self.model.vision_adapter
-        dtype = tower.patch_embedder.patch_embedding.weight.dtype
-        # TODO: consider packing the images into one sequence, with attention
-        # per image (MLX has no varlen attention).
-        h = mx.concatenate([adapter(tower(p.astype(dtype))) for p in pixel_values])
-        h = self.model.vision_projection(h)
-        return self.perception_emb_norm(h)
-
-    def embed_inputs(
-        self,
-        inputs: mx.array,
-        *,
-        pixel_values: mx.array | list[mx.array] | None = None,
-    ) -> mx.array:
-        """The normalized input embeddings, with the vision rows at the patch tokens."""
-        h = self.model.language_model.embed(inputs)
-        # The vision rows take the dtype of the text embeddings.
-        if pixel_values is not None:
-            h = splice(
-                h,
-                inputs,
-                rows=self.encode_image(pixel_values),
-                token_id=self.args.image_token_id,
-            )
-        return h
 
     def __call__(
         self,
@@ -237,8 +204,64 @@ class Model(nn.Module):
         cap = self.args.text.final_logit_softcapping
         return mx.tanh(out / cap) * cap
 
+    def embed_inputs(
+        self,
+        inputs: mx.array,
+        *,
+        pixel_values: mx.array | list[mx.array] | None = None,
+    ) -> mx.array:
+        """The normalized input embeddings, with the vision rows at the patch tokens."""
+        h = self.model.language_model.embed(inputs)
+        # The vision rows take the dtype of the text embeddings.
+        if pixel_values is not None:
+            h = splice(
+                h,
+                inputs,
+                rows=self.encode_image(pixel_values),
+                token_id=self.args.image_token_id,
+            )
+        return h
+
+    def encode_image(self, pixel_values: mx.array | list[mx.array]) -> mx.array:
+        """pixel_values: one image (num_channels, H, W), a list of images of
+        any size, or images of one size (num_images, num_channels, H, W)."""
+        if isinstance(pixel_values, mx.array) and pixel_values.ndim == 3:
+            pixel_values = [pixel_values]
+        assert len(pixel_values), "No images."
+        assert all(p.ndim == 3 for p in pixel_values), "Images must be (C, H, W)."
+        tower, adapter = self.model.vision_tower, self.model.vision_adapter
+        dtype = tower.patch_embedder.patch_embedding.weight.dtype
+        # TODO: consider packing the images into one sequence, with attention
+        # per image (MLX has no varlen attention).
+        h = mx.concatenate([adapter(tower(p.astype(dtype))) for p in pixel_values])
+        h = self.model.vision_projection(h)
+        return self.perception_emb_norm(h)
+
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         return checkpoint.sanitize(self, weights)
+
+    @property
+    def cast_predicate(self) -> Callable[[str], bool]:
+        """Keep the gate weights in fp32 when the model is converted."""
+
+        def predicate(k: str) -> bool:
+            return not k.endswith(("_alpha", "_beta"))
+
+        return predicate
+
+    @property
+    def quant_predicate(self) -> Callable[[str, nn.Module], bool]:
+        """Quantize only MoE layers except the first one and the last one."""
+        experts_re = re.compile(
+            r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate|up|down)_proj$"
+        )
+        full_precision = {0, self.args.text.num_hidden_layers - 1}
+
+        def predicate(path: str, module: nn.Module) -> bool:
+            m = experts_re.match(path)
+            return m is not None and int(m.group(1)) not in full_precision
+
+        return predicate
 
     def shard(self, group: mx.distributed.Group | None = None) -> None:
         group = group or mx.distributed.init()
@@ -270,29 +293,6 @@ class Model(nn.Module):
             shard_experts_inplace(experts.gate_proj, "all-to-sharded", group)
             shard_experts_inplace(experts.down_proj, "sharded-to-all", group)
             shard_experts_inplace(experts.up_proj, "all-to-sharded", group)
-
-    @property
-    def quant_predicate(self) -> Callable[[str, nn.Module], bool]:
-        """Quantize only MoE layers except the first one and the last one."""
-        experts_re = re.compile(
-            r"^model\.language_model\.layers\.(\d+)\.mlp\.experts\.(gate|up|down)_proj$"
-        )
-        full_precision = {0, self.args.text.num_hidden_layers - 1}
-
-        def predicate(path: str, module: nn.Module) -> bool:
-            m = experts_re.match(path)
-            return m is not None and int(m.group(1)) not in full_precision
-
-        return predicate
-
-    @property
-    def cast_predicate(self) -> Callable[[str], bool]:
-        """Keep the gate weights in fp32 when the model is converted."""
-
-        def predicate(k: str) -> bool:
-            return not k.endswith(("_alpha", "_beta"))
-
-        return predicate
 
     @property
     def layers(self) -> list[TransformerBlock]:

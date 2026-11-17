@@ -30,28 +30,6 @@ class LanguageModel(PipelineMixin, nn.Module):
         self.layer_group_size = args.layer_group_size
         self._set_mask_indices()
 
-    def _set_mask_indices(self):
-        # One layer of each kind, to size the two masks and read the offset.
-        layers = self.pipeline_layers
-        self._attn_idx = next((i for i, l in enumerate(layers) if l.is_global), None)
-        self._gla_idx = next((i for i, l in enumerate(layers) if not l.is_global), None)
-
-    def pipeline(self, group, split=None):
-        if split is None:
-            # Every rank needs an MLA layer for the position offset.
-            size = group.size()
-            n_groups, tail = divmod(len(self.layers), self.layer_group_size)
-            base, extra = divmod(n_groups, size)
-            split = [
-                (base + (1 if r < extra else 0)) * self.layer_group_size
-                for r in range(size)
-            ]
-            split[0] += tail
-        super().pipeline(group, split=split)
-        self._set_mask_indices()
-        if self._attn_idx is None:
-            raise ValueError(f"split {split} leaves a rank without an MLA layer")
-
     def __call__(
         self,
         inputs: mx.array,
@@ -97,6 +75,28 @@ class LanguageModel(PipelineMixin, nn.Module):
 
         return self.norm(h)
 
+    def _set_mask_indices(self):
+        # One layer of each kind, to size the two masks and read the offset.
+        layers = self.pipeline_layers
+        self._attn_idx = next((i for i, l in enumerate(layers) if l.is_global), None)
+        self._gla_idx = next((i for i, l in enumerate(layers) if not l.is_global), None)
+
+    def pipeline(self, group, split=None):
+        if split is None:
+            # Every rank needs an MLA layer for the position offset.
+            size = group.size()
+            n_groups, tail = divmod(len(self.layers), self.layer_group_size)
+            base, extra = divmod(n_groups, size)
+            split = [
+                (base + (1 if r < extra else 0)) * self.layer_group_size
+                for r in range(size)
+            ]
+            split[0] += tail
+        super().pipeline(group, split=split)
+        self._set_mask_indices()
+        if self._attn_idx is None:
+            raise ValueError(f"split {split} leaves a rank without an MLA layer")
+
 
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -121,6 +121,13 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
+
+        return predicate
+
+    @property
     def quant_predicate(self):
         def predicate(path, _):
             if path.endswith("mlp.gate.gate_proj"):
@@ -129,13 +136,6 @@ class Model(nn.Module):
             if path.endswith(("attention.embed_q", "attention.unembed_out")):
                 return False
             return True
-
-        return predicate
-
-    @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "expert_bias" not in k
 
         return predicate
 

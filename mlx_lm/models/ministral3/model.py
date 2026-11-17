@@ -68,18 +68,6 @@ class LanguageModel(PipelineMixin, nn.Module):
                 self.swa_idx = e
                 break
 
-    def pipeline(self, group, split=None):
-        super().pipeline(group, split=split)
-        self.fa_idx = None
-        self.swa_idx = None
-        for e, l in enumerate(self.pipeline_layers):
-            if self.swa_idx is None and l.use_sliding:
-                self.swa_idx = e
-            elif self.fa_idx is None and not l.use_sliding:
-                self.fa_idx = e
-            if self.fa_idx is not None and self.swa_idx is not None:
-                break
-
     def __call__(
         self,
         inputs: mx.array,
@@ -134,6 +122,18 @@ class LanguageModel(PipelineMixin, nn.Module):
             h = mx.distributed.all_gather(h)[: h.shape[0]]
 
         return self.norm(h)
+
+    def pipeline(self, group, split=None):
+        super().pipeline(group, split=split)
+        self.fa_idx = None
+        self.swa_idx = None
+        for e, l in enumerate(self.pipeline_layers):
+            if self.swa_idx is None and l.use_sliding:
+                self.swa_idx = e
+            elif self.fa_idx is None and not l.use_sliding:
+                self.fa_idx = e
+            if self.fa_idx is not None and self.swa_idx is not None:
+                break
 
 
 def shard_layers(layers, group: mx.distributed.Group):

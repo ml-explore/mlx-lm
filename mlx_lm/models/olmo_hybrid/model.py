@@ -91,6 +91,9 @@ class Model(nn.Module):
             out = self.lm_head(out)
         return out
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers
@@ -103,6 +106,3 @@ class Model(nn.Module):
             else:
                 caches.append(KVCache())
         return caches
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)

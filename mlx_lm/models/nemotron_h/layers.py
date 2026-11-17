@@ -24,6 +24,22 @@ __all__ = [
 ]
 
 
+class NemotronHMLP(nn.Module):
+    def __init__(self, args: ModelArgs, intermediate_size=None):
+        super().__init__()
+        intermediate_size = intermediate_size or args.intermediate_size
+
+        self.up_proj = nn.Linear(
+            args.hidden_size, intermediate_size, bias=args.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            intermediate_size, args.hidden_size, bias=args.mlp_bias
+        )
+
+    def __call__(self, x):
+        return self.down_proj(nn.relu2(self.up_proj(x)))
+
+
 class MambaRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float, group_size: int):
         super().__init__()
@@ -81,6 +97,35 @@ class NemotronHMamba2Mixer(nn.Module):
         self.out_proj = nn.Linear(
             self.intermediate_size, self.hidden_size, bias=args.mamba_proj_bias
         )
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        mask: Optional[mx.array],
+        cache: Optional[ArraysCache] = None,
+    ) -> mx.array:
+
+        projected = self.in_proj(hidden_states)
+
+        gate, conv_input, dt = mx.split(
+            projected,
+            [self.intermediate_size, self.intermediate_size + self.conv_dim],
+            axis=-1,
+        )
+        conv_output = self._conv(conv_input, cache, mask)
+        hidden_states_ssm, B, C = mx.split(
+            conv_output,
+            [
+                self.intermediate_size,
+                self.intermediate_size + self.n_groups * self.ssm_state_size,
+            ],
+            axis=-1,
+        )
+        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
+        if cache:
+            cache.advance(y.shape[1])
+        y = self.norm(y, gate)
+        return self.out_proj(y)
 
     def _conv(
         self,
@@ -154,35 +199,6 @@ class NemotronHMamba2Mixer(nn.Module):
 
         return y.reshape(batch_size, seq_len, self.intermediate_size)
 
-    def __call__(
-        self,
-        hidden_states: mx.array,
-        mask: Optional[mx.array],
-        cache: Optional[ArraysCache] = None,
-    ) -> mx.array:
-
-        projected = self.in_proj(hidden_states)
-
-        gate, conv_input, dt = mx.split(
-            projected,
-            [self.intermediate_size, self.intermediate_size + self.conv_dim],
-            axis=-1,
-        )
-        conv_output = self._conv(conv_input, cache, mask)
-        hidden_states_ssm, B, C = mx.split(
-            conv_output,
-            [
-                self.intermediate_size,
-                self.intermediate_size + self.n_groups * self.ssm_state_size,
-            ],
-            axis=-1,
-        )
-        y = self._ssm(hidden_states_ssm, B, C, dt, cache, mask)
-        if cache:
-            cache.advance(y.shape[1])
-        y = self.norm(y, gate)
-        return self.out_proj(y)
-
 
 class NemotronHAttention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -242,22 +258,6 @@ class NemotronHAttention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
-
-
-class NemotronHMLP(nn.Module):
-    def __init__(self, args: ModelArgs, intermediate_size=None):
-        super().__init__()
-        intermediate_size = intermediate_size or args.intermediate_size
-
-        self.up_proj = nn.Linear(
-            args.hidden_size, intermediate_size, bias=args.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            intermediate_size, args.hidden_size, bias=args.mlp_bias
-        )
-
-    def __call__(self, x):
-        return self.down_proj(nn.relu2(self.up_proj(x)))
 
 
 @mx.compile

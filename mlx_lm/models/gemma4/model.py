@@ -66,12 +66,12 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
-    def layers(self):
-        return self.model.language_model.layers
-
-    @property
     def quant_predicate(self):
         return moe_quant_predicate
+
+    @property
+    def layers(self):
+        return self.model.language_model.layers
 
     def make_cache(self):
         return make_cache(self.args.text)

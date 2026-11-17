@@ -59,26 +59,21 @@ class MambaBlock(nn.Module):
             self.intermediate_size, self.hidden_size, bias=args.use_bias
         )
 
-    def ssm_step(self, x, A, state=None):
-        D = self.D
-        deltaBC = self.x_proj(x)
-        delta, B, C = mx.split(
-            deltaBC,
-            [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
-            axis=-1,
+    def __call__(self, x, cache):
+        if cache is None:
+            conv_cache, state_cache = None, None
+        else:
+            conv_cache, state_cache = cache[0], cache[1]
+
+        output, (new_conv_cache, new_state_cache) = self._process_sequence(
+            x, conv_cache, state_cache
         )
-        if self.use_bcdt_rms:
-            eps = self.args.mixer_rms_eps
-            delta = mx.fast.rms_norm(delta, weight=None, eps=eps)
-            B = mx.fast.rms_norm(B, weight=None, eps=eps)
-            C = mx.fast.rms_norm(C, weight=None, eps=eps)
-        delta = nn.softplus(self.dt_proj(delta))
-        new_state = mx.expand_dims(delta * x, -1) * mx.expand_dims(B, 1)
-        if state is not None:
-            new_state += state * mx.exp(mx.expand_dims(delta, -1) * A)
-        y = (new_state @ mx.expand_dims(C, -1)).squeeze(2)
-        y = y + D * x
-        return y, new_state
+
+        if isinstance(cache, ArraysCache):
+            cache[0] = new_conv_cache
+            cache[1] = new_state_cache
+
+        return output
 
     def _process_sequence(self, x, conv_cache, state_cache):
         B, T, D = x.shape
@@ -102,21 +97,26 @@ class MambaBlock(nn.Module):
         z = self.out_proj(swiglu(z, y))
         return z, (new_conv_cache, current_state)
 
-    def __call__(self, x, cache):
-        if cache is None:
-            conv_cache, state_cache = None, None
-        else:
-            conv_cache, state_cache = cache[0], cache[1]
-
-        output, (new_conv_cache, new_state_cache) = self._process_sequence(
-            x, conv_cache, state_cache
+    def ssm_step(self, x, A, state=None):
+        D = self.D
+        deltaBC = self.x_proj(x)
+        delta, B, C = mx.split(
+            deltaBC,
+            [self.time_step_rank, self.time_step_rank + self.ssm_state_size],
+            axis=-1,
         )
-
-        if isinstance(cache, ArraysCache):
-            cache[0] = new_conv_cache
-            cache[1] = new_state_cache
-
-        return output
+        if self.use_bcdt_rms:
+            eps = self.args.mixer_rms_eps
+            delta = mx.fast.rms_norm(delta, weight=None, eps=eps)
+            B = mx.fast.rms_norm(B, weight=None, eps=eps)
+            C = mx.fast.rms_norm(C, weight=None, eps=eps)
+        delta = nn.softplus(self.dt_proj(delta))
+        new_state = mx.expand_dims(delta * x, -1) * mx.expand_dims(B, 1)
+        if state is not None:
+            new_state += state * mx.exp(mx.expand_dims(delta, -1) * A)
+        y = (new_state @ mx.expand_dims(C, -1)).squeeze(2)
+        y = y + D * x
+        return y, new_state
 
 
 class ResidualBlock(nn.Module):

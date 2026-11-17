@@ -85,6 +85,16 @@ class Model(nn.Module):
         out = self.backbone(inputs, cache=cache)
         return self.lm_head(out)
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
+    @property
+    def cast_predicate(self):
+        def predicate(k):
+            return "e_score_correction_bias" not in k and "A_log" not in k
+
+        return predicate
+
     @property
     def layers(self):
         return self.backbone.layers
@@ -97,13 +107,3 @@ class Model(nn.Module):
             elif l.block_type == "*":
                 caches.append(KVCache())
         return caches
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)
-
-    @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "e_score_correction_bias" not in k and "A_log" not in k
-
-        return predicate

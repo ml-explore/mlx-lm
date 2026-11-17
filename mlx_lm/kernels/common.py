@@ -6,6 +6,12 @@ from functools import lru_cache
 
 import mlx.core as mx
 
+__all__ = [
+    "BLOCK_SUM_HEADER",
+    "row_threads",
+    "scalar",
+]
+
 # A sum over all threads of a threadgroup of TG threads.
 BLOCK_SUM_HEADER = """
 template <int TG>

@@ -75,9 +75,9 @@ class Model(nn.Module):
         out[..., self._dummy_tokenizer_ids] = -float("inf")
         return out
 
+    def sanitize(self, weights):
+        return checkpoint.sanitize(self, weights)
+
     @property
     def layers(self):
         return self.model.layers
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize(self, weights)

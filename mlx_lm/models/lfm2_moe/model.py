@@ -83,14 +83,11 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
-    def layers(self):
-        return self.model.layers
+    def cast_predicate(self):
+        def predicate(k):
+            return "expert_bias" not in k
 
-    def make_cache(self):
-        return [
-            KVCache() if l.is_attention_layer else ArraysCache(size=1)
-            for l in self.layers
-        ]
+        return predicate
 
     @property
     def quant_predicate(self):
@@ -102,8 +99,11 @@ class Model(nn.Module):
         return predicate
 
     @property
-    def cast_predicate(self):
-        def predicate(k):
-            return "expert_bias" not in k
+    def layers(self):
+        return self.model.layers
 
-        return predicate
+    def make_cache(self):
+        return [
+            KVCache() if l.is_attention_layer else ArraysCache(size=1)
+            for l in self.layers
+        ]

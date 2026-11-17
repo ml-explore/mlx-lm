@@ -46,33 +46,6 @@ class InputScaleRMSNorm(nn.Module):
         return mx.fast.rms_norm(self.weight * x, None, self.eps)
 
 
-def residual_gate_coefficients(
-    gate: mx.array, *, temperature: float = 0.3, eps: float = 1e-3
-) -> tuple[mx.array, mx.array]:
-    """Return the weights of the stream and of the branch for a gate."""
-    w = gate.astype(mx.float32) / temperature
-    beta = mx.sigmoid(w)
-    alpha = mx.sqrt(mx.clip(mx.sigmoid(-w) * (1.0 + beta), eps, None))
-    return alpha, beta
-
-
-POOLED_TP_MAX_TOKENS = 8
-
-
-# Added to the sum of the top-k router scores.
-_ROUTER_SCORE_EPS = 1e-15
-
-
-def row_parallel_linear(
-    linear: nn.Linear, x: mx.array, group: mx.distributed.Group
-) -> mx.array:
-    assert "bias" not in linear, "Linear layers with a bias are not supported."
-    rows = linear.weight.shape[0] // group.size()
-    r = group.rank()
-    part = x @ linear.weight[r * rows : (r + 1) * rows].T
-    return gather_last_axis(part, group)
-
-
 class Attention(nn.Module):
     def __init__(self, args: TextArgs, *, use_rope: bool):
         super().__init__()
@@ -140,9 +113,8 @@ class Attention(nn.Module):
         return self.o_proj(rms_norm_sigmoid_gate(output, gate, eps=self.eps))
 
 
-class PreciseSwiGLU(nn.Module):
-    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
-        return precise_swiglu(x, gate, x)
+# Added to the sum of the top-k router scores.
+_ROUTER_SCORE_EPS = 1e-15
 
 
 class MoEGate(nn.Module):
@@ -152,6 +124,24 @@ class MoEGate(nn.Module):
         super().__init__()
         self.weight = mx.zeros((num_experts, dim), dtype=mx.float32)
         self.e_score_correction_bias = mx.zeros((num_experts,), dtype=mx.float32)
+
+
+class PreciseSwiGLU(nn.Module):
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return precise_swiglu(x, gate, x)
+
+
+POOLED_TP_MAX_TOKENS = 8
+
+
+def row_parallel_linear(
+    linear: nn.Linear, x: mx.array, group: mx.distributed.Group
+) -> mx.array:
+    assert "bias" not in linear, "Linear layers with a bias are not supported."
+    rows = linear.weight.shape[0] // group.size()
+    r = group.rank()
+    part = x @ linear.weight[r * rows : (r + 1) * rows].T
+    return gather_last_axis(part, group)
 
 
 class MoE(nn.Module):
@@ -225,6 +215,16 @@ class MoE(nn.Module):
             if split
             else self.post_expert_proj(h)
         )
+
+
+def residual_gate_coefficients(
+    gate: mx.array, *, temperature: float = 0.3, eps: float = 1e-3
+) -> tuple[mx.array, mx.array]:
+    """Return the weights of the stream and of the branch for a gate."""
+    w = gate.astype(mx.float32) / temperature
+    beta = mx.sigmoid(w)
+    alpha = mx.sqrt(mx.clip(mx.sigmoid(-w) * (1.0 + beta), eps, None))
+    return alpha, beta
 
 
 class TransformerBlock(nn.Module):

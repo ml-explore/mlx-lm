@@ -31,89 +31,6 @@ def clamped_swiglu(x, gate, limit):
     return gate * x
 
 
-class ClampedSwiGLU(nn.Module):
-    def __init__(self, limit: float):
-        super().__init__()
-        self.limit = limit
-
-    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
-        return clamped_swiglu(x, gate, self.limit)
-
-
-class Step3p5MLP(nn.Module):
-    def __init__(
-        self, args: ModelArgs, intermediate_size: int, swiglu_limit: float = 0
-    ):
-        super().__init__()
-        self.hidden_size = args.hidden_size
-        self.intermediate_size = intermediate_size
-
-        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
-
-        self.limit = swiglu_limit if swiglu_limit and swiglu_limit > 0 else None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        if self.limit is not None:
-            return self.down_proj(
-                clamped_swiglu(self.up_proj(x), self.gate_proj(x), self.limit)
-            )
-        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
-
-
-@mx.compile
-def moe_gate_select(gates, router_bias, top_k, routed_scaling_factor, norm_topk_prob):
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    corrected_scores = scores + router_bias
-
-    topk_indices = mx.argpartition(-corrected_scores, kth=top_k - 1, axis=-1)[
-        ..., :top_k
-    ]
-    topk_indices = mx.stop_gradient(topk_indices)
-    topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
-
-    if norm_topk_prob:
-        topk_weights = topk_weights / (
-            mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
-        )
-
-    return topk_indices, topk_weights * routed_scaling_factor
-
-
-class Step3p5MoE(SwitchGLU):
-    """The routed experts and their router, moe in the checkpoint."""
-
-    def __init__(self, args: ModelArgs, swiglu_limit: float):
-        activation = ClampedSwiGLU(swiglu_limit) if swiglu_limit > 0 else SwiGLU()
-        super().__init__(
-            args.hidden_size,
-            args.moe_intermediate_size,
-            args.moe_num_experts,
-            activation=activation,
-        )
-        self.top_k = args.moe_top_k
-        self.routed_scaling_factor = args.moe_router_scaling_factor
-        self.norm_topk_prob = args.norm_expert_weight
-        self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
-        self.router_bias = mx.zeros((args.moe_num_experts,))
-
-    def __call__(self, x: mx.array) -> mx.array:
-        topk_indices, topk_weights = moe_gate_select(
-            self.gate(x),
-            self.router_bias,
-            self.top_k,
-            self.routed_scaling_factor,
-            self.norm_topk_prob,
-        )
-        routed_output = super().__call__(x, topk_indices)
-        return (
-            (routed_output * topk_weights[..., None])
-            .sum(axis=-2)
-            .astype(routed_output.dtype)
-        )
-
-
 class Step3p5Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -207,6 +124,89 @@ class Step3p5Attention(nn.Module):
             output = output * mx.sigmoid(self.g_proj(x))[..., None]
 
         return self.o_proj(output.reshape(B, L, -1))
+
+
+class ClampedSwiGLU(nn.Module):
+    def __init__(self, limit: float):
+        super().__init__()
+        self.limit = limit
+
+    def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
+        return clamped_swiglu(x, gate, self.limit)
+
+
+@mx.compile
+def moe_gate_select(gates, router_bias, top_k, routed_scaling_factor, norm_topk_prob):
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    corrected_scores = scores + router_bias
+
+    topk_indices = mx.argpartition(-corrected_scores, kth=top_k - 1, axis=-1)[
+        ..., :top_k
+    ]
+    topk_indices = mx.stop_gradient(topk_indices)
+    topk_weights = mx.take_along_axis(scores, topk_indices, axis=-1)
+
+    if norm_topk_prob:
+        topk_weights = topk_weights / (
+            mx.sum(topk_weights, axis=-1, keepdims=True) + 1e-20
+        )
+
+    return topk_indices, topk_weights * routed_scaling_factor
+
+
+class Step3p5MoE(SwitchGLU):
+    """The routed experts and their router, moe in the checkpoint."""
+
+    def __init__(self, args: ModelArgs, swiglu_limit: float):
+        activation = ClampedSwiGLU(swiglu_limit) if swiglu_limit > 0 else SwiGLU()
+        super().__init__(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.moe_num_experts,
+            activation=activation,
+        )
+        self.top_k = args.moe_top_k
+        self.routed_scaling_factor = args.moe_router_scaling_factor
+        self.norm_topk_prob = args.norm_expert_weight
+        self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
+        self.router_bias = mx.zeros((args.moe_num_experts,))
+
+    def __call__(self, x: mx.array) -> mx.array:
+        topk_indices, topk_weights = moe_gate_select(
+            self.gate(x),
+            self.router_bias,
+            self.top_k,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+        )
+        routed_output = super().__call__(x, topk_indices)
+        return (
+            (routed_output * topk_weights[..., None])
+            .sum(axis=-2)
+            .astype(routed_output.dtype)
+        )
+
+
+class Step3p5MLP(nn.Module):
+    def __init__(
+        self, args: ModelArgs, intermediate_size: int, swiglu_limit: float = 0
+    ):
+        super().__init__()
+        self.hidden_size = args.hidden_size
+        self.intermediate_size = intermediate_size
+
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+
+        self.limit = swiglu_limit if swiglu_limit and swiglu_limit > 0 else None
+
+    def __call__(self, x: mx.array) -> mx.array:
+        if self.limit is not None:
+            return self.down_proj(
+                clamped_swiglu(self.up_proj(x), self.gate_proj(x), self.limit)
+            )
+        return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
 
 class Step3p5DecoderLayer(nn.Module):

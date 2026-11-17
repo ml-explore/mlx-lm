@@ -50,33 +50,6 @@ class KimiK3TextModel(nn.Module):
         self.in_blocks = 0
         self._set_cache_indices()
 
-    def _set_cache_indices(self):
-        self.ssm_idx = None
-        self.attn_idx = None
-        for i, layer in enumerate(self.layers[self.start_idx : self.end_idx]):
-            if layer.is_linear:
-                if self.ssm_idx is None:
-                    self.ssm_idx = i
-            elif self.attn_idx is None:
-                self.attn_idx = i
-            if self.ssm_idx is not None and self.attn_idx is not None:
-                break
-
-    def pipeline(self, group):
-        self.pipeline_rank = group.rank()
-        self.pipeline_size = group.size()
-        base, extra = divmod(len(self.layers), self.pipeline_size)
-        seg = self.pipeline_size - self.pipeline_rank - 1
-        self.start_idx = seg * base + min(seg, extra)
-        self.end_idx = self.start_idx + base + (1 if seg < extra else 0)
-        self.num_layers = self.end_idx - self.start_idx
-        self.layers = self.layers[: self.end_idx]
-        self.layers[: self.start_idx] = [None] * self.start_idx
-        if self.use_attn_res:
-            block_size = self.args.attn_res_block_size
-            self.in_blocks = (self.start_idx + block_size - 1) // block_size
-        self._set_cache_indices()
-
     def __call__(
         self,
         inputs: mx.array,
@@ -155,6 +128,33 @@ class KimiK3TextModel(nn.Module):
 
         return self.norm(h)
 
+    def _set_cache_indices(self):
+        self.ssm_idx = None
+        self.attn_idx = None
+        for i, layer in enumerate(self.layers[self.start_idx : self.end_idx]):
+            if layer.is_linear:
+                if self.ssm_idx is None:
+                    self.ssm_idx = i
+            elif self.attn_idx is None:
+                self.attn_idx = i
+            if self.ssm_idx is not None and self.attn_idx is not None:
+                break
+
+    def pipeline(self, group):
+        self.pipeline_rank = group.rank()
+        self.pipeline_size = group.size()
+        base, extra = divmod(len(self.layers), self.pipeline_size)
+        seg = self.pipeline_size - self.pipeline_rank - 1
+        self.start_idx = seg * base + min(seg, extra)
+        self.end_idx = self.start_idx + base + (1 if seg < extra else 0)
+        self.num_layers = self.end_idx - self.start_idx
+        self.layers = self.layers[: self.end_idx]
+        self.layers[: self.start_idx] = [None] * self.start_idx
+        if self.use_attn_res:
+            block_size = self.args.attn_res_block_size
+            self.in_blocks = (self.start_idx + block_size - 1) // block_size
+        self._set_cache_indices()
+
 
 class KimiK3Model(nn.Module):
     """The language model, named as in the checkpoint."""
@@ -202,19 +202,30 @@ class Model(nn.Module):
             return language_model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
-    @property
-    def layers(self):
-        language_model = self.model.language_model
-        return language_model.layers[language_model.start_idx : language_model.end_idx]
+    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+        return checkpoint.sanitize(self, weights)
 
-    def make_cache(self):
-        caches: List[Any] = []
-        for layer in self.layers:
-            if layer.is_linear:
-                caches.append(ArraysCache(size=2))
-            else:
-                caches.append(KVCache())
-        return caches
+    @property
+    def cast_predicate(self):
+        def predicate(path: str):
+            if "e_score_correction_bias" in path:
+                return False
+            if path.endswith("A_log") or path.endswith("dt_bias"):
+                return False
+            return True
+
+        return predicate
+
+    @property
+    def quant_predicate(self):
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            if path.endswith("res_proj"):
+                return False
+            return True
+
+        return predicate
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -325,27 +336,16 @@ class Model(nn.Module):
                     layer.mlp.down_proj, "sharded-to-all", group=group
                 )
 
-    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        return checkpoint.sanitize(self, weights)
-
     @property
-    def cast_predicate(self):
-        def predicate(path: str):
-            if "e_score_correction_bias" in path:
-                return False
-            if path.endswith("A_log") or path.endswith("dt_bias"):
-                return False
-            return True
+    def layers(self):
+        language_model = self.model.language_model
+        return language_model.layers[language_model.start_idx : language_model.end_idx]
 
-        return predicate
-
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith("mlp.gate"):
-                return {"group_size": 64, "bits": 8}
-            if path.endswith("res_proj"):
-                return False
-            return True
-
-        return predicate
+    def make_cache(self):
+        caches: List[Any] = []
+        for layer in self.layers:
+            if layer.is_linear:
+                caches.append(ArraysCache(size=2))
+            else:
+                caches.append(KVCache())
+        return caches

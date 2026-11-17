@@ -77,15 +77,15 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     @property
-    def layers(self):
-        return self.model.layers
-
-    @property
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k
 
         return predicate
+
+    @property
+    def layers(self):
+        return self.model.layers
 
     def make_cache(self):
         caches = []

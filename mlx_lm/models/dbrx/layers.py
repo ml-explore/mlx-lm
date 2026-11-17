@@ -21,6 +21,75 @@ __all__ = [
 ]
 
 
+class Router(nn.Module):
+    def __init__(self, d_model: int, num_experts: int):
+        super().__init__()
+        self.layer = nn.Linear(d_model, num_experts, bias=False)
+
+    def __call__(self, x: mx.array):
+        return self.layer(x)
+
+
+class MLP(nn.Module):
+    def __init__(self, d_model: int, ffn_dim: int):
+        super().__init__()
+        self.v1 = nn.Linear(d_model, ffn_dim, bias=False)
+        self.w1 = nn.Linear(d_model, ffn_dim, bias=False)
+        self.w2 = nn.Linear(ffn_dim, d_model, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        current_hidden_states = swiglu(self.w1(x), self.v1(x))
+        current_hidden_states = self.w2(current_hidden_states)
+        return current_hidden_states
+
+
+class SparseMoeBlock(nn.Module):
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.d_model = args.d_model
+        self.ffn_dim = args.ffn_config["ffn_hidden_size"]
+        self.num_experts = args.ffn_config["moe_num_experts"]
+        self.num_experts_per_tok = args.ffn_config["moe_top_k"]
+
+        self.router = Router(self.d_model, self.num_experts)
+        self.experts = [
+            MLP(self.d_model, self.ffn_dim) for _ in range(self.num_experts)
+        ]
+
+    def __call__(self, x: mx.array) -> mx.array:
+        ne = self.num_experts_per_tok
+        orig_shape = x.shape
+        x = x.reshape(-1, x.shape[-1])
+
+        gates = self.router(x)
+        gates = mx.softmax(gates.astype(mx.float32), axis=-1)
+
+        inds = mx.stop_gradient(mx.argpartition(-gates, kth=ne - 1, axis=-1)[:, :ne])
+        scores = mx.take_along_axis(gates, inds, axis=-1)
+        scores = scores / mx.linalg.norm(scores, ord=1, axis=-1, keepdims=True)
+        scores = scores.astype(x.dtype)
+
+        if self.training:
+            inds = np.array(inds)
+            y = mx.zeros((x.shape[0], ne, x.shape[-1]), x.dtype)
+            for e, expert in enumerate(self.experts):
+                idx1, idx2 = map(mx.array, np.where(inds == e))
+                if idx1.size == 0:
+                    continue
+                y[idx1, idx2] = expert(x[idx1])
+
+            y = (y * scores[:, :, None]).sum(axis=1)
+        else:
+            y = []
+            for xt, st, it in zip(x, scores, inds.tolist()):
+                yt = mx.stack([self.experts[e](xt) for e in it], axis=-1)
+                yt = (yt * st).sum(axis=-1)
+                y.append(yt)
+            y = mx.stack(y, axis=0)
+
+        return y.reshape(orig_shape)
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -97,75 +166,6 @@ class NormAttnNorm(nn.Module):
         h = self.attn(self.norm_1(x), mask=mask, cache=cache)
         x = h + x
         return x, self.norm_2(x)
-
-
-class MLP(nn.Module):
-    def __init__(self, d_model: int, ffn_dim: int):
-        super().__init__()
-        self.v1 = nn.Linear(d_model, ffn_dim, bias=False)
-        self.w1 = nn.Linear(d_model, ffn_dim, bias=False)
-        self.w2 = nn.Linear(ffn_dim, d_model, bias=False)
-
-    def __call__(self, x: mx.array) -> mx.array:
-        current_hidden_states = swiglu(self.w1(x), self.v1(x))
-        current_hidden_states = self.w2(current_hidden_states)
-        return current_hidden_states
-
-
-class Router(nn.Module):
-    def __init__(self, d_model: int, num_experts: int):
-        super().__init__()
-        self.layer = nn.Linear(d_model, num_experts, bias=False)
-
-    def __call__(self, x: mx.array):
-        return self.layer(x)
-
-
-class SparseMoeBlock(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.d_model = args.d_model
-        self.ffn_dim = args.ffn_config["ffn_hidden_size"]
-        self.num_experts = args.ffn_config["moe_num_experts"]
-        self.num_experts_per_tok = args.ffn_config["moe_top_k"]
-
-        self.router = Router(self.d_model, self.num_experts)
-        self.experts = [
-            MLP(self.d_model, self.ffn_dim) for _ in range(self.num_experts)
-        ]
-
-    def __call__(self, x: mx.array) -> mx.array:
-        ne = self.num_experts_per_tok
-        orig_shape = x.shape
-        x = x.reshape(-1, x.shape[-1])
-
-        gates = self.router(x)
-        gates = mx.softmax(gates.astype(mx.float32), axis=-1)
-
-        inds = mx.stop_gradient(mx.argpartition(-gates, kth=ne - 1, axis=-1)[:, :ne])
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        scores = scores / mx.linalg.norm(scores, ord=1, axis=-1, keepdims=True)
-        scores = scores.astype(x.dtype)
-
-        if self.training:
-            inds = np.array(inds)
-            y = mx.zeros((x.shape[0], ne, x.shape[-1]), x.dtype)
-            for e, expert in enumerate(self.experts):
-                idx1, idx2 = map(mx.array, np.where(inds == e))
-                if idx1.size == 0:
-                    continue
-                y[idx1, idx2] = expert(x[idx1])
-
-            y = (y * scores[:, :, None]).sum(axis=1)
-        else:
-            y = []
-            for xt, st, it in zip(x, scores, inds.tolist()):
-                yt = mx.stack([self.experts[e](xt) for e in it], axis=-1)
-                yt = (yt * st).sum(axis=-1)
-                y.append(yt)
-            y = mx.stack(y, axis=0)
-
-        return y.reshape(orig_shape)
 
 
 class DecoderLayer(nn.Module):
