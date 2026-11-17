@@ -243,6 +243,18 @@ class BailingMLA(nn.Module):
         kv_latent = mx.expand_dims(kv_latent, axis=1)
         if cache is not None:
             kv_latent, k_rope = cache.update_and_fetch(kv_latent, k_rope)
+            if isinstance(k_rope, (tuple, list)):
+                # QuantizedKVCache returns (quantized, scales, biases) tuples, but
+                # this MLA path needs plain arrays for the PE matmul and the latent
+                # projections. Dequantize on read (cache storage stays quantized).
+                # Fixes #2057.
+                kv_latent = mx.dequantize(
+                    *kv_latent, group_size=cache.group_size, bits=cache.bits
+                )
+                k_rope = mx.dequantize(
+                    *k_rope, group_size=cache.group_size, bits=cache.bits
+                )
+                cache = None  # already fetched; skip quantized-SDPA dispatch
 
         pe_scores = (q_rope * self.scale) @ k_rope.swapaxes(-1, -2)
         if mask is not None:
