@@ -3145,6 +3145,15 @@ class TestModels(unittest.TestCase):
             "layer_norm_epsilon": 1e-4,
             "use_bias": True,
             "use_conv_bias": True,
+            "n_routed_experts": 4,
+            "num_experts_per_tok": 2,
+            "moe_intermediate_size": 64,
+            "n_shared_experts": 1,
+            "moe_shared_expert_intermediate_size": 64,
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": True,
+            "routed_scaling_factor": 1.0,
             "layers_block_type": ["full_attention", "linear_attention", "mlp", "moe"],
         }
         expected = ["*", "M", "-", "E"]
