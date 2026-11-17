@@ -10,8 +10,9 @@ import mlx.nn as nn
 import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
+from mlx_lm.layers.moe import QuantizedSwitchLinear, SwitchLinear
+
 from ..cli_ui import rprint
-from ..models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 from ..utils import get_total_parameters
 from .dora import DoRAEmbedding, DoRALinear
 from .lora import LoRAEmbedding, LoRALinear, LoRASwitchLinear

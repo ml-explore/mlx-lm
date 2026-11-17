@@ -5,7 +5,7 @@ from typing import Dict
 
 import mlx.core as mx
 
-from mlx_lm.layers.multimodal import from_text_layout
+from mlx_lm.models.checkpoint import from_text_layout
 from mlx_lm.models.kimi_k3.layers import KimiK3DeltaAttention, KimiK3SparseMoE
 
 __all__ = [

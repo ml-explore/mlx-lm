@@ -3,7 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.internlm2 import checkpoint
 from mlx_lm.models.internlm2.config import ModelArgs
 from mlx_lm.models.internlm2.layers import TransformerBlock

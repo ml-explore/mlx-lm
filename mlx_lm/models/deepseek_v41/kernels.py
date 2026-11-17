@@ -4,11 +4,15 @@ from typing import Callable, Optional
 
 import mlx.core as mx
 
+__all__ = [
+    "sinkhorn",
+]
+
 
 def _make_sinkhorn_kernel() -> Optional[Callable]:
     if not mx.metal.is_available():
         return None
-    # The loop of _sinkhorn in one launch, one thread per matrix, in the same order.
+    # The loop of sinkhorn in one launch, one thread per matrix, in the same order.
     source = """
         uint n = thread_position_in_grid.x;
         if (n >= comb_shape[0]) {
@@ -48,7 +52,7 @@ def _make_sinkhorn_kernel() -> Optional[Callable]:
 _sinkhorn_kernel = _make_sinkhorn_kernel()
 
 
-def _sinkhorn(comb: mx.array, *, iters: int, eps: mx.array) -> mx.array:
+def sinkhorn(comb: mx.array, *, iters: int, eps: mx.array) -> mx.array:
     """Normalize the columns, then the rows and columns iters - 1 more times."""
     if (
         _sinkhorn_kernel is None

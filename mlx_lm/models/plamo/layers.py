@@ -6,8 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_lm.layers.activations import swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
 from mlx_lm.models.plamo.config import ModelArgs
 
 __all__ = [

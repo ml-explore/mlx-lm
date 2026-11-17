@@ -4,7 +4,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.models.muse_glimmer.config import ModelArgs
 
 __all__ = [

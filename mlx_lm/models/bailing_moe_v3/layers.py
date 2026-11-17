@@ -7,12 +7,11 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 
-from mlx_lm.layers.activations import swiglu
-from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.gated_delta import gated_delta_update, normalize_qk
-from mlx_lm.layers.mla import MultiLinear
+from mlx_lm.layers.attention import MultiLinear, scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.moe import SwitchGLU
+from mlx_lm.layers.recurrent import gated_delta_update, normalize_qk
 from mlx_lm.layers.rope import apply_yarn_mscale, initialize_rope
-from mlx_lm.layers.switch import SwitchGLU
 from mlx_lm.models.bailing_moe_v3.config import ModelArgs
 from mlx_lm.models.cache import ArraysCache
 

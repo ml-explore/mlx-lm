@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
-from mlx_lm.layers.pipeline import PipelineMixin
+from mlx_lm.layers.distributed import PipelineMixin
 from mlx_lm.models.deepseek_v41 import checkpoint
 from mlx_lm.models.deepseek_v41.config import ModelArgs
 from mlx_lm.models.deepseek_v41.layers import (

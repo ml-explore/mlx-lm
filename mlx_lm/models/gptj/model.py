@@ -5,7 +5,7 @@ from typing import Any, Optional
 from mlx import core as mx
 from mlx import nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.gptj import checkpoint
 from mlx_lm.models.gptj.config import ModelArgs
 from mlx_lm.models.gptj.layers import GPTJBlock

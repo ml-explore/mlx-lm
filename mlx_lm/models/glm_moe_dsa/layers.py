@@ -4,8 +4,12 @@ from typing import Any, Optional
 
 import mlx.core as mx
 
-from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.dsa import blocked_topk, min_context, sparse_attention
+from mlx_lm.layers.attention import (
+    blocked_topk,
+    min_context,
+    scaled_dot_product_attention,
+    sparse_attention,
+)
 from mlx_lm.models.deepseek_v32.layers import (
     DeepseekV32Attention,
     DeepseekV32DecoderLayer,

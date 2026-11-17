@@ -1,15 +1,16 @@
 # Copyright © 2023 Apple Inc.
 
+"""The experts of mixture-of-experts layers."""
+
 import math
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
+from mlx_lm.layers.common import SwiGLU
 
 __all__ = [
     "QuantizedSwitchLinear",
-    "SwiGLU",
     "SwitchGLU",
     "SwitchLinear",
     "SwitchMLP",
@@ -177,14 +178,6 @@ class SwitchLinear(nn.Module):
         if "bias" in self:
             ql.bias = self.bias
         return ql
-
-
-class SwiGLU(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-    def __call__(self, x, gate):
-        return swiglu(gate, x)
 
 
 class SwitchGLU(nn.Module):

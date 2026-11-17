@@ -5,9 +5,9 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import precise_swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.gated_delta import gated_delta_update, normalize_qk
+from mlx_lm.layers.common import precise_swiglu
+from mlx_lm.layers.recurrent import gated_delta_update, normalize_qk
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.models.olmo_hybrid.config import ModelArgs
 

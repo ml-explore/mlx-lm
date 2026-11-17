@@ -6,10 +6,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from mlx_lm.kernels import expert_routing
-from mlx_lm.layers.activations import swiglu
+from mlx_lm.kernels.expert_routing import expert_routing
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.switch import SwitchGLU
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.moe import SwitchGLU
 from mlx_lm.models.flint.config import ModelArgs
 
 __all__ = [

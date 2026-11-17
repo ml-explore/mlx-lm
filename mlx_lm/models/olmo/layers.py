@@ -5,9 +5,8 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
-from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask, scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
 from mlx_lm.models.olmo.config import ModelArgs
 
 __all__ = [

@@ -5,8 +5,8 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.models.youtu_llm.config import ModelArgs
 

@@ -5,7 +5,7 @@ import unittest
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
 
 
 class TestZeroCenteredRMSNorm(unittest.TestCase):

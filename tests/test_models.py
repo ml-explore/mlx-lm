@@ -11,20 +11,22 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
-from mlx_lm.models import rope_utils
-from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
+from mlx_lm.kernels.gated_delta import gated_delta_kernel
+from mlx_lm.layers import rope as rope_layers
+from mlx_lm.layers.attention import create_causal_mask, scaled_dot_product_attention
+from mlx_lm.layers.recurrent import (
+    gated_delta_ops,
+    gated_delta_update,
+    ssm_attn,
+    ssm_update,
+)
 from mlx_lm.models.cache import (
     BatchKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
 )
-from mlx_lm.models.gated_delta import (
-    gated_delta_kernel,
-    gated_delta_ops,
-    gated_delta_update,
-)
-from mlx_lm.models.ssm import ssm_attn, ssm_update
+from mlx_lm.utils import model_package
 
 
 class TestModels(unittest.TestCase):
@@ -232,10 +234,10 @@ class TestModels(unittest.TestCase):
         self.assertEqual(caches[1].offset, 3)
 
     def test_rope(self):
-        rope = rope_utils.initialize_rope(32, base=100, traditional=False)
+        rope = rope_layers.initialize_rope(32, base=100, traditional=False)
         self.assertTrue(isinstance(rope, nn.RoPE))
 
-        rope = rope_utils.initialize_rope(
+        rope = rope_layers.initialize_rope(
             32,
             base=100,
             traditional=False,
@@ -243,15 +245,15 @@ class TestModels(unittest.TestCase):
         )
         self.assertTrue(isinstance(rope, nn.RoPE))
 
-        rope = rope_utils.initialize_rope(
+        rope = rope_layers.initialize_rope(
             32,
             base=100,
             traditional=False,
             scaling_config={"rope_type": "llama3", "factor": 2.0},
         )
-        self.assertTrue(isinstance(rope, rope_utils.Llama3RoPE))
+        self.assertTrue(isinstance(rope, rope_layers.Llama3RoPE))
 
-        rope = rope_utils.initialize_rope(
+        rope = rope_layers.initialize_rope(
             16,
             base=100.0,
             traditional=False,
@@ -260,7 +262,7 @@ class TestModels(unittest.TestCase):
                 "partial_rotary_factor": 0.5,
             },
         )
-        self.assertTrue(isinstance(rope, rope_utils.ProportionalRoPE))
+        self.assertTrue(isinstance(rope, rope_layers.ProportionalRoPE))
         expected_freqs = 100.0 ** (mx.arange(0, 8, 2, dtype=mx.float32) / 16)
         self.assertTrue(mx.allclose(rope._freqs[:4], expected_freqs))
         self.assertTrue(mx.all(mx.isinf(rope._freqs[4:])))
@@ -289,7 +291,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue(mx.allclose(y, expected))
 
     def test_su_scaled_rope_no_mutation(self):
-        rope = rope_utils.SuScaledRoPE(
+        rope = rope_layers.SuScaledRoPE(
             dims=8,
             max_position_embeddings=131072,
             original_max_position_embeddings=4096,
@@ -301,7 +303,7 @@ class TestModels(unittest.TestCase):
         self.assertTrue((x == 1).all())
 
     def test_yarn_rope_no_mutation(self):
-        rope = rope_utils.YarnRoPE(
+        rope = rope_layers.YarnRoPE(
             dims=8,
             scaling_factor=2.0,
             mscale=1.0,
@@ -420,7 +422,7 @@ class TestModels(unittest.TestCase):
         not mx.metal.is_available(), "Global scale is only supported on Metal backend"
     )
     def test_switch_linear_global_scale(self):
-        from mlx_lm.models.switch_layers import SwitchLinear
+        from mlx_lm.layers.moe import SwitchLinear
         from mlx_lm.utils import dequantize_model
 
         mx.random.seed(0)
@@ -496,8 +498,8 @@ class TestModels(unittest.TestCase):
         from dataclasses import replace
 
         from mlx_lm import utils
+        from mlx_lm.layers.moe import QuantizedSwitchLinear
         from mlx_lm.models import bailing_moe_v3
-        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
 
         args = bailing_moe_v3.ModelArgs(
             vocab_size=64,
@@ -1122,7 +1124,7 @@ class TestModels(unittest.TestCase):
         self.assertEqual(args.rope_theta, 1000.0)
         self.assertEqual(args.rope_scaling, config["rope_parameters"])
         model = qwen3.Model(args)
-        self.assertIsInstance(model.layers[0].self_attn.rope, rope_utils.YarnRoPE)
+        self.assertIsInstance(model.layers[0].self_attn.rope, rope_layers.YarnRoPE)
 
         # Flat fields from older configs still take priority.
         config["rope_theta"] = 2000.0
@@ -1166,7 +1168,8 @@ class TestModels(unittest.TestCase):
             ("qwen3_5", "mtp.fc.weights"),
             ("qwen3_5_moe", "mtp.fc.weight"),
         ):
-            module = importlib.import_module(f"mlx_lm.models.{model_type}")
+            package = model_package({"model_type": model_type})
+            module = importlib.import_module(f"mlx_lm.models.{package}")
             args = module.ModelArgs.from_dict(
                 {
                     "model_type": model_type,
@@ -1539,8 +1542,8 @@ class TestModels(unittest.TestCase):
         self.assertFalse(any("gate_up_proj" in k for k in converted))
 
     def test_gemma4_moe_router_quantizes_to_8bit(self):
+        from mlx_lm.layers.moe import QuantizedSwitchLinear
         from mlx_lm.models import gemma4
-        from mlx_lm.models.switch_layers import QuantizedSwitchLinear
         from mlx_lm.utils import quantize_model
 
         args = gemma4.ModelArgs.from_dict(
@@ -5060,7 +5063,7 @@ class TestModels(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 self.model_test_runner(
@@ -5763,7 +5766,7 @@ class TestVLSanitize(unittest.TestCase):
                 self._assert_sanitized(model.sanitize(dict(weights)))
 
     def test_qwen3_vl_moe(self):
-        from mlx_lm.models.qwen3_vl_moe import Model, ModelArgs
+        from mlx_lm.models.qwen3_vl import Model, ModelArgs
 
         text_config = self._text_config(
             "qwen3_moe",
@@ -5781,7 +5784,7 @@ class TestVLSanitize(unittest.TestCase):
 
     def test_tie_word_embeddings_at_top_level(self):
         # Hugging Face's checkpoints keep it out of text_config.
-        from mlx_lm.models import qwen2_vl, qwen3_vl, qwen3_vl_moe
+        from mlx_lm.models import qwen2_vl, qwen3_vl
 
         moe = dict(
             num_experts=4,
@@ -5791,17 +5794,17 @@ class TestVLSanitize(unittest.TestCase):
             moe_intermediate_size=16,
             norm_topk_prob=True,
         )
-        for package, text_config in (
-            (qwen2_vl, self._text_config("qwen2")),
-            (qwen3_vl, self._text_config("qwen3")),
-            (qwen3_vl_moe, self._text_config("qwen3_moe", **moe)),
+        for package, model_type, text_config in (
+            (qwen2_vl, "qwen2_vl", self._text_config("qwen2")),
+            (qwen3_vl, "qwen3_vl", self._text_config("qwen3")),
+            (qwen3_vl, "qwen3_vl_moe", self._text_config("qwen3_moe", **moe)),
         ):
             del text_config["tie_word_embeddings"]
             for tie in (False, True):
-                with self.subTest(package=package.__name__, tie=tie):
+                with self.subTest(model_type=model_type, tie=tie):
                     args = package.ModelArgs.from_dict(
                         {
-                            "model_type": package.__name__.split(".")[-1],
+                            "model_type": model_type,
                             "text_config": text_config,
                             "tie_word_embeddings": tie,
                         }

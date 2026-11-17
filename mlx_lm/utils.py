@@ -532,7 +532,7 @@ def load_model(
         # Handle legacy quantization config
         quant_method = quantization_config["quant_method"]
         if quant_method == "bitnet":
-            from .models.bitlinear_layers import bitnet_quantize
+            from mlx_lm.layers.common import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
         elif quant_method == "mxfp4":
@@ -1110,7 +1110,7 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
-    from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from mlx_lm.layers.moe import QuantizedSwitchLinear, SwitchLinear
 
     dequantize_layers = []
     for name, module in model.named_modules():

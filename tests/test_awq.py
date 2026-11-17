@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten
 
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.models import ministral3, mistral3
 from mlx_lm.quant.awq import AWQ_MODEL_CONFIGS, apply_scale, awq_quantize
 

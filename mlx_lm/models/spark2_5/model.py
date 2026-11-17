@@ -5,7 +5,7 @@ from typing import Any, List, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.spark2_5 import checkpoint
 from mlx_lm.models.spark2_5.config import ModelArgs

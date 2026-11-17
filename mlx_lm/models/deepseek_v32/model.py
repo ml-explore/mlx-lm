@@ -6,8 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
-from mlx_lm.layers.masks import create_attention_mask
-from mlx_lm.layers.pipeline import PipelineMixin
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.distributed import PipelineMixin
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.deepseek_v32 import checkpoint
 from mlx_lm.models.deepseek_v32.config import ModelArgs

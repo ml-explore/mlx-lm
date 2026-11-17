@@ -6,8 +6,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from mlx_lm.layers.gated_delta import gated_delta_update, normalize_qk
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
+from mlx_lm.layers.recurrent import gated_delta_update, normalize_qk
 from mlx_lm.models.qwen3_5.config import TextModelArgs
 from mlx_lm.models.qwen3_next.layers import Qwen3NextAttention as Attention
 from mlx_lm.models.qwen3_next.layers import Qwen3NextMLP as MLP

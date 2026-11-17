@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.bitlinear import BitLinear
+from mlx_lm.layers.common import BitLinear
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.models.bitnet.config import ModelArgs
 

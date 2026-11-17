@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.minimax import checkpoint
 from mlx_lm.models.minimax.config import ModelArgs
 from mlx_lm.models.minimax.layers import MiniMaxDecoderLayer, ShardedRMSNorm

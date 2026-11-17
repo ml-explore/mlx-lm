@@ -5,7 +5,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.models.gemma2.config import ModelArgs
 
 __all__ = [

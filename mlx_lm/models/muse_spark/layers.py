@@ -6,19 +6,19 @@ import mlx.core as mx
 from mlx import nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from mlx_lm.kernels import (
-    expert_routing,
+from mlx_lm.kernels.expert_routing import expert_routing
+from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.common import precise_swiglu
+from mlx_lm.layers.distributed import gather_last_axis
+from mlx_lm.layers.moe import SwitchGLU
+from mlx_lm.models.muse_spark.config import TextArgs
+from mlx_lm.models.muse_spark.kernels import (
     norm_add_norm,
     post_expert_norm_combine,
     qk_norm,
     qk_norm_rope,
     rms_norm_sigmoid_gate,
 )
-from mlx_lm.layers.activations import precise_swiglu
-from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.distributed import gather_last_axis
-from mlx_lm.layers.switch import SwitchGLU
-from mlx_lm.models.muse_spark.config import TextArgs
 
 __all__ = [
     "Attention",

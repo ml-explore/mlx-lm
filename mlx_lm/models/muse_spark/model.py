@@ -7,14 +7,13 @@ import mlx.core as mx
 from mlx import nn
 from mlx.nn.layers.distributed import shard_linear
 
-from mlx_lm.kernels import pre_norm
-from mlx_lm.layers.distributed import gather_last_axis
-from mlx_lm.layers.masks import create_attention_mask
-from mlx_lm.layers.multimodal import splice
-from mlx_lm.layers.pipeline import PipelineMixin
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.common import splice
+from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.muse_spark import checkpoint
 from mlx_lm.models.muse_spark.config import ModelArgs, TextArgs
+from mlx_lm.models.muse_spark.kernels import pre_norm
 from mlx_lm.models.muse_spark.layers import TransformerBlock, WeightlessRMSNorm
 from mlx_lm.models.muse_spark.vision import VisionAdapter, VisionTower
 

@@ -6,8 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_linear
 
-from mlx_lm.layers.distributed import gather_last_axis
-from mlx_lm.layers.pipeline import PipelineMixin
+from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
 from mlx_lm.models import llama, ministral3, mistral4
 from mlx_lm.models.mistral3 import checkpoint
 from mlx_lm.models.mistral3.config import ModelArgs, language_model_package

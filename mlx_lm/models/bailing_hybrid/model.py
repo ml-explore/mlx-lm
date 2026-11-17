@@ -5,8 +5,9 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask, create_ssm_mask
-from mlx_lm.layers.pipeline import PipelineMixin
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.distributed import PipelineMixin
+from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.bailing_hybrid import checkpoint
 from mlx_lm.models.bailing_hybrid.config import ModelArgs
 from mlx_lm.models.bailing_hybrid.layers import DecoderLayer

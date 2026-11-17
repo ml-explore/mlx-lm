@@ -4,7 +4,7 @@ from typing import Any, Optional
 
 import mlx.core as mx
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.deepseek_v32.model import DeepseekV32Model
 from mlx_lm.models.deepseek_v32.model import Model as DSV32Model

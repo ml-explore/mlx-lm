@@ -5,9 +5,9 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.switch import SwitchGLU
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.moe import SwitchGLU
 from mlx_lm.models.lfm2_moe.config import ModelArgs
 
 __all__ = [

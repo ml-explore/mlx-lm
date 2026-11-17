@@ -5,8 +5,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.gemma3_text import checkpoint
 from mlx_lm.models.gemma3_text.config import ModelArgs

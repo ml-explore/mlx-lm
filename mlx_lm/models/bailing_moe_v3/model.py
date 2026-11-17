@@ -7,7 +7,8 @@ from typing import Any
 import mlx.core as mx
 from mlx import nn
 
-from mlx_lm.layers.masks import create_attention_mask, create_ssm_mask
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.bailing_moe_v3 import checkpoint
 from mlx_lm.models.bailing_moe_v3.config import ModelArgs
 from mlx_lm.models.bailing_moe_v3.layers import BailingDecoderLayer

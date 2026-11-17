@@ -2,6 +2,11 @@
 
 import mlx.core as mx
 
+__all__ = [
+    "qk_norm_rope_kernel",
+    "residual_norm_kernel",
+]
+
 
 def _make_qk_norm_rope_kernel():
     if not mx.metal.is_available():
@@ -48,7 +53,7 @@ def _make_qk_norm_rope_kernel():
     )
 
 
-_qk_norm_rope_kernel = _make_qk_norm_rope_kernel()
+qk_norm_rope_kernel = _make_qk_norm_rope_kernel()
 
 
 def _make_residual_norm_kernel():
@@ -96,4 +101,4 @@ def _make_residual_norm_kernel():
     )
 
 
-_residual_norm_kernel = _make_residual_norm_kernel()
+residual_norm_kernel = _make_residual_norm_kernel()

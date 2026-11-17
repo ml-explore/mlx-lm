@@ -5,7 +5,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.olmo3.config import ModelArgs
 from mlx_lm.models.olmo3.layers import Olmo3DecoderLayer

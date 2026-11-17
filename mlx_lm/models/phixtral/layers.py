@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.switch import SwitchMLP
+from mlx_lm.layers.moe import SwitchMLP
 
 __all__ = [
     "Embd",

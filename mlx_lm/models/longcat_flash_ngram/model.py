@@ -5,7 +5,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 from mlx_lm.models.longcat_flash.layers import LongcatFlashDecoderLayer
 from mlx_lm.models.longcat_flash.model import Model as LongcatFlashLM

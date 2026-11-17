@@ -3,7 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.afm7.config import ModelArgs
 from mlx_lm.models.afm7.layers import KVReuseTransformerBlock, TransformerBlock
 from mlx_lm.models.cache import ConcatenateKVCache, KVCache

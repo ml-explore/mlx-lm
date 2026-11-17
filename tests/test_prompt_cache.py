@@ -9,7 +9,7 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.generate import generate_step
-from mlx_lm.models.base import create_attention_mask, create_causal_mask
+from mlx_lm.layers.attention import create_attention_mask, create_causal_mask
 from mlx_lm.models.cache import (
     ArraysCache,
     BatchKVCache,

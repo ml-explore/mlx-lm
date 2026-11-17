@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-from mlx_lm.layers.multimodal import from_llava_layout
+from mlx_lm.models.checkpoint import from_llava_layout
 from mlx_lm.models.mistral3.config import language_model_package
 
 __all__ = [

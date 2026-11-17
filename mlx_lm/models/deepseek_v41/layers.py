@@ -6,11 +6,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from mlx_lm.layers.activations import swiglu
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.moe import SwitchGLU, SwitchLinear
 from mlx_lm.layers.rope import YarnRoPE
-from mlx_lm.layers.switch import SwitchGLU, SwitchLinear
 from mlx_lm.models.deepseek_v41.config import ModelArgs
-from mlx_lm.models.deepseek_v41.kernels import _sinkhorn
+from mlx_lm.models.deepseek_v41.kernels import sinkhorn
 
 __all__ = [
     "Attention",
@@ -126,7 +126,7 @@ class HyperConnection(nn.Module):
         post = 2.0 * mx.sigmoid(post)
         comb = comb.reshape(*comb.shape[:-1], self.hc, self.hc)
         comb = mx.softmax(comb, axis=-1) + self.hc_eps
-        return pre, post, _sinkhorn(comb, iters=self.iters, eps=self._eps)
+        return pre, post, sinkhorn(comb, iters=self.iters, eps=self._eps)
 
 
 def _collapse(streams: mx.array, mix: mx.array) -> mx.array:

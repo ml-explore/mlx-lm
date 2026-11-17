@@ -6,11 +6,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from mlx_lm.layers.activations import SwigluOAI
 from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
+from mlx_lm.layers.common import SwigluOAI, ZeroCenteredRMSNorm
+from mlx_lm.layers.moe import SwitchGLU
 from mlx_lm.layers.rope import initialize_rope
-from mlx_lm.layers.switch import SwitchGLU
 from mlx_lm.models.minimax_m3_vl.config import TextArgs
 
 __all__ = [

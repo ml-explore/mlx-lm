@@ -4,6 +4,10 @@ from typing import Dict
 
 import mlx.core as mx
 
+__all__ = [
+    "attn_res_combine",
+]
+
 
 @mx.compile
 def _attn_res_combine_reference(raw, inv_rms, partial_sum, w_eff, eps):
@@ -108,7 +112,7 @@ _ATTN_RES_THREADS = 512
 _attn_res_eps_cache: Dict[float, mx.array] = {}
 
 
-def _attn_res_combine(
+def attn_res_combine(
     raw: mx.array,
     inv_rms: mx.array,
     partial_sum: mx.array,

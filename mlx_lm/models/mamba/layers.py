@@ -3,7 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
+from mlx_lm.layers.common import swiglu
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.mamba.config import ModelArgs
 

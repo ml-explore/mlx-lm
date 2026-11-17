@@ -6,7 +6,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.models.gear import checkpoint
 from mlx_lm.models.gear.config import ModelArgs

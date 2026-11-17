@@ -1,6 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
-from mlx_lm.layers.multimodal import from_llava_layout
+from mlx_lm.models.checkpoint import from_llava_layout
 from mlx_lm.models.lfm2.checkpoint import sanitize_language_model
 
 __all__ = [

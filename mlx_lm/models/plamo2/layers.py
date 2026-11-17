@@ -5,9 +5,9 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
-from mlx_lm.layers.ssm import ssm_update
-from mlx_lm.models.base import create_attention_mask, create_ssm_mask
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.recurrent import create_ssm_mask, ssm_update
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.plamo2.config import ModelArgs
 

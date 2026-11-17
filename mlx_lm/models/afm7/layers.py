@@ -8,8 +8,8 @@ from typing import Any, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.models.afm7.config import ModelArgs
 

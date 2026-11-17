@@ -5,7 +5,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.mimo_v2_flash import checkpoint
 from mlx_lm.models.mimo_v2_flash.config import ModelArgs

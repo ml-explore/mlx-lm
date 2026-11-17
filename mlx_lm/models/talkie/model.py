@@ -5,7 +5,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.talkie import checkpoint
 from mlx_lm.models.talkie.config import ModelArgs
 from mlx_lm.models.talkie.layers import TransformerBlock, WeightGain, rms_norm

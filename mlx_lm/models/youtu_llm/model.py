@@ -3,7 +3,7 @@
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.youtu_llm import checkpoint
 from mlx_lm.models.youtu_llm.config import ModelArgs
 from mlx_lm.models.youtu_llm.layers import YoutuLLMDecoderLayer

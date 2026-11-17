@@ -7,13 +7,12 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
-from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.gated_delta import gated_delta_update, normalize_qk
-from mlx_lm.layers.mla import MultiLinear
-from mlx_lm.layers.switch import SwitchGLU
+from mlx_lm.layers.attention import MultiLinear, scaled_dot_product_attention
+from mlx_lm.layers.moe import SwitchGLU
+from mlx_lm.layers.recurrent import gated_delta_update, normalize_qk
 from mlx_lm.models.cache import KVCache
 from mlx_lm.models.kimi_k3.config import TextArgs
-from mlx_lm.models.kimi_k3.kernels import _attn_res_combine
+from mlx_lm.models.kimi_k3.kernels import attn_res_combine
 from mlx_lm.models.kimi_linear.layers import ShortConv1d
 
 __all__ = [
@@ -132,7 +131,7 @@ def _attn_res_mix(
 ) -> mx.array:
     if blocks.raw is None:
         return partial_sum
-    return _attn_res_combine(
+    return attn_res_combine(
         blocks.raw, blocks.inv_rms, partial_sum, w_eff, eps, use_kernel=use_kernel
     )
 

@@ -5,7 +5,7 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.bailing_moe import checkpoint
 from mlx_lm.models.bailing_moe.config import ModelArgs
 from mlx_lm.models.bailing_moe.layers import BailingMoeDecoderLayer

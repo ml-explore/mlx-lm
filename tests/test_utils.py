@@ -256,7 +256,7 @@ class TestUtils(unittest.TestCase):
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
     def test_infer_quant_config(self):
-        from mlx_lm.models.mla import MultiLinear
+        from mlx_lm.layers.attention import MultiLinear
 
         for mode, bits, group_size in [
             ("affine", 3, 64),

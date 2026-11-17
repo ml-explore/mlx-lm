@@ -4,8 +4,8 @@ import unittest
 
 import mlx.core as mx
 
+from mlx_lm.layers.rope import YarnRoPE
 from mlx_lm.models import deepseek_v41
-from mlx_lm.models.rope_utils import YarnRoPE
 
 
 class TestDeepseekV41(unittest.TestCase):

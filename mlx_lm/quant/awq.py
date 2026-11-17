@@ -10,9 +10,9 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_map, tree_map_with_path, tree_unflatten
 from tqdm import tqdm
 
-from mlx_lm.layers.norms import ZeroCenteredRMSNorm
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.switch_layers import SwitchLinear
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
+from mlx_lm.layers.moe import SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     load,

@@ -189,7 +189,7 @@ class TestTunerTrainer(unittest.TestCase):
 
     def test_switch_layers_backward(self):
         # indices.size >= 64 takes the sorted branch, which indexes with argsort output.
-        from mlx_lm.models.switch_layers import SwitchGLU, SwitchMLP
+        from mlx_lm.layers.moe import SwitchGLU, SwitchMLP
 
         for cls in (SwitchGLU, SwitchMLP):
             with self.subTest(layer=cls.__name__):

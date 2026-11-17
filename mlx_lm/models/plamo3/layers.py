@@ -6,12 +6,11 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
-from mlx_lm.layers.attention import scaled_dot_product_attention
-from mlx_lm.layers.masks import create_attention_mask
+from mlx_lm.layers.attention import create_attention_mask, scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.models.plamo3.config import ModelArgs
-from mlx_lm.models.plamo3.kernels import _qk_norm_rope_kernel, _residual_norm_kernel
+from mlx_lm.models.plamo3.kernels import qk_norm_rope_kernel, residual_norm_kernel
 
 __all__ = [
     "Attention",
@@ -123,11 +122,11 @@ class Attention(nn.Module):
             and B == L == 1
             and self.qk_dim == 128
             and isinstance(offset, int)
-            and _qk_norm_rope_kernel is not None
+            and qk_norm_rope_kernel is not None
             and mx.default_device() == mx.gpu
             and qkv.dtype == self.q_norm.weight.dtype == self.k_norm.weight.dtype
         ):
-            queries, keys = _qk_norm_rope_kernel(
+            queries, keys = qk_norm_rope_kernel(
                 inputs=[
                     qkv,
                     self.q_norm.scale,
@@ -238,14 +237,14 @@ class Plamo3DecoderLayer(nn.Module):
             and hidden_states.shape[:2] == (1, 1)
             and self.hidden_size % 128 == 0
             and self.hidden_size <= 4096
-            and _residual_norm_kernel is not None
+            and residual_norm_kernel is not None
             and mx.default_device() == mx.gpu
             and hidden_states_sa.dtype
             == residual.dtype
             == self.post_mixer_norm.weight.dtype
             == self.pre_mlp_norm.weight.dtype
         ):
-            residual, hidden_states = _residual_norm_kernel(
+            residual, hidden_states = residual_norm_kernel(
                 inputs=[
                     hidden_states_sa,
                     residual,

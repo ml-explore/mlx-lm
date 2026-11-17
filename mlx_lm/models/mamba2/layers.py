@@ -5,9 +5,8 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.layers.activations import swiglu
-from mlx_lm.layers.masks import create_ssm_mask
-from mlx_lm.layers.ssm import ssm_update
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.recurrent import create_ssm_mask, ssm_update
 from mlx_lm.models.cache import ArraysCache
 from mlx_lm.models.mamba2.config import ModelArgs
 
