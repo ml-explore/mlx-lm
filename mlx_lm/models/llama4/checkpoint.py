@@ -2,21 +2,25 @@
 
 import mlx.core as mx
 
+from mlx_lm.layers.multimodal import from_llava_layout
+
 __all__ = [
     "sanitize",
 ]
 
 
 def sanitize(model, weights):
-    def to_remove(k):
-        return "vision_model" in k or "multi_modal_projector" in k
-
-    # Remove vision weights
-    weights = {k: v for k, v in weights.items() if not to_remove(k)}
+    # The checkpoints, and older MLX conversions, have the LLaVA layout. Only
+    # the language model runs here.
+    weights = {
+        from_llava_layout(k): v
+        for k, v in weights.items()
+        if "vision_model" not in k and "multi_modal_projector" not in k
+    }
 
     # Rename expert weights for SwitchGLU
-    for l in range(model.args.text_config.num_hidden_layers):
-        prefix = f"language_model.model.layers.{l}.feed_forward.experts"
+    for l in range(model.args.text.num_hidden_layers):
+        prefix = f"model.language_model.layers.{l}.feed_forward.experts"
         if f"{prefix}.gate_up_proj" in weights:
             v = weights.pop(f"{prefix}.gate_up_proj")
             gate_k = f"{prefix}.gate_proj.weight"

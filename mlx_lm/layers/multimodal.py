@@ -6,6 +6,7 @@ import mlx.core as mx
 
 __all__ = [
     "from_llava_layout",
+    "from_text_layout",
     "splice",
 ]
 
@@ -23,6 +24,18 @@ def from_llava_layout(key: str) -> str:
         return "model.language_model." + key.removeprefix("language_model.model.")
     if key.startswith(("vision_tower.", "multi_modal_projector.")):
         return "model." + key
+    return key
+
+
+def from_text_layout(key: str) -> str:
+    """The name in a multimodal model of a key in a text model's layout.
+
+    model.* becomes model.language_model.*. Keys already under
+    model.language_model, and lm_head.*, are unchanged. Drop the encoders' keys
+    first: they are under model too.
+    """
+    if key.startswith("model.") and not key.startswith("model.language_model."):
+        return "model.language_model." + key.removeprefix("model.")
     return key
 
 

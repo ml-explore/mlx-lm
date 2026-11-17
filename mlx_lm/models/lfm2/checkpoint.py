@@ -3,10 +3,13 @@
 
 __all__ = [
     "sanitize",
+    "sanitize_language_model",
 ]
 
 
-def sanitize(model, weights):
+def sanitize_language_model(language_model, weights, prefix):
+    """Sanitize the language model's weights, named from prefix: "model." in the
+    text model, "model.language_model." in a multimodal one."""
     sanitized_weights = {}
     for name, param in weights.items():
         if "conv.weight" in name:
@@ -15,3 +18,7 @@ def sanitize(model, weights):
 
         sanitized_weights[name] = param
     return sanitized_weights
+
+
+def sanitize(model, weights):
+    return sanitize_language_model(model.model, weights, prefix="model.")

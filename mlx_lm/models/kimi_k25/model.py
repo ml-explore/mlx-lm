@@ -5,32 +5,38 @@ from typing import Any, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.models.deepseek_v3.config import ModelArgs as TextConfig
-from mlx_lm.models.deepseek_v3.model import DeepseekV3Model
-from mlx_lm.models.deepseek_v3.model import Model as DeepseekV3LM
+from mlx_lm.models.deepseek_v3.model import DeepseekV3Model, shard_layers
 from mlx_lm.models.kimi_k25 import checkpoint
 from mlx_lm.models.kimi_k25.config import ModelArgs
 
 __all__ = [
-    "LanguageModel",
+    "KimiK25Model",
     "Model",
 ]
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, config: TextConfig):
-        super().__init__()
-        self.args = config
-        self.model = DeepseekV3Model(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+class KimiK25Model(nn.Module):
+    """The language model, named as in the checkpoint."""
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache: Optional[Any] = None,
-    ):
-        out = self.model(inputs, cache)
-        return self.lm_head(out)
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = DeepseekV3Model(args.text)
+
+    # mlx_lm.utils pipelines model.model with these.
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    @property
+    def start_idx(self):
+        return self.language_model.start_idx
+
+    @property
+    def end_idx(self):
+        return self.language_model.end_idx
+
+    def pipeline(self, group, split=None):
+        self.language_model.pipeline(group, split)
 
 
 class Model(nn.Module):
@@ -38,28 +44,27 @@ class Model(nn.Module):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
-        self.language_model = LanguageModel(config.text_config)
+        self.model = KimiK25Model(config)
+        self.lm_head = nn.Linear(
+            config.text.hidden_size, config.text.vocab_size, bias=False
+        )
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
     ):
-        return self.language_model(inputs, cache)
+        return self.lm_head(self.model.language_model(inputs, cache))
 
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
-        DeepseekV3LM.shard(self.language_model, group)
-
-    @property
-    def model(self):
-        return self.language_model.model
+        shard_layers(self.model.language_model.layers, group or mx.distributed.init())
 
     @property
     def layers(self):
-        return self.language_model.model.pipeline_layers
+        return self.model.language_model.pipeline_layers
 
     @property
     def cast_predicate(self):

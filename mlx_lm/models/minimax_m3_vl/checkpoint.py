@@ -4,18 +4,25 @@ from typing import Dict
 
 import mlx.core as mx
 
+from mlx_lm.layers.multimodal import from_llava_layout
+
 __all__ = [
     "sanitize",
 ]
 
 
 def sanitize(model, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-    args = model.args.text_config
-    # The vision tower and the projectors are not used.
+    args = model.args.text
+    # The checkpoints, and older MLX conversions, have the LLaVA layout. The
+    # vision tower and the projectors are not used.
     skip = ("vision_tower.", "multi_modal_projector.", "patch_merge_mlp.")
-    out = {k: v for k, v in weights.items() if not k.startswith(skip)}
+    out = {
+        from_llava_layout(k): v
+        for k, v in weights.items()
+        if not k.removeprefix("model.").startswith(skip)
+    }
     if args.tie_word_embeddings:
-        out.pop("language_model.lm_head.weight", None)
+        out.pop("lm_head.weight", None)
 
     # MXFP8 stores e4m3 bytes plus one E8M0 exponent per 32 values, which is
     # MLX's mxfp8 layout once the bytes are read as uint32.
@@ -35,13 +42,13 @@ def sanitize(model, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
 
     experts = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
     for i in range(args.num_hidden_layers):
-        moe = f"language_model.model.layers.{i}.block_sparse_moe"
+        moe = f"model.language_model.layers.{i}.block_sparse_moe"
         # Some exports keep a dense layer's MLP under block_sparse_moe. Its
         # gate is named gate_proj, the router's is gate, so this is exact.
         for proj in ("gate_proj", "up_proj", "down_proj"):
             if f"{moe}.{proj}.weight" not in out:
                 continue
-            mlp = f"language_model.model.layers.{i}.mlp"
+            mlp = f"model.language_model.layers.{i}.mlp"
             for part in ("weight", "scales", "biases"):
                 v = out.pop(f"{moe}.{proj}.{part}", None)
                 if v is not None:

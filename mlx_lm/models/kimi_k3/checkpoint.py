@@ -5,6 +5,7 @@ from typing import Dict
 
 import mlx.core as mx
 
+from mlx_lm.layers.multimodal import from_text_layout
 from mlx_lm.models.kimi_k3.layers import KimiK3DeltaAttention, KimiK3SparseMoE
 
 __all__ = [
@@ -14,21 +15,19 @@ __all__ = [
 
 
 def sanitize_language_model(
-    language_model, weights: Dict[str, mx.array]
+    language_model, weights: Dict[str, mx.array], prefix: str
 ) -> Dict[str, mx.array]:
+    """Sanitize the language model's weights, whose names start with prefix."""
     args = language_model.args
     weights = {
-        k: v for k, v in weights.items() if not k.startswith(("model.mtp", "mtp"))
+        k: v for k, v in weights.items() if not k.startswith((f"{prefix}mtp", "mtp"))
     }
-    layer_re = re.compile(r"model\.layers\.(\d+)\.")
+    layer_re = re.compile(re.escape(prefix) + r"layers\.(\d+)\.")
     weights = {
         k: v
         for k, v in weights.items()
         if not (m := layer_re.match(k)) or int(m.group(1)) < args.num_hidden_layers
     }
-
-    if args.tie_word_embeddings:
-        weights.pop("lm_head.weight", None)
 
     res_renames = []
     for src in ("self_attention_res", "mlp_res", "output_attn_res"):
@@ -40,8 +39,8 @@ def sanitize_language_model(
                 weights[k[: -len(pat)] + dst] = weights.pop(k)
                 break
 
-    for layer_idx, layer in enumerate(language_model.model.layers):
-        lp = f"model.layers.{layer_idx}"
+    for layer_idx, layer in enumerate(language_model.layers):
+        lp = f"{prefix}layers.{layer_idx}"
 
         if isinstance(layer.mlp, KimiK3SparseMoE):
             src_prefix = f"{lp}.block_sparse_moe"
@@ -182,19 +181,20 @@ def sanitize_language_model(
     return weights
 
 
+# Only the language model runs here.
+_ENCODERS = ("vision_tower", "vision_model", "multi_modal_projector", "mm_projector")
+
+
 def sanitize(model, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-    prefix = "language_model."
+    # The checkpoints have the text model's layout, under language_model in the
+    # multimodal ones, as do older MLX conversions.
     weights = {
-        k[len(prefix) :] if k.startswith(prefix) else k: v
+        from_text_layout(k.removeprefix("language_model.")): v
         for k, v in weights.items()
-        if not k.startswith(
-            (
-                "vision_tower",
-                "vision_model",
-                "multi_modal_projector",
-                "mm_projector",
-            )
-        )
+        if not k.removeprefix("model.").startswith(_ENCODERS)
     }
-    weights = model.language_model.sanitize(weights)
-    return {f"{prefix}{k}": v for k, v in weights.items()}
+    if model.args.text.tie_word_embeddings:
+        weights.pop("lm_head.weight", None)
+    return sanitize_language_model(
+        model.model.language_model, weights, prefix="model.language_model."
+    )

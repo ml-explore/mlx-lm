@@ -1,7 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, Optional
 
 from mlx_lm.models.base import BaseModelArgs
 
@@ -61,7 +61,7 @@ class TextArgs(BaseModelArgs):
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    text_config: Union[TextArgs, dict]
+    text_config: dict
     model_type: str = "kimi_k3"
 
     @classmethod
@@ -71,5 +71,4 @@ class ModelArgs(BaseModelArgs):
         return super().from_dict(params)
 
     def __post_init__(self):
-        if isinstance(self.text_config, dict):
-            self.text_config = TextArgs.from_dict(self.text_config)
+        self.text = TextArgs.from_dict(self.text_config)

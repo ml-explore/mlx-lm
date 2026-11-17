@@ -10,13 +10,13 @@ from mlx_lm.models.llama4.config import ModelArgs, TextArgs
 from mlx_lm.models.llama4.layers import TransformerBlock
 
 __all__ = [
-    "LanguageModel",
-    "LlamaModel",
+    "Llama4Model",
+    "Llama4TextModel",
     "Model",
 ]
 
 
-class LlamaModel(nn.Module):
+class Llama4TextModel(nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
         self.args = args
@@ -66,23 +66,12 @@ class LlamaModel(nn.Module):
         return self.norm(h)
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, args: TextArgs):
-        super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.model = LlamaModel(self.args)
-        self.lm_head = nn.Linear(
-            self.args.hidden_size, self.args.vocab_size, bias=False
-        )
+class Llama4Model(nn.Module):
+    """The language model, named as in the checkpoint."""
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-    ):
-        out = self.model(inputs, cache)
-        return self.lm_head(out)
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = Llama4TextModel(args.text)
 
 
 class Model(nn.Module):
@@ -90,24 +79,27 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = LanguageModel(args.text_config)
+        self.model = Llama4Model(args)
+        self.lm_head = nn.Linear(
+            args.text.hidden_size, args.text.vocab_size, bias=False
+        )
 
     def __call__(
         self,
         inputs: mx.array,
         cache=None,
     ):
-        return self.language_model(inputs, cache)
+        return self.lm_head(self.model.language_model(inputs, cache))
 
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.model.language_model.layers
 
     def make_cache(self):
-        chunk_size = self.args.text_config.attention_chunk_size
+        chunk_size = self.args.text.attention_chunk_size
         caches = []
         for i in range(len(self.layers)):
             if (i + 1) % 4 != 0:

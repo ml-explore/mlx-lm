@@ -18,8 +18,8 @@ from mlx_lm.models.kimi_k3.layers import (
 )
 
 __all__ = [
+    "KimiK3Model",
     "KimiK3TextModel",
-    "LanguageModel",
     "Model",
 ]
 
@@ -155,29 +155,56 @@ class KimiK3TextModel(nn.Module):
         return self.norm(h)
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, args: TextArgs):
+class KimiK3Model(nn.Module):
+    """The language model, named as in the checkpoint."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = KimiK3TextModel(args.text)
+
+    # mlx_lm.utils pipelines model.model with these.
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    @property
+    def start_idx(self):
+        return self.language_model.start_idx
+
+    @property
+    def end_idx(self):
+        return self.language_model.end_idx
+
+    def pipeline(self, group):
+        self.language_model.pipeline(group)
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
-        self.model = KimiK3TextModel(args)
-        if args.tie_word_embeddings:
-            self.lm_head = None
-        else:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model_type = args.model_type
+        self.model = KimiK3Model(args)
+        if not args.text.tie_word_embeddings:
+            self.lm_head = nn.Linear(
+                args.text.hidden_size, args.text.vocab_size, bias=False
+            )
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[List[Any]] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache)
-        if self.lm_head is None:
-            return self.model.embed_tokens.as_linear(out)
+        language_model = self.model.language_model
+        out = language_model(inputs, cache)
+        if self.args.text.tie_word_embeddings:
+            return language_model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
     @property
     def layers(self):
-        return self.model.layers[self.model.start_idx : self.model.end_idx]
+        language_model = self.model.language_model
+        return language_model.layers[language_model.start_idx : language_model.end_idx]
 
     def make_cache(self):
         caches: List[Any] = []
@@ -187,57 +214,6 @@ class LanguageModel(nn.Module):
             else:
                 caches.append(KVCache())
         return caches
-
-    def sanitize(self, weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
-        return checkpoint.sanitize_language_model(self, weights)
-
-    @property
-    def cast_predicate(self):
-        def predicate(path: str):
-            if "e_score_correction_bias" in path:
-                return False
-            if path.endswith("A_log") or path.endswith("dt_bias"):
-                return False
-            return True
-
-        return predicate
-
-    @property
-    def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith("mlp.gate"):
-                return {"group_size": 64, "bits": 8}
-            if path.endswith("res_proj"):
-                return False
-            return True
-
-        return predicate
-
-
-class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.language_model = LanguageModel(args.text_config)
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache: Optional[List[Any]] = None,
-    ) -> mx.array:
-        return self.language_model(inputs, cache)
-
-    @property
-    def model(self):
-        return self.language_model.model
-
-    @property
-    def layers(self):
-        return self.language_model.layers
-
-    def make_cache(self):
-        return self.language_model.make_cache()
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
@@ -353,8 +329,22 @@ class Model(nn.Module):
 
     @property
     def cast_predicate(self):
-        return self.language_model.cast_predicate
+        def predicate(path: str):
+            if "e_score_correction_bias" in path:
+                return False
+            if path.endswith("A_log") or path.endswith("dt_bias"):
+                return False
+            return True
+
+        return predicate
 
     @property
     def quant_predicate(self):
-        return self.language_model.quant_predicate
+        def predicate(path, _):
+            if path.endswith("mlp.gate"):
+                return {"group_size": 64, "bits": 8}
+            if path.endswith("res_proj"):
+                return False
+            return True
+
+        return predicate

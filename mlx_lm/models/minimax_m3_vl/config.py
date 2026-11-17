@@ -1,7 +1,7 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional
 
 from mlx_lm.models.base import BaseModelArgs
 
@@ -88,9 +88,8 @@ class TextArgs(BaseModelArgs):
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    text_config: Union[TextArgs, dict]
+    text_config: dict
     model_type: str = "minimax_m3_vl"
 
     def __post_init__(self):
-        if isinstance(self.text_config, dict):
-            self.text_config = TextArgs.from_dict(self.text_config)
+        self.text = TextArgs.from_dict(self.text_config)

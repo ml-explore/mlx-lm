@@ -1,21 +1,24 @@
 # Copyright © 2026 Apple Inc.
 
-from mlx.utils import tree_flatten, tree_unflatten
-
-from mlx_lm.models.deepseek_v3.model import Model as DeepseekV3LM
+from mlx_lm.layers.multimodal import from_llava_layout
+from mlx_lm.models.deepseek_v3.checkpoint import sanitize_language_model
 
 __all__ = [
     "sanitize",
 ]
 
+# Only the language model runs here.
+_ENCODERS = ("vision_tower", "vision_model", "multi_modal_projector", "mm_projector")
+
 
 def sanitize(model, weights):
-    weights = tree_unflatten(list(weights.items()))
-    weights.pop("vision_tower", None)
-    weights.pop("vision_model", None)
-    weights.pop("multi_modal_projector", None)
-    weights.pop("mm_projector", None)
-    lm_weights = dict(tree_flatten(weights["language_model"]))
-    lm_weights = DeepseekV3LM.sanitize(model.language_model, lm_weights)
-    weights["language_model"] = tree_unflatten(list(lm_weights.items()))
-    return dict(tree_flatten(weights))
+    # The checkpoints, and older MLX conversions, have the LLaVA layout.
+    weights = {from_llava_layout(k): v for k, v in weights.items()}
+    weights = {
+        k: v
+        for k, v in weights.items()
+        if not k.removeprefix("model.").startswith(_ENCODERS)
+    }
+    return sanitize_language_model(
+        model.model.language_model, weights, prefix="model.language_model."
+    )

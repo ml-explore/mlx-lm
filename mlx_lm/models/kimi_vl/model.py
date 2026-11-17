@@ -7,28 +7,20 @@ import mlx.nn as nn
 
 from mlx_lm.models.deepseek_v3.model import DeepseekV3Model
 from mlx_lm.models.kimi_vl import checkpoint
-from mlx_lm.models.kimi_vl.config import ModelArgs, TextArgs
+from mlx_lm.models.kimi_vl.config import ModelArgs
 
 __all__ = [
-    "LanguageModel",
+    "KimiVLModel",
     "Model",
 ]
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, config: TextArgs):
-        super().__init__()
-        self.args = config
-        self.model = DeepseekV3Model(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+class KimiVLModel(nn.Module):
+    """The language model, named as in the checkpoint."""
 
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache: Optional[Any] = None,
-    ):
-        out = self.model(inputs, cache)
-        return self.lm_head(out)
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = DeepseekV3Model(args.text)
 
 
 class Model(nn.Module):
@@ -36,21 +28,24 @@ class Model(nn.Module):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
-        self.language_model = LanguageModel(config.text_config)
+        self.model = KimiVLModel(config)
+        self.lm_head = nn.Linear(
+            config.text.hidden_size, config.text.vocab_size, bias=False
+        )
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
     ):
-        return self.language_model(inputs, cache)
+        return self.lm_head(self.model.language_model(inputs, cache))
 
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.model.language_model.layers
 
     @property
     def cast_predicate(self):

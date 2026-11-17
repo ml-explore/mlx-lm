@@ -5178,7 +5178,7 @@ class TestModels(unittest.TestCase):
         model.update(dense.parameters())
 
         # Compressed-tensors NVFP4 stores w = fp4 * scale / G per expert.
-        moe = "language_model.model.layers.1.block_sparse_moe"
+        moe = "model.language_model.layers.1.block_sparse_moe"
         weights = dict(tree_flatten(dense.parameters()))
         projs = (("w1", "gate_proj"), ("w2", "down_proj"), ("w3", "up_proj"))
         for _, dst in projs:

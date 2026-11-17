@@ -15,7 +15,7 @@ from mlx_lm.models.minimax_m3_vl.config import ModelArgs, TextArgs
 from mlx_lm.models.minimax_m3_vl.layers import DecoderLayer
 
 __all__ = [
-    "LanguageModel",
+    "MiniMaxM3VLModel",
     "Model",
     "TextModel",
 ]
@@ -64,21 +64,28 @@ class TextModel(PipelineMixin, nn.Module):
         return self.norm(h)
 
 
-class LanguageModel(nn.Module):
-    def __init__(self, config: TextArgs):
-        super().__init__()
-        self.args = config
-        self.model = TextModel(config)
-        if not config.tie_word_embeddings:
-            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+class MiniMaxM3VLModel(nn.Module):
+    """The language model, named as in the checkpoint."""
 
-    def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        out = self.model(inputs, cache=cache)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-        return out
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = TextModel(args.text)
+
+    # mlx_lm.utils pipelines model.model with these.
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    @property
+    def start_idx(self):
+        return self.language_model.start_idx
+
+    @property
+    def end_idx(self):
+        return self.language_model.end_idx
+
+    def pipeline(self, group, split=None):
+        self.language_model.pipeline(group, split)
 
 
 class Model(nn.Module):
@@ -86,10 +93,18 @@ class Model(nn.Module):
         super().__init__()
         self.args = config
         self.model_type = config.model_type
-        self.language_model = LanguageModel(config.text_config)
+        self.model = MiniMaxM3VLModel(config)
+        if not config.text.tie_word_embeddings:
+            self.lm_head = nn.Linear(
+                config.text.hidden_size, config.text.vocab_size, bias=False
+            )
 
     def __call__(self, inputs: mx.array, cache: Optional[Any] = None) -> mx.array:
-        return self.language_model(inputs, cache)
+        language_model = self.model.language_model
+        out = language_model(inputs, cache=cache)
+        if self.args.text.tie_word_embeddings:
+            return language_model.embed_tokens.as_linear(out)
+        return self.lm_head(out)
 
     def make_cache(self) -> List[Any]:
         # Only sparse layers have indexer keys; an unused KVCache breaks .state.
@@ -153,15 +168,7 @@ class Model(nn.Module):
 
     @property
     def layers(self) -> List[nn.Module]:
-        return self.language_model.model.pipeline_layers
-
-    @property
-    def model(self) -> nn.Module:
-        # sharded_load() reaches for model.model.pipeline().
-        return self.language_model.model
-
-    def pipeline(self, group: mx.distributed.Group):
-        self.language_model.model.pipeline(group)
+        return self.model.language_model.pipeline_layers
 
     @property
     def cast_predicate(self) -> Callable[[str], bool]:

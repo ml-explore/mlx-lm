@@ -5,13 +5,22 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.models import lfm2
+from mlx_lm.models.lfm2.model import Lfm2Model, make_cache
 from mlx_lm.models.lfm2_vl import checkpoint
 from mlx_lm.models.lfm2_vl.config import ModelArgs
 
 __all__ = [
+    "Lfm2VlModel",
     "Model",
 ]
+
+
+class Lfm2VlModel(nn.Module):
+    """The language model, named as in the checkpoint."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = Lfm2Model(args.text)
 
 
 class Model(nn.Module):
@@ -19,7 +28,7 @@ class Model(nn.Module):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.language_model = lfm2.Model(lfm2.ModelArgs.from_dict(args.text_config))
+        self.model = Lfm2VlModel(args)
 
     def __call__(
         self,
@@ -27,16 +36,16 @@ class Model(nn.Module):
         cache=None,
         input_embeddings: Optional[mx.array] = None,
     ):
-        return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
-        )
+        language_model = self.model.language_model
+        out = language_model(inputs, cache, input_embeddings)
+        return language_model.embed_tokens.as_linear(out)
 
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
 
     @property
     def layers(self):
-        return self.language_model.model.layers
+        return self.model.language_model.layers
 
     def make_cache(self):
-        return self.language_model.make_cache()
+        return make_cache(self.layers)

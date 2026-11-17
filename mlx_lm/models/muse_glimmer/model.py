@@ -12,10 +12,11 @@ from mlx_lm.models.muse_glimmer.layers import DecoderLayer
 __all__ = [
     "Model",
     "MuseGlimmerModel",
+    "MuseGlimmerTextModel",
 ]
 
 
-class MuseGlimmerModel(nn.Module):
+class MuseGlimmerTextModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -51,6 +52,14 @@ class MuseGlimmerModel(nn.Module):
         return self.norm(h)
 
 
+class MuseGlimmerModel(nn.Module):
+    """The language model, named as in the checkpoint."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = MuseGlimmerTextModel(args)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -62,9 +71,10 @@ class Model(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
     def __call__(self, inputs: mx.array, cache=None):
-        out = self.model(inputs, cache=cache)
+        language_model = self.model.language_model
+        out = language_model(inputs, cache=cache)
         if self.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = language_model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
         out = out * self.args.output_multiplier
@@ -76,7 +86,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.language_model.layers
 
     @property
     def head_dim(self):

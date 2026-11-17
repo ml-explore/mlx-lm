@@ -1,7 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any
 
 from mlx_lm.models.base import BaseModelArgs
 
@@ -39,8 +39,8 @@ class TextArgs(BaseModelArgs):
 
 @dataclass
 class ModelArgs(BaseModelArgs):
-    text_config: Union[TextArgs, dict]
+    text_config: dict
     model_type: str
 
     def __post_init__(self):
-        self.text_config = TextArgs.from_dict(self.text_config)
+        self.text = TextArgs.from_dict(self.text_config)

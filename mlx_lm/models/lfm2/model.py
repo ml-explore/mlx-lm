@@ -14,6 +14,7 @@ from mlx_lm.models.lfm2.layers import Lfm2DecoderLayer
 __all__ = [
     "Lfm2Model",
     "Model",
+    "make_cache",
 ]
 
 
@@ -62,6 +63,11 @@ class Lfm2Model(nn.Module):
         return self.embedding_norm(h)
 
 
+def make_cache(layers):
+    """A KV cache for each attention layer, a conv state for each conv layer."""
+    return [KVCache() if l.is_attention_layer else ArraysCache(size=1) for l in layers]
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -86,7 +92,4 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        return [
-            KVCache() if l.is_attention_layer else ArraysCache(size=1)
-            for l in self.layers
-        ]
+        return make_cache(self.layers)
