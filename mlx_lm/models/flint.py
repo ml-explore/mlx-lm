@@ -41,6 +41,59 @@ class ModelArgs(BaseModelArgs):
             self.rope_theta = self.rope_parameters["rope_theta"]
 
 
+# Query rows per band, and the key-tile multiple band starts snap to. The fused
+# kernel's key tile (16 or 32) and query tile (32 or 64) divide these, so a band
+# sees the same tile grid and online-softmax order as the single call.
+_BAND_QUERIES = 256
+_BAND_KEY_ALIGN = 64
+# Other head dims run the unfused fallback, whose softmax reduction depends on the key count.
+_BAND_HEAD_DIMS = (64, 128)
+# Queries <= 8 leave the full kernel (sdpa_vector or the unfused fallback).
+_SDPA_VECTOR_MAX_QUERIES = 8
+
+
+def _banded_sliding_attention(queries, keys, values, cache, scale, mask, sinks, window):
+    """Sliding-window prefill attention that skips key tiles the window never reaches.
+
+    For an ``L``-token chunk the rotating cache returns its retained keys in time
+    order followed by the chunk, and ``mask`` is the model's window mask built with
+    the same ``window``, so query ``i`` sees keys ``(kL - L + i - window, kL - L + i]``.
+    Fully masked key tiles add exactly zero to the online softmax, so processing
+    query bands over only the keys they can reach is bit-identical, whatever the
+    cache's max_size. Returns None when the single call should be kept.
+    """
+    L, kL = queries.shape[2], keys.shape[2]
+    if (
+        not isinstance(cache, RotatingKVCache)
+        or cache.keep != 0
+        or not isinstance(mask, mx.array)
+        or mask.shape != (L, kL)
+        or queries.shape[-1] not in _BAND_HEAD_DIMS
+        or L <= _SDPA_VECTOR_MAX_QUERIES
+        or 0 < L % _BAND_QUERIES <= _SDPA_VECTOR_MAX_QUERIES
+        or kL <= _BAND_QUERIES + window
+    ):
+        return None
+    prior = kL - L
+    outs = []
+    for s in range(0, L, _BAND_QUERIES):
+        n = min(_BAND_QUERIES, L - s)
+        start = max(0, prior + s - window + 1)
+        start -= start % _BAND_KEY_ALIGN
+        stop = prior + s + n
+        outs.append(
+            mx.fast.scaled_dot_product_attention(
+                queries[:, :, s : s + n],
+                keys[:, :, start:stop],
+                values[:, :, start:stop],
+                scale=scale,
+                mask=mask[s : s + n, start:stop],
+                sinks=sinks,
+            )
+        )
+    return mx.concatenate(outs, axis=2)
+
+
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs, layer_idx: int):
         super().__init__()
@@ -61,8 +114,10 @@ class Attention(nn.Module):
 
         if args.layer_types[layer_idx] == "sliding_attention":
             self.rope = nn.RoPE(head_dim, traditional=False, base=args.rope_theta)
+            self.sliding_window = args.sliding_window
         else:
             self.rope = None
+            self.sliding_window = None
 
     def __call__(
         self,
@@ -89,15 +144,28 @@ class Attention(nn.Module):
         if cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
-        output = scaled_dot_product_attention(
-            queries,
-            keys,
-            values,
-            cache=cache,
-            scale=self.scale,
-            mask=mask,
-            sinks=self.softmax_offset,
-        )
+        output = None
+        if self.sliding_window is not None and L > 1:
+            output = _banded_sliding_attention(
+                queries,
+                keys,
+                values,
+                cache,
+                self.scale,
+                mask,
+                self.softmax_offset,
+                self.sliding_window,
+            )
+        if output is None:
+            output = scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                cache=cache,
+                scale=self.scale,
+                mask=mask,
+                sinks=self.softmax_offset,
+            )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
         return self.o_proj(output)
 
