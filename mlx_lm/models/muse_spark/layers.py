@@ -35,6 +35,13 @@ __all__ = [
 ]
 
 
+# Added to the sum of the top-k router scores.
+_ROUTER_SCORE_EPS = 1e-15
+
+
+POOLED_TP_MAX_TOKENS = 8
+
+
 class InputScaleRMSNorm(nn.Module):
 
     def __init__(self, dims: int, eps: float):
@@ -113,10 +120,6 @@ class Attention(nn.Module):
         return self.o_proj(rms_norm_sigmoid_gate(output, gate, eps=self.eps))
 
 
-# Added to the sum of the top-k router scores.
-_ROUTER_SCORE_EPS = 1e-15
-
-
 class MoEGate(nn.Module):
     """The router, (num_experts, dim) for a gemv, and its score bias."""
 
@@ -129,9 +132,6 @@ class MoEGate(nn.Module):
 class PreciseSwiGLU(nn.Module):
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         return precise_swiglu(x, gate, x)
-
-
-POOLED_TP_MAX_TOKENS = 8
 
 
 def row_parallel_linear(

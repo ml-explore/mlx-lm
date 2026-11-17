@@ -27,6 +27,9 @@ __all__ = [
 ]
 
 
+_FP4_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
+
+
 def _apply_rope(
     x: mx.array,
     rope: YarnRoPE,
@@ -158,9 +161,6 @@ class Compressor(nn.Module):
         gate = gate[:, :full].reshape(batch, -1, self.ratio, dim)
         latent = mx.sum(kv * mx.softmax(gate, axis=2), axis=2)
         return self.kv_norm(latent.astype(x.dtype)), first
-
-
-_FP4_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
 
 
 def _round_fp4(x: mx.array) -> mx.array:

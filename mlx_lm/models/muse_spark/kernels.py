@@ -99,32 +99,6 @@ _qk_norm_kernel = mx.fast.metal_kernel(
 )
 
 
-def qk_norm(
-    qkvg: mx.array,
-    *,
-    n_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    eps: float,
-    query_scale: float,
-) -> list[mx.array]:
-    tokens = qkvg.shape[:-1]
-    rows = qkvg.size // qkvg.shape[-1] * (n_heads + n_kv_heads)
-    return _qk_norm_kernel(
-        inputs=[qkvg, scalar(query_scale), scalar(eps)],
-        template=[
-            ("T", qkvg.dtype),
-            ("D", head_dim),
-            ("HQ", n_heads),
-            ("HK", n_kv_heads),
-        ],
-        grid=(rows * 32, 1, 1),
-        threadgroup=(256, 1, 1),
-        output_shapes=[tokens + (n_heads, head_dim), tokens + (n_kv_heads, head_dim)],
-        output_dtypes=[qkvg.dtype, qkvg.dtype],
-    )
-
-
 # The q and k head norms, the q scale and the rotary embedding, in one kernel.
 
 # qk_norm, then the rotation of mx.fast.rope(traditional=True), which rotates
@@ -177,6 +151,175 @@ _qk_norm_rope_kernel = mx.fast.metal_kernel(
 )
 
 
+# The attention output norm and sigmoid gate, in one kernel.
+
+_NORM_GATE_SOURCE = """
+    // One SIMD group per (token, head) row of D values.
+    uint row = thread_position_in_grid.x / 32;
+    uint lane = thread_index_in_simdgroup;
+    uint B = x_shape[0], H = x_shape[1], L = x_shape[2];
+    if (row >= B * L * H) {
+        return;
+    }
+    uint h = row % H;
+    uint l = (row / H) % L;
+    uint b = row / (H * L);
+    int xd = x_strides[3], gd = g_strides[2];
+    auto xr = x + b * x_strides[0] + h * x_strides[1] + l * x_strides[2];
+    auto gr = g + b * g_strides[0] + l * g_strides[1] + h * D * gd;
+
+    constexpr int R = (D + 31) / 32;
+    float v[R];
+    float sum_sq = 0.0f;
+    for (int i = 0; i < R; i++) {
+        int d = lane + 32 * i;
+        v[i] = d < D ? static_cast<float>(xr[d * xd]) : 0.0f;
+        sum_sq += v[i] * v[i];
+    }
+    float rstd = metal::precise::rsqrt(simd_sum(sum_sq) / D + eps);
+    for (int i = 0; i < R; i++) {
+        int d = lane + 32 * i;
+        if (d < D) {
+            float sig = 1.0f / (1.0f + metal::exp(-static_cast<float>(gr[d * gd])));
+            out[row * D + d] = static_cast<T>(v[i] * rstd * sig);
+        }
+    }
+"""
+
+_norm_gate_kernel = mx.fast.metal_kernel(
+    name="rms_norm_sigmoid_gate",
+    input_names=["x", "g", "eps"],
+    output_names=["out"],
+    source=_NORM_GATE_SOURCE,
+    ensure_row_contiguous=False,
+)
+
+
+# Only the pre-norm, with the same sums as in norm_add_norm.
+_PRE_NORM_ONLY = _HEAD + """
+    float v[R], pw[R];
+    float sum_sq = 0.0f;
+    for (int i = 0; i < R; i++) {
+        int d = t + i * TG;
+        v[i] = pw[i] = 0.0f;
+        if (d < D) {
+            v[i] = stream[base + d];
+            pw[i] = pre_w[d];
+        }
+        sum_sq += v[i] * v[i];
+    }
+    float rstd;
+""" + _PRE_NORM
+
+_pre_norm_kernel = mx.fast.metal_kernel(
+    name="norm_add_norm_pre_norm",
+    input_names=["stream", "pre_w", "pre_eps"],
+    output_names=["normed"],
+    source=_PRE_NORM_ONLY,
+    header=_BLOCK_SUM_ONCE_HEADER,
+)
+
+
+# This kernel inputs [tokens * k, D]:
+# normalises each input token x_i / sqrt(sum(x_i)**2) * w_i -- rms norm
+# and then combine as a weighted sum
+_EXPERT_COMBINE_SOURCE = """
+    constexpr int R = (D + TG - 1) / TG;
+    constexpr int SG = TG / 32;
+    threadgroup float buf[K * SG];
+    uint t = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+    size_t row = threadgroup_position_in_grid.x;
+
+    float w[R];
+    for (int i = 0; i < R; i++) {
+        int d = t + i * TG;
+        w[i] = d < D ? static_cast<float>(norm_w[d]) : 0.0f;
+    }
+    T x[K][R];
+    for (int k = 0; k < K; k++) {
+        size_t base = (row * K + k) * D;
+        for (int i = 0; i < R; i++) {
+            int d = t + i * TG;
+            x[k][i] = d < D ? experts[base + d] : static_cast<T>(0.0f);
+        }
+    }
+    float sum_sq[K];
+    for (int k = 0; k < K; k++) {
+        sum_sq[k] = 0.0f;
+        for (int i = 0; i < R; i++) {
+            float v = static_cast<float>(x[k][i]) * w[i];
+            sum_sq[k] += v * v;
+        }
+        sum_sq[k] = simd_sum(sum_sq[k]);
+    }
+    if (TG > 32) {
+        if (lane == 0) {
+            for (int k = 0; k < K; k++) {
+                buf[k * SG + sg] = sum_sq[k];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int k = 0; k < K; k++) {
+            sum_sq[k] = simd_sum(lane < SG ? buf[k * SG + lane] : 0.0f);
+        }
+    }
+
+    float acc[R];
+    for (int i = 0; i < R; i++) {
+        acc[i] = 0.0f;
+    }
+    for (int k = 0; k < K; k++) {
+        float inv = metal::precise::rsqrt(sum_sq[k] / D + eps);
+        float ew = static_cast<T>(weights[row * K + k]);
+        for (int i = 0; i < R; i++) {
+            float v = static_cast<float>(x[k][i]) * w[i];
+            acc[i] = static_cast<T>(acc[i] + v * inv * ew);
+        }
+    }
+    for (int i = 0; i < R; i++) {
+        int d = t + i * TG;
+        if (d < D) {
+            out[row * D + d] = static_cast<T>(acc[i]);
+        }
+    }
+"""
+
+_expert_combine_kernel = mx.fast.metal_kernel(
+    name="post_expert_norm_combine",
+    input_names=["experts", "weights", "norm_w", "eps"],
+    output_names=["out"],
+    source=_EXPERT_COMBINE_SOURCE,
+)
+
+
+def qk_norm(
+    qkvg: mx.array,
+    *,
+    n_heads: int,
+    n_kv_heads: int,
+    head_dim: int,
+    eps: float,
+    query_scale: float,
+) -> list[mx.array]:
+    tokens = qkvg.shape[:-1]
+    rows = qkvg.size // qkvg.shape[-1] * (n_heads + n_kv_heads)
+    return _qk_norm_kernel(
+        inputs=[qkvg, scalar(query_scale), scalar(eps)],
+        template=[
+            ("T", qkvg.dtype),
+            ("D", head_dim),
+            ("HQ", n_heads),
+            ("HK", n_kv_heads),
+        ],
+        grid=(rows * 32, 1, 1),
+        threadgroup=(256, 1, 1),
+        output_shapes=[tokens + (n_heads, head_dim), tokens + (n_kv_heads, head_dim)],
+        output_dtypes=[qkvg.dtype, qkvg.dtype],
+    )
+
+
 def qk_norm_rope(
     qkvg: mx.array,
     *,
@@ -222,50 +365,6 @@ def qk_norm_rope(
     )
 
 
-# The attention output norm and sigmoid gate, in one kernel.
-
-_NORM_GATE_SOURCE = """
-    // One SIMD group per (token, head) row of D values.
-    uint row = thread_position_in_grid.x / 32;
-    uint lane = thread_index_in_simdgroup;
-    uint B = x_shape[0], H = x_shape[1], L = x_shape[2];
-    if (row >= B * L * H) {
-        return;
-    }
-    uint h = row % H;
-    uint l = (row / H) % L;
-    uint b = row / (H * L);
-    int xd = x_strides[3], gd = g_strides[2];
-    auto xr = x + b * x_strides[0] + h * x_strides[1] + l * x_strides[2];
-    auto gr = g + b * g_strides[0] + l * g_strides[1] + h * D * gd;
-
-    constexpr int R = (D + 31) / 32;
-    float v[R];
-    float sum_sq = 0.0f;
-    for (int i = 0; i < R; i++) {
-        int d = lane + 32 * i;
-        v[i] = d < D ? static_cast<float>(xr[d * xd]) : 0.0f;
-        sum_sq += v[i] * v[i];
-    }
-    float rstd = metal::precise::rsqrt(simd_sum(sum_sq) / D + eps);
-    for (int i = 0; i < R; i++) {
-        int d = lane + 32 * i;
-        if (d < D) {
-            float sig = 1.0f / (1.0f + metal::exp(-static_cast<float>(gr[d * gd])));
-            out[row * D + d] = static_cast<T>(v[i] * rstd * sig);
-        }
-    }
-"""
-
-_norm_gate_kernel = mx.fast.metal_kernel(
-    name="rms_norm_sigmoid_gate",
-    input_names=["x", "g", "eps"],
-    output_names=["out"],
-    source=_NORM_GATE_SOURCE,
-    ensure_row_contiguous=False,
-)
-
-
 def rms_norm_sigmoid_gate(x: mx.array, gate: mx.array, *, eps: float) -> mx.array:
     """Return rms_norm(x) * sigmoid(gate) for each head, like the reference's
     fused kernel: fp32 math and one rounding. x is the attention output
@@ -279,31 +378,6 @@ def rms_norm_sigmoid_gate(x: mx.array, gate: mx.array, *, eps: float) -> mx.arra
         output_shapes=[(B, L, H * D)],
         output_dtypes=[x.dtype],
     )[0]
-
-
-# Only the pre-norm, with the same sums as in norm_add_norm.
-_PRE_NORM_ONLY = _HEAD + """
-    float v[R], pw[R];
-    float sum_sq = 0.0f;
-    for (int i = 0; i < R; i++) {
-        int d = t + i * TG;
-        v[i] = pw[i] = 0.0f;
-        if (d < D) {
-            v[i] = stream[base + d];
-            pw[i] = pre_w[d];
-        }
-        sum_sq += v[i] * v[i];
-    }
-    float rstd;
-""" + _PRE_NORM
-
-_pre_norm_kernel = mx.fast.metal_kernel(
-    name="norm_add_norm_pre_norm",
-    input_names=["stream", "pre_w", "pre_eps"],
-    output_names=["normed"],
-    source=_PRE_NORM_ONLY,
-    header=_BLOCK_SUM_ONCE_HEADER,
-)
 
 
 def pre_norm(stream: mx.array, norm: nn.RMSNorm, *, dtype: mx.Dtype) -> mx.array:
@@ -433,80 +507,6 @@ def norm_add_norm(
         **kwargs,
     )
     return new_stream, normed
-
-
-# This kernel inputs [tokens * k, D]:
-# normalises each input token x_i / sqrt(sum(x_i)**2) * w_i -- rms norm
-# and then combine as a weighted sum
-_EXPERT_COMBINE_SOURCE = """
-    constexpr int R = (D + TG - 1) / TG;
-    constexpr int SG = TG / 32;
-    threadgroup float buf[K * SG];
-    uint t = thread_position_in_threadgroup.x;
-    uint lane = thread_index_in_simdgroup;
-    uint sg = simdgroup_index_in_threadgroup;
-    size_t row = threadgroup_position_in_grid.x;
-
-    float w[R];
-    for (int i = 0; i < R; i++) {
-        int d = t + i * TG;
-        w[i] = d < D ? static_cast<float>(norm_w[d]) : 0.0f;
-    }
-    T x[K][R];
-    for (int k = 0; k < K; k++) {
-        size_t base = (row * K + k) * D;
-        for (int i = 0; i < R; i++) {
-            int d = t + i * TG;
-            x[k][i] = d < D ? experts[base + d] : static_cast<T>(0.0f);
-        }
-    }
-    float sum_sq[K];
-    for (int k = 0; k < K; k++) {
-        sum_sq[k] = 0.0f;
-        for (int i = 0; i < R; i++) {
-            float v = static_cast<float>(x[k][i]) * w[i];
-            sum_sq[k] += v * v;
-        }
-        sum_sq[k] = simd_sum(sum_sq[k]);
-    }
-    if (TG > 32) {
-        if (lane == 0) {
-            for (int k = 0; k < K; k++) {
-                buf[k * SG + sg] = sum_sq[k];
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (int k = 0; k < K; k++) {
-            sum_sq[k] = simd_sum(lane < SG ? buf[k * SG + lane] : 0.0f);
-        }
-    }
-
-    float acc[R];
-    for (int i = 0; i < R; i++) {
-        acc[i] = 0.0f;
-    }
-    for (int k = 0; k < K; k++) {
-        float inv = metal::precise::rsqrt(sum_sq[k] / D + eps);
-        float ew = static_cast<T>(weights[row * K + k]);
-        for (int i = 0; i < R; i++) {
-            float v = static_cast<float>(x[k][i]) * w[i];
-            acc[i] = static_cast<T>(acc[i] + v * inv * ew);
-        }
-    }
-    for (int i = 0; i < R; i++) {
-        int d = t + i * TG;
-        if (d < D) {
-            out[row * D + d] = static_cast<T>(acc[i]);
-        }
-    }
-"""
-
-_expert_combine_kernel = mx.fast.metal_kernel(
-    name="post_expert_norm_combine",
-    input_names=["experts", "weights", "norm_w", "eps"],
-    output_names=["out"],
-    source=_EXPERT_COMBINE_SOURCE,
-)
 
 
 def post_expert_norm_combine(

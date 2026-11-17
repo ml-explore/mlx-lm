@@ -23,10 +23,6 @@ _ZERO_CENTERED_NORMS = (
 )
 
 
-def norm_gain(weight: mx.array) -> mx.array:
-    return (1.0 + weight.astype(mx.float32)).astype(mx.bfloat16)
-
-
 _NVFP4_E2M1_MAX = 6.0
 
 
@@ -40,6 +36,10 @@ _UNUSED_QUANT_TENSORS = (
     "mlp.experts.gate_up_proj_input_scale",
     "mlp.experts.down_proj_input_scale",
 )
+
+
+def norm_gain(weight: mx.array) -> mx.array:
+    return (1.0 + weight.astype(mx.float32)).astype(mx.bfloat16)
 
 
 def interleave_rope_rows(w: mx.array, head_dim: int) -> mx.array:

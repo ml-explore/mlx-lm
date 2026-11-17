@@ -25,6 +25,10 @@ __all__ = [
 ]
 
 
+# TODO: mx.contiguous of a slice fails on arrays this large; copy in chunks.
+_MAX_COPY_ELEMENTS = 1 << 31
+
+
 class MuseSparkTextModel(PipelineMixin, nn.Module):
     def __init__(self, args: TextArgs):
         super().__init__()
@@ -138,10 +142,6 @@ class MuseSparkModel(nn.Module):
 
     def pipeline(self, group, split=None) -> None:
         self.language_model.pipeline(group, split)
-
-
-# TODO: mx.contiguous of a slice fails on arrays this large; copy in chunks.
-_MAX_COPY_ELEMENTS = 1 << 31
 
 
 def shard_experts_inplace(

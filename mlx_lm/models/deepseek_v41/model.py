@@ -23,6 +23,15 @@ __all__ = [
 ]
 
 
+# The shared state that grows each step, kept in the LayerCache field of that name.
+_CACHE_FIELDS = ("compress_kv", "index_k")
+
+
+# A view at a byte offset that is not a multiple of its item size reads the
+# wrong bytes, so each part of a message starts at a multiple of 8 bytes.
+_ALIGN = 8
+
+
 def _shared_reads(args: ModelArgs, layer: int) -> dict[str, int]:
     """The shared state a layer reads, as {key: layer that writes it}."""
     ratios = args.compress_ratios
@@ -52,10 +61,6 @@ def _entries(args: ModelArgs, source: Optional[int], position: int) -> int:
 def _index_keys(args: ModelArgs, layer: int, position: int) -> int:
     """The index keys that index layer `layer` scores after `position` tokens."""
     return _entries(args, _shared_reads(args, layer).get("index_k"), position)
-
-
-# The shared state that grows each step, kept in the LayerCache field of that name.
-_CACHE_FIELDS = ("compress_kv", "index_k")
 
 
 def _window_indices(*, previous: int, length: int, window: int) -> mx.array:
@@ -101,11 +106,6 @@ def _layout(
             topk = min(args.index_topk, _index_keys(args, source, end))
             layout.append((key, (batch, length, topk), mx.int32))
     return layout
-
-
-# A view at a byte offset that is not a multiple of its item size reads the
-# wrong bytes, so each part of a message starts at a multiple of 8 bytes.
-_ALIGN = 8
 
 
 def _nbytes(shape: tuple[int, ...], dtype: mx.Dtype) -> int:

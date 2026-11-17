@@ -17,6 +17,16 @@ __all__ = [
 ]
 
 
+# Activation function mapping
+_ACT2FN = {
+    "silu": nn.silu,
+    "relu": nn.relu,
+    "gelu": nn.gelu,
+    "gelu_new": nn.gelu_approx,
+    "gelu_fast": nn.gelu_approx,
+}
+
+
 class LinearSubblockReplacement(nn.Module):
     """A simple linear layer used to replace Attention or MLP blocks."""
 
@@ -105,16 +115,6 @@ def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:
     """Calculates intermediate size based on multiplier, rounding up to multiple of 256."""
     intermediate_size = int(2 * ffn_mult * n_embd / 3)
     return _find_multiple(intermediate_size, 256)
-
-
-# Activation function mapping
-_ACT2FN = {
-    "silu": nn.silu,
-    "relu": nn.relu,
-    "gelu": nn.gelu,
-    "gelu_new": nn.gelu_approx,
-    "gelu_fast": nn.gelu_approx,
-}
 
 
 class MLP(nn.Module):

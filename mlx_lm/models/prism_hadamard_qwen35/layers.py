@@ -12,6 +12,9 @@ __all__ = [
 ]
 
 
+_BLOCKS = (0, 512, 1024, 2048, 4096, 8192)
+
+
 def hadamard_rotate(x, block, signs, inverse=False):
     """Signed, normalized blockwise Walsh-Hadamard rotation of the last axis."""
     shape, dtype = x.shape, x.dtype
@@ -24,9 +27,6 @@ def hadamard_rotate(x, block, signs, inverse=False):
     if inverse:
         x = x * signs
     return x.astype(dtype)
-
-
-_BLOCKS = (0, 512, 1024, 2048, 4096, 8192)
 
 
 class HadamardQuantizedLinear(nn.Module):
