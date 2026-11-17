@@ -9,6 +9,7 @@ import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .prefill import prefill_layers
 from .rope_utils import initialize_rope
 
 
@@ -74,10 +75,16 @@ class Attention(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        query_length: Optional[int] = None,
+        position_offset: int = 0,
     ) -> mx.array:
         B, L, _ = x.shape
-        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        queries = queries.reshape(B, L, self.n_heads, -1).transpose(0, 2, 1, 3)
+        query_length = query_length or L
+        queries = self.q_proj(x[:, -query_length:])
+        keys, values = self.k_proj(x), self.v_proj(x)
+        queries = queries.reshape(B, query_length, self.n_heads, -1).transpose(
+            0, 2, 1, 3
+        )
 
         keys = keys.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
         values = values.reshape(B, L, self.n_kv_heads, -1).transpose(0, 2, 1, 3)
@@ -86,18 +93,24 @@ class Attention(nn.Module):
         keys = self.k_norm(keys)
 
         if cache is not None:
-            queries = self.rope(queries, offset=cache.offset)
-            keys = self.rope(keys, offset=cache.offset)
+            offset = cache.offset + position_offset
+            queries = self.rope(queries, offset=offset + L - query_length)
+            keys = self.rope(keys, offset=offset)
             keys, values = cache.update_and_fetch(keys, values)
+            if position_offset:
+                cache.offset += position_offset
         else:
-            queries = self.rope(queries)
+            queries = self.rope(queries, offset=L - query_length)
             keys = self.rope(keys)
+
+        if isinstance(mask, mx.array):
+            mask = mask[..., -query_length:, :]
 
         # Sliding window
         output = scaled_dot_product_attention(
             queries, keys, values, cache=cache, scale=self.scale, mask=mask
         )
-        output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
+        output = output.transpose(0, 2, 1, 3).reshape(B, query_length, -1)
         return self.o_proj(output)
 
 
@@ -153,8 +166,14 @@ class TransformerBlock(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        query_length: Optional[int] = None,
+        position_offset: int = 0,
     ) -> mx.array:
-        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        r = self.self_attn(
+            self.input_layernorm(x), mask, cache, query_length, position_offset
+        )
+        if query_length is not None:
+            x = x[:, -query_length:]
         h = clip_residual(x, self.post_attention_layernorm(r))
         r = self.mlp(self.pre_feedforward_layernorm(h))
         out = clip_residual(h, self.post_feedforward_layernorm(r))
@@ -182,6 +201,7 @@ class Gemma3Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        prefill: bool = False,
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -191,6 +211,15 @@ class Gemma3Model(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if prefill:
+            layer_types = [
+                "sliding_attention" if layer.self_attn.is_sliding else "full_attention"
+                for layer in self.layers
+            ]
+            out = prefill_layers(h, self.layers, layer_types, self.window_size, cache)
+            if out is not None:
+                return self.norm(out)
 
         global_mask = create_attention_mask(h, cache[self.sliding_window_pattern - 1])
 
@@ -220,6 +249,10 @@ class Model(nn.Module):
         self.model = Gemma3Model(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.tie_word_embeddings = False
+
+    def prefill(self, inputs, cache=None, input_embeddings=None):
+        """Update prompt caches without returning logits."""
+        self.model(inputs, cache, input_embeddings, prefill=True)
 
     def __call__(
         self,

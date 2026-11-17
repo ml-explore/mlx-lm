@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import SwigluOAI
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
+from .prefill import prefill_layers
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
@@ -81,27 +82,45 @@ class AttentionBlock(nn.Module):
             scaling_config=config.rope_scaling,
         )
 
-    def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        mask: mx.array,
+        cache=None,
+        query_length=None,
+        position_offset=0,
+    ) -> mx.array:
         B, L, _ = x.shape
         D = self.head_dim
+        query_length = query_length or L
 
-        q = self.q_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
+        q = (
+            self.q_proj(x[:, -query_length:])
+            .reshape(B, query_length, -1, D)
+            .swapaxes(1, 2)
+        )
         k = self.k_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
         v = self.v_proj(x).reshape(B, L, -1, D).swapaxes(1, 2)
 
         if cache is not None:
-            q = self.rope(q, offset=cache.offset)
-            k = self.rope(k, offset=cache.offset)
+            offset = cache.offset + position_offset
+            q = self.rope(q, offset=offset + L - query_length)
+            k = self.rope(k, offset=offset)
             k, v = cache.update_and_fetch(k, v)
+            if position_offset:
+                cache.offset += position_offset
         else:
-            q = self.rope(q)
+            q = self.rope(q, offset=L - query_length)
             k = self.rope(k)
+
+        if isinstance(mask, mx.array):
+            mask = mask[..., -query_length:, :]
 
         v_hat = scaled_dot_product_attention(
             q, k, v, cache, self.sm_scale, mask=mask, sinks=self.sinks
         )
 
-        return self.o_proj(v_hat.swapaxes(1, 2).reshape(B, L, -1))
+        return self.o_proj(v_hat.swapaxes(1, 2).reshape(B, query_length, -1))
 
 
 class MLPBlock(nn.Module):
@@ -153,10 +172,19 @@ class TransformerBlock(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
 
-    def __call__(self, x: mx.array, mask: mx.array, cache=None) -> mx.array:
+    def __call__(
+        self,
+        x: mx.array,
+        mask: mx.array,
+        cache=None,
+        query_length=None,
+        position_offset=0,
+    ) -> mx.array:
         residual = x
         x = self.input_layernorm(x)
-        x = self.self_attn(x, mask, cache)
+        x = self.self_attn(x, mask, cache, query_length, position_offset)
+        if query_length is not None:
+            residual = residual[:, -query_length:]
         x = residual + x
 
         residual = x
@@ -185,6 +213,7 @@ class GptOssMoeModel(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        prefill: bool = False,
     ):
         if input_embeddings is not None:
             x = input_embeddings
@@ -193,6 +222,13 @@ class GptOssMoeModel(nn.Module):
 
         if cache is None:
             cache = [None] * len(self.layers)
+
+        if prefill:
+            out = prefill_layers(
+                x, self.layers, self.layer_types, self.window_size, cache
+            )
+            if out is not None:
+                return self.norm(out)
 
         full_mask = create_attention_mask(x, cache[self.ga_idx])
         swa_mask = create_attention_mask(
@@ -216,6 +252,10 @@ class Model(nn.Module):
 
     def __call__(self, inputs: mx.array, cache=None):
         return self.lm_head(self.model(inputs, cache))
+
+    def prefill(self, inputs, cache=None):
+        """Update prompt caches without returning logits."""
+        self.model(inputs, cache, prefill=True)
 
     def sanitize(self, weights):
         if any("gate_proj.weight" in k for k in weights.keys()):
