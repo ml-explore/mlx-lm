@@ -8,6 +8,7 @@ from mlx_lm.models.ministral3.layers import Fp8Linear, FusedGLU
 
 __all__ = [
     "sanitize",
+    "sanitize_language_model",
 ]
 
 
@@ -54,13 +55,25 @@ def _fp8_as_mxfp8(weights):
             )
 
 
-def sanitize(model, weights):
+def _use_fp8_linears(module, weights, prefix):
+    """Swap the linear layers that have an fp8 output scale for Fp8Linear."""
+    fp8_modules = []
+    for p, m in module.named_modules():
+        if isinstance(m, nn.Linear) and f"{prefix}{p}.output_scale" in weights:
+            out_dims, in_dims = m.weight.shape
+            per_row = weights[f"{prefix}{p}.output_scale"].ndim == 1
+            fp8_modules.append((p, Fp8Linear(in_dims, out_dims, per_row)))
+    if fp8_modules:
+        module.update_modules(tree_unflatten(fp8_modules))
+
+
+def sanitize_language_model(language_model, weights, prefix):
+    """Sanitize the language model's weights, named from prefix: "model." in the
+    text model, "model.language_model." in a multimodal one."""
     # Remove unused precomputed rotary freqs
     weights = {
         k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k
     }
-    if model.args.tie_word_embeddings:
-        weights.pop("lm_head.weight", None)
 
     # fp8 layers keep the e4m3 bytes, and the scale moves to the layer.
     # Static activation scales have no consumer here.
@@ -79,25 +92,26 @@ def sanitize(model, weights):
         return fp8 and _fuse(weights, parts, name)
 
     # Projections that read the same input run as one matmul.
-    for l, layer in enumerate(model.model.layers):
-        attn, mlp = f"model.layers.{l}.self_attn", f"model.layers.{l}.mlp"
+    for l, layer in enumerate(language_model.layers):
+        attn, mlp = f"{prefix}layers.{l}.self_attn", f"{prefix}layers.{l}.mlp"
         a = layer.self_attn
         if fused([f"{attn}.{n}_proj" for n in "qkv"], f"{attn}.qkv_proj"):
             rows = (a.n_heads + 2 * a.n_kv_heads) * a.head_dim
-            a.qkv_proj = nn.Linear(model.args.hidden_size, rows, bias=False)
+            a.qkv_proj = nn.Linear(language_model.args.hidden_size, rows, bias=False)
             del a.q_proj, a.k_proj, a.v_proj
         if fused([f"{mlp}.gate_proj", f"{mlp}.up_proj"], f"{mlp}.gate_up_proj"):
             out_dims, in_dims = layer.mlp.gate_proj.weight.shape
             layer.mlp = FusedGLU(in_dims, out_dims)
 
     _fp8_as_mxfp8(weights)
-    fp8_modules = []
-    for p, m in model.named_modules():
-        if isinstance(m, nn.Linear) and f"{p}.output_scale" in weights:
-            out_dims, in_dims = m.weight.shape
-            per_row = weights[f"{p}.output_scale"].ndim == 1
-            fp8_modules.append((p, Fp8Linear(in_dims, out_dims, per_row)))
-    if fp8_modules:
-        model.update_modules(tree_unflatten(fp8_modules))
+    _use_fp8_linears(language_model, weights, prefix)
+    return weights
 
+
+def sanitize(model, weights):
+    weights = sanitize_language_model(model.model, weights, prefix="model.")
+    if model.args.tie_word_embeddings:
+        weights.pop("lm_head.weight", None)
+    # The output layer is outside the language model.
+    _use_fp8_linears(model, weights, prefix="")
     return weights

@@ -13,12 +13,13 @@ from mlx_lm.models.gemma3_text.config import ModelArgs
 from mlx_lm.models.gemma3_text.layers import TransformerBlock
 
 __all__ = [
-    "Gemma3Model",
+    "Gemma3TextModel",
     "Model",
+    "make_cache",
 ]
 
 
-class Gemma3Model(nn.Module):
+class Gemma3TextModel(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -69,12 +70,23 @@ class Gemma3Model(nn.Module):
         return self.norm(h)
 
 
+def make_cache(args: ModelArgs):
+    """A global cache for every sliding_window_pattern-th layer, sliding ones otherwise."""
+    caches = []
+    for i in range(args.num_hidden_layers):
+        if i % args.sliding_window_pattern == args.sliding_window_pattern - 1:
+            caches.append(KVCache())
+        else:
+            caches.append(RotatingKVCache(max_size=args.sliding_window))
+    return caches
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Gemma3Model(args)
+        self.model = Gemma3TextModel(args)
         self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         self.tie_word_embeddings = False
 
@@ -99,13 +111,4 @@ class Model(nn.Module):
         return self.model.layers
 
     def make_cache(self):
-        caches = []
-        for i in range(self.args.num_hidden_layers):
-            if (
-                i % self.args.sliding_window_pattern
-                == self.args.sliding_window_pattern - 1
-            ):
-                caches.append(KVCache())
-            else:
-                caches.append(RotatingKVCache(max_size=self.args.sliding_window))
-        return caches
+        return make_cache(self.args)

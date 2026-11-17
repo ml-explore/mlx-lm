@@ -18,6 +18,7 @@ from mlx_lm.models.mistral4.layers import Mistral4DecoderLayer
 __all__ = [
     "Mistral4Model",
     "Model",
+    "shard_layers",
 ]
 
 
@@ -77,6 +78,68 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
         return self.norm(h)
 
 
+def shard_layers(layers, group: mx.distributed.Group):
+    """Shard the decoder layers for tensor parallelism."""
+    N = group.size()
+
+    for layer in layers:
+        if layer.self_attn.q_lora_rank is None:
+            layer.self_attn.q_proj = shard_linear(
+                layer.self_attn.q_proj, "all-to-sharded", group=group
+            )
+        else:
+            layer.self_attn.q_b_proj = shard_linear(
+                layer.self_attn.q_b_proj, "all-to-sharded", group=group
+            )
+
+        layer.self_attn.num_heads //= N
+        num_heads = layer.self_attn.num_heads
+        sh = group.rank() * num_heads
+        eh = sh + num_heads
+
+        def shard_heads(w):
+            return w[sh:eh]
+
+        layer.self_attn.embed_q.apply(shard_heads)
+        layer.self_attn.unembed_out.apply(shard_heads)
+
+        layer.self_attn.o_proj = shard_linear(
+            layer.self_attn.o_proj, "sharded-to-all", group=group
+        )
+
+        if isinstance(layer.mlp, DeepseekV3MLP):
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
+
+        else:
+            # Shard in place: the MoE aggregates the partial sums itself.
+            layer.mlp.sharding_group = group
+            if hasattr(layer.mlp, "shared_experts"):
+                shard_inplace(
+                    layer.mlp.shared_experts.gate_proj,
+                    "all-to-sharded",
+                    group=group,
+                )
+                shard_inplace(
+                    layer.mlp.shared_experts.down_proj,
+                    "sharded-to-all",
+                    group=group,
+                )
+                shard_inplace(
+                    layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
+                )
+            shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+            shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -107,68 +170,4 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
-        group = group or mx.distributed.init()
-        N = group.size()
-
-        for layer in self.model.layers:
-            if layer.self_attn.q_lora_rank is None:
-                layer.self_attn.q_proj = shard_linear(
-                    layer.self_attn.q_proj, "all-to-sharded", group=group
-                )
-            else:
-                layer.self_attn.q_b_proj = shard_linear(
-                    layer.self_attn.q_b_proj, "all-to-sharded", group=group
-                )
-
-            layer.self_attn.num_heads //= N
-            num_heads = layer.self_attn.num_heads
-            sh = group.rank() * num_heads
-            eh = sh + num_heads
-
-            def shard_heads(w):
-                return w[sh:eh]
-
-            layer.self_attn.embed_q.apply(shard_heads)
-            layer.self_attn.unembed_out.apply(shard_heads)
-
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-
-            if isinstance(layer.mlp, DeepseekV3MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
-                )
-                layer.mlp.down_proj = shard_linear(
-                    layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
-                )
-
-            else:
-                # Shard in place: the MoE aggregates the partial sums itself.
-                layer.mlp.sharding_group = group
-                if hasattr(layer.mlp, "shared_experts"):
-                    shard_inplace(
-                        layer.mlp.shared_experts.gate_proj,
-                        "all-to-sharded",
-                        group=group,
-                    )
-                    shard_inplace(
-                        layer.mlp.shared_experts.down_proj,
-                        "sharded-to-all",
-                        group=group,
-                    )
-                    shard_inplace(
-                        layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
-                    )
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                )
+        shard_layers(self.model.layers, group or mx.distributed.init())

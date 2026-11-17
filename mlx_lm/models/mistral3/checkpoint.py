@@ -1,21 +1,23 @@
 # Copyright © 2026 Apple Inc.
 
+from mlx_lm.layers.multimodal import from_llava_layout
+from mlx_lm.models.mistral3.config import language_model_package
 
 __all__ = [
     "sanitize",
 ]
 
+# Only the language model runs here.
+_ENCODERS = ("model.vision_tower.", "model.multi_modal_projector.")
+
 
 def sanitize(model, weights):
-    lm_weights = {}
-    for key, value in weights.items():
-        if "vision_tower" in key or "multi_modal_projector" in key:
-            continue
-        if key.startswith("model.language_model."):
-            key = "model." + key.removeprefix("model.language_model.")
-        else:
-            key = key.removeprefix("language_model.")
-        lm_weights[key] = value
-
-    sanitized_lm = model.language_model.sanitize(lm_weights)
-    return {"language_model." + k: v for k, v in sanitized_lm.items()}
+    # Older checkpoints, and older MLX conversions, have the LLaVA layout.
+    weights = {from_llava_layout(k): v for k, v in weights.items()}
+    weights = {k: v for k, v in weights.items() if not k.startswith(_ENCODERS)}
+    if model.args.text.tie_word_embeddings:
+        weights.pop("lm_head.weight", None)
+    language_model = language_model_package(model.args.text.model_type)
+    return language_model.checkpoint.sanitize_language_model(
+        model.model.language_model, weights, prefix="model.language_model."
+    )

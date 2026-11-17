@@ -24,6 +24,7 @@ from mlx_lm.models.ministral3.layers import (
 __all__ = [
     "LanguageModel",
     "Model",
+    "shard_layers",
 ]
 
 
@@ -136,6 +137,39 @@ class LanguageModel(PipelineMixin, nn.Module):
         return self.norm(h)
 
 
+def shard_layers(layers, group: mx.distributed.Group):
+    """Shard the decoder layers for tensor parallelism."""
+    N = group.size()
+    for layer in layers:
+        # Shard the self attention
+        attn = layer.self_attn
+        if "qkv_proj" in attn:
+            # Each rank takes its heads of q, k and v.
+            q = attn.n_heads * attn.head_dim
+            kv = attn.n_kv_heads * attn.head_dim
+            attn.qkv_proj = _shard_linear(
+                attn.qkv_proj, "all-to-sharded", group, segments=[q, q + kv]
+            )
+        else:
+            attn.q_proj = _shard_linear(attn.q_proj, "all-to-sharded", group)
+            attn.k_proj = _shard_linear(attn.k_proj, "all-to-sharded", group)
+            attn.v_proj = _shard_linear(attn.v_proj, "all-to-sharded", group)
+        attn.o_proj = _shard_linear(attn.o_proj, "sharded-to-all", group)
+        attn.n_heads //= N
+        attn.n_kv_heads //= N
+
+        # Shard the MLP
+        mlp = layer.mlp
+        if isinstance(mlp, FusedGLU):
+            mlp.gate_up_proj = _shard_linear(
+                mlp.gate_up_proj, "all-to-sharded", group, segments=2
+            )
+        else:
+            mlp.gate_proj = _shard_linear(mlp.gate_proj, "all-to-sharded", group)
+            mlp.up_proj = _shard_linear(mlp.up_proj, "all-to-sharded", group)
+        mlp.down_proj = _shard_linear(mlp.down_proj, "sharded-to-all", group)
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -174,34 +208,7 @@ class Model(nn.Module):
             self.lm_head = _shard_linear(self.lm_head, "all-to-sharded", group)
             self.sharding_group = group
 
-        for layer in self.model.layers:
-            # Shard the self attention
-            attn = layer.self_attn
-            if "qkv_proj" in attn:
-                # Each rank takes its heads of q, k and v.
-                q = attn.n_heads * attn.head_dim
-                kv = attn.n_kv_heads * attn.head_dim
-                attn.qkv_proj = _shard_linear(
-                    attn.qkv_proj, "all-to-sharded", group, segments=[q, q + kv]
-                )
-            else:
-                attn.q_proj = _shard_linear(attn.q_proj, "all-to-sharded", group)
-                attn.k_proj = _shard_linear(attn.k_proj, "all-to-sharded", group)
-                attn.v_proj = _shard_linear(attn.v_proj, "all-to-sharded", group)
-            attn.o_proj = _shard_linear(attn.o_proj, "sharded-to-all", group)
-            attn.n_heads //= N
-            attn.n_kv_heads //= N
-
-            # Shard the MLP
-            mlp = layer.mlp
-            if isinstance(mlp, FusedGLU):
-                mlp.gate_up_proj = _shard_linear(
-                    mlp.gate_up_proj, "all-to-sharded", group, segments=2
-                )
-            else:
-                mlp.gate_proj = _shard_linear(mlp.gate_proj, "all-to-sharded", group)
-                mlp.up_proj = _shard_linear(mlp.up_proj, "all-to-sharded", group)
-            mlp.down_proj = _shard_linear(mlp.down_proj, "sharded-to-all", group)
+        shard_layers(self.model.layers, group)
 
     @property
     def layers(self):

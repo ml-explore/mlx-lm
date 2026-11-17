@@ -16,6 +16,8 @@ __all__ = [
     "Gemma4TextModel",
     "Model",
     "logit_softcap",
+    "make_cache",
+    "moe_quant_predicate",
 ]
 
 
@@ -215,6 +217,26 @@ class Gemma4TextModel(nn.Module):
         return self.norm(h)
 
 
+def moe_quant_predicate(path, _):
+    """The routers keep 8 bits."""
+    if path.endswith("router.proj"):
+        return {"group_size": 64, "bits": 8}
+    return True
+
+
+def make_cache(args: ModelArgs):
+    """A cache for each layer that computes its keys and values; the KV-shared
+    layers reuse those of earlier layers."""
+    first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers
+    caches = []
+    for i in range(first_kv_shared):
+        if args.layer_types[i] == "full_attention":
+            caches.append(KVCache())
+        else:
+            caches.append(RotatingKVCache(max_size=args.sliding_window, keep=0))
+    return caches
+
+
 class Model(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -252,12 +274,7 @@ class Model(nn.Module):
 
     @property
     def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith("router.proj"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
+        return moe_quant_predicate
 
     @property
     def layers(self):
@@ -272,16 +289,4 @@ class Model(nn.Module):
         return self.args.num_key_value_heads
 
     def make_cache(self):
-        first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
-        caches = []
-        for i in range(first_kv_shared):
-            if self.args.layer_types[i] == "full_attention":
-                caches.append(KVCache())
-            else:
-                caches.append(
-                    RotatingKVCache(
-                        max_size=self.args.sliding_window,
-                        keep=0,
-                    )
-                )
-        return caches
+        return make_cache(self.args)

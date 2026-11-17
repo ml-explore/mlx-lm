@@ -4,12 +4,16 @@ import mlx.core as mx
 
 __all__ = [
     "sanitize",
+    "sanitize_language_model",
 ]
 
 
-def sanitize(model, weights):
+def sanitize_language_model(language_model, weights, prefix):
+    """Sanitize the language model's weights, named from prefix: "model." in the
+    text model, "model.language_model." in a multimodal one."""
+    args = language_model.config
     sanitized = {}
-    first_kv_shared = model.args.num_hidden_layers - model.args.num_kv_shared_layers
+    first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers
     for k, v in weights.items():
         if any(
             s in k
@@ -50,3 +54,7 @@ def sanitize(model, weights):
         sanitized[k] = v
 
     return sanitized
+
+
+def sanitize(model, weights):
+    return sanitize_language_model(model.model, weights, prefix="model.")

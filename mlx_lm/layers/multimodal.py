@@ -5,8 +5,25 @@
 import mlx.core as mx
 
 __all__ = [
+    "from_llava_layout",
     "splice",
 ]
+
+
+def from_llava_layout(key: str) -> str:
+    """The current name of a key in the LLaVA layout, as transformers maps it.
+
+    language_model.model.* becomes model.language_model.*, language_model.lm_head.*
+    becomes lm_head.*, and the vision tower and the projector move under model.
+    Other keys are unchanged.
+    """
+    if key.startswith("language_model.lm_head."):
+        return key.removeprefix("language_model.")
+    if key.startswith("language_model.model."):
+        return "model.language_model." + key.removeprefix("language_model.model.")
+    if key.startswith(("vision_tower.", "multi_modal_projector.")):
+        return "model." + key
+    return key
 
 
 def splice(

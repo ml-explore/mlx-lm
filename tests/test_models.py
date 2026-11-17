@@ -1432,30 +1432,24 @@ class TestModels(unittest.TestCase):
         model = gemma4.Model(args)
 
         base = mx.arange(8, dtype=mx.float32)
-        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
-        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        old_mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
 
         converted = model.sanitize(
             {
-                hf_norm_key: base,
+                norm_key: base,
                 "model.vision_tower.stub": mx.zeros((1,), dtype=mx.float32),
             }
         )
-        self.assertIn(mlx_norm_key, converted)
-        self.assertNotIn(
-            "language_model.model.model.layers.0.input_layernorm.weight", converted
-        )
-        self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
-        self.assertFalse(any("vision_tower" in k for k in converted))
+        self.assertEqual(list(converted), [norm_key])
+        self.assertTrue(mx.array_equal(converted[norm_key], base))
 
-        loaded = model.sanitize({mlx_norm_key: base})
-        self.assertIn(mlx_norm_key, loaded)
-        self.assertNotIn(
-            "language_model.model.model.layers.0.input_layernorm.weight", loaded
-        )
-        self.assertTrue(mx.array_equal(loaded[mlx_norm_key], base))
+        # Older MLX conversions
+        loaded = model.sanitize({old_mlx_norm_key: base})
+        self.assertEqual(list(loaded), [norm_key])
+        self.assertTrue(mx.array_equal(loaded[norm_key], base))
 
-    def test_gemma4_raw_hf_language_model_prefixes_model(self):
+    def test_gemma4_raw_hf_language_model_names_unchanged(self):
         from mlx_lm.models import gemma4
 
         args = gemma4.ModelArgs.from_dict(
@@ -1485,11 +1479,10 @@ class TestModels(unittest.TestCase):
 
         base = mx.arange(8, dtype=mx.float32)
         hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
-        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
 
         converted = model.sanitize({hf_norm_key: base})
-        self.assertIn(mlx_norm_key, converted)
-        self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
+        self.assertEqual(list(converted), [hf_norm_key])
+        self.assertTrue(mx.array_equal(converted[hf_norm_key], base))
 
     def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
         from mlx_lm.models import gemma4
@@ -1533,9 +1526,9 @@ class TestModels(unittest.TestCase):
             }
         )
 
-        gate_key = "language_model.model.layers.0.experts.switch_glu.gate_proj.weight"
-        up_key = "language_model.model.layers.0.experts.switch_glu.up_proj.weight"
-        down_key = "language_model.model.layers.0.experts.switch_glu.down_proj.weight"
+        gate_key = "model.language_model.layers.0.experts.switch_glu.gate_proj.weight"
+        up_key = "model.language_model.layers.0.experts.switch_glu.up_proj.weight"
+        down_key = "model.language_model.layers.0.experts.switch_glu.down_proj.weight"
 
         self.assertIn(gate_key, converted)
         self.assertIn(up_key, converted)
@@ -1585,13 +1578,13 @@ class TestModels(unittest.TestCase):
             bits=4,
         )
 
-        layer = model.language_model.model.layers[0]
+        layer = model.model.language_model.layers[0]
         self.assertIsInstance(layer.router.proj, nn.QuantizedLinear)
         self.assertEqual(layer.router.proj.bits, 8)
         self.assertIsInstance(layer.experts.switch_glu.gate_proj, QuantizedSwitchLinear)
         self.assertEqual(layer.experts.switch_glu.gate_proj.bits, 4)
         self.assertEqual(
-            config["quantization"]["language_model.model.layers.0.router.proj"]["bits"],
+            config["quantization"]["model.language_model.layers.0.router.proj"]["bits"],
             8,
         )
         self.assertEqual(config["quantization"]["bits"], 4)
@@ -2741,7 +2734,7 @@ class TestModels(unittest.TestCase):
         self.assertIsInstance(layer.mlp, ministral3.layers.FusedGLU)
         self.assertIsInstance(layer.mlp.gate_up_proj, ministral3.layers.Fp8Linear)
         self.assertIsInstance(layer.mlp.down_proj, ministral3.layers.Fp8Linear)
-        self.assertIsInstance(model.language_model.lm_head, nn.Linear)
+        self.assertIsInstance(model.lm_head, nn.Linear)
         self.assertIn("q_proj", ref.layers[0].self_attn)
         self.assertIsInstance(ref.layers[0].mlp, ministral3.layers.MLP)
 
@@ -2782,15 +2775,14 @@ class TestModels(unittest.TestCase):
         for shard in (False, True):
             if shard:
                 # Each sharded fp8 layer keeps its output scale.
-                model.language_model.shard(mx.distributed.init())
+                model.shard(mx.distributed.init())
                 self.assertIsInstance(
                     model.layers[0].self_attn.o_proj,
                     ministral3.layers.Fp8ShardedToAllLinear,
                 )
                 # Each rank computes a slice of the vocabulary.
-                lm = model.language_model
-                self.assertIsInstance(lm.lm_head, nn.AllToShardedLinear)
-                self.assertIsNotNone(lm.sharding_group)
+                self.assertIsInstance(model.lm_head, nn.AllToShardedLinear)
+                self.assertIsNotNone(model.sharding_group)
             out = model(x)
             # fp32 matmuls on M5 GPUs have ~3e-4 error. A wrong scale gives ~1.
             err = mx.abs(out - expected).max() / mx.abs(expected).max()
@@ -5815,6 +5807,53 @@ class TestVLSanitize(unittest.TestCase):
                         }
                     )
                     self.assertEqual(args.text.tie_word_embeddings, tie)
+
+    def test_mistral3_layouts(self):
+        # Hugging Face's current layout, and the LLaVA layout of its older
+        # checkpoints and of older MLX conversions. The encoders are dropped.
+        from mlx_lm.models import mistral3
+
+        model = mistral3.Model(
+            mistral3.ModelArgs.from_dict(
+                {"model_type": "mistral3", "text_config": self._text_config("mistral")}
+            )
+        )
+        current = dict(tree_flatten(model.parameters()))
+        llava = {}
+        for k, v in current.items():
+            if k.startswith("model.language_model."):
+                k = "language_model.model." + k.removeprefix("model.language_model.")
+            else:
+                k = "language_model." + k
+            llava[k] = v
+        hf_encoders = {
+            "model.vision_tower.patch_conv.weight": None,
+            "model.multi_modal_projector.linear_1.weight": None,
+        }
+        llava_encoders = {
+            "vision_tower.patch_conv.weight": None,
+            "multi_modal_projector.linear_1.weight": None,
+        }
+        for name, weights in (
+            ("hf", {**current, **hf_encoders}),
+            ("llava", {**llava, **llava_encoders}),
+        ):
+            with self.subTest(layout=name):
+                self.assertEqual(sorted(model.sanitize(weights)), sorted(current))
+
+    def test_mistral3_mistral_defaults(self):
+        # transformers leaves Mistral's defaults out of the text_config it saves:
+        # mistral-community/pixtral-12b has no num_attention_heads.
+        from mlx_lm.models import mistral3
+
+        text_config = self._text_config("mistral")
+        del text_config["num_attention_heads"]
+        del text_config["num_key_value_heads"]
+        args = mistral3.ModelArgs.from_dict(
+            {"model_type": "llava", "text_config": text_config}
+        )
+        self.assertEqual(args.text.num_attention_heads, 32)
+        self.assertEqual(args.text.num_key_value_heads, 8)
 
 
 if __name__ == "__main__":

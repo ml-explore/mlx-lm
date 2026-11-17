@@ -48,6 +48,7 @@ from .tokenizer_utils import load as _load_tokenizer
 MODEL_REMAPPING = {
     "mistral": "llama",
     "llava": "mistral3",
+    "pixtral": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
     "joyai_llm_flash": "deepseek_v3",

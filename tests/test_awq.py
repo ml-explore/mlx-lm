@@ -68,11 +68,11 @@ class TestAWQ(unittest.TestCase):
         config = ministral3_config()
         model = ministral3.Model(ministral3.ModelArgs.from_dict(config))
         self._quantize(model)
-        self._assert_quantized(model, prefix="")
+        self._assert_quantized(model, language_model="model")
 
     def test_mistral3_awq_quantize(self):
-        # The wrapper needs lm_key to descend into the language model, and it
-        # builds either a llama or a ministral3 depending on text_config.
+        # The wrapper's language model is at model.language_model, and it is
+        # either a llama or a ministral3 depending on text_config.
         for model_type in ["mistral3", "llava"]:
             for text_config in [llama_config(), ministral3_config()]:
                 inner = text_config["model_type"]
@@ -83,7 +83,7 @@ class TestAWQ(unittest.TestCase):
                         )
                     )
                     self._quantize(model)
-                    self._assert_quantized(model, prefix="language_model.")
+                    self._assert_quantized(model, language_model="model.language_model")
 
     def _quantize(self, model):
         awq_quantize(
@@ -96,15 +96,15 @@ class TestAWQ(unittest.TestCase):
         )
         mx.eval(model.parameters())
 
-    def _assert_quantized(self, model, prefix):
+    def _assert_quantized(self, model, language_model):
         keys = {k for k, _ in tree_flatten(model.parameters())}
         for key in [
-            "model.embed_tokens.scales",
-            "model.layers.0.self_attn.q_proj.scales",
-            "model.layers.0.mlp.gate_proj.scales",
+            f"{language_model}.embed_tokens.scales",
+            f"{language_model}.layers.0.self_attn.q_proj.scales",
+            f"{language_model}.layers.0.mlp.gate_proj.scales",
             "lm_head.scales",
         ]:
-            self.assertIn(prefix + key, keys)
+            self.assertIn(key, keys)
 
     def test_apply_scale_to_zero_centered_norm(self):
         mx.random.seed(0)

@@ -4,10 +4,15 @@ import mlx.core as mx
 
 __all__ = [
     "sanitize",
+    "sanitize_language_model",
 ]
 
 
-def sanitize(model, weights):
+def sanitize_language_model(language_model, weights, prefix):
+    """Sanitize the language model's weights, named from prefix: "model." in the
+    text model, "model.language_model." in a multimodal one."""
+    args = language_model.args
+
     def broadcasts(scale_shape, weight_shape):
         if len(scale_shape) > len(weight_shape):
             return False
@@ -61,46 +66,46 @@ def sanitize(model, weights):
             new_weights[k] = v
     weights = new_weights
 
-    for l in range(model.args.num_hidden_layers):
-        prefix = f"model.layers.{l}"
+    for l in range(args.num_hidden_layers):
+        layer = f"{prefix}layers.{l}"
 
         # Handle fused gate_up_proj format (Mistral4NaiveMoe)
-        gup_key = f"{prefix}.mlp.experts.gate_up_proj"
+        gup_key = f"{layer}.mlp.experts.gate_up_proj"
         if gup_key in weights:
             gate_up = weights.pop(gup_key)
             gate, up = mx.split(gate_up, 2, axis=1)
-            weights[f"{prefix}.mlp.switch_mlp.gate_proj.weight"] = gate
-            weights[f"{prefix}.mlp.switch_mlp.up_proj.weight"] = up
-        down_key = f"{prefix}.mlp.experts.down_proj"
+            weights[f"{layer}.mlp.switch_mlp.gate_proj.weight"] = gate
+            weights[f"{layer}.mlp.switch_mlp.up_proj.weight"] = up
+        down_key = f"{layer}.mlp.experts.down_proj"
         if down_key in weights:
-            weights[f"{prefix}.mlp.switch_mlp.down_proj.weight"] = weights.pop(down_key)
+            weights[f"{layer}.mlp.switch_mlp.down_proj.weight"] = weights.pop(down_key)
 
         for m in ["gate_proj", "down_proj", "up_proj"]:
             for k in ["weight", "scales", "biases"]:
-                if f"{prefix}.mlp.experts.0.{m}.{k}" in weights:
+                if f"{layer}.mlp.experts.0.{m}.{k}" in weights:
                     to_join = [
-                        weights.pop(f"{prefix}.mlp.experts.{e}.{m}.{k}")
-                        for e in range(model.args.n_routed_experts)
+                        weights.pop(f"{layer}.mlp.experts.{e}.{m}.{k}")
+                        for e in range(args.n_routed_experts)
                     ]
-                    weights[f"{prefix}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
+                    weights[f"{layer}.mlp.switch_mlp.{m}.{k}"] = mx.stack(to_join)
 
         # Absorb kv_b_proj into embed_q / unembed_out.
         # TODO: affine only; non-affine modes have no biases key.
-        attn = f"{prefix}.self_attn"
+        attn = f"{layer}.self_attn"
         if f"{attn}.kv_b_proj.weight" in weights:
             quantized = f"{attn}.kv_b_proj.scales" in weights
             w = weights.pop(f"{attn}.kv_b_proj.weight")
-            head_dim = model.args.qk_nope_head_dim + model.args.v_head_dim
+            head_dim = args.qk_nope_head_dim + args.v_head_dim
             if quantized:
-                dims = model.args.kv_lora_rank
+                dims = args.kv_lora_rank
                 scales = weights.pop(f"{attn}.kv_b_proj.scales")
                 biases = weights.pop(f"{attn}.kv_b_proj.biases")
                 bits = (w.shape[-1] * 32) // dims
                 group_size = dims // scales.shape[-1]
                 w = mx.dequantize(w, scales, biases, bits=bits, group_size=group_size)
-            w = w.reshape(model.args.num_attention_heads, head_dim, -1)
-            wk = mx.contiguous(w[:, : model.args.qk_nope_head_dim, :].swapaxes(-1, -2))
-            wv = mx.contiguous(w[:, model.args.qk_nope_head_dim :, :])
+            w = w.reshape(args.num_attention_heads, head_dim, -1)
+            wk = mx.contiguous(w[:, : args.qk_nope_head_dim, :].swapaxes(-1, -2))
+            wv = mx.contiguous(w[:, args.qk_nope_head_dim :, :])
             if quantized:
                 wk, wk_scales, wk_biases = mx.quantize(
                     wk, bits=bits, group_size=group_size
@@ -116,3 +121,7 @@ def sanitize(model, weights):
             weights[f"{attn}.unembed_out.weight"] = wv
 
     return {k: v for k, v in weights.items() if "rotary_emb.inv_freq" not in k}
+
+
+def sanitize(model, weights):
+    return sanitize_language_model(model.model, weights, prefix="model.")

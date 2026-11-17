@@ -1,17 +1,21 @@
 # Copyright © 2025 Apple Inc.
 
-from mlx.utils import tree_flatten, tree_unflatten
+from mlx_lm.layers.multimodal import from_llava_layout
 
 __all__ = [
     "sanitize",
 ]
 
+# Only the language model runs here.
+_ENCODERS = ("model.vision_tower.", "model.multi_modal_projector.")
+
 
 def sanitize(model, weights):
-    weights = tree_unflatten(list(weights.items()))
-    weights.pop("vision_tower", None)
-    weights.pop("multi_modal_projector", None)
-    lm_weights = dict(tree_flatten(weights["language_model"]))
-    lm_weights = model.language_model.sanitize(lm_weights)
-    weights["language_model"] = tree_unflatten(list(lm_weights.items()))
-    return dict(tree_flatten(weights))
+    # Older checkpoints, and older MLX conversions, have the LLaVA layout.
+    weights = {from_llava_layout(k): v for k, v in weights.items()}
+    weights = {k: v for k, v in weights.items() if not k.startswith(_ENCODERS)}
+    # The output layer is the embedding unless the checkpoint has its own.
+    if "lm_head.weight" not in weights:
+        model.tie_word_embeddings = True
+        model.pop("lm_head")
+    return weights
