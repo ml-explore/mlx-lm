@@ -24,6 +24,11 @@ inline float block_sum(float v, threadgroup float* buf, uint lane, uint sg) {
 """
 
 
+def on_metal() -> bool:
+    """Whether the kernels can run: the default device is the GPU of the Metal backend."""
+    return mx.metal.is_available() and mx.default_device() == mx.gpu
+
+
 @lru_cache
 def scalar(value: float, dtype: mx.Dtype = mx.float32) -> mx.array:
     """A cached 0-d array, which a kernel gets as a constant."""

@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import expert_routing, on_metal
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
@@ -180,8 +181,21 @@ class MoEGate(nn.Module):
         assert config.topk_method == "noaux_tc", "Unsupported topk method."
 
     def __call__(self, x):
+        gates = x @ self.weight.T
+        if not self.training and on_metal() and self.top_k > 1 and self.norm_topk_prob:
+            # group_expert_select's routing in one kernel.
+            return expert_routing(
+                gates,
+                self.e_score_correction_bias,
+                top_k=self.top_k,
+                multiplier=1.0,
+                score_eps=0.0,
+                route_scale=self.routed_scaling_factor,
+                n_group=self.n_group,
+                topk_group=self.topk_group,
+            )
         return group_expert_select(
-            x @ self.weight.T,
+            gates,
             self.e_score_correction_bias,
             self.top_k,
             self.n_group,

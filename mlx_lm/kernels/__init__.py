@@ -2,21 +2,25 @@
 
 """Fused Metal kernels, one kernel per file."""
 
+from ._common import on_metal
 from .expert_routing import expert_routing
 from .norm_add_norm import norm_add_norm, pre_norm
 from .post_expert_norm_combine import post_expert_norm_combine
 from .qk_norm import qk_norm
 from .qk_norm_rope import qk_norm_rope
 from .rms_norm_sigmoid_gate import rms_norm_sigmoid_gate
+from .softmax_topk import softmax_topk
 from .sparse_mla import sparse_mla_attention
 
 __all__ = [
     "expert_routing",
     "norm_add_norm",
+    "on_metal",
     "post_expert_norm_combine",
     "pre_norm",
     "qk_norm",
     "qk_norm_rope",
     "rms_norm_sigmoid_gate",
+    "softmax_topk",
     "sparse_mla_attention",
 ]

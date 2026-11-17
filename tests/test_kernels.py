@@ -1,6 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
 import unittest
+from functools import partial
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import mlx.core as mx
@@ -14,9 +16,45 @@ from mlx_lm.kernels import (
     qk_norm,
     qk_norm_rope,
     rms_norm_sigmoid_gate,
+    softmax_topk,
     sparse_mla,
     sparse_mla_attention,
 )
+from mlx_lm.models import (
+    Klear,
+    afmoe,
+    bailing_hybrid,
+    bailing_moe,
+    bailing_moe_linear,
+    bailing_moe_v3,
+    deepseek,
+    deepseek_v2,
+    deepseek_v3,
+    deepseek_v32,
+    dots1,
+    exaone_moe,
+    gemma4_text,
+    glm4_moe,
+    glm4_moe_lite,
+    gpt_oss,
+    granitemoehybrid,
+    hunyuan,
+    jamba,
+    kimi_k3,
+    laguna,
+    lfm2_moe,
+    mellum,
+    mimo_v2_flash,
+    minimax,
+    minimax_m3_vl,
+    mixtral,
+    olmoe,
+    qwen2_moe,
+    qwen3_moe,
+    qwen3_next,
+    step3p5,
+)
+from mlx_lm.models.cache import make_prompt_cache
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
 
@@ -89,6 +127,105 @@ def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
     probs = mx.softmax(scores, axis=-1)
     values = kv[rows].astype(mx.float32)  # [L, K, r]
     return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
+
+
+# One config for the MoE blocks below: each reads the fields it needs.
+_MOE_ARGS = SimpleNamespace(
+    hidden_size=128,
+    intermediate_size=64,
+    moe_intermediate_size=64,
+    num_experts=16,
+    num_local_experts=16,
+    n_routed_experts=16,
+    num_experts_per_tok=4,
+    top_k_experts=4,
+    norm_topk_prob=True,
+    shared_expert_intermediate_size=64,
+    n_shared_experts=1,
+    num_shared_experts=1,
+    mlp_bias=False,
+    rms_norm_eps=1e-6,
+    routed_scaling_factor=2.5,
+    use_expert_bias=True,
+    n_group=4,
+    topk_group=2,
+    topk_method="noaux_tc",
+    score_func="sigmoid",
+    route_norm=True,
+    route_scale=2.5,
+    moe_topk=4,
+    num_shared_expert=1,
+    use_mixed_mlp_moe=True,
+    moe_num_experts=16,
+    moe_top_k=4,
+    moe_router_scaling_factor=2.5,
+    norm_expert_weight=True,
+    share_expert_dim=64,
+    swiglu_limits=None,
+    swiglu_limits_shared=None,
+    shared_intermediate_size=64,
+    swiglu_alpha=1.702,
+    swiglu_limit=7.0,
+    moe_routed_scaling_factor=2.5,
+    moe_router_logit_softcapping=0.0,
+    moe_router_score_func="sigmoid",
+    score_function="sigmoid",
+    moe_router_enable_expert_bias=True,
+    moe_router_enable_routed_scaling=True,
+    moe_router_enable_shared_expert=True,
+    moe_shared_expert_intermediate_size=64,
+    use_bias=False,
+    num_experts_per_token=4,
+    num_expert_group=4,
+    moe_renormalize=True,
+    routed_expert_hidden_size=None,
+    latent_moe_use_norm=False,
+    activation_situ_beta=1.0,
+    activation_situ_linear_beta=1.0,
+    zero_expert_num=2,
+    zero_expert_type="identity",
+    expert_ffn_hidden_size=64,
+    router_bias=False,
+)
+
+
+class _Gemma4MoE(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.router = gemma4_text.Router(args)
+        self.experts = gemma4_text.Experts(args)
+
+    def __call__(self, x):
+        return self.experts(x, *self.router(x))
+
+
+def _tiny_qwen3_moe():
+    args = qwen3_moe.ModelArgs(
+        model_type="qwen3_moe",
+        hidden_size=128,
+        num_hidden_layers=2,
+        intermediate_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        rms_norm_eps=1e-6,
+        vocab_size=1000,
+        num_experts=16,
+        num_experts_per_tok=4,
+        decoder_sparse_step=1,
+        mlp_only_layers=[],
+        moe_intermediate_size=64,
+        rope_theta=10000.0,
+        tie_word_embeddings=False,
+        max_position_embeddings=512,
+        norm_topk_prob=True,
+    )
+    mx.random.seed(6)
+    model = qwen3_moe.Model(args)
+    model.set_dtype(mx.bfloat16)
+    nn.quantize(model, group_size=64, bits=4)
+    model.eval()
+    return model
 
 
 @unittest.skipIf(not mx.metal.is_available(), "The kernels need the Metal backend")
@@ -164,6 +301,177 @@ class TestKernels(unittest.TestCase):
         self.assertEqual(inds.dtype, mx.uint32)
         self.assertTrue(mx.array_equal(inds, ref_inds))
         self._assert_close(weights, ref_weights, TOL[mx.float32])
+
+    def test_expert_routing_groups(self):
+        # Groups of 8 experts (a lane holds experts of several groups) and of 32 (as
+        # DeepSeek-V3: a lane's i-th expert is in group i). The biases are positive so
+        # that no masked expert is picked, whatever the masked score. No ties for this
+        # seed.
+        mx.random.seed(8)
+        for E, G, TG, k in ((64, 8, 3, 6), (256, 8, 4, 8)):
+            logits = 2 * mx.random.normal((2, 3, E))
+            bias = 0.2 * mx.random.uniform(shape=(E,))
+            scores = mx.sigmoid(logits)
+            biased = scores + bias
+            top2 = mx.sort(mx.unflatten(biased, -1, (G, E // G)), axis=-1)[..., -2:]
+            kept = mx.argsort(-top2.sum(-1), axis=-1)[..., :TG]
+            in_kept = (mx.arange(E) // (E // G))[:, None] == kept[..., None, :]
+            biased = mx.where(in_kept.any(-1), biased, -1.0)
+            ref_inds = mx.argsort(-biased, axis=-1)[..., :k]
+            ref_weights = mx.take_along_axis(scores, ref_inds, axis=-1)
+            ref_weights = ref_weights / ref_weights.sum(-1, keepdims=True) * 2.5
+            for masked in (0.0, -float("inf")):
+                inds, weights = expert_routing(
+                    logits,
+                    bias,
+                    top_k=k,
+                    multiplier=1.0,
+                    score_eps=0.0,
+                    route_scale=2.5,
+                    n_group=G,
+                    topk_group=TG,
+                    masked_score=masked,
+                )
+                self.assertTrue(mx.array_equal(inds, ref_inds))
+                self._assert_close(weights, ref_weights, TOL[mx.float32])
+
+    def test_softmax_topk(self):
+        mx.random.seed(5)
+        # E = 40 and 160 leave some SIMD lanes without an expert. No ties for this seed.
+        for E, k in ((40, 4), (128, 8), (160, 1)):
+            logits = 2 * mx.random.normal((2, 3, E))
+            probs = mx.softmax(logits, axis=-1)
+            ref_inds = mx.argsort(-probs, axis=-1)[..., :k]
+            for normalize in (True, False):
+                inds, weights = softmax_topk(logits, top_k=k, normalize=normalize)
+                ref_weights = mx.take_along_axis(probs, ref_inds, axis=-1)
+                if normalize:
+                    ref_weights = ref_weights / ref_weights.sum(-1, keepdims=True)
+                self.assertEqual(inds.dtype, mx.uint32)
+                self.assertTrue(mx.array_equal(inds, ref_inds))
+                self._assert_close(weights, ref_weights, TOL[mx.float32])
+                # bf16 logits: bf16 weights, as mx.softmax.
+                inds, weights = softmax_topk(
+                    logits.astype(mx.bfloat16), top_k=k, normalize=normalize
+                )
+                self.assertEqual(weights.dtype, mx.bfloat16)
+                self._assert_close(
+                    weights, ref_weights.astype(mx.bfloat16), TOL[mx.bfloat16]
+                )
+
+    def test_qwen3_moe_decode_routing(self):
+        # A decode step with the routing kernel against the generic routing.
+        model = _tiny_qwen3_moe()
+        prompt = mx.random.randint(0, 1000, (1, 8))
+
+        def decode():
+            cache = make_prompt_cache(model)
+            model(prompt, cache=cache)
+            return model(mx.array([[5]]), cache=cache)
+
+        out = decode()
+        with patch.object(qwen3_moe, "on_metal", lambda: False):
+            ref = decode()
+        self._assert_close(out, ref, 3e-2)
+        self.assertTrue(mx.array_equal(out.argmax(-1), ref.argmax(-1)))
+
+    def test_moe_blocks_routing(self):
+        # Each model's MoE block on one token with its routing kernel, against the
+        # generic routing; _MOE_ARGS masks 2 groups of 4 experts out of 4.
+        ungrouped = SimpleNamespace(
+            **{**vars(_MOE_ARGS), "n_group": 1, "topk_group": 1}
+        )
+        greedy = SimpleNamespace(**{**vars(_MOE_ARGS), "topk_method": "greedy"})
+        blocks = [
+            (qwen3_next, qwen3_next.Qwen3NextSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (qwen2_moe, qwen2_moe.Qwen2MoeSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (mixtral, mixtral.MixtralSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (olmoe, olmoe.OlmoeSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (gemma4_text, _Gemma4MoE, _MOE_ARGS, "softmax_topk"),
+            (deepseek_v3, deepseek_v3.DeepseekV3MoE, _MOE_ARGS, "expert_routing"),
+            (deepseek_v3, deepseek_v3.DeepseekV3MoE, ungrouped, "expert_routing"),
+            (deepseek_v32, deepseek_v32.DeepseekV32MoE, ungrouped, "expert_routing"),
+            (glm4_moe, glm4_moe.MoE, ungrouped, "expert_routing"),
+            (glm4_moe_lite, glm4_moe_lite.Glm4MoeLiteMoE, ungrouped, "expert_routing"),
+            (exaone_moe, exaone_moe.MoE, ungrouped, "expert_routing"),
+            (mimo_v2_flash, mimo_v2_flash.MoE, ungrouped, "expert_routing"),
+            (minimax, minimax.MiniMaxSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (lfm2_moe, lfm2_moe.Lfm2MoeSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (
+                granitemoehybrid,
+                granitemoehybrid.GraniteMoeHybridMoE,
+                _MOE_ARGS,
+                "softmax_topk",
+            ),
+            (jamba, jamba.JambaSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (hunyuan, hunyuan.MoeBlock, _MOE_ARGS, "softmax_topk"),
+            (mellum, mellum.MellumSparseMoeBlock, _MOE_ARGS, "softmax_topk"),
+            (deepseek, deepseek.DeepseekMoE, _MOE_ARGS, "softmax_topk"),
+            (deepseek_v2, deepseek_v2.DeepseekV2MoE, greedy, "softmax_topk"),
+            (afmoe, afmoe.AfmoeMoE, ungrouped, "expert_routing"),
+            (dots1, dots1.Dots1MoE, ungrouped, "expert_routing"),
+            (
+                step3p5,
+                partial(step3p5.Step3p5MoE, layer_idx=0),
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (Klear, Klear.KlearSparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (minimax_m3_vl, minimax_m3_vl.SparseMoeBlock, _MOE_ARGS, "expert_routing"),
+            (laguna, laguna.MoE, _MOE_ARGS, "expert_routing"),
+            (afmoe, afmoe.AfmoeMoE, _MOE_ARGS, "expert_routing"),
+            (dots1, dots1.Dots1MoE, _MOE_ARGS, "expert_routing"),
+            (
+                bailing_moe,
+                bailing_moe.BailingMoeSparseMoeBlock,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (
+                bailing_moe_linear,
+                bailing_moe_linear.SparseMoeBlock,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (
+                bailing_hybrid,
+                bailing_hybrid.SparseMoeBlock,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (
+                bailing_moe_v3,
+                bailing_moe_v3.BailingSparseMoE,
+                _MOE_ARGS,
+                "expert_routing",
+            ),
+            (kimi_k3, kimi_k3.KimiK3SparseMoE, _MOE_ARGS, "expert_routing"),
+            (gpt_oss, gpt_oss.MLPBlock, _MOE_ARGS, "softmax_topk"),
+        ]
+        for module, block_cls, args, routing in blocks:
+            with self.subTest(module.__name__, n_group=args.n_group):
+                mx.random.seed(7)
+                block = block_cls(args)
+                block.set_dtype(mx.bfloat16)
+                nn.quantize(block, group_size=64, bits=4)
+                block.eval()
+                # A correction bias that changes which experts are picked.
+                for _, m in block.named_modules():
+                    for name in (
+                        "e_score_correction_bias",
+                        "expert_bias",
+                        "router_bias",
+                    ):
+                        if name in m:
+                            m[name] = 0.1 * mx.random.normal(m[name].shape)
+                x = mx.random.normal((1, 1, 128)).astype(mx.bfloat16)
+                kernel = getattr(module, routing)
+                with patch.object(module, routing, wraps=kernel) as routed:
+                    out = block(x)
+                self.assertEqual(routed.call_count, 1)
+                with patch.object(module, "on_metal", lambda: False):
+                    ref = block(x)
+                self._assert_close(out, ref, 3e-2)
 
     def test_post_expert_norm_combine(self):
         # fp32 only: in bf16 the kernel rounds after each expert.

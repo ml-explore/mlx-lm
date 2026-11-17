@@ -6,6 +6,7 @@ from typing import Any, List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .activations import swiglu
 from .base import (
     BaseModelArgs,
@@ -307,6 +308,9 @@ class GraniteMoeHybridTopKGating(nn.Module):
 
     def __call__(self, hidden_states: mx.array):
         logits = self.layer(hidden_states)
+        if not self.training and on_metal():
+            # The softmax of the top k logits: the softmax renormalized over the top k.
+            return softmax_topk(logits, top_k=self.top_k, normalize=True)
         top_k_idx = mx.stop_gradient(
             mx.argpartition(logits, kth=-self.top_k, axis=-1)[..., -self.top_k :]
         )

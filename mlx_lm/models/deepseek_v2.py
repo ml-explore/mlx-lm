@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import on_metal, softmax_topk
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
@@ -282,6 +283,13 @@ class MoEGate(nn.Module):
 
     def __call__(self, x):
         gates = x @ self.weight.T
+        if (
+            not self.training
+            and on_metal()
+            and self.topk_method != "group_limited_greedy"
+        ):
+            inds, scores = softmax_topk(gates, top_k=self.top_k, normalize=False)
+            return inds, scores * self.routed_scaling_factor
 
         scores = mx.softmax(gates, axis=-1, precise=True)
 

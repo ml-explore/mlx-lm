@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Union
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
@@ -112,14 +113,19 @@ class OlmoeSparseMoeBlock(nn.Module):
         B, L, D = x.shape
         x_flat = x.reshape(-1, D)
         router_logits = self.gate(x_flat)
-        routing_weights = mx.softmax(router_logits, axis=1, precise=True)
         k = self.top_k
-        indices = mx.stop_gradient(
-            mx.argpartition(-routing_weights, kth=k - 1, axis=-1)[..., :k]
-        )
-        scores = mx.take_along_axis(routing_weights, indices, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+        if not self.training and on_metal():
+            indices, scores = softmax_topk(
+                router_logits, top_k=k, normalize=self.norm_topk_prob
+            )
+        else:
+            routing_weights = mx.softmax(router_logits, axis=1, precise=True)
+            indices = mx.stop_gradient(
+                mx.argpartition(-routing_weights, kth=k - 1, axis=-1)[..., :k]
+            )
+            scores = mx.take_along_axis(routing_weights, indices, axis=-1)
+            if self.norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
         y = self.switch_mlp(x_flat, indices)
         y = (y * scores[..., None]).sum(axis=-2)
         return y.reshape(B, L, D)

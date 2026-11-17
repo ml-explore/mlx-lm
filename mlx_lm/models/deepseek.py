@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..kernels import on_metal, softmax_topk
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .switch_layers import SwitchGLU
@@ -136,6 +137,8 @@ class MoEGate(nn.Module):
 
     def __call__(self, x):
         gates = x @ self.weight.T
+        if not self.training and on_metal():
+            return softmax_topk(gates, top_k=self.top_k, normalize=False)
         scores = mx.softmax(gates, axis=-1, precise=True)
         k = self.top_k
         inds = mx.stop_gradient(mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k])

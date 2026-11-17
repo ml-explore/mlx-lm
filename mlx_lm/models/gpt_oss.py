@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 
+from ..kernels import on_metal, softmax_topk
 from .activations import SwigluOAI
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
@@ -127,8 +128,14 @@ class MLPBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         g = self.router(x)
-        experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
-        expert_weights = mx.softmax(experts, axis=-1, precise=True)
+        if not self.training and on_metal():
+            # The softmax of the top k logits: the softmax renormalized over the top k.
+            indices, expert_weights = softmax_topk(
+                g, top_k=self.num_experts_per_tok, normalize=True
+            )
+        else:
+            experts, indices = mlx_topk(g, k=self.num_experts_per_tok, axis=-1)
+            expert_weights = mx.softmax(experts, axis=-1, precise=True)
 
         # Experts block
         x = self.experts(x, indices)

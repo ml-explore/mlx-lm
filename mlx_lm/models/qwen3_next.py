@@ -9,6 +9,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.nn.layers.distributed import sum_gradients
 
+from ..kernels import on_metal, softmax_topk
 from .activations import precise_swiglu, swiglu
 from .base import (
     BaseModelArgs,
@@ -323,14 +324,18 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         gates = self.gate(x)
-        gates = mx.softmax(gates, axis=-1, precise=True)
-
-        k = self.top_k
-        inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
-        inds = mx.stop_gradient(inds)
-        scores = mx.take_along_axis(gates, inds, axis=-1)
-        if self.norm_topk_prob:
-            scores = scores / scores.sum(axis=-1, keepdims=True)
+        if not self.training and on_metal():
+            inds, scores = softmax_topk(
+                gates, top_k=self.top_k, normalize=self.norm_topk_prob
+            )
+        else:
+            gates = mx.softmax(gates, axis=-1, precise=True)
+            k = self.top_k
+            inds = mx.argpartition(gates, kth=-k, axis=-1)[..., -k:]
+            inds = mx.stop_gradient(inds)
+            scores = mx.take_along_axis(gates, inds, axis=-1)
+            if self.norm_topk_prob:
+                scores = scores / scores.sum(axis=-1, keepdims=True)
 
         y = self.switch_mlp(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
