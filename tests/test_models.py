@@ -231,6 +231,17 @@ class TestModels(unittest.TestCase):
         self.assertEqual(caches[0].offset, 3)
         self.assertEqual(caches[1].offset, 3)
 
+    def test_apply_yarn_mscale(self):
+        config = {"rope_type": "yarn", "factor": 4.0, "mscale_all_dim": 1.0}
+        mscale = 0.1 * math.log(4.0) + 1.0
+        expected = 2.0 * mscale * mscale
+        self.assertAlmostEqual(rope_utils.apply_yarn_mscale(2.0, config), expected)
+        legacy = {"type": "yarn", "factor": 4.0, "mscale_all_dim": 1.0}
+        self.assertAlmostEqual(rope_utils.apply_yarn_mscale(2.0, legacy), expected)
+        default = {**config, "rope_type": "default"}
+        self.assertEqual(rope_utils.apply_yarn_mscale(2.0, default), 2.0)
+        self.assertEqual(rope_utils.apply_yarn_mscale(2.0, None), 2.0)
+
     def test_rope(self):
         rope = rope_utils.initialize_rope(32, base=100, traditional=False)
         self.assertTrue(isinstance(rope, nn.RoPE))

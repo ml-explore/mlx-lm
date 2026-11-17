@@ -45,6 +45,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
+from .models.rope_utils import get_rope_type
 from .processors import load_processor
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
@@ -53,6 +54,45 @@ from .utils import (
     maybe_set_recommended_wired_limit,
     sharded_load,
 )
+
+
+class PromptTooLongError(Exception):
+    pass
+
+
+def _scales_rope(section):
+    for key in ("rope_scaling", "rope_parameters"):
+        params = section.get(key)
+        if not params:
+            continue
+        if not isinstance(params, dict) or any(
+            isinstance(v, dict) for v in params.values()
+        ):
+            logging.warning(
+                f"Unknown {key} format. The prompt length is not checked "
+                "against the model context length."
+            )
+            return True
+        if get_rope_type(params) != "default":
+            return True
+    return False
+
+
+def _declared_context_length(config):
+    """The context length the model config declares, or None if unusable.
+
+    Scaled rope can run past `max_position_embeddings`, so it is not a limit.
+    """
+    sections = [config]
+    if isinstance(config.get("text_config"), dict):
+        sections.append(config["text_config"])
+    if any(_scales_rope(section) for section in sections):
+        return None
+    for section in sections:
+        limit = section.get("max_position_embeddings")
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            return limit
+    return None
 
 
 def get_system_fingerprint():
@@ -391,6 +431,7 @@ class ModelProvider:
         self.processor = None
         self.draft_model = None
         self.is_batchable = False
+        self.context_length: Optional[int] = None
 
         group = mx.distributed.init()
         self.pipeline_group = group if group.size() > 1 and cli_args.pipeline else None
@@ -421,6 +462,7 @@ class ModelProvider:
         self.processor = None
         self.draft_model = None
         self.is_batchable = False
+        self.context_length = None
 
     def _load(self, model_path, adapter_path=None, draft_model_path=None):
         if self.is_distributed and (
@@ -484,6 +526,7 @@ class ModelProvider:
         self.processor = load_processor(model, config)
         self.draft_model = draft_model
         self.is_batchable = is_batchable
+        self.context_length = _declared_context_length(config)
 
     def load_default(self):
         if self._model_map["default_model"] is not None:
@@ -628,6 +671,14 @@ class ResponseGenerator:
 
         rq = request[0] if request is not None else Queue()
         return rq, *shareable
+
+    def _check_prompt_length(self, prompt):
+        limit = self.model_provider.context_length
+        if limit is not None and len(prompt) > limit:
+            raise PromptTooLongError(
+                f"Prompt has {len(prompt)} tokens, which is longer than the "
+                f"model context length of {limit} tokens."
+            )
 
     def _tokenize(self, tokenizer, request, args):
         """Tokenize a request and split the prompt into segments.
@@ -827,6 +878,7 @@ class ResponseGenerator:
                         prompt, segments, segment_types, initial_state, _ = (
                             self._tokenize(current_tokenizer, request, args)
                         )
+                        self._check_prompt_length(prompt)
                     except Exception as e:
                         rqueue.put(e)
                         continue
@@ -1058,6 +1110,7 @@ class ResponseGenerator:
             prompt, _, _, initial_state, vision = self._tokenize(
                 tokenizer, request, args
             )
+            self._check_prompt_length(prompt)
             stop_sm = TextStateMachine.from_stop_words(args.stop_words)
             text_sm = TextStateMachine.from_tokenizer(tokenizer)
 
@@ -1590,6 +1643,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 args,
                 progress_callback=keepalive_callback,
             )
+        except PromptTooLongError as e:
+            self._set_completion_headers(400)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
