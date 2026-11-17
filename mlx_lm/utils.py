@@ -58,6 +58,7 @@ MODEL_REMAPPING = {
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
     "deepseek_v41_text": "deepseek_v41",
+    "nemotron_h_puzzle": "nemotron_h",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
