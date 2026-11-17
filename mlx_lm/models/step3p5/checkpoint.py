@@ -1,43 +1,45 @@
 # Copyright © 2026 Apple Inc.
 
-
 __all__ = [
     "sanitize",
 ]
 
+# Older MLX conversions put the routed and shared experts under mlp.
+_MLX_NAMES = (
+    (".mlp.switch_mlp.", ".moe."),
+    (".mlp.gate.gate.", ".moe.gate."),
+    (".mlp.gate.router_bias", ".moe.router_bias"),
+    (".mlp.share_expert.", ".share_expert."),
+)
+
 
 def sanitize(model, weights):
-    remappings = [
-        (".moe.gate_proj.", ".mlp.switch_mlp.gate_proj."),
-        (".moe.up_proj.", ".mlp.switch_mlp.up_proj."),
-        (".moe.down_proj.", ".mlp.switch_mlp.down_proj."),
-        (".moe.gate.", ".mlp.gate.gate."),
-        (".moe.router_bias", ".mlp.gate.router_bias"),
-        (".share_expert.", ".mlp.share_expert."),
-    ]
+    if any(".mlp.switch_mlp." in k for k in weights):
+        weights = _upgrade_mlx_layout(weights)
 
-    is_vanilla = any(
-        src in k and dst not in k for k in weights for src, dst in remappings
-    )
-
-    new_weights = {}
+    # The multi-token prediction layers follow the model's; they are not used.
+    sanitized = {}
     for k, v in weights.items():
         if ".mtp" in k:
             continue
-        if "model.layers." in k:
-            parts = k.split(".")
-            if len(parts) > 2 and parts[2].isdigit():
-                if int(parts[2]) >= model.args.num_hidden_layers:
-                    continue
+        parts = k.split(".")
+        if k.startswith("model.layers.") and parts[2].isdigit():
+            if int(parts[2]) >= model.args.num_hidden_layers:
+                continue
+        sanitized[k] = v
+    return sanitized
 
-        for src, dst in remappings:
-            if src in k and dst not in k:
-                k = k.replace(src, dst)
+
+def _upgrade_mlx_layout(weights):
+    """Older MLX conversions: the checkpoint's names, and the norms stored as
+    1 + weight."""
+    upgraded = {}
+    for k, v in weights.items():
+        for old, new in _MLX_NAMES:
+            if old in k:
+                k = k.replace(old, new)
                 break
-
-        if is_vanilla and k.endswith(".weight") and "norm" in k:
-            v = v + 1
-
-        new_weights[k] = v
-
-    return new_weights
+        if k.endswith(".weight") and "norm" in k:
+            v = v - 1
+        upgraded[k] = v
+    return upgraded

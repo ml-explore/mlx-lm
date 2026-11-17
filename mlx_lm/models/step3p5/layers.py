@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import sum_gradients
 
 from mlx_lm.layers.activations import swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.layers.switch import SwiGLU, SwitchGLU
 from mlx_lm.models.step3p5.config import ModelArgs
@@ -19,8 +20,6 @@ __all__ = [
     "Step3p5DecoderLayer",
     "Step3p5MLP",
     "Step3p5MoE",
-    "Step3p5MoEGate",
-    "ZeroCenteredRMSNorm",
     "clamped_swiglu",
     "moe_gate_select",
 ]
@@ -40,16 +39,6 @@ class ClampedSwiGLU(nn.Module):
 
     def __call__(self, x: mx.array, gate: mx.array) -> mx.array:
         return clamped_swiglu(x, gate, self.limit)
-
-
-class ZeroCenteredRMSNorm(nn.Module):
-    def __init__(self, dims: int, eps: float = 1e-5):
-        super().__init__()
-        self.weight = mx.ones((dims,))
-        self.eps = eps
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.fast.rms_norm(x, self.weight, self.eps)
 
 
 class Step3p5MLP(nn.Module):
@@ -93,74 +82,37 @@ def moe_gate_select(gates, router_bias, top_k, routed_scaling_factor, norm_topk_
     return topk_indices, topk_weights * routed_scaling_factor
 
 
-class Step3p5MoEGate(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
+class Step3p5MoE(SwitchGLU):
+    """The routed experts and their router, moe in the checkpoint."""
+
+    def __init__(self, args: ModelArgs, swiglu_limit: float):
+        activation = ClampedSwiGLU(swiglu_limit) if swiglu_limit > 0 else SwiGLU()
+        super().__init__(
+            args.hidden_size,
+            args.moe_intermediate_size,
+            args.moe_num_experts,
+            activation=activation,
+        )
         self.top_k = args.moe_top_k
-        self.n_routed_experts = args.moe_num_experts
         self.routed_scaling_factor = args.moe_router_scaling_factor
         self.norm_topk_prob = args.norm_expert_weight
+        self.gate = nn.Linear(args.hidden_size, args.moe_num_experts, bias=False)
+        self.router_bias = mx.zeros((args.moe_num_experts,))
 
-        self.gate = nn.Linear(args.hidden_size, self.n_routed_experts, bias=False)
-        self.router_bias = mx.zeros((self.n_routed_experts,))
-
-    def __call__(self, x: mx.array):
-        return moe_gate_select(
+    def __call__(self, x: mx.array) -> mx.array:
+        topk_indices, topk_weights = moe_gate_select(
             self.gate(x),
             self.router_bias,
             self.top_k,
             self.routed_scaling_factor,
             self.norm_topk_prob,
         )
-
-
-class Step3p5MoE(nn.Module):
-    def __init__(self, args: ModelArgs, layer_idx: int):
-        super().__init__()
-
-        swiglu_limit = 0
-        if args.swiglu_limits and layer_idx < len(args.swiglu_limits):
-            swiglu_limit = args.swiglu_limits[layer_idx] or 0
-
-        swiglu_limit_shared = 0
-        if args.swiglu_limits_shared and layer_idx < len(args.swiglu_limits_shared):
-            swiglu_limit_shared = args.swiglu_limits_shared[layer_idx] or 0
-
-        self.gate = Step3p5MoEGate(args)
-
-        activation = ClampedSwiGLU(swiglu_limit) if swiglu_limit > 0 else SwiGLU()
-        self.switch_mlp = SwitchGLU(
-            args.hidden_size,
-            args.moe_intermediate_size,
-            args.moe_num_experts,
-            activation=activation,
-        )
-
-        self.share_expert = Step3p5MLP(
-            args,
-            intermediate_size=args.share_expert_dim,
-            swiglu_limit=swiglu_limit_shared,
-        )
-
-        self.sharding_group = None
-
-    def __call__(self, x: mx.array) -> mx.array:
-        if self.sharding_group is not None:
-            x = sum_gradients(self.sharding_group)(x)
-
-        topk_indices, topk_weights = self.gate(x)
-        routed_output = self.switch_mlp(x, topk_indices)
-        routed_output = (
+        routed_output = super().__call__(x, topk_indices)
+        return (
             (routed_output * topk_weights[..., None])
             .sum(axis=-2)
             .astype(routed_output.dtype)
         )
-        y = routed_output + self.share_expert(x)
-
-        if self.sharding_group is not None:
-            y = mx.distributed.all_sum(y, group=self.sharding_group)
-
-        return y
 
 
 class Step3p5Attention(nn.Module):
@@ -273,16 +225,26 @@ class Step3p5DecoderLayer(nn.Module):
 
         self.is_moe_layer = layer_idx in moe_layers_idx
 
+        swiglu_limit_shared = 0
+        if args.swiglu_limits_shared and layer_idx < len(args.swiglu_limits_shared):
+            swiglu_limit_shared = args.swiglu_limits_shared[layer_idx] or 0
+
         if self.is_moe_layer:
-            self.mlp = Step3p5MoE(args, layer_idx)
-        else:
             swiglu_limit = 0
-            if args.swiglu_limits_shared and layer_idx < len(args.swiglu_limits_shared):
-                swiglu_limit = args.swiglu_limits_shared[layer_idx] or 0
+            if args.swiglu_limits and layer_idx < len(args.swiglu_limits):
+                swiglu_limit = args.swiglu_limits[layer_idx] or 0
+            self.moe = Step3p5MoE(args, swiglu_limit)
+            self.share_expert = Step3p5MLP(
+                args,
+                intermediate_size=args.share_expert_dim,
+                swiglu_limit=swiglu_limit_shared,
+            )
+            self.sharding_group = None
+        else:
             self.mlp = Step3p5MLP(
                 args,
                 intermediate_size=args.intermediate_size,
-                swiglu_limit=swiglu_limit,
+                swiglu_limit=swiglu_limit_shared,
             )
 
         self.input_layernorm = ZeroCenteredRMSNorm(
@@ -300,5 +262,15 @@ class Step3p5DecoderLayer(nn.Module):
     ) -> mx.array:
         r = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
         h = x + r
-        r = self.mlp(self.post_attention_layernorm(h))
+        r = self._feed_forward(self.post_attention_layernorm(h))
         return h + r
+
+    def _feed_forward(self, x: mx.array) -> mx.array:
+        if not self.is_moe_layer:
+            return self.mlp(x)
+        if self.sharding_group is not None:
+            x = sum_gradients(self.sharding_group)(x)
+        y = self.moe(x) + self.share_expert(x)
+        if self.sharding_group is not None:
+            y = mx.distributed.all_sum(y, group=self.sharding_group)
+        return y
