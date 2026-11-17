@@ -1570,6 +1570,74 @@ class TestModels(unittest.TestCase):
         self.assertIn(mlx_norm_key, converted)
         self.assertTrue(mx.array_equal(converted[mlx_norm_key], base))
 
+    def test_gemma4_raw_hf_untied_lm_head(self):
+        from mlx_lm.models import gemma4
+
+        args = gemma4.ModelArgs.from_dict(
+            {
+                "model_type": "gemma4",
+                "vocab_size": 32,
+                "tie_word_embeddings": False,
+                "text_config": {
+                    "model_type": "gemma4_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "intermediate_size": 16,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "num_global_key_value_heads": 1,
+                    "head_dim": 8,
+                    "global_head_dim": 8,
+                    "sliding_window": 8,
+                    "sliding_window_pattern": 1,
+                    "layer_types": ["full_attention"],
+                    "hidden_size_per_layer_input": 0,
+                    "num_kv_shared_layers": 0,
+                    "tie_word_embeddings": False,
+                },
+            }
+        )
+        model = gemma4.Model(args)
+
+        # Same weights, with the key names that transformers saves.
+        hf_weights = {}
+        for k, v in tree_flatten(model.parameters()):
+            if k.startswith("language_model.model."):
+                k = "model.language_model." + k.removeprefix("language_model.model.")
+            else:
+                k = k.removeprefix("language_model.")
+            hf_weights[k] = v
+        self.assertIn("lm_head.weight", hf_weights)
+
+        converted = model.sanitize(hf_weights)
+        model.load_weights(list(converted.items()))
+        self.assertTrue(
+            mx.array_equal(
+                model.language_model.lm_head.weight, hf_weights["lm_head.weight"]
+            )
+        )
+
+        # Already converted weights must keep their names.
+        self.assertEqual(set(model.sanitize(converted)), set(converted))
+
+    def test_gemma4_top_level_tie_word_embeddings(self):
+        from mlx_lm.models import gemma4
+
+        # (top-level flag, text_config flag, expected)
+        for top, text, tied in (
+            (None, False, False),
+            (False, True, False),
+            (True, False, True),
+        ):
+            config = {
+                "model_type": "gemma4",
+                "text_config": {"tie_word_embeddings": text},
+            }
+            if top is not None:
+                config["tie_word_embeddings"] = top
+            args = gemma4.ModelArgs.from_dict(config)
+            self.assertEqual(args.text_config["tie_word_embeddings"], tied)
+
     def test_gemma4_raw_hf_moe_expert_weights_split_for_switch_glu(self):
         from mlx_lm.models import gemma4
 
