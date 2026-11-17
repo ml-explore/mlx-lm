@@ -242,8 +242,7 @@ class JambaSparseMoeBlock(nn.Module):
         inds = mx.stop_gradient(mx.argpartition(-gates, kth=k - 1, axis=-1)[..., :k])
         scores = mx.take_along_axis(gates, inds, axis=-1)
         scores = mx.softmax(scores, axis=-1, precise=True)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x, inds, scores)
         return y
 
 

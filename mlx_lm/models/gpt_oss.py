@@ -131,11 +131,7 @@ class MLPBlock(nn.Module):
         expert_weights = mx.softmax(experts, axis=-1, precise=True)
 
         # Experts block
-        x = self.experts(x, indices)
-
-        x = x * mx.expand_dims(expert_weights, axis=-1)
-
-        y = x.sum(axis=-2)
+        y = self.experts.combine(x, indices, expert_weights)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

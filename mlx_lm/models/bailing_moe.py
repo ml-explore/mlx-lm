@@ -1,7 +1,6 @@
 # Copyright © 2025 Apple Inc.
 
 from dataclasses import dataclass
-from functools import partial
 from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
@@ -48,13 +47,6 @@ class ModelArgs(BaseModelArgs):
     topk_group: int = 4
     moe_shared_expert_intermediate_size: Optional[int] = None
     moe_router_enable_shared_expert: bool = True
-
-
-@partial(mx.compile, shapeless=True)
-def aggregate_expert_outputs(expert_outputs, scores):
-    return (
-        (expert_outputs * scores[..., None]).sum(axis=-2).astype(expert_outputs.dtype)
-    )
 
 
 class BailingMoeMLP(nn.Module):
@@ -258,8 +250,7 @@ class BailingMoeSparseMoeBlock(nn.Module):
 
     def __call__(self, x):
         topk_idx, topk_weight = self.gate(x)
-        out = self.switch_mlp(x, topk_idx)
-        out = aggregate_expert_outputs(out, topk_weight)
+        out = self.switch_mlp.combine(x, topk_idx, topk_weight).astype(x.dtype)
         if self.shared_experts is not None:
             out = out + self.shared_experts(x)
         return out

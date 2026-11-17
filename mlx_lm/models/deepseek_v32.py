@@ -408,8 +408,7 @@ class DeepseekV32MoE(nn.Module):
             x = sum_gradients(self.sharding_group)(x)
 
         inds, scores = self.gate(x)
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = self.switch_mlp.combine(x, inds, scores).astype(x.dtype)
         if self.config.n_shared_experts is not None:
             y = y + self.shared_experts(x)
 

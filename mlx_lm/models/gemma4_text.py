@@ -148,6 +148,9 @@ class Router(nn.Module):
 class GeGLU(nn.Module):
     """GELU-gated linear unit activation for SwitchGLU."""
 
+    # The activation in the fused Metal kernels (kernels/switch_glu.py): tanh GELU.
+    metal_act = 1
+
     def __call__(self, x, gate):
         return geglu(gate, x)
 
@@ -169,10 +172,7 @@ class Experts(nn.Module):
     def __call__(
         self, x: mx.array, top_k_indices: mx.array, top_k_weights: mx.array
     ) -> mx.array:
-        w = mx.expand_dims(top_k_weights, -1)
-        y = self.switch_glu(x, top_k_indices)
-
-        return (w * y).sum(-2)
+        return self.switch_glu.combine(x, top_k_indices, top_k_weights)
 
 
 class Attention(nn.Module):

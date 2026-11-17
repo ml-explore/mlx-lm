@@ -209,8 +209,7 @@ class Dots1MoE(nn.Module):
 
     def __call__(self, x):
         inds, scores = self.gate(x)
-        y = self.experts(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = self.experts.combine(x, inds, scores).astype(x.dtype)
         if self.n_shared_experts is not None:
             y = y + self.shared_experts(x)
 

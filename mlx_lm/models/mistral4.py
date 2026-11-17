@@ -263,8 +263,7 @@ class Mistral4MoE(nn.Module):
             self.args.routed_scaling_factor,
             self.args.norm_topk_prob,
         )
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = self.switch_mlp.combine(x, inds, scores).astype(x.dtype)
         if self.args.n_shared_experts is not None:
             y = y + self.shared_experts(x)
 

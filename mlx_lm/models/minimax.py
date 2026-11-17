@@ -189,8 +189,7 @@ class MiniMaxSparseMoeBlock(nn.Module):
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
         scores = scores.astype(x.dtype)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x, inds, scores)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

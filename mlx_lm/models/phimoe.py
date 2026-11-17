@@ -133,8 +133,7 @@ class PhiMoESparseMoeBlock(nn.Module):
 
         inds, scores = sparsemixer(gates, top_k=self.top_k, jitter_eps=self.jitter_eps)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x, inds, scores)
 
         return y
 

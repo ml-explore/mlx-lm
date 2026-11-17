@@ -141,8 +141,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores /= mx.sum(scores, axis=-1, keepdims=True)
 
-        y = self.switch_mlp(x, inds)
-        y = (y * scores[..., None]).sum(axis=-2).astype(y.dtype)
+        y = self.switch_mlp.combine(x, inds, scores).astype(x.dtype)
 
         if self.sharding_group is not None:
             y = mx.distributed.all_sum(y, group=self.sharding_group)

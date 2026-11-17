@@ -174,8 +174,7 @@ class SparseMoeBlock(nn.Module):
         scores = scores / (mx.sum(scores, axis=-1, keepdims=True) + 1e-20)
         scores = (scores * self.routed_scaling_factor).astype(x_flat.dtype)
 
-        y = self.switch_mlp(x_flat, inds)
-        y = (y * scores[..., None]).sum(axis=-2)
+        y = self.switch_mlp.combine(x_flat, inds, scores)
         y = y + shared_out
 
         if self.sharding_group is not None:

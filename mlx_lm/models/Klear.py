@@ -146,8 +146,7 @@ class KlearSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores = scores / mx.sum(scores, axis=-1, keepdims=True)
         scores = scores.astype(x.dtype)
-        expert_out = self.experts(x, inds)
-        y_experts = (expert_out * scores[..., None]).sum(axis=-2)
+        y_experts = self.experts.combine(x, inds, scores)
         coef = mx.softmax(self.coefficient(x), axis=-1, precise=True)
         shared = self.shared_experts(x)
         y = y_experts * coef[..., :1] + shared * coef[..., 1:]
