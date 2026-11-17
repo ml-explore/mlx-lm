@@ -1,24 +1,46 @@
 # Copyright © 2025 Apple Inc.
 
-from mlx.utils import tree_flatten, tree_unflatten
+import re
 
 __all__ = [
+    "current_name",
     "sanitize",
+    "upgrade_mlx_layout",
 ]
 
 
 def sanitize(model, weights):
-    weights = tree_unflatten(list(weights.items()))
-    weights.pop("visual", None)
-    weights.pop("vision_tower", None)
-    # Newer HF checkpoints nest both towers under a top-level "model".
-    if language_model := weights.get("model", {}).get("language_model"):
-        weights["model"] = language_model
-    weights = dict(tree_flatten(weights))
+    if any(k.startswith("language_model.") for k in weights):
+        weights = upgrade_mlx_layout(weights)
+    weights = {current_name(k): v for k, v in weights.items()}
+    # mlx-lm does not run the vision encoder yet.
+    weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+    if model.args.text.tie_word_embeddings:
+        weights.pop("lm_head.weight", None)
+    return weights
 
-    sanitized = {}
-    for key, value in weights.items():
-        if not key.startswith("language_model."):
-            key = "language_model." + key
-        sanitized[key] = value
-    return sanitized
+
+def current_name(key):
+    """The name of a weight of Qwen2-VL's checkpoints on the Hub, which have the
+    language model under model and the vision encoder under visual, in the current
+    layout. transformers renames them the same way."""
+    if key.startswith("visual."):
+        return "model." + key
+    return re.sub(
+        r"^model\.(?!language_model\.|visual\.)", "model.language_model.", key
+    )
+
+
+def upgrade_mlx_layout(weights):
+    """A checkpoint that mlx-lm or mlx-vlm converted with the language model under
+    language_model."""
+    upgraded = {}
+    for k, v in weights.items():
+        if k.startswith("vision_tower."):
+            continue
+        if k.startswith("language_model.model."):
+            k = "model.language_model." + k.removeprefix("language_model.model.")
+        else:
+            k = k.removeprefix("language_model.")
+        upgraded[k] = v
+    return upgraded

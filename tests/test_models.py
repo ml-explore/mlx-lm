@@ -925,7 +925,19 @@ class TestModels(unittest.TestCase):
             max_position_embeddings=512,
             head_dim=8,
         )
-        self.check_moe_sanitize(qwen3_next.Model(args), args.num_experts, "switch_mlp")
+        model = qwen3_next.Model(args)
+        self.check_moe_sanitize(model, args.num_experts, "experts")
+
+        # Converted by an older mlx-lm: switch_mlp, and the norms storing 1 + weight.
+        base = mx.arange(8, dtype=mx.float32)
+        upgraded = model.sanitize(
+            {
+                "model.layers.1.mlp.switch_mlp.gate_proj.weight": mx.zeros((4, 1, 1)),
+                "model.norm.weight": base + 1.0,
+            }
+        )
+        self.assertIn("model.layers.1.mlp.experts.gate_proj.weight", upgraded)
+        self.assertTrue(mx.array_equal(upgraded["model.norm.weight"], base))
 
     def test_klear_sanitize_sparse_step(self):
         from mlx_lm.models import Klear
@@ -1125,7 +1137,7 @@ class TestModels(unittest.TestCase):
         with self.assertRaises(ValueError):
             qwen3.ModelArgs.from_dict(config)
 
-    def test_qwen3_5_family_convert_then_load_norm_not_shift_twice(self):
+    def test_qwen3_5_family_sanitize(self):
         text_config = {
             "hidden_size": 8,
             "intermediate_size": 16,
@@ -1143,12 +1155,14 @@ class TestModels(unittest.TestCase):
             "tie_word_embeddings": False,
             "max_position_embeddings": 64,
         }
-        hf_norm_key = "model.language_model.layers.0.input_layernorm.weight"
-        hf_conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
-        mlx_norm_key = "language_model.model.layers.0.input_layernorm.weight"
-        mlx_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
+        norm_key = "model.language_model.layers.0.input_layernorm.weight"
+        conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
+        experts = "model.language_model.layers.0.mlp.experts"
+        old_norm_key = "language_model.model.layers.0.input_layernorm.weight"
+        old_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
+        base = mx.arange(8, dtype=mx.float32)
 
-        for model_type, hf_mtp_key in (
+        for model_type, mtp_key in (
             ("qwen3_5", "mtp.fc.weights"),
             ("qwen3_5_moe", "mtp.fc.weight"),
         ):
@@ -1161,31 +1175,58 @@ class TestModels(unittest.TestCase):
             )
             model = module.Model(args)
 
-            base = mx.arange(8, dtype=mx.float32)
-            raw_conv = mx.zeros((4, 1, 3), dtype=mx.float32)
-
-            # Raw HF Conv1D layout is the reliable signal that RMSNorm weights
-            # are still zero-centered and need the MLX +1 conversion.
+            # Hugging Face: the norms load as they are, conv1d becomes
+            # channels-last, the fused experts split, and MTP and the vision
+            # encoder go.
+            gate_up = mx.arange(2 * 6 * 4, dtype=mx.float32).reshape(2, 6, 4)
             converted = model.sanitize(
                 {
-                    hf_norm_key: base,
-                    hf_conv_key: raw_conv,
-                    hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
+                    norm_key: base,
+                    conv_key: mx.zeros((4, 1, 3)),
+                    f"{experts}.gate_up_proj": gate_up,
+                    f"{experts}.down_proj": mx.zeros((2, 4, 3)),
+                    mtp_key: mx.zeros((1,)),
+                    "model.visual.patch_embed.proj.weight": mx.zeros((1,)),
                 }
             )
-            self.assertIn(mlx_norm_key, converted)
-            self.assertTrue(mx.array_equal(converted[mlx_norm_key], base + 1.0))
-            self.assertEqual(converted[mlx_conv_key].shape, (4, 3, 1))
-            self.assertFalse(any("mtp." in k for k in converted))
-
-            # MTP can also be present in an already-converted checkpoint. It
-            # must be dropped without shifting converted norm weights again.
-            loaded = model.sanitize(
-                {**converted, hf_mtp_key: mx.zeros((1,), dtype=mx.float32)}
+            self.assertTrue(mx.array_equal(converted[norm_key], base))
+            self.assertEqual(converted[conv_key].shape, (4, 3, 1))
+            self.assertTrue(
+                mx.array_equal(converted[f"{experts}.gate_proj.weight"], gate_up[:, :3])
             )
             self.assertTrue(
-                mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
+                mx.array_equal(converted[f"{experts}.up_proj.weight"], gate_up[:, 3:])
             )
+            self.assertIn(f"{experts}.down_proj.weight", converted)
+            self.assertFalse(
+                any(k.startswith(("mtp.", "model.visual.")) for k in converted)
+            )
+
+            # Converted by this mlx-lm: unchanged.
+            again = model.sanitize(dict(converted))
+            self.assertEqual(sorted(again), sorted(converted))
+            self.assertTrue(mx.array_equal(again[norm_key], base))
+
+            # Converted by an older mlx-lm: the language model under
+            # language_model, switch_mlp, and the norms storing 1 + weight.
+            old = model.sanitize(
+                {
+                    old_norm_key: base + 1.0,
+                    old_conv_key: mx.zeros((4, 3, 1)),
+                    "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight": (
+                        mx.zeros((2, 3, 4))
+                    ),
+                    "language_model.lm_head.weight": mx.zeros((32, 8)),
+                    "vision_tower.patch_embed.proj.weight": mx.zeros((1,)),
+                }
+            )
+            self.assertEqual(
+                sorted(old),
+                sorted(
+                    [norm_key, conv_key, f"{experts}.up_proj.weight", "lm_head.weight"]
+                ),
+            )
+            self.assertTrue(mx.array_equal(old[norm_key], base))
 
     def _prism_hadamard_packed(self, rows, width, seed):
         # Random 2-bit affine weights that dequantize exactly, and the dense
@@ -1276,6 +1317,18 @@ class TestModels(unittest.TestCase):
             "mlp.down_proj",
         )
 
+        zero_centered_norms = (
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            "language_model.norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        )
+
+        def text_path(path):
+            # The packs name the modules as qwen3_5's text model did.
+            return path.replace("model.language_model.", "model.", 1)
+
         def build(schema, tied):
             # A packed checkpoint plus a stock qwen3_5 model holding the
             # unfolded weights.
@@ -1285,25 +1338,25 @@ class TestModels(unittest.TestCase):
                     {"model_type": "qwen3_5", "text_config": text}
                 )
             )
-            lm = ref.language_model
-            named = dict(lm.named_modules())
-            paths = [
-                p
-                for p in named
-                if p.endswith(targets) or p in ("model.embed_tokens", "lm_head")
-            ]
-            weights = dict(tree_flatten(lm.parameters()))
+            named = dict(ref.named_modules())
+            embed = "model.language_model.embed_tokens"
+            paths = [p for p in named if p.endswith(targets) or p in (embed, "lm_head")]
+            # The packs store the norms as 1 + weight, as mlx-lm did.
+            weights = {
+                text_path(k): v + 1.0 if k.endswith(zero_centered_norms) else v
+                for k, v in tree_flatten(ref.parameters())
+            }
             modules = []
             for seed, path in enumerate(paths):
                 rows, width = named[path].weight.shape
                 packed, dense = self._prism_hadamard_packed(rows, width, 100 + seed)
-                weights.update({f"{path}.{k}": v for k, v in packed.items()})
+                weights.update({f"{text_path(path)}.{k}": v for k, v in packed.items()})
                 named[path].weight = dense
                 modules.append(
                     {
-                        "path": path,
+                        "path": text_path(path),
                         "block": 512,
-                        "embedding": path == "model.embed_tokens",
+                        "embedding": path == embed,
                         "dtype": "float16",
                     }
                 )
@@ -5651,12 +5704,25 @@ class TestVLSanitize(unittest.TestCase):
         "lm_head.weight": None,
     }
 
+    # Converted by an older mlx-lm or by mlx-vlm
+    MLX_WEIGHTS = {
+        "vision_tower.blocks.0.attn.qkv.weight": None,
+        "language_model.model.embed_tokens.weight": None,
+        "language_model.model.layers.0.self_attn.q_proj.weight": None,
+        "language_model.model.norm.weight": None,
+        "language_model.lm_head.weight": None,
+    }
+
     def _assert_sanitized(self, result):
-        self.assertEqual([k for k in result if "visual" in k], [])
-        self.assertEqual([k for k in result if "vision_tower" in k], [])
-        self.assertIn("language_model.model.layers.0.self_attn.q_proj.weight", result)
-        self.assertIn("language_model.model.embed_tokens.weight", result)
-        self.assertIn("language_model.lm_head.weight", result)
+        self.assertEqual(
+            sorted(result),
+            [
+                "lm_head.weight",
+                "model.language_model.embed_tokens.weight",
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                "model.language_model.norm.weight",
+            ],
+        )
 
     def _text_config(self, model_type, **extra):
         config = {
@@ -5685,6 +5751,7 @@ class TestVLSanitize(unittest.TestCase):
         for name, weights in (
             ("hf", self.HF_WEIGHTS),
             ("legacy", self.LEGACY_WEIGHTS),
+            ("mlx", self.MLX_WEIGHTS),
         ):
             with self.subTest(layout=name):
                 self._assert_sanitized(model.sanitize(dict(weights)))
@@ -5698,6 +5765,7 @@ class TestVLSanitize(unittest.TestCase):
         for name, weights in (
             ("hf", self.HF_WEIGHTS),
             ("legacy", self.LEGACY_WEIGHTS),
+            ("mlx", self.MLX_WEIGHTS),
         ):
             with self.subTest(layout=name):
                 self._assert_sanitized(model.sanitize(dict(weights)))
@@ -5715,7 +5783,38 @@ class TestVLSanitize(unittest.TestCase):
             norm_topk_prob=True,
         )
         model = Model(ModelArgs(model_type="qwen3_vl_moe", text_config=text_config))
-        self._assert_sanitized(model.sanitize(dict(self.HF_WEIGHTS)))
+        for name, weights in (("hf", self.HF_WEIGHTS), ("mlx", self.MLX_WEIGHTS)):
+            with self.subTest(layout=name):
+                self._assert_sanitized(model.sanitize(dict(weights)))
+
+    def test_tie_word_embeddings_at_top_level(self):
+        # Hugging Face's checkpoints keep it out of text_config.
+        from mlx_lm.models import qwen2_vl, qwen3_vl, qwen3_vl_moe
+
+        moe = dict(
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            moe_intermediate_size=16,
+            norm_topk_prob=True,
+        )
+        for package, text_config in (
+            (qwen2_vl, self._text_config("qwen2")),
+            (qwen3_vl, self._text_config("qwen3")),
+            (qwen3_vl_moe, self._text_config("qwen3_moe", **moe)),
+        ):
+            del text_config["tie_word_embeddings"]
+            for tie in (False, True):
+                with self.subTest(package=package.__name__, tie=tie):
+                    args = package.ModelArgs.from_dict(
+                        {
+                            "model_type": package.__name__.split(".")[-1],
+                            "text_config": text_config,
+                            "tie_word_embeddings": tie,
+                        }
+                    )
+                    self.assertEqual(args.text.tie_word_embeddings, tie)
 
 
 if __name__ == "__main__":

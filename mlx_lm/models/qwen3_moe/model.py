@@ -15,7 +15,57 @@ from mlx_lm.models.qwen3_moe.layers import MLP, Qwen3MoeDecoderLayer
 __all__ = [
     "Model",
     "Qwen3MoeModel",
+    "moe_quant_predicate",
+    "shard_layers",
 ]
+
+
+def shard_layers(layers, group: mx.distributed.Group):
+    """Shard the decoder layers for tensor parallelism."""
+    N = group.size()
+    for layer in layers:
+        # Shard the self attention
+        layer.self_attn.q_proj = shard_linear(
+            layer.self_attn.q_proj, "all-to-sharded", group=group
+        )
+        layer.self_attn.k_proj = shard_linear(
+            layer.self_attn.k_proj, "all-to-sharded", group=group
+        )
+        layer.self_attn.v_proj = shard_linear(
+            layer.self_attn.v_proj, "all-to-sharded", group=group
+        )
+        layer.self_attn.o_proj = shard_linear(
+            layer.self_attn.o_proj, "sharded-to-all", group=group
+        )
+        layer.self_attn.n_heads //= N
+        layer.self_attn.n_kv_heads //= N
+
+        # Shard the dense MLP layers
+        if isinstance(layer.mlp, MLP):
+            layer.mlp.gate_proj = shard_linear(
+                layer.mlp.gate_proj, "all-to-sharded", group=group
+            )
+            layer.mlp.down_proj = shard_linear(
+                layer.mlp.down_proj, "sharded-to-all", group=group
+            )
+            layer.mlp.up_proj = shard_linear(
+                layer.mlp.up_proj, "all-to-sharded", group=group
+            )
+
+        # Shard the MoE. Shard in place since the MoE should be responsible
+        # for aggregating the results. The router (gate) stays replicated.
+        else:
+            layer.mlp.sharding_group = group
+            shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
+            shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+            shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
+
+
+def moe_quant_predicate(path, _):
+    """The router in 8 bits."""
+    if path.endswith("mlp.gate"):
+        return {"group_size": 64, "bits": 8}
+    return True
 
 
 class Qwen3MoeModel(PipelineMixin, nn.Module):
@@ -97,59 +147,11 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
-        group = group or mx.distributed.init()
-        N = group.size()
-        for layer in self.model.layers:
-            # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
-
-            # Shard the dense MLP layers
-            if isinstance(layer.mlp, MLP):
-                layer.mlp.gate_proj = shard_linear(
-                    layer.mlp.gate_proj, "all-to-sharded", group=group
-                )
-                layer.mlp.down_proj = shard_linear(
-                    layer.mlp.down_proj, "sharded-to-all", group=group
-                )
-                layer.mlp.up_proj = shard_linear(
-                    layer.mlp.up_proj, "all-to-sharded", group=group
-                )
-
-            # Shard the MoE. Shard in place since the MoE should be responsible
-            # for aggregating the results. The router (gate) stays replicated.
-            else:
-                layer.mlp.sharding_group = group
-                shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
-                )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                )
+        shard_layers(self.model.layers, group or mx.distributed.init())
 
     @property
     def quant_predicate(self):
-        def predicate(path, _):
-            if path.endswith("mlp.gate"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
+        return moe_quant_predicate
 
     @property
     def layers(self):

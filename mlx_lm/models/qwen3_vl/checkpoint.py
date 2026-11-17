@@ -1,6 +1,8 @@
 # Copyright © 2025 Apple Inc.
 
-from mlx.utils import tree_flatten, tree_unflatten
+import mlx.core as mx
+
+from mlx_lm.models.qwen2_vl.checkpoint import current_name, upgrade_mlx_layout
 
 __all__ = [
     "sanitize",
@@ -8,17 +10,22 @@ __all__ = [
 
 
 def sanitize(model, weights):
-    weights = tree_unflatten(list(weights.items()))
-    weights.pop("visual", None)
-    weights.pop("vision_tower", None)
-    # Newer HF checkpoints nest both towers under a top-level "model".
-    if language_model := weights.get("model", {}).get("language_model"):
-        weights["model"] = language_model
-    weights = dict(tree_flatten(weights))
+    if any(k.startswith("language_model.") for k in weights):
+        weights = upgrade_mlx_layout(weights)
+    weights = {current_name(k): v for k, v in weights.items()}
+    # mlx-lm does not run the vision encoder yet.
+    weights = {k: v for k, v in weights.items() if not k.startswith("model.visual.")}
+    if model.args.text.tie_word_embeddings:
+        weights.pop("lm_head.weight", None)
 
-    sanitized = {}
-    for key, value in weights.items():
-        if not key.startswith("language_model."):
-            key = "language_model." + key
-        sanitized[key] = value
-    return sanitized
+    # The fused experts are stored [num_experts, input, output].
+    for k in list(weights):
+        if k.endswith(".experts.gate_up_proj"):
+            switch_mlp = k.removesuffix(".experts.gate_up_proj") + ".switch_mlp"
+            gate, up = mx.split(weights.pop(k).swapaxes(-2, -1), 2, axis=-2)
+            weights[f"{switch_mlp}.gate_proj.weight"] = gate
+            weights[f"{switch_mlp}.up_proj.weight"] = up
+        elif k.endswith(".experts.down_proj"):
+            switch_mlp = k.removesuffix(".experts.down_proj") + ".switch_mlp"
+            weights[f"{switch_mlp}.down_proj.weight"] = weights.pop(k).swapaxes(-2, -1)
+    return weights

@@ -15,7 +15,40 @@ from mlx_lm.models.qwen2.layers import TransformerBlock
 __all__ = [
     "Model",
     "Qwen2Model",
+    "shard_layers",
 ]
+
+
+def shard_layers(layers, group: mx.distributed.Group):
+    """Shard the decoder layers for tensor parallelism."""
+    N = group.size()
+    for layer in layers:
+        # Shard the self attention
+        layer.self_attn.q_proj = shard_linear(
+            layer.self_attn.q_proj, "all-to-sharded", group=group
+        )
+        layer.self_attn.k_proj = shard_linear(
+            layer.self_attn.k_proj, "all-to-sharded", group=group
+        )
+        layer.self_attn.v_proj = shard_linear(
+            layer.self_attn.v_proj, "all-to-sharded", group=group
+        )
+        layer.self_attn.o_proj = shard_linear(
+            layer.self_attn.o_proj, "sharded-to-all", group=group
+        )
+        layer.self_attn.n_heads //= N
+        layer.self_attn.n_kv_heads //= N
+
+        # Shard the MLP
+        layer.mlp.gate_proj = shard_linear(
+            layer.mlp.gate_proj, "all-to-sharded", group=group
+        )
+        layer.mlp.down_proj = shard_linear(
+            layer.mlp.down_proj, "sharded-to-all", group=group
+        )
+        layer.mlp.up_proj = shard_linear(
+            layer.mlp.up_proj, "all-to-sharded", group=group
+        )
 
 
 class Qwen2Model(PipelineMixin, nn.Module):
@@ -95,35 +128,7 @@ class Model(nn.Module):
         return checkpoint.sanitize(self, weights)
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
-        group = group or mx.distributed.init()
-        N = group.size()
-        for layer in self.model.layers:
-            # Shard the self attention
-            layer.self_attn.q_proj = shard_linear(
-                layer.self_attn.q_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.k_proj = shard_linear(
-                layer.self_attn.k_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.v_proj = shard_linear(
-                layer.self_attn.v_proj, "all-to-sharded", group=group
-            )
-            layer.self_attn.o_proj = shard_linear(
-                layer.self_attn.o_proj, "sharded-to-all", group=group
-            )
-            layer.self_attn.n_heads //= N
-            layer.self_attn.n_kv_heads //= N
-
-            # Shard the MLP
-            layer.mlp.gate_proj = shard_linear(
-                layer.mlp.gate_proj, "all-to-sharded", group=group
-            )
-            layer.mlp.down_proj = shard_linear(
-                layer.mlp.down_proj, "sharded-to-all", group=group
-            )
-            layer.mlp.up_proj = shard_linear(
-                layer.mlp.up_proj, "all-to-sharded", group=group
-            )
+        shard_layers(self.model.layers, group or mx.distributed.init())
 
     @property
     def layers(self):

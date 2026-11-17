@@ -9,6 +9,7 @@ from mlx.utils import tree_map
 
 from mlx_lm.layers.distributed import gather_last_axis
 from mlx_lm.layers.masks import create_attention_mask, create_ssm_mask
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.layers.pipeline import PipelineMixin
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen3_5 import checkpoint
@@ -18,8 +19,8 @@ from mlx_lm.models.qwen3_next.layers import Qwen3NextMLP as MLP
 
 __all__ = [
     "Model",
+    "Qwen3_5Model",
     "Qwen3_5TextModel",
-    "TextModel",
 ]
 
 
@@ -30,7 +31,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         self.layers = [
             DecoderLayer(args=args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
@@ -98,14 +99,40 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         return self.norm(hidden_states)
 
 
-class TextModel(nn.Module):
-    def __init__(self, args: TextModelArgs):
+class Qwen3_5Model(nn.Module):
+    """The language model, named as in the checkpoint."""
+
+    def __init__(self, args: ModelArgs):
+        super().__init__()
+        self.language_model = Qwen3_5TextModel(args.text)
+
+    # mlx_lm.utils pipelines model.model with these.
+    @property
+    def layers(self):
+        return self.language_model.layers
+
+    @property
+    def start_idx(self):
+        return self.language_model.start_idx
+
+    @property
+    def end_idx(self):
+        return self.language_model.end_idx
+
+    def pipeline(self, group, split=None):
+        self.language_model.pipeline(group, split)
+
+
+class Model(nn.Module):
+    def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
         self.model_type = args.model_type
-        self.model = Qwen3_5TextModel(args)
-        if not args.tie_word_embeddings:
-            self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        self.model = Qwen3_5Model(args)
+        if not args.text.tie_word_embeddings:
+            self.lm_head = nn.Linear(
+                args.text.hidden_size, args.text.vocab_size, bias=False
+            )
         self.sharding_group = None
 
     def __call__(
@@ -114,67 +141,21 @@ class TextModel(nn.Module):
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
-        if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
-        else:
-            out = self.lm_head(out)
-            if self.sharding_group is not None:
-                out = gather_last_axis(out, self.sharding_group)
+        language_model = self.model.language_model
+        out = language_model(inputs, cache, input_embeddings=input_embeddings)
+        if self.args.text.tie_word_embeddings:
+            return language_model.embed_tokens.as_linear(out)
+        out = self.lm_head(out)
+        if self.sharding_group is not None:
+            out = gather_last_axis(out, self.sharding_group)
         return out
 
     @property
     def layers(self):
-        return self.model.pipeline_layers
+        return self.model.language_model.pipeline_layers
 
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
-
-    def sanitize(self, weights):
-        return checkpoint.sanitize_text_model(self, weights)
-
-    @property
-    def quant_predicate(self):
-        if self.args.num_experts <= 0:
-            return None
-
-        def predicate(path, _):
-            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
-                return {"group_size": 64, "bits": 8}
-            return True
-
-        return predicate
-
-    @property
-    def cast_predicate(self):
-        def predicate(path: str):
-            if path.endswith("A_log"):
-                return False
-            return True
-
-        return predicate
-
-
-class Model(nn.Module):
-    def __init__(self, args: ModelArgs):
-        super().__init__()
-        self.args = args
-        self.model_type = args.model_type
-        self.language_model = TextModel(TextModelArgs.from_dict(args.text_config))
-
-    def __call__(
-        self,
-        inputs: mx.array,
-        cache=None,
-        input_embeddings: Optional[mx.array] = None,
-    ):
-        return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
-        )
-
-    @property
-    def model(self):
-        return self.language_model.model
 
     def sanitize(self, weights):
         return checkpoint.sanitize(self, weights)
@@ -185,12 +166,11 @@ class Model(nn.Module):
         rank = group.rank()
 
         # Each rank computes a slice of the vocabulary
-        lm = self.language_model
-        if not lm.args.tie_word_embeddings:
-            vocab = lm.args.vocab_size
+        if not self.args.text.tie_word_embeddings:
+            vocab = self.args.text.vocab_size
             assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
-            lm.lm_head = shard_linear(lm.lm_head, "all-to-sharded", group=group)
-            lm.sharding_group = group
+            self.lm_head = shard_linear(self.lm_head, "all-to-sharded", group=group)
+            self.sharding_group = group
 
         # A sharding factory for the convolution in gated delta net
         def conv_sharding(key_dim):
@@ -296,26 +276,30 @@ class Model(nn.Module):
                     layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
                 )
                 shard_inplace(
-                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                    layer.mlp.experts.gate_proj, "all-to-sharded", group=group
                 )
                 shard_inplace(
-                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+                    layer.mlp.experts.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
-                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
-                )
-
-    @property
-    def layers(self):
-        return self.language_model.model.pipeline_layers
-
-    def make_cache(self):
-        return self.language_model.make_cache()
+                shard_inplace(layer.mlp.experts.up_proj, "all-to-sharded", group=group)
 
     @property
     def quant_predicate(self):
-        return self.language_model.quant_predicate
+        if self.args.text.num_experts <= 0:
+            return None
+
+        def predicate(path, _):
+            if path.endswith("mlp.gate") or path.endswith("shared_expert_gate"):
+                return {"group_size": 64, "bits": 8}
+            return True
+
+        return predicate
 
     @property
     def cast_predicate(self):
-        return self.language_model.cast_predicate
+        def predicate(path: str):
+            if path.endswith("A_log"):
+                return False
+            return True
+
+        return predicate

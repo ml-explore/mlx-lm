@@ -8,6 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.masks import create_attention_mask, create_ssm_mask
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.layers.pipeline import PipelineMixin
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen3_next import checkpoint
@@ -28,7 +29,7 @@ class Qwen3NextModel(PipelineMixin, nn.Module):
             Qwen3NextDecoderLayer(args=args, layer_idx=i)
             for i in range(args.num_hidden_layers)
         ]
-        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 

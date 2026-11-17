@@ -78,6 +78,9 @@ class ModelArgs(BaseModelArgs):
     model_type: str
     text_config: dict
 
+    def __post_init__(self):
+        self.text = TextModelArgs.from_dict(self.text_config)
+
     @classmethod
     def from_dict(cls, params):
         if "text_config" not in params:

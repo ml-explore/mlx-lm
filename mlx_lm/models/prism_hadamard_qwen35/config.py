@@ -28,6 +28,7 @@ class ModelArgs(qwen3_5.ModelArgs):
     modules: List[Dict[str, Any]] = field(default_factory=list)
 
     def __post_init__(self):
+        super().__post_init__()
         if _NAMESPACES.get(self.schema_version) != self.tensor_namespace:
             raise ValueError(
                 f"Unsupported Hadamard pack: schema {self.schema_version}, "

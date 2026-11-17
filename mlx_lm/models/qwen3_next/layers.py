@@ -11,6 +11,7 @@ from mlx.nn.layers.distributed import sum_gradients
 from mlx_lm.layers.activations import precise_swiglu, swiglu
 from mlx_lm.layers.attention import scaled_dot_product_attention
 from mlx_lm.layers.gated_delta import gated_delta_update, normalize_qk
+from mlx_lm.layers.norms import ZeroCenteredRMSNorm
 from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.layers.switch import SwitchGLU
 from mlx_lm.models.qwen3_next.config import ModelArgs
@@ -70,8 +71,8 @@ class Qwen3NextAttention(nn.Module):
             bias=args.attention_bias,
         )
 
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.q_norm = ZeroCenteredRMSNorm(self.head_dim, eps=args.rms_norm_eps)
+        self.k_norm = ZeroCenteredRMSNorm(self.head_dim, eps=args.rms_norm_eps)
 
         self.rope = initialize_rope(
             int(self.head_dim * args.partial_rotary_factor),
@@ -278,7 +279,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.top_k = args.num_experts_per_tok
 
         self.gate = nn.Linear(dim, num_experts, bias=False)
-        self.switch_mlp = SwitchGLU(dim, intermediate_size, num_experts)
+        self.experts = SwitchGLU(dim, intermediate_size, num_experts)
 
         self.shared_expert = Qwen3NextMLP(dim, shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(dim, 1, bias=False)
@@ -302,7 +303,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
 
-        y = self.switch_mlp(x, inds)
+        y = self.experts(x, inds)
         y = (y * scores[..., None]).sum(axis=-2)
 
         shared_y = self.shared_expert(x)
@@ -325,8 +326,10 @@ class Qwen3NextDecoderLayer(nn.Module):
         else:
             self.self_attn = Qwen3NextAttention(args)
 
-        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
+        self.input_layernorm = ZeroCenteredRMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.post_attention_layernorm = ZeroCenteredRMSNorm(
             args.hidden_size, eps=args.rms_norm_eps
         )
         if (layer_idx not in args.mlp_only_layers) and (
