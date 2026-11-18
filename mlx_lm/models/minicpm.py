@@ -25,7 +25,7 @@ class ModelArgs(BaseModelArgs):
     scale_depth: float
     scale_emb: float
     max_position_embeddings: Optional[int] = None
-    rope_theta: float = 1000000.0
+    rope_theta: float = 10000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[str, float]]] = None
     tie_word_embeddings: bool = False
