@@ -1,12 +1,13 @@
 # Copyright © 2023 Apple Inc.
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask
+from .cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -25,6 +26,20 @@ class ModelArgs(BaseModelArgs):
     attn_logit_softcapping: float = 50.0
     final_logit_softcapping: float = 30.0
     query_pre_attn_scalar: float = 144.0
+    sliding_window: int = 4096
+    layer_types: Optional[List[str]] = None
+
+    def __post_init__(self):
+        if self.layer_types is None:
+            # same alternation HF derives when layer_types is absent
+            self.layer_types = [
+                (
+                    "sliding_attention"
+                    if self.sliding_window and (i + 1) % 2
+                    else "full_attention"
+                )
+                for i in range(self.num_hidden_layers)
+            ]
 
 
 class RMSNorm(nn.Module):
@@ -173,9 +188,20 @@ class GemmaModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0], return_array=True)
-
-        for layer, c in zip(self.layers, cache):
+        full_mask = None
+        sliding_mask = None
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
+            if self.args.layer_types[i] == "sliding_attention":
+                if sliding_mask is None:
+                    sliding_mask = create_attention_mask(
+                        h, c, window_size=self.args.sliding_window,
+                        return_array=True,
+                    )
+                mask = sliding_mask
+            else:
+                if full_mask is None:
+                    full_mask = create_attention_mask(h, c, return_array=True)
+                mask = full_mask
             h = layer(h, mask, c)
 
         return self.norm(h)
@@ -199,6 +225,16 @@ class Model(nn.Module):
         out = mx.tanh(out / self.final_logit_softcapping)
         out = out * self.final_logit_softcapping
         return out
+
+    def make_cache(self):
+        return [
+            (
+                RotatingKVCache(max_size=self.args.sliding_window)
+                if t == "sliding_attention"
+                else KVCache()
+            )
+            for t in self.args.layer_types
+        ]
 
     @property
     def layers(self):

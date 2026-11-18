@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 
 
 @dataclass
@@ -21,6 +22,7 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int = 49152
     rope_theta: float = 100000
     tie_word_embeddings: bool = True
+    sliding_window: Optional[int] = None
 
 
 class Attention(nn.Module):
@@ -132,7 +134,9 @@ class Starcoder2Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(
+            h, cache[0], window_size=self.args.sliding_window
+        )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -160,6 +164,13 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
+
+    def make_cache(self):
+        window = self.args.sliding_window
+        return [
+            RotatingKVCache(max_size=window) if window else KVCache()
+            for _ in range(self.args.num_hidden_layers)
+        ]
 
     @property
     def layers(self):

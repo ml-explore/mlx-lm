@@ -8,6 +8,7 @@ import mlx.nn as nn
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .cache import KVCache, RotatingKVCache
 from .rope_utils import SuScaledRoPE
 
 
@@ -28,6 +29,7 @@ class ModelArgs(BaseModelArgs):
     max_position_embeddings: int = 131072
     original_max_position_embeddings: int = 4096
     tie_word_embeddings: bool = False
+    sliding_window: Optional[int] = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
@@ -179,7 +181,9 @@ class Phi3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        mask = create_attention_mask(h, cache[0])
+        mask = create_attention_mask(
+            h, cache[0], window_size=self.args.sliding_window
+        )
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -207,6 +211,13 @@ class Model(nn.Module):
         else:
             out = self.lm_head(out)
         return out
+
+    def make_cache(self):
+        window = self.args.sliding_window
+        return [
+            RotatingKVCache(max_size=window) if window else KVCache()
+            for _ in range(self.args.num_hidden_layers)
+        ]
 
     @property
     def layers(self):
