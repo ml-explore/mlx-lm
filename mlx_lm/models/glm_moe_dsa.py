@@ -13,7 +13,7 @@ from .deepseek_v32 import (
     DeepseekV32Model,
 )
 from .deepseek_v32 import Model as DSV32Model
-from .dsa import blocked_topk, sparse_attention
+from .dsa import blocked_topk, min_context, sparse_attention
 
 
 @dataclass
@@ -58,6 +58,8 @@ class ModelArgs(BaseModelArgs):
     index_skip_topk_offset: int = 2
     sparse_prefill: bool = True
     sparse_prefill_min_context: int = 16384
+    sparse_prefill_fused: bool = True  # sparse prefill attention in one Metal kernel
+    sparse_prefill_fused_min_context: int = 0  # with the kernel, sparse from here
 
     def __post_init__(self):
         self.rope_scaling = self.rope_parameters
@@ -87,6 +89,8 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
         self.skip_topk = config.indexer_types[layer_idx] == "shared"
         self.sparse_prefill = config.sparse_prefill
         self.sparse_prefill_min_context = config.sparse_prefill_min_context
+        self.sparse_prefill_fused = config.sparse_prefill_fused
+        self.sparse_prefill_fused_min_context = config.sparse_prefill_fused_min_context
         if self.skip_topk:
             self.indexer = None
 
@@ -121,12 +125,12 @@ class GlmMoeDsaAttention(DeepseekV32Attention):
             cache = [None] * 2
 
         # Sparse prefill supports one sequence. Batches use the masked dense path.
-        # Below the minimum context the dense path is faster.
+        # Below the minimum context the dense path is faster (see dsa.min_context).
         sparse = (
             self.sparse_prefill
             and B == 1
             and L > 1
-            and kv_latent.shape[2] >= self.sparse_prefill_min_context
+            and kv_latent.shape[2] >= min_context(self, q_pe, kv_latent, k_pe)
         )
         if self.indexer is not None:
             if sparse:

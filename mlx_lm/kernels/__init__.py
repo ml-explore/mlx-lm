@@ -8,6 +8,7 @@ from .post_expert_norm_combine import post_expert_norm_combine
 from .qk_norm import qk_norm
 from .qk_norm_rope import qk_norm_rope
 from .rms_norm_sigmoid_gate import rms_norm_sigmoid_gate
+from .sparse_mla import sparse_mla_attention
 
 __all__ = [
     "expert_routing",
@@ -17,4 +18,5 @@ __all__ = [
     "qk_norm",
     "qk_norm_rope",
     "rms_norm_sigmoid_gate",
+    "sparse_mla_attention",
 ]
