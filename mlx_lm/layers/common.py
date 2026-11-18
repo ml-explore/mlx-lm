@@ -96,7 +96,11 @@ class SwiGLU(nn.Module):
 
 
 class ZeroCenteredRMSNorm(nn.Module):
-    """RMSNorm with the weight stored as an offset from 1."""
+    """RMSNorm with a zero-centred weight: it scales by ``1 + weight``.
+
+    The weight starts at zero, so a new norm is a plain RMSNorm. Only the
+    weight is centred, not the input; centring the input is LayerNorm.
+    """
 
     def __init__(self, dims: int, *, eps: float):
         super().__init__()

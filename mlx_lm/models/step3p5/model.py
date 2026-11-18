@@ -7,11 +7,10 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
-from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.step3p5 import checkpoint
 from mlx_lm.models.step3p5.config import ModelArgs
-from mlx_lm.models.step3p5.layers import Step3p5DecoderLayer
+from mlx_lm.models.step3p5.layers import Step3p5DecoderLayer, Step3p5MLP
 
 __all__ = [
     "Model",
@@ -31,7 +30,7 @@ class Step3p5Model(nn.Module):
             Step3p5DecoderLayer(args, layer_idx)
             for layer_idx in range(args.num_hidden_layers)
         ]
-        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         self._swa_idx = next(
             (i for i, l in enumerate(self.layers) if l.is_sliding), None
@@ -97,7 +96,7 @@ class Model(nn.Module):
     @property
     def quant_predicate(self):
         def predicate(path, _):
-            if path.endswith("moe.gate"):
+            if "mlp.gate.gate" in path:
                 return {"group_size": 64, "bits": 8}
             return True
 
@@ -128,14 +127,7 @@ class Model(nn.Module):
                     layer.self_attn.g_proj, "all-to-sharded", group=group
                 )
 
-            if layer.is_moe_layer:
-                # In place: the layer sums the routed and shared experts once.
-                layer.sharding_group = group
-                for mlp in (layer.share_expert, layer.moe):
-                    shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
-                    shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
-                    shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
-            else:
+            if isinstance(layer.mlp, Step3p5MLP):
                 layer.mlp.gate_proj = shard_linear(
                     layer.mlp.gate_proj, "all-to-sharded", group=group
                 )
@@ -144,6 +136,26 @@ class Model(nn.Module):
                 )
                 layer.mlp.down_proj = shard_linear(
                     layer.mlp.down_proj, "sharded-to-all", group=group
+                )
+            else:
+                layer.mlp.sharding_group = group
+                shard_inplace(
+                    layer.mlp.share_expert.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.share_expert.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.share_expert.down_proj, "sharded-to-all", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
+                shard_inplace(
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
 
     @property
