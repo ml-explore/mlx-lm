@@ -10,6 +10,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
+from .rope_utils import initialize_rope
 from .switch_layers import SwitchGLU
 
 
@@ -29,11 +30,22 @@ class ModelArgs(BaseModelArgs):
     vocab_size: int
     num_key_value_heads: int
     head_dim: int
-    rope_theta: float
     tie_word_embeddings: bool
     max_position_embeddings: int
     norm_topk_prob: bool
+    rope_theta: Optional[float] = None
     rope_scaling: Optional[Dict[str, Union[float, str]]] = None
+    rope_parameters: Optional[dict] = None
+
+    def __post_init__(self):
+        # transformers >= 5 nests rope_theta and rope_scaling under rope_parameters.
+        if self.rope_parameters:
+            if self.rope_theta is None:
+                self.rope_theta = self.rope_parameters.get("rope_theta")
+            if self.rope_scaling is None:
+                self.rope_scaling = self.rope_parameters
+        if self.rope_theta is None:
+            raise ValueError("rope_theta is missing from the model config.")
 
 
 class Attention(nn.Module):
@@ -58,10 +70,12 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
-        self.rope = nn.RoPE(
+        self.rope = initialize_rope(
             head_dim,
-            traditional=False,
             base=args.rope_theta,
+            traditional=False,
+            scaling_config=args.rope_scaling,
+            max_position_embeddings=args.max_position_embeddings,
         )
 
     def __call__(
