@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-
 __all__ = [
     "sanitize",
 ]

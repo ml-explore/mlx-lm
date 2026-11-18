@@ -14,7 +14,6 @@ MODELS = Path(mlx_lm.models.__file__).parent
 PACKAGES: list[str] = sorted(
     info.name for info in pkgutil.iter_modules(mlx_lm.models.__path__) if info.ispkg
 )
-# The files of a package, by role (CONTRIBUTING.md).
 REQUIRED_FILES = {"__init__", "config", "model"}
 OPTIONAL_FILES = {"checkpoint", "kernels", "layers", "processor", "vision"}
 EXPORTS = {"Model", "ModelArgs"}

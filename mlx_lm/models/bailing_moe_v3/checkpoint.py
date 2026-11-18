@@ -1,7 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-from __future__ import annotations
-
 import mlx.core as mx
 
 __all__ = [
@@ -42,6 +40,10 @@ def sanitize(model, weights):
                 )
 
         attention_prefix = f"{layer_prefix}.attention"
+        # transformers 5 saves the KDA output projection as dense.
+        dense_key = f"{attention_prefix}.dense.weight"
+        if model.layers[layer_index].is_linear and dense_key in weights:
+            weights[f"{attention_prefix}.o_proj.weight"] = weights.pop(dense_key)
         kv_b_key = f"{attention_prefix}.kv_b_proj.weight"
         if kv_b_key not in weights:
             continue

@@ -193,7 +193,7 @@ def splice(
     rows: mx.array,
     token_id: int,
 ) -> mx.array:
-    """Put the rows, in order, at the positions of the token in the inputs."""
+    """The embeddings with the rows, in order, at the token_id positions of inputs."""
     # A shape check only, so no host sync.
     if rows.shape[0] == 0:
         return embeddings

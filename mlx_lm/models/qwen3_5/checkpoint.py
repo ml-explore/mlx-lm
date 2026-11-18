@@ -3,6 +3,7 @@
 import mlx.core as mx
 
 from mlx_lm.models.checkpoint import from_text_layout
+from mlx_lm.models.qwen3_5.config import TextModelArgs
 
 __all__ = [
     "sanitize",
@@ -18,9 +19,8 @@ _OFFSET_NORMS = (
 )
 
 
-def _upgrade_mlx_layout(weights):
-    """A checkpoint that mlx-lm or mlx-vlm converted with the language model under
-    language_model."""
+def _upgrade_mlx_layout(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """Weights mlx-lm or mlx-vlm saved under language_model, in the current layout."""
     upgraded = {}
     for k, v in weights.items():
         if k.startswith("vision_tower."):
@@ -31,6 +31,23 @@ def _upgrade_mlx_layout(weights):
             k = k.removeprefix("language_model.")
         upgraded[k] = v
     return upgraded
+
+
+def _stack_experts(
+    weights: dict[str, mx.array], args: TextModelArgs
+) -> dict[str, mx.array]:
+    """The FP8 releases and transformers 5 saves store the experts one by one."""
+    for i in range(args.num_hidden_layers):
+        prefix = f"model.language_model.layers.{i}.mlp"
+        for n in ("gate_proj", "up_proj", "down_proj"):
+            if f"{prefix}.experts.0.{n}.weight" not in weights:
+                continue
+            experts = [
+                weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                for e in range(args.num_experts)
+            ]
+            weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(experts)
+    return weights
 
 
 def sanitize(model, weights):
@@ -44,6 +61,7 @@ def sanitize(model, weights):
     weights = {from_text_layout(k): v for k, v in weights.items()}
     if model.args.text.tie_word_embeddings:
         weights.pop("lm_head.weight", None)
+    weights = _stack_experts(weights, model.args.text)
 
     # Hugging Face stores conv1d channels-first; MLX conversions already have this
     # model's format.

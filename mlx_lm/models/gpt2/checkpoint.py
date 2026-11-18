@@ -1,12 +1,13 @@
 # Copyright © 2023 Apple Inc.
 
-
 __all__ = [
     "sanitize",
 ]
 
 
 def sanitize(model, weights):
+    # GPT2LMHeadModel checkpoints, e.g. distilgpt2.
+    weights = {k.removeprefix("transformer."): v for k, v in weights.items()}
     new_weights = {}
     for i in range(model.args.n_layer):
         if f"h.{i}.attn.bias" in weights:

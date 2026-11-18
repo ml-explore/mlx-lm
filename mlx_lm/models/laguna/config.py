@@ -24,7 +24,8 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-6
     attention_bias: bool = False
     qkv_bias: bool = False
-    gating: bool = True
+    # True, "per-head" or "per-element".
+    gating: bool | str = True
     tie_word_embeddings: bool = False
     sliding_window: Optional[int] = 512
     partial_rotary_factor: Optional[float] = None

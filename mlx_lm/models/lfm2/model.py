@@ -65,7 +65,6 @@ class Lfm2Model(nn.Module):
 
 
 def make_cache(layers):
-    """A KV cache for each attention layer, a conv state for each conv layer."""
     return [KVCache() if l.is_attention_layer else ArraysCache(size=1) for l in layers]
 
 

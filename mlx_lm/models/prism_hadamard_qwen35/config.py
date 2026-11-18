@@ -14,8 +14,6 @@ __all__ = [
 # vision-language pack keyed like the mlx-vlm qwen3_5 model. The text weights
 # and the transform are the same in both.
 _NAMESPACES = {1: "mlx-lm-text", 2: "mlx-vlm-qwen3_5"}
-
-
 _QUANTIZATION = {"bits": 2, "group_size": 128, "mode": "affine"}
 
 

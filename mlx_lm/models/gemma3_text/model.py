@@ -71,7 +71,6 @@ class Gemma3TextModel(nn.Module):
 
 
 def make_cache(args: ModelArgs):
-    """A global cache for every sliding_window_pattern-th layer, sliding ones otherwise."""
     caches = []
     for i in range(args.num_hidden_layers):
         if i % args.sliding_window_pattern == args.sliding_window_pattern - 1:

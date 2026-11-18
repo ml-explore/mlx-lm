@@ -31,7 +31,6 @@ class ScaleConfig:
 
 @dataclass
 class AWQConfig:
-    # The path of the token embedding in the model.
     embed: str
     lm_head: str
     no_clip: list[str]

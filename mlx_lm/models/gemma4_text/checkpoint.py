@@ -9,8 +9,7 @@ __all__ = [
 
 
 def sanitize_language_model(language_model, weights, prefix):
-    """Sanitize the language model's weights, named from prefix: "model." in the
-    text model, "model.language_model." in a multimodal one."""
+    """Sanitize the language model's weights, whose names start with prefix."""
     args = language_model.config
     sanitized = {}
     first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers

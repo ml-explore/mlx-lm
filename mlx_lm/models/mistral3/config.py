@@ -1,6 +1,7 @@
 # Copyright © 2026 Apple Inc.
 
 from dataclasses import dataclass
+from types import ModuleType
 
 from mlx_lm.models import llama, ministral3, mistral4
 from mlx_lm.models.base import BaseModelArgs
@@ -23,9 +24,8 @@ _MISTRAL_DEFAULTS = {
 }
 
 
-def language_model_package(model_type):
-    """The package of the language model: Ministral 3's, Mistral 4's, or Llama's,
-    which runs the Mistral and Llama language models."""
+def language_model_package(model_type: str | None) -> ModuleType:
+    """The package that runs the language model; llama's also runs Mistral's."""
     if model_type == "ministral3":
         return ministral3
     if model_type == "mistral4":

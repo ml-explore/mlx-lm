@@ -1,8 +1,8 @@
 # Copyright © 2025 Apple Inc.
 
-from __future__ import annotations
-
 import mlx.core as mx
+
+from mlx_lm.models.qwen3_next.config import ModelArgs
 
 __all__ = [
     "sanitize",
@@ -18,15 +18,17 @@ _OFFSET_NORMS = (
 )
 
 
-def _from_hugging_face(model, weights):
-    """Stack the experts, which Hugging Face stores one by one, and add 1 to the norms."""
-    for l in range(model.args.num_hidden_layers):
+def _from_hugging_face(
+    weights: dict[str, mx.array], args: ModelArgs
+) -> dict[str, mx.array]:
+    """Stack the experts that Hugging Face stores one by one, and add 1 to the norms."""
+    for l in range(args.num_hidden_layers):
         prefix = f"model.layers.{l}.mlp"
         for n in ["up_proj", "down_proj", "gate_proj"]:
             if f"{prefix}.experts.0.{n}.weight" in weights:
                 to_join = [
                     weights.pop(f"{prefix}.experts.{e}.{n}.weight")
-                    for e in range(model.args.num_experts)
+                    for e in range(args.num_experts)
                 ]
                 weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
     for k, v in weights.items():
@@ -43,7 +45,7 @@ def sanitize(model, weights):
 
     # MLX conversions already have this model's format.
     if any(".mlp.experts.0." in k for k in weights):
-        weights = _from_hugging_face(model, weights)
+        weights = _from_hugging_face(weights, model.args)
 
     for k, v in weights.items():
         if "conv1d.weight" in k and v.shape[-1] != 1:

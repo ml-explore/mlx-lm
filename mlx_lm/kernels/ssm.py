@@ -71,7 +71,7 @@ def ssm_update_kernel(
     D: mx.array,
     dt: mx.array,
     state: mx.array,
-):
+) -> list[mx.array]:
     """One step of the state update; dt is already biased and clipped."""
     n, _, h, d = hidden_states.shape
     input_type = hidden_states.dtype

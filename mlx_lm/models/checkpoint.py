@@ -7,12 +7,7 @@ __all__ = [
 
 
 def from_llava_layout(key: str) -> str:
-    """The current name of a key in the LLaVA layout, as transformers maps it.
-
-    language_model.model.* becomes model.language_model.*, language_model.lm_head.*
-    becomes lm_head.*, and the vision tower and the projector move under model.
-    Other keys are unchanged.
-    """
+    """The current name of a key in the LLaVA layout, as transformers maps it."""
     if key.startswith("language_model.lm_head."):
         return key.removeprefix("language_model.")
     if key.startswith("language_model.model."):
@@ -25,9 +20,7 @@ def from_llava_layout(key: str) -> str:
 def from_text_layout(key: str) -> str:
     """The name in a multimodal model of a key in a text model's layout.
 
-    model.* becomes model.language_model.*. Keys already under
-    model.language_model, and lm_head.*, are unchanged. Drop the encoders' keys
-    first: they are under model too.
+    Drop the encoders' keys first: they are under model too.
     """
     if key.startswith("model.") and not key.startswith("model.language_model."):
         return "model.language_model." + key.removeprefix("model.")

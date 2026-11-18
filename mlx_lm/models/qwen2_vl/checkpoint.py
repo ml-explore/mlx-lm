@@ -2,6 +2,8 @@
 
 import re
 
+import mlx.core as mx
+
 __all__ = [
     "current_name",
     "sanitize",
@@ -9,9 +11,8 @@ __all__ = [
 ]
 
 
-def upgrade_mlx_layout(weights):
-    """A checkpoint that mlx-lm or mlx-vlm converted with the language model under
-    language_model."""
+def upgrade_mlx_layout(weights: dict[str, mx.array]) -> dict[str, mx.array]:
+    """Weights mlx-lm or mlx-vlm saved under language_model, in the current layout."""
     upgraded = {}
     for k, v in weights.items():
         if k.startswith("vision_tower."):
@@ -24,10 +25,8 @@ def upgrade_mlx_layout(weights):
     return upgraded
 
 
-def current_name(key):
-    """The name of a weight of Qwen2-VL's checkpoints on the Hub, which have the
-    language model under model and the vision encoder under visual, in the current
-    layout. transformers renames them the same way."""
+def current_name(key: str) -> str:
+    """The current name of a key in Qwen2-VL's Hub layout, as transformers maps it."""
     if key.startswith("visual."):
         return "model." + key
     return re.sub(

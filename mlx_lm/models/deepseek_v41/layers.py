@@ -24,6 +24,8 @@ __all__ = [
     "MoE",
     "Router",
     "SharedMLP",
+    "append",
+    "collapse",
 ]
 
 
@@ -53,7 +55,7 @@ def _apply_rope(
     return mx.concatenate([head, tail.astype(x.dtype)], axis=-1)
 
 
-def _append(cached: Optional[mx.array], new: mx.array) -> mx.array:
+def append(cached: Optional[mx.array], new: mx.array) -> mx.array:
     if cached is None:
         return new
     return mx.concatenate([cached, new], axis=1)
@@ -75,7 +77,7 @@ class LayerCache:
 
     def update_window(self, kv: mx.array) -> mx.array:
         """Return the window with kv appended, and keep its last rows."""
-        window = _append(self.window, kv)
+        window = append(self.window, kv)
         self.window = window[:, -self.window_size :]
         self.offset += kv.shape[1]
         return window
@@ -146,8 +148,8 @@ class Compressor(nn.Module):
 
         h = x.astype(mx.float32)
         pending = 0 if cache.pending_kv is None else cache.pending_kv.shape[1]
-        kv = _append(cache.pending_kv, self.kv_proj(h))
-        gate = _append(cache.pending_gate, self.gate_proj(h))
+        kv = append(cache.pending_kv, self.kv_proj(h))
+        gate = append(cache.pending_gate, self.gate_proj(h))
         full = kv.shape[1] - kv.shape[1] % self.ratio
         cache.pending_kv = kv[:, full:]
         cache.pending_gate = gate[:, full:]
@@ -455,7 +457,7 @@ class Attention(nn.Module):
                 scale=self.ratio,
             )
             kv = _fake_quant_fp4(kv, block_size=16, e4m3_scale=True)
-            cache.compress_kv = _append(cache.compress_kv, kv)
+            cache.compress_kv = append(cache.compress_kv, kv)
             if self.is_index_source:
                 k = self.indexer.k_norm(self.indexer.k_proj(latent))
                 k = _apply_rope(
@@ -466,7 +468,7 @@ class Attention(nn.Module):
                     scale=self.ratio,
                 )
                 k = _fake_quant_fp4(k, block_size=32)
-                cache.index_k = _append(cache.index_k, k)
+                cache.index_k = append(cache.index_k, k)
         shared["compress_kv"] = cache.compress_kv
         if self.is_index_source:
             shared["index_k"] = cache.index_k
@@ -592,7 +594,7 @@ class HyperConnection(nn.Module):
         return pre, post, sinkhorn(comb, iters=self.iters, eps=self._eps)
 
 
-def _collapse(streams: mx.array, mix: mx.array) -> mx.array:
+def collapse(streams: mx.array, mix: mx.array) -> mx.array:
     out = mx.sum(mix[..., None] * streams.astype(mx.float32), axis=2)
     return out.astype(streams.dtype)
 
@@ -629,13 +631,13 @@ class DecoderLayer(nn.Module):
         shared: dict[str, Optional[mx.array]],
     ) -> tuple[mx.array, mx.array]:
         attn_pre, attn_post, attn_comb = self.attn_hc(streams)
-        h = self.input_layernorm(_collapse(streams, pre_mix))
+        h = self.input_layernorm(collapse(streams, pre_mix))
         h = self.self_attn(
             h, start_pos=start_pos, window_idx=window_idx, cache=cache, shared=shared
         )
         streams = _expand(h, streams, attn_post, attn_comb)
 
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(streams)
-        h = self.mlp(self.post_attention_layernorm(_collapse(streams, attn_pre)))
+        h = self.mlp(self.post_attention_layernorm(collapse(streams, attn_pre)))
         streams = _expand(h, streams, ffn_post, ffn_comb)
         return streams, ffn_pre

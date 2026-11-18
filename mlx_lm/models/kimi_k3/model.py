@@ -15,7 +15,7 @@ from mlx_lm.models.kimi_k3.layers import (
     KimiK3DecoderLayer,
     KimiK3SparseMoE,
     ResidualBlocks,
-    _attn_res_mix,
+    attn_res_mix,
 )
 
 __all__ = [
@@ -115,7 +115,7 @@ class KimiK3TextModel(nn.Module):
                 self._output_res_w_eff = self.output_attn_res_norm.weight.astype(
                     mx.float32
                 ) * self.output_attn_res_proj.weight.reshape(-1)
-            h = _attn_res_mix(
+            h = attn_res_mix(
                 blocks,
                 h,
                 self._output_res_w_eff,
@@ -157,7 +157,7 @@ class KimiK3TextModel(nn.Module):
 
 
 class KimiK3Model(nn.Module):
-    """The language model, named as in the checkpoint."""
+    """Puts the language model at model.language_model, as the checkpoint names it."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()

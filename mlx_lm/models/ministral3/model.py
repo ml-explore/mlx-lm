@@ -17,7 +17,7 @@ from mlx_lm.models.ministral3.layers import (
     Fp8ShardedToAllLinear,
     FusedGLU,
     TransformerBlock,
-    _get_llama_4_attn_scale,
+    get_llama_4_attn_scale,
 )
 
 __all__ = [
@@ -96,7 +96,7 @@ class LanguageModel(PipelineMixin, nn.Module):
                 h, cache[self.swa_idx], window_size=self.sliding_window
             )
 
-        attn_scale = _get_llama_4_attn_scale(
+        attn_scale = get_llama_4_attn_scale(
             inputs.shape[1],
             offset,
             self.args.rope_parameters["llama_4_scaling_beta"],

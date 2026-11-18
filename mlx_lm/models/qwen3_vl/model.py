@@ -20,7 +20,7 @@ __all__ = [
 
 
 class Qwen3VLModel(nn.Module):
-    """The language model, named as in the checkpoint."""
+    """Puts the language model at model.language_model, as the checkpoint names it."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()

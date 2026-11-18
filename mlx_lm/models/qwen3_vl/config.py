@@ -23,7 +23,6 @@ class ModelArgs(BaseModelArgs):
             "tie_word_embeddings": self.tie_word_embeddings,
             **self.text_config,
         }
-        # Dense or mixture of experts: Qwen3's or Qwen3-MoE's language model.
         if text_config.get("num_experts", 0) > 0:
             self.text = Qwen3MoeArgs.from_dict(text_config)
         else:

@@ -13,7 +13,6 @@ __all__ = [
     "sanitize_language_model",
 ]
 
-
 # Only the language model runs here.
 _ENCODERS = ("vision_tower", "vision_model", "multi_modal_projector", "mm_projector")
 

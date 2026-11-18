@@ -18,7 +18,7 @@ __all__ = [
 
 
 class Mistral3Model(nn.Module):
-    """The language model, named as in the checkpoint."""
+    """Puts the language model at model.language_model, as the checkpoint names it."""
 
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -80,8 +80,8 @@ class Model(nn.Module):
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
-        language_model = language_model_package(self.args.text.model_type)
-        language_model.model.shard_layers(self.model.language_model.layers, group)
+        package = language_model_package(self.args.text.model_type)
+        package.model.shard_layers(self.model.language_model.layers, group)
         if not self.args.text.tie_word_embeddings:
             N, vocab = group.size(), self.args.text.vocab_size
             assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"

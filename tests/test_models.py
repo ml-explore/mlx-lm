@@ -588,6 +588,18 @@ class TestModels(unittest.TestCase):
                 base_scale,
             )
 
+        model = bailing_moe_v3.Model(args)
+        weights = dict(tree_flatten(model.parameters()))
+        saved = {
+            k.replace(".attention.o_proj.", ".attention.dense."): v
+            for k, v in weights.items()
+        }
+        self.assertIn("model.layers.0.attention.dense.weight", saved)
+        loaded = bailing_moe_v3.Model(args)
+        loaded.load_weights(list(loaded.sanitize(saved).items()), strict=True)
+        inputs = mx.array([[0, 1, 2]])
+        self.assertTrue(mx.allclose(loaded(inputs), model(inputs)).item())
+
     def test_gear(self):
         from mlx_lm.models import gear
 
@@ -930,9 +942,8 @@ class TestModels(unittest.TestCase):
         model = qwen3_next.Model(args)
         self.check_moe_sanitize(model, args.num_experts, "switch_mlp")
 
-        # An MLX conversion stores the norms as 1 + weight and loads as it is;
-        # Hugging Face's checkpoints, with the experts one by one, store an
-        # offset from 1.
+        # MLX conversions store the norms as 1 + weight; Hugging Face's
+        # checkpoints, with the experts one by one, as an offset from 1.
         base = mx.arange(8, dtype=mx.float32)
         converted = model.sanitize(
             {
@@ -1171,6 +1182,9 @@ class TestModels(unittest.TestCase):
         switch_mlp = "model.language_model.layers.0.mlp.switch_mlp"
         old_norm_key = "language_model.model.layers.0.input_layernorm.weight"
         old_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
+        sanitized_keys = sorted(
+            [norm_key, conv_key, f"{switch_mlp}.up_proj.weight", "lm_head.weight"]
+        )
         base = mx.arange(8, dtype=mx.float32)
 
         for model_type, mtp_key in (
@@ -1187,9 +1201,7 @@ class TestModels(unittest.TestCase):
             )
             model = module.Model(args)
 
-            # Hugging Face: the norms store an offset from 1, conv1d becomes
-            # channels-last, the fused experts split into switch_mlp, and MTP
-            # and the vision encoder go.
+            # Hugging Face's checkpoint.
             gate_up = mx.arange(2 * 6 * 4, dtype=mx.float32).reshape(2, 6, 4)
             converted = model.sanitize(
                 {
@@ -1223,8 +1235,7 @@ class TestModels(unittest.TestCase):
             self.assertEqual(sorted(again), sorted(converted))
             self.assertTrue(mx.array_equal(again[norm_key], base + 1.0))
 
-            # Converted by an older mlx-lm: the language model under
-            # language_model.
+            # Converted by an older mlx-lm.
             old = model.sanitize(
                 {
                     old_norm_key: base + 1.0,
@@ -1236,21 +1247,10 @@ class TestModels(unittest.TestCase):
                     "vision_tower.patch_embed.proj.weight": mx.zeros((1,)),
                 }
             )
-            self.assertEqual(
-                sorted(old),
-                sorted(
-                    [
-                        norm_key,
-                        conv_key,
-                        f"{switch_mlp}.up_proj.weight",
-                        "lm_head.weight",
-                    ]
-                ),
-            )
+            self.assertEqual(sorted(old), sanitized_keys)
             self.assertTrue(mx.array_equal(old[norm_key], base + 1.0))
 
-            # Text-only checkpoints have the text model's names: an MLX
-            # conversion,
+            # A text-only MLX conversion.
             text = model.sanitize(
                 {
                     "model.layers.0.input_layernorm.weight": base + 1.0,
@@ -1261,20 +1261,10 @@ class TestModels(unittest.TestCase):
                     "lm_head.weight": mx.zeros((32, 8)),
                 }
             )
-            self.assertEqual(
-                sorted(text),
-                sorted(
-                    [
-                        norm_key,
-                        conv_key,
-                        f"{switch_mlp}.up_proj.weight",
-                        "lm_head.weight",
-                    ]
-                ),
-            )
+            self.assertEqual(sorted(text), sanitized_keys)
             self.assertTrue(mx.array_equal(text[norm_key], base + 1.0))
 
-            # and Hugging Face's.
+            # A text-only Hugging Face checkpoint.
             hf_text = model.sanitize(
                 {
                     "model.layers.0.input_layernorm.weight": base,
@@ -1283,6 +1273,49 @@ class TestModels(unittest.TestCase):
             )
             self.assertTrue(mx.array_equal(hf_text[norm_key], base + 1.0))
             self.assertEqual(hf_text[conv_key].shape, (4, 3, 1))
+
+    def test_qwen3_5_moe_sanitize_stacks_experts(self):
+        package = model_package({"model_type": "qwen3_5_moe"})
+        module = importlib.import_module(f"mlx_lm.models.{package}")
+        args = module.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5_moe",
+                "text_config": {
+                    "model_type": "qwen3_5_moe_text",
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "num_key_value_heads": 1,
+                    "vocab_size": 32,
+                    "full_attention_interval": 1,
+                    "num_experts": 2,
+                    "num_experts_per_tok": 1,
+                    "moe_intermediate_size": 3,
+                    "shared_expert_intermediate_size": 3,
+                },
+            }
+        )
+        model = module.Model(args)
+        weights = {}
+        for e in range(2):
+            experts = f"model.layers.0.mlp.experts.{e}"
+            weights[f"{experts}.gate_proj.weight"] = mx.full((3, 8), e)
+            weights[f"{experts}.up_proj.weight"] = mx.full((3, 8), 10 + e)
+            weights[f"{experts}.down_proj.weight"] = mx.full((8, 3), 20 + e)
+        converted = model.sanitize(weights)
+
+        switch_mlp = "model.language_model.layers.0.mlp.switch_mlp"
+        names = ("down_proj", "gate_proj", "up_proj")
+        self.assertEqual(sorted(converted), [f"{switch_mlp}.{n}.weight" for n in names])
+        for n, first, shape in (
+            ("gate_proj", 0, (3, 8)),
+            ("up_proj", 10, (3, 8)),
+            ("down_proj", 20, (8, 3)),
+        ):
+            expected = mx.stack([mx.full(shape, first), mx.full(shape, first + 1)])
+            self.assertTrue(
+                mx.array_equal(converted[f"{switch_mlp}.{n}.weight"], expected)
+            )
 
     def _prism_hadamard_packed(self, rows, width, seed):
         # Random 2-bit affine weights that dequantize exactly, and the dense
@@ -1632,6 +1665,35 @@ class TestModels(unittest.TestCase):
             8,
         )
         self.assertEqual(config["quantization"]["bits"], 4)
+
+    def test_gemma4_vocab_size_from_text_config(self):
+        from mlx_lm.models import gemma4
+
+        text_config = {
+            "model_type": "gemma4_text",
+            "hidden_size": 8,
+            "num_hidden_layers": 1,
+            "intermediate_size": 16,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "global_head_dim": 8,
+            "layer_types": ["full_attention"],
+            "hidden_size_per_layer_input": 0,
+            "num_kv_shared_layers": 0,
+        }
+        # transformers' Gemma4Config has no top-level vocab_size.
+        args = gemma4.ModelArgs.from_dict(
+            {"model_type": "gemma4", "text_config": dict(text_config, vocab_size=32)}
+        )
+        model = gemma4.Model(args)
+        self.assertEqual(model.model.language_model.embed_tokens.weight.shape, (32, 8))
+        self.assertEqual(model(mx.array([[0, 1, 2]])).shape, (1, 3, 32))
+
+        args = gemma4.ModelArgs.from_dict(
+            {"model_type": "gemma4", "vocab_size": 48, "text_config": text_config}
+        )
+        self.assertEqual(args.text.vocab_size, 48)
 
     def test_granite_sensitive_projections_quantize_to_8bit(self):
         from mlx_lm.models import granite
@@ -2312,6 +2374,44 @@ class TestModels(unittest.TestCase):
         model = gpt2.Model(args)
         self.model_test_runner(model, args.model_type, args.vocab_size, args.n_layer)
 
+    def test_gpt2_sanitize(self):
+        from mlx_lm.models import gpt2
+
+        args = gpt2.ModelArgs(
+            model_type="gpt2",
+            n_ctx=16,
+            n_embd=32,
+            n_head=4,
+            n_layer=2,
+            n_positions=16,
+            layer_norm_epsilon=1e-5,
+            vocab_size=100,
+        )
+        model = gpt2.Model(args)
+        mlx_weights = dict(tree_flatten(model.parameters()))
+        # openai-community/gpt2
+        hub = {}
+        for k, v in mlx_weights.items():
+            if k.endswith(("c_attn.weight", "c_proj.weight", "c_fc.weight")):
+                v = v.T
+            hub[k.removeprefix("model.")] = v
+        for i in range(args.n_layer):
+            hub[f"h.{i}.attn.bias"] = mx.zeros((1, 1, 16, 16))
+        # distilgpt2
+        lm_head_model = {f"transformer.{k}": v for k, v in hub.items()}
+
+        inputs = mx.array([[0, 1, 2]])
+        expected = model(inputs)
+        for name, weights in (
+            ("mlx", mlx_weights),
+            ("hub", hub),
+            ("lm_head_model", lm_head_model),
+        ):
+            with self.subTest(layout=name):
+                m = gpt2.Model(args)
+                m.load_weights(list(m.sanitize(dict(weights)).items()), strict=True)
+                self.assertTrue(mx.allclose(m(inputs), expected).item())
+
     def test_gptj(self):
 
         from mlx_lm.models import gptj
@@ -2347,6 +2447,29 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_gpt_neox_intermediate_size(self):
+        from mlx_lm.models import gpt_neox
+
+        config = {
+            "model_type": "gpt_neox",
+            "max_position_embeddings": 2048,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_hidden_layers": 2,
+            "layer_norm_eps": 1e-5,
+            "vocab_size": 256,
+            "rotary_emb_base": 10_000,
+            "rotary_pct": 0.25,
+        }
+        model = gpt_neox.Model(gpt_neox.ModelArgs.from_dict(config))
+        self.assertEqual(model.layers[0].mlp.dense_h_to_4h.weight.shape, (256, 64))
+
+        # sapienzanlp/modello-italia-9b: 2.5 x hidden_size
+        config["intermediate_size"] = 160
+        model = gpt_neox.Model(gpt_neox.ModelArgs.from_dict(config))
+        self.assertEqual(model.layers[0].mlp.dense_h_to_4h.weight.shape, (160, 64))
+        self.assertEqual(model.layers[0].mlp.dense_4h_to_h.weight.shape, (64, 160))
 
     def test_openelm(self):
         from mlx_lm.models import openelm
@@ -3281,6 +3404,12 @@ class TestModels(unittest.TestCase):
         model = phimoe.Model(args)
         self.assertIsInstance(model.layers[0].self_attn.rope, nn.RoPE)
 
+        # Phi-tiny-MoE has narrower heads.
+        args.head_dim = 16
+        model = phimoe.Model(args)
+        self.assertEqual(model.layers[0].self_attn.q_proj.weight.shape, (64, 128))
+        self.assertEqual(model(mx.array([[0, 1]])).shape, (1, 2, args.vocab_size))
+
     def test_recurrent_gemma(self):
         from mlx_lm.models import recurrent_gemma
 
@@ -3422,6 +3551,58 @@ class TestModels(unittest.TestCase):
         self.model_test_runner(
             model, args.model_type, args.vocab_size, args.num_hidden_layers
         )
+
+    def test_olmo_hybrid_sanitize(self):
+        from mlx_lm.models import olmo_hybrid
+
+        args = olmo_hybrid.ModelArgs(
+            model_type="olmo_hybrid",
+            hidden_size=32,
+            intermediate_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=100,
+            max_position_embeddings=128,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=12,
+            linear_value_head_dim=24,
+            linear_conv_kernel_dim=4,
+            linear_allow_neg_eigval=True,
+            tie_word_embeddings=False,
+            attention_bias=False,
+            layer_types=["linear_attention", "full_attention"],
+        )
+        model = olmo_hybrid.Model(args)
+        mlx_weights = dict(tree_flatten(model.parameters()))
+        # allenai/Olmo-Hybrid-7B
+        hub = {}
+        for k, v in mlx_weights.items():
+            if "conv1d.weight" in k:
+                v = v.moveaxis(1, 2)
+            hub[k] = v
+        # transformers 5: renamed norms, q/k/v conv split into equal thirds.
+        saved = {}
+        for k, v in hub.items():
+            k = k.replace(".input_layernorm.", ".attention_layer_norm.")
+            k = k.replace(".post_attention_layernorm.", ".feedforward_layer_norm.")
+            saved[k] = v
+        prefix = "model.layers.0.linear_attn"
+        convs = [f"{prefix}.{p}_conv1d.weight" for p in ("q", "k", "v")]
+        fused = mx.concatenate([saved[n] for n in convs], axis=0)
+        for n, part in zip(convs, mx.split(fused, 3, axis=0)):
+            saved[n] = part
+        self.assertEqual(saved[convs[0]].shape, (32, 1, 4))
+
+        inputs = mx.array([[0, 1, 2, 3]])
+        expected = model(inputs)
+        for name, weights in (("mlx", mlx_weights), ("hub", hub), ("saved", saved)):
+            with self.subTest(layout=name):
+                m = olmo_hybrid.Model(args)
+                m.load_weights(list(m.sanitize(dict(weights)).items()), strict=True)
+                self.assertTrue(mx.allclose(m(inputs), expected).item())
 
     def test_exaone(self):
         from mlx_lm.models import exaone
@@ -3813,6 +3994,34 @@ class TestModels(unittest.TestCase):
             else:
                 original[k] = v
         check(original)
+
+    def test_laguna_per_element_gating(self):
+        from mlx_lm.models import laguna
+
+        config = {
+            "model_type": "laguna",
+            "vocab_size": 100,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+        }
+        per_head = laguna.Model(laguna.ModelArgs(**config))
+        per_element = laguna.Model(laguna.ModelArgs(**config, gating="per-element"))
+        self.assertEqual(
+            per_element.layers[0].self_attn.g_proj.weight.shape, (4 * 8, 32)
+        )
+        # A head's gate repeated over its channels gates it as a whole.
+        weights = dict(tree_flatten(per_head.parameters()))
+        key = "model.layers.0.self_attn.g_proj.weight"
+        weights[key] = mx.repeat(weights[key], 8, axis=0)
+        per_element.load_weights(list(weights.items()), strict=True)
+        inputs = mx.array([[0, 1, 2]])
+        self.assertTrue(
+            mx.allclose(per_element(inputs), per_head(inputs), atol=1e-5).item()
+        )
 
     def test_mimo_v2_flash_attention_value_scale(self):
         from mlx_lm.models import mimo_v2_flash
@@ -5832,6 +6041,46 @@ class TestVLSanitize(unittest.TestCase):
             with self.subTest(layout=name):
                 self._assert_sanitized(model.sanitize(dict(weights)))
 
+    def test_qwen3_vl_moe_experts(self):
+        # hidden_size 32: gate_up_proj is square at 16, down_proj at 32.
+        from mlx_lm.models.qwen3_vl import Model, ModelArgs
+
+        experts = "model.language_model.layers.0.mlp.experts"
+        switch_mlp = "model.language_model.layers.0.mlp.switch_mlp"
+        for inter in (8, 16, 32):
+            text_config = self._text_config(
+                "qwen3_moe",
+                num_experts=4,
+                num_experts_per_tok=2,
+                decoder_sparse_step=1,
+                mlp_only_layers=[],
+                moe_intermediate_size=inter,
+                norm_topk_prob=True,
+            )
+            model = Model(ModelArgs(model_type="qwen3_vl_moe", text_config=text_config))
+            gate_up = mx.arange(4 * 2 * inter * 32, dtype=mx.float32)
+            gate_up = gate_up.reshape(4, 2 * inter, 32)
+            down = mx.arange(4 * 32 * inter, dtype=mx.float32).reshape(4, 32, inter)
+            expected = {
+                f"{switch_mlp}.gate_proj.weight": gate_up[:, :inter],
+                f"{switch_mlp}.up_proj.weight": gate_up[:, inter:],
+                f"{switch_mlp}.down_proj.weight": down,
+            }
+            for name, stored_gate_up, stored_down in (
+                ("transformers", gate_up, down),
+                ("released", gate_up.swapaxes(1, 2), down.swapaxes(1, 2)),
+            ):
+                with self.subTest(moe_intermediate_size=inter, layout=name):
+                    converted = model.sanitize(
+                        {
+                            f"{experts}.gate_up_proj": stored_gate_up,
+                            f"{experts}.down_proj": stored_down,
+                        }
+                    )
+                    self.assertEqual(sorted(converted), sorted(expected))
+                    for k, v in expected.items():
+                        self.assertTrue(mx.array_equal(converted[k], v), k)
+
     def test_tie_word_embeddings_at_top_level(self):
         # Hugging Face's checkpoints keep it out of text_config.
         from mlx_lm.models import qwen2_vl, qwen3_vl
@@ -5862,9 +6111,8 @@ class TestVLSanitize(unittest.TestCase):
                     self.assertEqual(args.text.tie_word_embeddings, tie)
 
     def test_mistral3_layouts(self):
-        # Hugging Face's current layout, the LLaVA layout of its older
-        # checkpoints and of older MLX conversions, and the text model's layout
-        # of text-only conversions. The encoders are dropped.
+        # LLaVA: older Hugging Face checkpoints and MLX conversions. Text: text-only
+        # conversions.
         from mlx_lm.models import mistral3
 
         model = mistral3.Model(

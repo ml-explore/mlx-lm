@@ -76,8 +76,8 @@ class MLP(nn.Module):
         super().__init__()
 
         self.hidden_size = args.hidden_size
-        self.dense_h_to_4h = nn.Linear(self.hidden_size, 4 * self.hidden_size)
-        self.dense_4h_to_h = nn.Linear(4 * self.hidden_size, self.hidden_size)
+        self.dense_h_to_4h = nn.Linear(self.hidden_size, args.intermediate_size)
+        self.dense_4h_to_h = nn.Linear(args.intermediate_size, self.hidden_size)
 
     def __call__(self, x) -> mx.array:
         # gelu_approx corresponds to FastGELUActivation in transformers.

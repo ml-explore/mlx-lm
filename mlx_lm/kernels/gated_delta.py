@@ -350,22 +350,12 @@ def _make_gated_delta_packed_kernel():
 
 
 _gated_delta_kernel = _make_gated_delta_kernel(has_mask=False, vectorized=False)
-
-
 _gated_delta_kernel_masked = _make_gated_delta_kernel(has_mask=True, vectorized=False)
-
-
 _gated_delta_kernel_vec = _make_gated_delta_kernel(has_mask=False, vectorized=True)
-
-
 _gated_delta_kernel_vec_masked = _make_gated_delta_kernel(
     has_mask=True, vectorized=True
 )
-
-
 _gated_delta_kernel_xtree = _make_gated_delta_kernel_xtree()
-
-
 _gated_delta_kernel_packed = _make_gated_delta_packed_kernel()
 
 

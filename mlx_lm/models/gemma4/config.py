@@ -19,12 +19,11 @@ class ModelArgs(BaseModelArgs):
     def __post_init__(self):
         if self.text_config is None:
             self.text_config = {}
-        # Gemma 4's defaults, which transformers leaves out of the text_config
-        # it saves. The vocabulary size is the model's.
+        # Fallbacks for what transformers leaves out of the text_config it saves.
         text_config = {
             "num_attention_heads": 8,
             "num_key_value_heads": 1,
-            **self.text_config,
             "vocab_size": self.vocab_size,
+            **self.text_config,
         }
         self.text = TextModelArgs.from_dict(text_config)

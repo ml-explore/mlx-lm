@@ -17,10 +17,9 @@ __all__ = [
     "Processor",
     "image_tokens",
 ]
-IMAGE_PATCH = "<|patch|>"
-
 
 IMAGE_START = "<|image_start|>"
+IMAGE_PATCH = "<|patch|>"
 IMAGE_END = "<|image_end|>"
 
 

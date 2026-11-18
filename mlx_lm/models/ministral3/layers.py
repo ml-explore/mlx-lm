@@ -22,6 +22,7 @@ __all__ = [
     "FusedGLU",
     "MLP",
     "TransformerBlock",
+    "get_llama_4_attn_scale",
 ]
 
 
@@ -71,7 +72,7 @@ class FusedGLU(nn.Module):
         return self.down_proj(swiglu(gate, up))
 
 
-def _get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
+def get_llama_4_attn_scale(size, offset, beta: float, max_position_embeddings: int):
     if isinstance(offset, mx.array) and offset.ndim > 0:
         offset = offset[:, None]
 
@@ -144,7 +145,7 @@ class Attention(nn.Module):
             queries = self.rope(queries)
             keys = self.rope(keys)
         if attn_scale is None:
-            attn_scale = _get_llama_4_attn_scale(
+            attn_scale = get_llama_4_attn_scale(
                 L,
                 offset,
                 self.scaling_beta,

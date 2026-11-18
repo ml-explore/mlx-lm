@@ -74,7 +74,7 @@ class Qwen3MoeModel(PipelineMixin, nn.Module):
 
 
 def moe_quant_predicate(path, _):
-    """The router in 8 bits."""
+    """Keep the routers in 8 bits."""
     if path.endswith("mlp.gate"):
         return {"group_size": 64, "bits": 8}
     return True

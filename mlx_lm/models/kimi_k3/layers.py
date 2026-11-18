@@ -23,6 +23,7 @@ __all__ = [
     "KimiK3SparseMoE",
     "ResidualBlocks",
     "SiTU",
+    "attn_res_mix",
 ]
 
 
@@ -463,7 +464,7 @@ class KimiK3SparseMoE(nn.Module):
         return y
 
 
-def _attn_res_mix(
+def attn_res_mix(
     blocks: ResidualBlocks,
     partial_sum: mx.array,
     w_eff: mx.array,
@@ -535,7 +536,7 @@ class KimiK3DecoderLayer(nn.Module):
             ) * self.mlp_res_proj.weight.reshape(-1)
 
         partial_sum = x
-        h = _attn_res_mix(
+        h = attn_res_mix(
             blocks, partial_sum, self._attn_res_w_eff, self.eps, not self.training
         )
         if self.is_block_start:
@@ -545,7 +546,7 @@ class KimiK3DecoderLayer(nn.Module):
         y = self.self_attn(self.input_layernorm(h), mask, cache)
         partial_sum = y if partial_sum is None else partial_sum + y
 
-        h = _attn_res_mix(
+        h = attn_res_mix(
             blocks, partial_sum, self._mlp_res_w_eff, self.eps, not self.training
         )
         partial_sum = partial_sum + self.mlp(self.post_attention_layernorm(h))

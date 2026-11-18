@@ -83,7 +83,6 @@ _ATTN_RES_SOURCE = """
     }
 """
 
-
 _attn_res_kernel = (
     mx.fast.metal_kernel(
         name="attnres_mix",
@@ -95,11 +94,8 @@ _attn_res_kernel = (
     else None
 )
 
-
-_attn_res_eps_cache: Dict[float, mx.array] = {}
-
-
 _ATTN_RES_THREADS = 512
+_attn_res_eps_cache: Dict[float, mx.array] = {}
 
 
 @mx.compile

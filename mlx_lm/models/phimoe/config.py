@@ -27,3 +27,8 @@ class ModelArgs(BaseModelArgs):
     num_experts_per_tok: int = 2
     rope_theta: float = 10000.0
     router_jitter_noise: float = 0.01
+    head_dim: int | None = None
+
+    def __post_init__(self):
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads

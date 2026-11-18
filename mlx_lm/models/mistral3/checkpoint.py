@@ -19,7 +19,7 @@ def sanitize(model, weights):
     weights = {from_text_layout(k): v for k, v in weights.items()}
     if model.args.text.tie_word_embeddings:
         weights.pop("lm_head.weight", None)
-    language_model = language_model_package(model.args.text.model_type)
-    return language_model.checkpoint.sanitize_language_model(
+    package = language_model_package(model.args.text.model_type)
+    return package.checkpoint.sanitize_language_model(
         model.model.language_model, weights, prefix="model.language_model."
     )

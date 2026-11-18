@@ -218,15 +218,14 @@ def logit_softcap(softcap, x):
 
 
 def moe_quant_predicate(path, _):
-    """The routers keep 8 bits."""
+    """Keep the routers in 8 bits."""
     if path.endswith("router.proj"):
         return {"group_size": 64, "bits": 8}
     return True
 
 
 def make_cache(args: ModelArgs):
-    """A cache for each layer that computes its keys and values; the KV-shared
-    layers reuse those of earlier layers."""
+    """A cache for each layer before the KV-shared ones, which reuse earlier caches."""
     first_kv_shared = args.num_hidden_layers - args.num_kv_shared_layers
     caches = []
     for i in range(first_kv_shared):

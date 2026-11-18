@@ -10,7 +10,7 @@ from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.distributed import PipelineMixin
 from mlx_lm.models.deepseek_v3.layers import DeepseekV3MLP
 from mlx_lm.models.deepseek_v3.model import DeepseekV3Model
-from mlx_lm.models.ministral3.layers import _get_llama_4_attn_scale
+from mlx_lm.models.ministral3.layers import get_llama_4_attn_scale
 from mlx_lm.models.mistral4 import checkpoint
 from mlx_lm.models.mistral4.config import ModelArgs
 from mlx_lm.models.mistral4.layers import Mistral4DecoderLayer
@@ -51,7 +51,7 @@ class Mistral4Model(DeepseekV3Model, PipelineMixin, nn.Module):
         # "causal" suits prefill; at L == 1 it is None, which decode wants.
         mask = create_attention_mask(h, cache[0])
 
-        attn_scale = _get_llama_4_attn_scale(
+        attn_scale = get_llama_4_attn_scale(
             h.shape[1],
             offset,
             self.args.rope_parameters["llama_4_scaling_beta"],

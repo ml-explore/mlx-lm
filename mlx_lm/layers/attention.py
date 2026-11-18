@@ -215,6 +215,9 @@ class QuantizedMultiLinear(nn.Module):
         )
 
 
+# Sparse prefill for DeepSeek sparse attention (DSA) models (deepseek_v32, glm_moe_dsa):
+# attention over each query's top-k keys from the indexer.
+
 SPARSE_QUERY_BLOCK = 1024
 
 

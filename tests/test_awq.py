@@ -59,9 +59,8 @@ class TestAWQ(unittest.TestCase):
         model = ministral3.Model(ministral3.ModelArgs.from_dict(ministral3_config()))
         attn = model.model.layers[0].self_attn
         x = mx.random.normal((1, 5, 64))
-        expected = ministral3.layers._get_llama_4_attn_scale(5, 0, 0.5, 512).astype(
-            x.dtype
-        )
+        expected = ministral3.layers.get_llama_4_attn_scale(5, 0, 0.5, 512)
+        expected = expected.astype(x.dtype)
         self.assertTrue(mx.allclose(attn(x), attn(x, expected), atol=1e-6).item())
 
     def test_ministral3_awq_quantize(self):
@@ -71,8 +70,7 @@ class TestAWQ(unittest.TestCase):
         self._assert_quantized(model, language_model="model")
 
     def test_mistral3_awq_quantize(self):
-        # The wrapper's language model is at model.language_model, and it is
-        # either a llama or a ministral3 depending on text_config.
+        # The language model is a llama or a ministral3, by text_config.
         for model_type in ["mistral3", "llava"]:
             for text_config in [llama_config(), ministral3_config()]:
                 inner = text_config["model_type"]

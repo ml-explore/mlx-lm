@@ -68,6 +68,7 @@ class Attention(nn.Module):
         self.n_kv_heads = n_kv_heads = args.num_key_value_heads
         self.head_dim = head_dim = args.head_dim
         self.gating = args.gating
+        self.gate_per_element = args.gating == "per-element"
 
         layer_type = args.layer_types[layer_idx]
         self.use_sliding = layer_type == "sliding_attention"
@@ -83,8 +84,10 @@ class Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=args.rms_norm_eps)
 
-        # Optional per-head attention output gating (softplus).
-        if self.gating:
+        # Optional attention output gating (softplus).
+        if self.gate_per_element:
+            self.g_proj = nn.Linear(dim, n_heads * head_dim, bias=False)
+        elif self.gating:
             self.g_proj = nn.Linear(dim, n_heads, bias=False)
 
         self.rope = _layer_rope(args, layer_type)
@@ -121,7 +124,10 @@ class Attention(nn.Module):
 
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
-        if self.gating:
+        if self.gate_per_element:
+            gate = nn.softplus(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
+            output = output * gate
+        elif self.gating:
             # gate: [B, L, n_heads]; broadcast across head_dim.
             gate = nn.softplus(self.g_proj(x).astype(mx.float32)).astype(output.dtype)
             output = output.reshape(B, L, self.n_heads, self.head_dim)

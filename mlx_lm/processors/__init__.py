@@ -1,20 +1,22 @@
 # Copyright © 2026 Apple Inc.
 
 import importlib
-from typing import Any, Protocol, Sequence
+from collections.abc import Sequence
+from typing import Any, Protocol
 
 from mlx_lm.utils import model_package
 
 __all__ = [
+    "ENCODER_CONFIGS",
+    "PROCESSORS",
     "Processor",
     "load_processor",
 ]
 
-# The model packages with a processor.
 PROCESSORS = ("muse_spark",)
 
-# The configurations of the encoders. A checkpoint converted without its
-# encoders has none, and takes only text.
+# A checkpoint converted without its encoders has none of these, and takes
+# only text.
 ENCODER_CONFIGS = ("vision_config", "audio_config")
 
 

@@ -24,7 +24,10 @@ class ModelArgs(BaseModelArgs):
     rotary_pct: float
     use_parallel_residual: bool = True
     num_key_value_heads: int = None
+    intermediate_size: int | None = None
 
     def __post_init__(self):
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
+        if self.intermediate_size is None:
+            self.intermediate_size = 4 * self.hidden_size

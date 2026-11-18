@@ -1,6 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-
 __all__ = [
     "sanitize",
     "sanitize_language_model",
@@ -8,8 +7,7 @@ __all__ = [
 
 
 def sanitize_language_model(language_model, weights, prefix):
-    """Sanitize the language model's weights, named from prefix: "model." in the
-    text model, "model.language_model." in a multimodal one."""
+    """Sanitize the language model's weights, whose names start with prefix."""
     sanitized_weights = {}
     for name, param in weights.items():
         if "conv.weight" in name:

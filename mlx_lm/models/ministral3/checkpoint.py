@@ -12,7 +12,9 @@ __all__ = [
 ]
 
 
-def _use_fp8_linears(module, weights, prefix):
+def _use_fp8_linears(
+    module: nn.Module, weights: dict[str, mx.array], prefix: str
+) -> None:
     """Swap the linear layers that have an fp8 output scale for Fp8Linear."""
     fp8_modules = []
     for p, m in module.named_modules():
@@ -68,8 +70,7 @@ def _fp8_as_mxfp8(weights):
 
 
 def sanitize_language_model(language_model, weights, prefix):
-    """Sanitize the language model's weights, named from prefix: "model." in the
-    text model, "model.language_model." in a multimodal one."""
+    """Sanitize the language model's weights, whose names start with prefix."""
     # Remove unused precomputed rotary freqs
     weights = {
         k: v for k, v in weights.items() if "self_attn.rotary_emb.inv_freq" not in k

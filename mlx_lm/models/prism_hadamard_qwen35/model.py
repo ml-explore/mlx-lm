@@ -5,6 +5,7 @@ import mlx.nn as nn
 from mlx.utils import tree_unflatten
 
 from mlx_lm.models import qwen3_5
+from mlx_lm.models.checkpoint import from_text_layout
 from mlx_lm.models.prism_hadamard_qwen35.config import ModelArgs
 from mlx_lm.models.prism_hadamard_qwen35.layers import (
     HadamardQuantizedEmbedding,
@@ -16,13 +17,6 @@ __all__ = [
 ]
 
 
-def _model_path(path: str) -> str:
-    """A path of the packs, which name the modules as qwen3_5's text model did."""
-    if path.startswith("model."):
-        return "model.language_model." + path.removeprefix("model.")
-    return path
-
-
 class Model(qwen3_5.Model):
     def __init__(self, args: ModelArgs):
         super().__init__(args)
@@ -30,7 +24,8 @@ class Model(qwen3_5.Model):
         replacements = []
         seen = set()
         for record in args.modules:
-            path = _model_path(record["path"])
+            # The packs name the modules as qwen3_5's text model did.
+            path = from_text_layout(record["path"])
             if path in seen:
                 raise ValueError(f"Duplicate packed module: {path}")
             seen.add(path)
@@ -53,15 +48,12 @@ class Model(qwen3_5.Model):
         self.update_modules(tree_unflatten(replacements))
 
     def sanitize(self, weights):
-        if self.args.schema_version == 1:
-            # The text-only packs name the weights as qwen3_5's text model did.
-            weights = {f"language_model.{k}": v for k, v in weights.items()}
         weights = super().sanitize(weights)
         bad = []
         for record in self.args.modules:
             if not record["block"]:
                 continue
-            key = f"{_model_path(record['path'])}.signs"
+            key = f"{from_text_layout(record['path'])}.signs"
             if key not in weights:
                 raise ValueError(f"Missing Hadamard sign vector: {key}")
             signs = weights[key]

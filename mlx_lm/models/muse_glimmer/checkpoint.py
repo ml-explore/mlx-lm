@@ -6,7 +6,7 @@ __all__ = [
     "sanitize",
 ]
 
-# This is a text-only port.
+# Only the language model runs here.
 _ENCODERS = ("vision_tower", "vision_adapter", "vision_projection")
 
 

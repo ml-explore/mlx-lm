@@ -13,8 +13,8 @@ from mlx_lm.models.deepseek_v41.config import ModelArgs
 from mlx_lm.models.deepseek_v41.layers import (
     DecoderLayer,
     LayerCache,
-    _append,
-    _collapse,
+    append,
+    collapse,
 )
 
 __all__ = [
@@ -196,7 +196,7 @@ class TextModel(PipelineMixin, nn.Module):
             streams, pre_mix = mx.depends([streams, pre_mix], sent)
             # Prefill only evaluates the cache, which must still send.
             cache[-1].window = mx.depends(cache[-1].window, sent)
-        out = _collapse(streams, pre_mix)
+        out = collapse(streams, pre_mix)
         if size > 1:
             # Rank 0 runs the last layers, and every rank needs its output.
             out = mx.distributed.all_gather(out)[:batch]
@@ -227,7 +227,7 @@ class TextModel(PipelineMixin, nn.Module):
                 # The first layer never writes this field, so it keeps the
                 # entries of the source in the stage before.
                 if part.shape[1]:
-                    setattr(cache, key, _append(getattr(cache, key), part))
+                    setattr(cache, key, append(getattr(cache, key), part))
                 shared[key] = getattr(cache, key)
             elif key == "candidates":
                 keys = _index_keys(self.args, self._shared_in[key], start_pos + length)
