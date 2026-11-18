@@ -1,4 +1,4 @@
-# Copyright © 2025 Apple Inc.
+# Copyright © 2026 Apple Inc.
 
 from typing import Optional, Tuple
 
@@ -140,7 +140,7 @@ def ssm_attn(
         dt_bias: Bias for time deltas of shape (num_heads,).
         time_step_limit: Minimum and maximum value for time deltas.
         mask: Optional multiplicative mask.
-        lengths: Optional lenghts of sequences, assumed to be the full length if unspecified.
+        lengths: Optional lengths of sequences, assumed to be the full length if unspecified.
         step: Step size for processing x.
 
     Code modified from
@@ -153,6 +153,7 @@ def ssm_attn(
     dt = compute_dt(dt, dt_bias, time_step_limit)
     repeats = h // g
     A = -mx.exp(A_log).astype(dt.dtype)
+
     dtA = dt * A.reshape(1, 1, -1)
     if mask is not None:
         dtA = dtA * mask[..., None]

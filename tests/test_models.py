@@ -2,8 +2,11 @@
 
 import copy
 import importlib
+import json
 import math
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import mlx.core as mx
@@ -11,9 +14,10 @@ import mlx.nn as nn
 import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
-from mlx_lm.models import rope_utils
+from mlx_lm.models import mamba3, rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
 from mlx_lm.models.cache import (
+    ArraysCache,
     BatchKVCache,
     KVCache,
     RotatingKVCache,
@@ -25,9 +29,163 @@ from mlx_lm.models.gated_delta import (
     gated_delta_update,
 )
 from mlx_lm.models.ssm import ssm_attn, ssm_update
+from mlx_lm.utils import _get_classes, load_config
 
 
 class TestModels(unittest.TestCase):
+    def test_mamba3_native_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / "config.json").write_text(
+                json.dumps({"ssm_cfg": {"layer": "Mamba3", "is_mimo": False}})
+            )
+            config = load_config(path)
+            self.assertEqual(config["model_type"], "mamba3")
+            self.assertFalse(mamba3.ModelArgs.from_dict(config).is_mimo)
+
+    def _make_mamba3_model(self, rank=2):
+        mx.random.seed(7)
+        return mamba3.Model(
+            mamba3.ModelArgs(
+                vocab_size=32,
+                d_model=16,
+                n_layer=2,
+                d_state=8,
+                headdim=8,
+                mimo_rank=rank,
+            )
+        )
+
+    def test_mamba3_routing(self):
+        for config in [
+            {"model_type": "mamba3", "architectures": ["Mamba3LMModel"]},
+            {"model_type": "mamba3_custom"},
+            {"model_type": "mamba3"},
+        ]:
+            self.assertEqual(_get_classes(config), (mamba3.Model, mamba3.ModelArgs))
+
+    def test_mamba3_rotary_pairs(self):
+        x = mx.arange(8, dtype=mx.float32).reshape(1, 1, 1, 8)
+        angle = mx.full((1, 1, 2), mx.pi / 2)
+        np.testing.assert_allclose(
+            np.array(mamba3.rotate_bc(x, angle)).ravel(),
+            [-4, -5, 2, 3, 0, 1, 6, 7],
+            atol=1e-6,
+        )
+
+    def test_mamba3_cached_decode(self):
+        for rank in (1, 2, 4):
+            with self.subTest(rank=rank):
+                model = self._make_mamba3_model(rank)
+                tokens = mx.array([[1, 2, 3, 4, 5, 6, 7]])
+                expected = model(tokens)
+                cache = model.make_cache()
+                parts = [model(tokens[:, :3], cache), model(tokens[:, 3:5], cache)]
+                parts.extend(model(tokens[:, i : i + 1], cache) for i in (5, 6))
+                np.testing.assert_allclose(
+                    np.array(mx.concatenate(parts, 1)),
+                    np.array(expected),
+                    atol=2e-5,
+                    rtol=2e-5,
+                )
+
+    def test_mamba3_padding(self):
+        model = self._make_mamba3_model()
+        tokens = mx.array([[0, 0, 1, 2, 3], [4, 5, 6, 0, 0]])
+        cache = [ArraysCache(3, left_padding=[2, 0]) for _ in model.layers]
+        for c in cache:
+            c.prepare(lengths=[5, 3])
+        actual = model(tokens, cache)
+        for row, start, end in [(0, 2, 5), (1, 0, 3)]:
+            single = model.make_cache()
+            expected = model(tokens[row : row + 1, start:end], single)
+            np.testing.assert_allclose(
+                np.array(actual[row : row + 1, start:end]),
+                np.array(expected),
+                atol=2e-5,
+                rtol=2e-5,
+            )
+            for a, b in zip(cache, single):
+                for i in range(3):
+                    np.testing.assert_allclose(
+                        np.array(a[i][row : row + 1]),
+                        np.array(b[i]),
+                        atol=2e-5,
+                        rtol=2e-5,
+                    )
+
+    def test_mamba3_quantization(self):
+        model = mamba3.Model(
+            mamba3.ModelArgs(
+                vocab_size=32, d_model=32, n_layer=1, d_state=8, headdim=16
+            )
+        )
+        nn.quantize(model, group_size=32, bits=4)
+        output = model(mx.array([[1, 2, 3]]), model.make_cache())
+        self.assertEqual(output.shape, (1, 3, 32))
+        self.assertTrue(mx.all(mx.isfinite(output)).item())
+
+    def _check_mamba3_variant(self, is_mimo):
+        for out_norm in (False, True):
+            with self.subTest(is_mimo=is_mimo, out_norm=out_norm):
+                args = mamba3.ModelArgs(
+                    vocab_size=31,
+                    d_model=32,
+                    n_layer=2,
+                    d_intermediate=64,
+                    ssm_cfg={
+                        "layer": "Mamba3",
+                        "is_mimo": is_mimo,
+                        "mimo_rank": 2,
+                        "d_state": 8,
+                        "headdim": 16,
+                        "is_outproj_norm": out_norm,
+                    },
+                )
+                model = mamba3.Model(args)
+                self.assertEqual(args.mimo_rank, 2 if is_mimo else 1)
+                self.assertEqual(hasattr(model.layers[0].mixer, "mimo_x"), is_mimo)
+                tokens = mx.array([[1, 2, 3, 4, 5]])
+                expected = model(tokens)
+                cache = model.make_cache()
+                actual = mx.concatenate(
+                    [model(tokens[:, :2], cache), model(tokens[:, 2:], cache)], 1
+                )
+                self.assertEqual(actual.shape, (1, 5, 32))
+                np.testing.assert_allclose(
+                    np.array(actual), np.array(expected), atol=2e-5, rtol=2e-5
+                )
+
+    def test_mamba3_siso(self):
+        self._check_mamba3_variant(False)
+
+    def test_mamba3_mimo(self):
+        self._check_mamba3_variant(True)
+
+    def test_mamba3_siso_rotary_pairs(self):
+        x = mx.arange(8, dtype=mx.float32).reshape(1, 1, 1, 8)
+        angle = mx.full((1, 1, 2), mx.pi / 2)
+        np.testing.assert_allclose(
+            np.array(mamba3.rotate_bc(x, angle, False)).ravel(),
+            [-1, 0, -3, 2, 4, 5, 6, 7],
+            atol=1e-6,
+        )
+
+    def test_mamba3_sanitize(self):
+        model = self._make_mamba3_model()
+        weights = {
+            "embedding.weight": model.backbone.embedding.weight,
+            "lm_head.weight": model.lm_head.weight,
+        }
+        converted = model.sanitize(weights)
+        self.assertIn("backbone.embedding.weight", converted)
+        self.assertEqual(set(model.sanitize(converted)), set(converted))
+
+    def test_mamba3_invalid_dimensions(self):
+        for config in [{"mimo_rank": 0}, {"headdim": 7}, {"d_state": 6}]:
+            with self.assertRaises(ValueError):
+                mamba3.ModelArgs(**config)
+
     def test_kv_cache(self):
         cache = KVCache()
 
@@ -387,9 +545,7 @@ class TestModels(unittest.TestCase):
             # Leave packed integer weights alone
             model.update(
                 tree_map(
-                    lambda p: (
-                        p.astype(t) if mx.issubdtype(p.dtype, mx.floating) else p
-                    ),
+                    lambda p: p.astype(t) if mx.issubdtype(p.dtype, mx.floating) else p,
                     model.parameters(),
                 )
             )
