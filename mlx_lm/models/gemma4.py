@@ -81,8 +81,16 @@ class Model(nn.Module):
         return self.language_model.sanitize(new_weights)
 
     @property
+    def model(self):
+        # sharded_load checks model.model.pipeline
+        return self.language_model.model
+
+    def shard(self, group=None):
+        self.language_model.shard(group)
+
+    @property
     def layers(self):
-        return self.language_model.layers
+        return self.language_model.model.pipeline_layers
 
     @property
     def quant_predicate(self):
