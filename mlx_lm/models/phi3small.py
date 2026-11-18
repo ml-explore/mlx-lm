@@ -143,7 +143,14 @@ class Attention(nn.Module):
         # )
 
         if mask is not None:
-            scores = scores + mask
+            if mask.ndim == 4:
+                mask = mask[:, :, None]
+            if mask.dtype == mx.bool_:
+                scores = mx.where(
+                    mask, scores, mx.array(mx.finfo(scores.dtype).min, scores.dtype)
+                )
+            else:
+                scores = scores + mask
         scores = scores + mx.where(
             dense_mask, mx.array(0, scores.dtype), mx.array(-float("inf"), scores.dtype)
         )
