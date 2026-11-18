@@ -218,39 +218,76 @@ class Model(nn.Module):
         return self.lm_head(self.model(inputs, cache))
 
     def sanitize(self, weights):
+        # Idempotence guard — stay first so a re-run is a no-op.
         if any("gate_proj.weight" in k for k in weights.keys()):
-            return weights  # already sanitized
+            return weights
+
+        # Layout A (MXFP4 release): keys end in _blocks / _scales.
+        # Layout B (older transformers BF16): gate_up_proj shape (E, 2F, H).
+        # Layout C (current transformers BF16): gate_up_proj shape (E, H, 2F),
+        #     interleaved on the last dim. Distinguished by shape against
+        #     config.intermediate_size (needed for the 20b model where H == F).
+        is_mxfp4 = any(k.endswith("_blocks") for k in weights)
+        two_f = 2 * self.args.intermediate_size
+        layout_c = False
+        if not is_mxfp4:
+            for k, v in weights.items():
+                if k.endswith("experts.gate_up_proj"):
+                    layout_c = v.shape[-1] == two_f
+                    break
 
         new_weights = {}
         for k, v in weights.items():
             if "gate_up_proj" in k and "bias" not in k:
                 if "_blocks" in k:
+                    # Layout A weight — preserved bit-for-bit.
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
-                if "_scales" in k:
+                    gate = mx.contiguous(v[..., ::2, :])
+                    up = mx.contiguous(v[..., 1::2, :])
+                elif "_scales" in k:
+                    # Layout A scales — preserved bit-for-bit.
                     k = k.replace("_scales", ".scales")
-                new_weights[k.replace("gate_up_proj", "gate_proj")] = mx.contiguous(
-                    v[..., ::2, :]
-                )
-                new_weights[k.replace("gate_up_proj", "up_proj")] = mx.contiguous(
-                    v[..., 1::2, :]
-                )
+                    gate = mx.contiguous(v[..., ::2, :])
+                    up = mx.contiguous(v[..., 1::2, :])
+                elif layout_c:
+                    # Layout C — split on dim -1 (interleaved), then
+                    # transpose (E, H, F) -> (E, F, H) for SwitchLinear.
+                    k = k + ".weight"
+                    gate = mx.contiguous(v[..., ::2].transpose(0, 2, 1))
+                    up = mx.contiguous(v[..., 1::2].transpose(0, 2, 1))
+                else:
+                    # Layout B — split on dim -2, already (E, F, H).
+                    k = k + ".weight"
+                    gate = mx.contiguous(v[..., ::2, :])
+                    up = mx.contiguous(v[..., 1::2, :])
+                new_weights[k.replace("gate_up_proj", "gate_proj")] = gate
+                new_weights[k.replace("gate_up_proj", "up_proj")] = up
+
             elif "down_proj" in k and "bias" not in k:
                 if "_blocks" in k:
                     v = v.view(mx.uint32).flatten(-2)
                     k = k.replace("_blocks", ".weight")
-                if "_scales" in k:
+                    new_weights[k] = v
+                elif "_scales" in k:
                     k = k.replace("_scales", ".scales")
-                new_weights[k] = v
+                    new_weights[k] = v
+                else:
+                    # BF16: on-disk (E, F, H) -> SwitchLinear (E, H, F).
+                    new_weights[k + ".weight"] = mx.contiguous(v.transpose(0, 2, 1))
+
             elif "gate_up_proj_bias" in k:
+                # Bias is 1-D over 2F, interleaved on last dim; same for B & C.
                 new_weights[k.replace("gate_up_proj_bias", "gate_proj.bias")] = (
                     mx.contiguous(v[..., ::2])
                 )
                 new_weights[k.replace("gate_up_proj_bias", "up_proj.bias")] = (
                     mx.contiguous(v[..., 1::2])
                 )
+
             elif "down_proj_bias" in k:
                 new_weights[k.replace("down_proj_bias", "down_proj.bias")] = v
+
             else:
                 new_weights[k] = v
 
