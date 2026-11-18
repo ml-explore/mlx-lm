@@ -1,7 +1,13 @@
 # Copyright © 2026 Apple Inc.
 
+import atexit
 import dataclasses
+import json
 import logging
+import os
+import shutil
+import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -91,6 +97,50 @@ class Metrics:
             metrics.append(("valid_loss", self.valid_loss))
             metrics.append(("valid_ppl", self.valid_ppl))
         return metrics
+
+
+class Temperature:
+    """GPU temperature (C) of this machine, read from `macmon pipe`."""
+
+    fields = ("gpu_temp",)
+
+    def __init__(self, interval_ms=1000):
+        self.samples = []
+        # Ranks that mlx.launch starts over ssh do not have Homebrew on PATH.
+        path = os.pathsep.join(
+            [os.environ.get("PATH", os.defpath), "/opt/homebrew/bin"]
+        )
+        macmon = shutil.which("macmon", path=path)
+        if macmon is None:
+            logging.warning("macmon not found, temperature is not logged")
+            return
+        proc = subprocess.Popen(
+            [macmon, "pipe", "-i", str(interval_ms)], stdout=subprocess.PIPE, text=True
+        )
+        atexit.register(proc.terminate)
+        threading.Thread(target=self._read, args=(proc.stdout,), daemon=True).start()
+
+    def _read(self, lines):
+        for line in lines:
+            temp = json.loads(line)["temp"]
+            self.samples.append((temp["gpu_temp_avg"],))
+
+    def report(self, group):
+        """Mean of each rank's samples since the last report.
+
+        This is a collective, so every rank must call it.
+        """
+        samples, self.samples = self.samples, []
+        local = (
+            np.mean(samples, axis=0) if samples else np.full(len(self.fields), np.nan)
+        )
+        rows = group.all_gather(mx.array(local, dtype=mx.float32))
+        return [
+            (f"{name}/rank{rank}", value)
+            for rank, row in enumerate(rows.reshape(group.size, -1).tolist())
+            for name, value in zip(self.fields, row)
+            if not np.isnan(value)
+        ]
 
 
 _wandb = None  # the module, once init_wandb has opened a run
