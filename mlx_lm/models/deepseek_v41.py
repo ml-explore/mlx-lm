@@ -13,7 +13,7 @@ from .activations import swiglu
 from .base import BaseModelArgs
 from .pipeline import PipelineMixin
 from .rope_utils import YarnRoPE
-from .switch_layers import SwitchGLU, SwitchLinear
+from .switch_layers import SwitchGLU, SwitchLinear, shard_switch_linear
 
 
 @dataclass
@@ -1097,10 +1097,13 @@ class Model(nn.Module):
             attn.sinks = attn.sinks[rank * attn.num_heads : (rank + 1) * attn.num_heads]
 
             layer.mlp.sharding_group = group
-            for mlp in (layer.mlp.experts.switch_mlp, layer.mlp.shared_experts):
-                shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
-                shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
-                shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
+            for mlp, shard_fn in (
+                (layer.mlp.experts.switch_mlp, shard_switch_linear),
+                (layer.mlp.shared_experts, shard_inplace),
+            ):
+                shard_fn(mlp.gate_proj, "all-to-sharded", group=group)
+                shard_fn(mlp.up_proj, "all-to-sharded", group=group)
+                shard_fn(mlp.down_proj, "sharded-to-all", group=group)
 
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         """Rename the checkpoint keys and keep the fp8/fp4 weights packed."""

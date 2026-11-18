@@ -6,14 +6,14 @@ from typing import Any, Dict, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.nn.layers.distributed import shard_linear, sum_gradients
 
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import CacheList, KVCache
 from .mla import MultiLinear
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, shard_switch_linear
 
 
 @dataclass
@@ -491,6 +491,12 @@ class Model(nn.Module):
                 )
 
             layer.mlp.sharding_group = group
-            shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+            shard_switch_linear(
+                layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+            )
+            shard_switch_linear(
+                layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+            )
+            shard_switch_linear(
+                layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+            )

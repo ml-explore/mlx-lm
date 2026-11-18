@@ -12,7 +12,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .cache import CacheList, KVCache
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, shard_switch_linear
 
 
 class GemmaRMSNorm(nn.Module):
@@ -581,10 +581,13 @@ class Model(nn.Module):
             if layer.is_moe:
                 moe = layer.block_sparse_moe
                 # In place, so the block aggregates both experts with one sum.
-                for mlp in (moe.switch_mlp, moe.shared_experts):
-                    shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
-                    shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
-                    shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
+                for mlp, shard_fn in (
+                    (moe.switch_mlp, shard_switch_linear),
+                    (moe.shared_experts, shard_inplace),
+                ):
+                    shard_fn(mlp.gate_proj, "all-to-sharded", group=group)
+                    shard_fn(mlp.up_proj, "all-to-sharded", group=group)
+                    shard_fn(mlp.down_proj, "sharded-to-all", group=group)
                 moe.sharding_group = group
             else:
                 mlp = layer.mlp

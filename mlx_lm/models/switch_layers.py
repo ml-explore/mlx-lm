@@ -4,8 +4,25 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.nn.layers.distributed import shard_inplace
 
 from .activations import swiglu
+
+
+def shard_switch_linear(module, sharding, *, group=None):
+    """Shard expert features in-place while keeping per-expert scales."""
+    if sharding not in ("all-to-sharded", "sharded-to-all"):
+        raise ValueError(f"Unsupported switch linear sharding: {sharding}")
+
+    def predicate(path, weight):
+        # Tensor parallelism keeps all experts on each rank.
+        if path == "global_scale":
+            return None
+        if sharding == "all-to-sharded":
+            return -1 if path == "bias" else -2
+        return None if path == "bias" else -1
+
+    shard_inplace(module, predicate, group=group)
 
 
 def _gather_sort(x, indices):

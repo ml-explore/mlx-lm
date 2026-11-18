@@ -21,6 +21,7 @@ from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
 from .qwen3_next import Qwen3NextSparseMoeBlock as SparseMoeBlock
+from .switch_layers import shard_switch_linear
 
 
 @dataclass
@@ -558,13 +559,13 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 

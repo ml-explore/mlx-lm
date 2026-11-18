@@ -11,7 +11,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
 from .activations import swiglu
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .pipeline import PipelineMixin
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, shard_switch_linear
 
 
 @dataclass
@@ -491,13 +491,13 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 

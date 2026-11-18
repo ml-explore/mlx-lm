@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+import copy
 import importlib
 import unittest
 
@@ -53,6 +54,94 @@ class Stage(PipelineMixin):
 
 
 class TestModelParallel(unittest.TestCase):
+
+    def test_shard_quantized_experts(self):
+        args = qwen3_moe.ModelArgs(
+            model_type="qwen3_moe",
+            hidden_size=128,
+            num_hidden_layers=1,
+            intermediate_size=128,
+            num_attention_heads=4,
+            num_key_value_heads=4,
+            head_dim=32,
+            num_experts=4,
+            num_experts_per_tok=2,
+            decoder_sparse_step=1,
+            mlp_only_layers=[],
+            moe_intermediate_size=128,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+            rope_theta=10000.0,
+            tie_word_embeddings=False,
+            max_position_embeddings=64,
+            norm_topk_prob=True,
+        )
+        mx.random.seed(0)
+        x = mx.random.normal((1, 1, 1, 128))
+        indices = mx.array([3, 1, 0, 2])
+        projections = ("gate_proj", "up_proj", "down_proj")
+        for mode, global_scale in [
+            ("affine", False),
+            ("nvfp4", False),
+            ("nvfp4", True),
+        ]:
+            model = qwen3_moe.Model(args)
+            experts = model.model.layers[0].mlp.switch_mlp
+            for name in projections:
+                projection = getattr(experts, name)
+                # Give each expert a different tensor scale.
+                projection.weight *= mx.array([1.0, 2.0, 4.0, 8.0])[:, None, None]
+                setattr(
+                    experts,
+                    name,
+                    projection.to_quantized(
+                        group_size=16 if mode == "nvfp4" else 32,
+                        bits=4,
+                        mode=mode,
+                        global_scale=global_scale,
+                    ),
+                )
+
+            for size in (1, 2, 4):
+                shards = []
+                for rank in range(size):
+                    shard = copy.deepcopy(model)
+                    shard.shard(Group(rank, size))
+                    shards.append(shard.model.layers[0].mlp.switch_mlp)
+                for name in projections:
+                    with self.subTest(
+                        mode=mode, global_scale=global_scale, size=size, projection=name
+                    ):
+                        projection = getattr(experts, name)
+                        outputs = []
+                        for rank, shard in enumerate(shards):
+                            local = getattr(shard, name)
+                            if global_scale:
+                                self.assertEqual(
+                                    local.global_scale.shape,
+                                    projection.global_scale.shape,
+                                )
+                                self.assertTrue(
+                                    mx.array_equal(
+                                        local.global_scale, projection.global_scale
+                                    )
+                                )
+                            local_x = (
+                                mx.split(x, size, axis=-1)[rank]
+                                if name == "down_proj"
+                                else x
+                            )
+                            outputs.append(local(local_x, indices))
+                        output = (
+                            sum(outputs)
+                            if name == "down_proj"
+                            else mx.concatenate(outputs, axis=-1)
+                        )
+                        self.assertTrue(
+                            mx.allclose(
+                                output, projection(x, indices), rtol=1e-5, atol=1e-5
+                            )
+                        )
 
     def test_shard(self):
         test_configs = [

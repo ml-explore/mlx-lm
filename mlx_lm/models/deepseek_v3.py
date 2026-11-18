@@ -13,7 +13,7 @@ from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_atten
 from .mla import MultiLinear
 from .pipeline import PipelineMixin
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, shard_switch_linear
 
 
 @dataclass
@@ -533,13 +533,13 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 

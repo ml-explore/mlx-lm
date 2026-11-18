@@ -6,13 +6,13 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear, sum_gradients
+from mlx.nn.layers.distributed import shard_linear, sum_gradients
 
 from .activations import SwigluOAI
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, shard_switch_linear
 
 
 @dataclass
@@ -288,10 +288,14 @@ class Model(nn.Module):
                 * (R + 1)
             ]
 
-            shard_inplace(layer.mlp.experts.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.mlp.experts.down_proj, "sharded-to-all", group=group)
+            shard_switch_linear(
+                layer.mlp.experts.gate_proj, "all-to-sharded", group=group
+            )
+            shard_switch_linear(
+                layer.mlp.experts.down_proj, "sharded-to-all", group=group
+            )
             layer.mlp.experts.down_proj.bias /= N
-            shard_inplace(
+            shard_switch_linear(
                 layer.mlp.experts.up_proj, sharding="all-to-sharded", group=group
             )
 

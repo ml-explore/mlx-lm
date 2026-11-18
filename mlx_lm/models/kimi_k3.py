@@ -19,7 +19,7 @@ from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update, normalize_qk
 from .kimi_linear import ShortConv1d
 from .mla import MultiLinear
-from .switch_layers import SwitchGLU
+from .switch_layers import SwitchGLU, shard_switch_linear
 
 
 @mx.compile
@@ -1190,13 +1190,13 @@ class Model(nn.Module):
 
             if isinstance(layer.mlp, KimiK3SparseMoE):
                 layer.mlp.sharding_group = group
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
                 if layer.mlp.shared_experts is not None:
