@@ -12,6 +12,8 @@ Some key features include:
   fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
   with support for quantized models.
 * Distributed inference and fine-tuning with `mx.distributed`
+* [Long-context inference across several Macs](mlx_lm/CONTEXT_SHARDING.md)
+  with the KV cache split between the machines (experimental).
 
 The easiest way to get started is to install the `mlx-lm` package:
 

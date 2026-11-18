@@ -7,7 +7,12 @@ from typing import Any, Dict, Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import (
+    BaseModelArgs,
+    create_attention_mask,
+    image_bidirectional_mask,
+    scaled_dot_product_attention,
+)
 from .cache import KVCache, RotatingKVCache
 from .rope_utils import initialize_rope
 
@@ -182,6 +187,7 @@ class Gemma3Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
         if input_embeddings is not None:
             h = input_embeddings
@@ -192,13 +198,18 @@ class Gemma3Model(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        global_mask = create_attention_mask(h, cache[self.sliding_window_pattern - 1])
+        global_cache = cache[self.sliding_window_pattern - 1]
+        global_mask = image_bidirectional_mask(
+            create_attention_mask(h, global_cache), h, global_cache, None, image_groups
+        )
 
         if self.sliding_window_pattern > 1:
-            sliding_window_mask = create_attention_mask(
+            sliding_window_mask = image_bidirectional_mask(
+                create_attention_mask(h, cache[0], window_size=self.window_size),
                 h,
                 cache[0],
-                window_size=self.window_size,
+                self.window_size,
+                image_groups,
             )
         else:
             sliding_window_mask = None
@@ -226,8 +237,9 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        image_groups: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, input_embeddings)
+        out = self.model(inputs, cache, input_embeddings, image_groups)
         if self.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
