@@ -1,8 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-"""Recurrent layers: the gated delta rule and SSMs. Their Metal kernels are in
-mlx_lm.kernels."""
-
 from functools import partial
 from typing import Optional, Tuple
 

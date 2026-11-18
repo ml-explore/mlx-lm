@@ -950,9 +950,9 @@ class TestModels(unittest.TestCase):
         self.assertIn("model.layers.1.mlp.switch_mlp.gate_proj.weight", hf)
 
     def test_klear_sanitize_sparse_step(self):
-        from mlx_lm.models import Klear
+        from mlx_lm.models import klear
 
-        args = Klear.ModelArgs(
+        args = klear.ModelArgs(
             model_type="Klear",
             hidden_size=32,
             num_hidden_layers=4,
@@ -972,7 +972,7 @@ class TestModels(unittest.TestCase):
             max_position_embeddings=512,
             norm_topk_prob=True,
         )
-        self.check_moe_sanitize(Klear.Model(args), args.num_experts, "experts")
+        self.check_moe_sanitize(klear.Model(args), args.num_experts, "experts")
 
     def ernie4_5_moe_model(self):
         from mlx_lm.models import ernie4_5_moe

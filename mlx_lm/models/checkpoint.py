@@ -1,8 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-"""What the packages' checkpoint.py share: mapping older checkpoint layouts to
-the current one."""
-
 __all__ = [
     "from_llava_layout",
     "from_text_layout",

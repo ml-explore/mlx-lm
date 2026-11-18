@@ -1,7 +1,5 @@
 # Copyright © 2023 Apple Inc.
 
-"""The experts of mixture-of-experts layers."""
-
 import math
 
 import mlx.core as mx

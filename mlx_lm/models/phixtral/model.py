@@ -5,7 +5,8 @@ import mlx.nn as nn
 
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.phixtral import checkpoint
-from mlx_lm.models.phixtral.layers import ModelArgs, OutputHead, TransformerDecoder
+from mlx_lm.models.phixtral.config import ModelArgs
+from mlx_lm.models.phixtral.layers import OutputHead, TransformerDecoder
 
 __all__ = [
     "Model",

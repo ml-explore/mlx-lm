@@ -1,8 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-"""Small building blocks: the activations, ZeroCenteredRMSNorm, BitLinear and
-splice."""
-
 from functools import partial
 
 import mlx.core as mx

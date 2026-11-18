@@ -1,12 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-"""The processors of the models that take images, audio or other inputs.
-
-A model's processor is in its package, as ``processor.py``. It expands the
-placeholders of a prompt, and returns the inputs of the model's encoders, which
-``Model.embed_inputs`` takes as keyword arguments.
-"""
-
 import importlib
 from typing import Any, Protocol, Sequence
 

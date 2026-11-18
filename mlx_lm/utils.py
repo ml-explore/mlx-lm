@@ -61,10 +61,13 @@ MODEL_REMAPPING = {
     "deepseek_v41_text": "deepseek_v41",
     "qwen3_5_moe": "qwen3_5",
     "qwen3_vl_moe": "qwen3_vl",
+    "solar_open": "glm4_moe",
     # Package names cannot have hyphens.
     "lfm2-vl": "lfm2_vl",
     "lille-130m": "lille_130m",
     "nemotron-nas": "nemotron_nas",
+    # Package names are lower case.
+    "Klear": "klear",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {

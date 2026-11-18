@@ -1,46 +1,22 @@
 # Copyright © 2023 Apple Inc.
 
-import inspect
 import math
-from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.attention import scaled_dot_product_attention
 from mlx_lm.layers.moe import SwitchMLP
+from mlx_lm.models.phixtral.config import ModelArgs
 
 __all__ = [
     "Embd",
     "MOE",
-    "ModelArgs",
     "OutputHead",
     "ParallelBlock",
     "RoPEAttention",
     "TransformerDecoder",
 ]
-
-
-@dataclass
-class ModelArgs:
-    model_type: str
-    num_vocab: int = 51200
-    model_dim: int = 2560
-    num_heads: int = 32
-    num_layers: int = 32
-    rotary_dim: int = 32
-    num_experts_per_tok: int = 2
-    num_local_experts: int = 4
-
-    @classmethod
-    def from_dict(cls, params):
-        return cls(
-            **{
-                k: v
-                for k, v in params.items()
-                if k in inspect.signature(cls).parameters
-            }
-        )
 
 
 class Embd(nn.Module):

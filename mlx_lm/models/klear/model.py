@@ -6,9 +6,9 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.layers.attention import create_attention_mask
-from mlx_lm.models.Klear import checkpoint
-from mlx_lm.models.Klear.config import ModelArgs
-from mlx_lm.models.Klear.layers import KlearDecoderLayer
+from mlx_lm.models.klear import checkpoint
+from mlx_lm.models.klear.config import ModelArgs
+from mlx_lm.models.klear.layers import KlearDecoderLayer
 
 __all__ = [
     "KlearModel",

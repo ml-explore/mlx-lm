@@ -1,8 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-"""Attention: scaled dot product attention, its masks, MLA's multi-head linear
-layers and DSA's sparse attention."""
-
 import math
 from typing import Optional
 

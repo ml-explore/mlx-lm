@@ -1,7 +1,5 @@
 # Copyright © 2026 Apple Inc.
 
-"""Muse Spark's fused Metal kernels, and their launch functions."""
-
 import math
 
 import mlx.core as mx

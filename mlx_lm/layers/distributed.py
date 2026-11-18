@@ -1,7 +1,5 @@
 # Copyright © 2025 Apple Inc.
 
-"""Running a model across devices: pipeline and tensor parallelism."""
-
 import mlx.core as mx
 
 __all__ = [
