@@ -2,6 +2,9 @@
 
 """Image processors of multimodal models, one module per model."""
 
+from typing import BinaryIO
+
+import numpy as np
 from mlx import nn
 
 from . import inkling2, muse_spark
@@ -23,3 +26,15 @@ def load_processor(
     name = config.get("processor_type", model_module)
     processor = PROCESSORS.get(name)
     return processor.from_config(config) if processor else None
+
+
+def load_image(
+    processor: inkling2.Processor | muse_spark.Processor, fp: str | BinaryIO
+) -> np.ndarray:
+    """A uint8 (H, W, 3) image for the processor."""
+    if hasattr(processor, "load_image"):
+        return processor.load_image(fp)
+    from PIL import Image
+
+    with Image.open(fp) as image:
+        return np.asarray(image.convert("RGB"))

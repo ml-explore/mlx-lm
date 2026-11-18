@@ -4,12 +4,21 @@
 
 import math
 from dataclasses import dataclass
-from typing import ClassVar, Sequence
+from typing import BinaryIO, ClassVar, Sequence
 
 import mlx.core as mx
 import numpy as np
 
 IMAGE_TOKEN = "<|unused_200054|>"
+
+
+def _composite_alpha(rgba: np.ndarray) -> np.ndarray:
+    height, width, _ = rgba.shape
+    y, x = np.ogrid[:height, :width]
+    background = np.where((x // 8 + y // 8) % 2 == 0, 204, 153)[..., None]
+    rgb, alpha = rgba[..., :3].astype(np.int32), rgba[..., 3:].astype(np.int32)
+    blended = (rgb * alpha + background * (255 - alpha) + 127) // 255
+    return blended.astype(np.uint8)
 
 
 @dataclass(frozen=True)
@@ -28,6 +37,17 @@ class Processor:
         patch_size = vision.get("native_patch_size", 20)
         merge_size = vision.get("adapter_merge_size", 2)
         return cls(block_size=patch_size * merge_size)
+
+    def load_image(self, fp: str | BinaryIO) -> np.ndarray:
+        """A uint8 (H, W, 3) image. As the reference, transparent pixels are
+        put on a gray checkerboard."""
+        from PIL import Image
+
+        with Image.open(fp) as image:
+            if not image.has_transparency_data:
+                return np.asarray(image.convert("RGB"))
+            rgba = np.asarray(image.convert("RGBA"))
+        return _composite_alpha(rgba)
 
     def preprocess_image(self, image: np.ndarray) -> tuple[mx.array, int]:
         assert image.ndim == 3 and image.shape[-1] == 3, "Images must be (H, W, 3)."
