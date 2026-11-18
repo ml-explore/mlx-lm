@@ -8,7 +8,6 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 from mlx.utils import tree_map
 
 from mlx_lm.layers.attention import create_attention_mask
-from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
 from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
@@ -31,7 +30,7 @@ class Qwen3_5TextModel(PipelineMixin, nn.Module):
         self.layers = [
             DecoderLayer(args=args, layer_idx=i) for i in range(args.num_hidden_layers)
         ]
-        self.norm = ZeroCenteredRMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.ssm_idx = 0
         self.fa_idx = args.full_attention_interval - 1
 
@@ -290,12 +289,14 @@ class Model(nn.Module):
                     layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
                 )
                 shard_inplace(
-                    layer.mlp.experts.gate_proj, "all-to-sharded", group=group
+                    layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
                 shard_inplace(
-                    layer.mlp.experts.down_proj, "sharded-to-all", group=group
+                    layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(layer.mlp.experts.up_proj, "all-to-sharded", group=group)
+                shard_inplace(
+                    layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+                )
 
     @property
     def layers(self):

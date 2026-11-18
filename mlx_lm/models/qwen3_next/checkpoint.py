@@ -8,8 +8,8 @@ __all__ = [
     "sanitize",
 ]
 
-# The norms whose weight is an offset from 1.
-_ZERO_CENTERED_NORMS = (
+# The norms that Hugging Face stores as an offset from 1, and this model as 1 + weight.
+_OFFSET_NORMS = (
     ".input_layernorm.weight",
     ".post_attention_layernorm.weight",
     "model.norm.weight",
@@ -18,33 +18,32 @@ _ZERO_CENTERED_NORMS = (
 )
 
 
-def _upgrade_mlx_layout(weights):
-    """A checkpoint that mlx-lm converted with the experts under switch_mlp and the
-    norms storing 1 + weight."""
-    upgraded = {}
+def _from_hugging_face(model, weights):
+    """Stack the experts, which Hugging Face stores one by one, and add 1 to the norms."""
+    for l in range(model.args.num_hidden_layers):
+        prefix = f"model.layers.{l}.mlp"
+        for n in ["up_proj", "down_proj", "gate_proj"]:
+            if f"{prefix}.experts.0.{n}.weight" in weights:
+                to_join = [
+                    weights.pop(f"{prefix}.experts.{e}.{n}.weight")
+                    for e in range(model.args.num_experts)
+                ]
+                weights[f"{prefix}.switch_mlp.{n}.weight"] = mx.stack(to_join)
     for k, v in weights.items():
-        k = k.replace(".switch_mlp.", ".experts.")
-        upgraded[k] = v - 1.0 if k.endswith(_ZERO_CENTERED_NORMS) else v
-    return upgraded
+        if k.endswith(_OFFSET_NORMS):
+            weights[k] = v + 1.0
+    return weights
 
 
 def sanitize(model, weights):
-    if any(".switch_mlp." in k for k in weights):
-        weights = _upgrade_mlx_layout(weights)
     weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
     if model.args.tie_word_embeddings:
         weights.pop("lm_head.weight", None)
 
-    for l in range(model.args.num_hidden_layers):
-        prefix = f"model.layers.{l}.mlp.experts"
-        for n in ["up_proj", "down_proj", "gate_proj"]:
-            if f"{prefix}.0.{n}.weight" in weights:
-                to_join = [
-                    weights.pop(f"{prefix}.{e}.{n}.weight")
-                    for e in range(model.args.num_experts)
-                ]
-                weights[f"{prefix}.{n}.weight"] = mx.stack(to_join)
+    # MLX conversions already have this model's format.
+    if any(".mlp.experts.0." in k for k in weights):
+        weights = _from_hugging_face(model, weights)
 
     for k, v in weights.items():
         if "conv1d.weight" in k and v.shape[-1] != 1:

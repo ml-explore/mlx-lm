@@ -928,18 +928,26 @@ class TestModels(unittest.TestCase):
             head_dim=8,
         )
         model = qwen3_next.Model(args)
-        self.check_moe_sanitize(model, args.num_experts, "experts")
+        self.check_moe_sanitize(model, args.num_experts, "switch_mlp")
 
-        # Converted by an older mlx-lm: switch_mlp, and the norms storing 1 + weight.
+        # An MLX conversion stores the norms as 1 + weight and loads as it is;
+        # Hugging Face's checkpoints, with the experts one by one, store an
+        # offset from 1.
         base = mx.arange(8, dtype=mx.float32)
-        upgraded = model.sanitize(
+        converted = model.sanitize(
             {
                 "model.layers.1.mlp.switch_mlp.gate_proj.weight": mx.zeros((4, 1, 1)),
                 "model.norm.weight": base + 1.0,
             }
         )
-        self.assertIn("model.layers.1.mlp.experts.gate_proj.weight", upgraded)
-        self.assertTrue(mx.array_equal(upgraded["model.norm.weight"], base))
+        self.assertTrue(mx.array_equal(converted["model.norm.weight"], base + 1.0))
+        hf = {"model.norm.weight": base}
+        for e in range(args.num_experts):
+            for n in ("up_proj", "down_proj", "gate_proj"):
+                hf[f"model.layers.1.mlp.experts.{e}.{n}.weight"] = mx.zeros((1, 1))
+        hf = model.sanitize(hf)
+        self.assertTrue(mx.array_equal(hf["model.norm.weight"], base + 1.0))
+        self.assertIn("model.layers.1.mlp.switch_mlp.gate_proj.weight", hf)
 
     def test_klear_sanitize_sparse_step(self):
         from mlx_lm.models import Klear
@@ -1159,7 +1167,8 @@ class TestModels(unittest.TestCase):
         }
         norm_key = "model.language_model.layers.0.input_layernorm.weight"
         conv_key = "model.language_model.layers.0.linear_attn.conv1d.weight"
-        experts = "model.language_model.layers.0.mlp.experts"
+        hf_experts = "model.language_model.layers.0.mlp.experts"
+        switch_mlp = "model.language_model.layers.0.mlp.switch_mlp"
         old_norm_key = "language_model.model.layers.0.input_layernorm.weight"
         old_conv_key = "language_model.model.layers.0.linear_attn.conv1d.weight"
         base = mx.arange(8, dtype=mx.float32)
@@ -1178,29 +1187,33 @@ class TestModels(unittest.TestCase):
             )
             model = module.Model(args)
 
-            # Hugging Face: the norms load as they are, conv1d becomes
-            # channels-last, the fused experts split, and MTP and the vision
-            # encoder go.
+            # Hugging Face: the norms store an offset from 1, conv1d becomes
+            # channels-last, the fused experts split into switch_mlp, and MTP
+            # and the vision encoder go.
             gate_up = mx.arange(2 * 6 * 4, dtype=mx.float32).reshape(2, 6, 4)
             converted = model.sanitize(
                 {
                     norm_key: base,
                     conv_key: mx.zeros((4, 1, 3)),
-                    f"{experts}.gate_up_proj": gate_up,
-                    f"{experts}.down_proj": mx.zeros((2, 4, 3)),
+                    f"{hf_experts}.gate_up_proj": gate_up,
+                    f"{hf_experts}.down_proj": mx.zeros((2, 4, 3)),
                     mtp_key: mx.zeros((1,)),
                     "model.visual.patch_embed.proj.weight": mx.zeros((1,)),
                 }
             )
-            self.assertTrue(mx.array_equal(converted[norm_key], base))
+            self.assertTrue(mx.array_equal(converted[norm_key], base + 1.0))
             self.assertEqual(converted[conv_key].shape, (4, 3, 1))
             self.assertTrue(
-                mx.array_equal(converted[f"{experts}.gate_proj.weight"], gate_up[:, :3])
+                mx.array_equal(
+                    converted[f"{switch_mlp}.gate_proj.weight"], gate_up[:, :3]
+                )
             )
             self.assertTrue(
-                mx.array_equal(converted[f"{experts}.up_proj.weight"], gate_up[:, 3:])
+                mx.array_equal(
+                    converted[f"{switch_mlp}.up_proj.weight"], gate_up[:, 3:]
+                )
             )
-            self.assertIn(f"{experts}.down_proj.weight", converted)
+            self.assertIn(f"{switch_mlp}.down_proj.weight", converted)
             self.assertFalse(
                 any(k.startswith(("mtp.", "model.visual.")) for k in converted)
             )
@@ -1208,10 +1221,10 @@ class TestModels(unittest.TestCase):
             # Converted by this mlx-lm: unchanged.
             again = model.sanitize(dict(converted))
             self.assertEqual(sorted(again), sorted(converted))
-            self.assertTrue(mx.array_equal(again[norm_key], base))
+            self.assertTrue(mx.array_equal(again[norm_key], base + 1.0))
 
             # Converted by an older mlx-lm: the language model under
-            # language_model, switch_mlp, and the norms storing 1 + weight.
+            # language_model.
             old = model.sanitize(
                 {
                     old_norm_key: base + 1.0,
@@ -1226,10 +1239,50 @@ class TestModels(unittest.TestCase):
             self.assertEqual(
                 sorted(old),
                 sorted(
-                    [norm_key, conv_key, f"{experts}.up_proj.weight", "lm_head.weight"]
+                    [
+                        norm_key,
+                        conv_key,
+                        f"{switch_mlp}.up_proj.weight",
+                        "lm_head.weight",
+                    ]
                 ),
             )
-            self.assertTrue(mx.array_equal(old[norm_key], base))
+            self.assertTrue(mx.array_equal(old[norm_key], base + 1.0))
+
+            # Text-only checkpoints have the text model's names: an MLX
+            # conversion,
+            text = model.sanitize(
+                {
+                    "model.layers.0.input_layernorm.weight": base + 1.0,
+                    "model.layers.0.linear_attn.conv1d.weight": mx.zeros((4, 3, 1)),
+                    "model.layers.0.mlp.switch_mlp.up_proj.weight": (
+                        mx.zeros((2, 3, 4))
+                    ),
+                    "lm_head.weight": mx.zeros((32, 8)),
+                }
+            )
+            self.assertEqual(
+                sorted(text),
+                sorted(
+                    [
+                        norm_key,
+                        conv_key,
+                        f"{switch_mlp}.up_proj.weight",
+                        "lm_head.weight",
+                    ]
+                ),
+            )
+            self.assertTrue(mx.array_equal(text[norm_key], base + 1.0))
+
+            # and Hugging Face's.
+            hf_text = model.sanitize(
+                {
+                    "model.layers.0.input_layernorm.weight": base,
+                    "model.layers.0.linear_attn.conv1d.weight": mx.zeros((4, 1, 3)),
+                }
+            )
+            self.assertTrue(mx.array_equal(hf_text[norm_key], base + 1.0))
+            self.assertEqual(hf_text[conv_key].shape, (4, 3, 1))
 
     def _prism_hadamard_packed(self, rows, width, seed):
         # Random 2-bit affine weights that dequantize exactly, and the dense
@@ -1320,14 +1373,6 @@ class TestModels(unittest.TestCase):
             "mlp.down_proj",
         )
 
-        zero_centered_norms = (
-            ".input_layernorm.weight",
-            ".post_attention_layernorm.weight",
-            "language_model.norm.weight",
-            ".q_norm.weight",
-            ".k_norm.weight",
-        )
-
         def text_path(path):
             # The packs name the modules as qwen3_5's text model did.
             return path.replace("model.language_model.", "model.", 1)
@@ -1344,11 +1389,7 @@ class TestModels(unittest.TestCase):
             named = dict(ref.named_modules())
             embed = "model.language_model.embed_tokens"
             paths = [p for p in named if p.endswith(targets) or p in (embed, "lm_head")]
-            # The packs store the norms as 1 + weight, as mlx-lm did.
-            weights = {
-                text_path(k): v + 1.0 if k.endswith(zero_centered_norms) else v
-                for k, v in tree_flatten(ref.parameters())
-            }
+            weights = {text_path(k): v for k, v in tree_flatten(ref.parameters())}
             modules = []
             for seed, path in enumerate(paths):
                 rows, width = named[path].weight.shape
@@ -5821,8 +5862,9 @@ class TestVLSanitize(unittest.TestCase):
                     self.assertEqual(args.text.tie_word_embeddings, tie)
 
     def test_mistral3_layouts(self):
-        # Hugging Face's current layout, and the LLaVA layout of its older
-        # checkpoints and of older MLX conversions. The encoders are dropped.
+        # Hugging Face's current layout, the LLaVA layout of its older
+        # checkpoints and of older MLX conversions, and the text model's layout
+        # of text-only conversions. The encoders are dropped.
         from mlx_lm.models import mistral3
 
         model = mistral3.Model(
@@ -5838,6 +5880,9 @@ class TestVLSanitize(unittest.TestCase):
             else:
                 k = "language_model." + k
             llava[k] = v
+        text = {}
+        for k, v in current.items():
+            text[k.replace("model.language_model.", "model.", 1)] = v
         hf_encoders = {
             "model.vision_tower.patch_conv.weight": None,
             "model.multi_modal_projector.linear_1.weight": None,
@@ -5849,6 +5894,7 @@ class TestVLSanitize(unittest.TestCase):
         for name, weights in (
             ("hf", {**current, **hf_encoders}),
             ("llava", {**llava, **llava_encoders}),
+            ("text", text),
         ):
             with self.subTest(layout=name):
                 self.assertEqual(sorted(model.sanitize(weights)), sorted(current))
