@@ -1,38 +1,18 @@
 # Copyright © 2026 Apple Inc.
 
-"""Models, tool parsers and chat templates from other installed packages.
-
-A package declares each one with an entry point. The name is the one mlx-lm
-looks up: the ``model_type`` of a model, or the name of a tool parser or chat
-template. The value is a module with the same contents as a built-in one:
-
-    [project.entry-points."mlx_lm.models"]
-    acme = "acme_lm.models.acme"
-
-    [project.entry-points."mlx_lm.tool_parsers"]
-    acme = "acme_lm.tool_parsers.acme"
-
-    [project.entry-points."mlx_lm.chat_templates"]
-    acme = "acme_lm.chat_templates.acme"
-
-A built-in module always wins over a plug-in with the same name.
-"""
-
 import functools
 import importlib.util
 import warnings
 from importlib.metadata import EntryPoint, entry_points
+from typing import Literal
 
-__all__ = ["module_name"]
+__all__ = ["Kind", "module_name"]
+
+Kind = Literal["models", "tool_parsers", "chat_templates"]
 
 
-def module_name(kind: str, name: str) -> str:
-    """The module for ``name``: ``mlx_lm.{kind}.{name}``, else a plug-in's.
-
-    Raises:
-        ValueError: If neither exists, or if the plug-in entry points for
-            ``name`` are not valid.
-    """
+def module_name(kind: Kind, name: str) -> str:
+    """The built-in module for ``name``, else the plug-in's; ValueError if none."""
     builtin = f"mlx_lm.{kind}.{name}"
     found = _entry_points(kind).get(name, [])
     if importlib.util.find_spec(builtin) is not None:
@@ -45,12 +25,7 @@ def module_name(kind: str, name: str) -> str:
 
 
 def _plugin_module(group: str, found: list[EntryPoint]) -> str:
-    """The module of the one entry point that gives a name in a group.
-
-    Raises:
-        ValueError: If two packages give the name, or if the entry point names
-            an object, not a module.
-    """
+    """The module of the one valid entry point for a name; ValueError if invalid."""
     ep = found[0]
     if len(found) > 1:
         packages = " and ".join(e.dist.name for e in found)
@@ -64,7 +39,7 @@ def _plugin_module(group: str, found: list[EntryPoint]) -> str:
 
 
 @functools.cache
-def _entry_points(kind: str) -> dict[str, list[EntryPoint]]:
+def _entry_points(kind: Kind) -> dict[str, list[EntryPoint]]:
     """The entry points of the ``mlx_lm.{kind}`` group, by name."""
     found = {}
     for ep in entry_points(group=f"mlx_lm.{kind}"):

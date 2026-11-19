@@ -17,7 +17,7 @@ PROCESSOR = (
     "    def from_config(cls, config):\n"
     "        return cls()\n"
 )
-ACME = {"model_type": "acme", "architectures": ["AcmeForCausalLM"]}
+ACME = {"model_type": "acme"}
 
 
 class TestPlugins(unittest.TestCase):
@@ -28,8 +28,8 @@ class TestPlugins(unittest.TestCase):
             "acme_lm",
             {
                 "mlx_lm.models": {
-                    "AcmeForCausalLM": "acme_lm.models.acme",
-                    "LlamaForCausalLM": "acme_lm.models.llama",
+                    "acme": "acme_lm.models.acme",
+                    "llama": "acme_lm.models.llama",
                 },
                 "mlx_lm.tool_parsers": {"acme": "acme_lm.tool_parsers.acme"},
                 "mlx_lm.chat_templates": {"acme": "acme_lm.chat_templates.acme"},
@@ -78,21 +78,17 @@ class TestPlugins(unittest.TestCase):
         model_class, _ = utils._get_classes(ACME)
         self.assertEqual(model_class.__module__, package)
 
-    def test_replaces_builtin_model(self):
-        config = {"model_type": "llama", "architectures": ["LlamaForCausalLM"]}
-        # assertWarns reads every module in sys.modules, and transformers'
-        # lazy modules import their submodules on that read.
+    def test_builtin_model_wins(self):
+        # assertWarns reads sys.modules, which imports transformers' lazy modules.
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            package = utils.model_package(config)
-        self.assertEqual(package, "acme_lm.models.llama")
+            package = utils.model_package({"model_type": "llama"})
+        self.assertEqual(package, "mlx_lm.models.llama")
         self.assertEqual(len(caught), 1)
 
-    def test_builtin_models_unchanged(self):
-        package = utils.model_package({"model_type": "qwen2"})
-        self.assertEqual(package, "mlx_lm.models.qwen2")
+    def test_unknown_model(self):
         with self.assertRaises(ValueError):
-            utils.model_package({"model_type": "acme"})
+            utils.model_package({"model_type": "unknown"})
 
     def test_processor(self):
         processor = load_processor({**ACME, "vision_config": {"patch_size": 16}})
@@ -104,17 +100,15 @@ class TestPlugins(unittest.TestCase):
             self.assertEqual(name, f"acme_lm.{kind}.acme")
 
     def test_two_packages_give_the_same_name(self):
-        entry_points = {"mlx_lm.models": {"AcmeForCausalLM": "other_lm.acme"}}
-        self.install("other_lm", entry_points, {})
+        self.install("other_lm", {"mlx_lm.models": {"acme": "other_lm.acme"}}, {})
         with self.assertRaises(ValueError):
             utils.model_package(ACME)
 
     def test_entry_point_must_be_a_module(self):
-        entry_points = {"mlx_lm.models": {"OtherForCausalLM": "other_lm.acme:Model"}}
+        entry_points = {"mlx_lm.models": {"other": "other_lm.acme:Model"}}
         self.install("other_lm", entry_points, {})
-        config = {"model_type": "other", "architectures": ["OtherForCausalLM"]}
         with self.assertRaises(ValueError):
-            utils.model_package(config)
+            utils.model_package({"model_type": "other"})
 
 
 if __name__ == "__main__":

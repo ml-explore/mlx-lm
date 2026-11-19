@@ -22,11 +22,8 @@ class Processor(Protocol):
         """The text with the placeholders expanded, and the encoder inputs."""
 
 
-def load_processor(config: dict) -> Processor | None:
-    """The processor of the model of a configuration, or None if it takes only text.
-
-    The processor is the ``processor`` module of the model's package.
-    """
+def load_processor(config: dict[str, Any]) -> Processor | None:
+    """The processor of the model of a configuration, or None if it takes only text."""
     if not any(config.get(key) for key in ENCODER_CONFIGS):
         return None
     if "processor_type" in config:

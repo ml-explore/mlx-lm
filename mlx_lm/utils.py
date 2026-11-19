@@ -41,41 +41,12 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Local imports
-from mlx_lm import plugins
+from mlx_lm import models, plugins
 
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
 
 # Constants
-MODEL_REMAPPING = {
-    "mistral": "llama",
-    "llava": "mistral3",
-    "pixtral": "mistral3",
-    "phi-msft": "phixtral",
-    "falcon_mamba": "mamba",
-    "joyai_llm_flash": "deepseek_v3",
-    "kimi_k2": "deepseek_v3",
-    "qwen2_5_vl": "qwen2_vl",
-    "minimax_m2": "minimax",
-    "iquestcoder": "llama",
-    "xverse": "llama",
-    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
-    "deepseek_v41_text": "deepseek_v41",
-    "qwen3_5_moe": "qwen3_5",
-    "qwen3_vl_moe": "qwen3_vl",
-    "solar_open": "glm4_moe",
-    # Package names cannot have hyphens.
-    "lfm2-vl": "lfm2_vl",
-    "lille-130m": "lille_130m",
-    "nemotron-nas": "nemotron_nas",
-    # Package names are lower case.
-    "Klear": "klear",
-}
-
-MODEL_ARCHITECTURE_REMAPPING = {
-    "BailingMoeV3ForCausalLM": "bailing_moe_v3",
-}
-
 MAX_FILE_SIZE_GB = 5
 
 
@@ -209,30 +180,9 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
-def model_package(config: dict) -> str:
-    """The package of the model of a configuration: built-in, else a plug-in's.
-
-    Raises:
-        ValueError: If no package runs the model.
-    """
-    return plugins.module_name("models", _model_name(config))
-
-
-def _model_name(config: dict) -> str:
-    """The package name of a configuration's model, after the remappings."""
-    for architecture in _architectures(config):
-        if architecture in MODEL_ARCHITECTURE_REMAPPING:
-            return MODEL_ARCHITECTURE_REMAPPING[architecture]
-    model_type = config["model_type"]
-    return MODEL_REMAPPING.get(model_type, model_type)
-
-
-def _architectures(config: dict) -> tuple[str, ...]:
-    """The Hugging Face architectures of a configuration."""
-    architectures = config.get("architectures") or ()
-    if isinstance(architectures, str):
-        return (architectures,)
-    return tuple(architectures)
+def model_package(config: dict[str, Any]) -> str:
+    """The package, built-in or plug-in, that runs a configuration's model."""
+    return plugins.module_name("models", models.package_name(config))
 
 
 def _get_classes(config: dict):
@@ -244,9 +194,6 @@ def _get_classes(config: dict):
 
     Returns:
         A tuple containing the Model class and the ModelArgs class.
-
-    Raises:
-        ValueError: If no package runs the model.
     """
     arch = importlib.import_module(model_package(config))
     return arch.Model, arch.ModelArgs
