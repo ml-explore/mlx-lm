@@ -264,6 +264,34 @@ model, tokenizer = load(
 )
 ```
 
+#### Models from Other Packages
+
+Another installed package can add models, tool parsers and chat templates. It
+declares each one with an entry point in its `pyproject.toml`:
+
+```toml
+[project.entry-points."mlx_lm.models"]
+AcmeForCausalLM = "acme_lm.models.acme"
+
+[project.entry-points."mlx_lm.tool_parsers"]
+acme = "acme_lm.tool_parsers.acme"
+
+[project.entry-points."mlx_lm.chat_templates"]
+acme = "acme_lm.chat_templates.acme"
+```
+
+- The name of a model is an architecture from the `architectures` list in the
+  model's `config.json`. The name of a tool parser or a chat template is the
+  value of `tool_parser_type` or `chat_template_type`.
+- The value is a module with the same contents as a built-in one: a package in
+  `mlx_lm/models`, or a module in `mlx_lm/tool_parsers` or
+  `mlx_lm/chat_templates`.
+- A plug-in replaces a built-in with the same name, and `mlx-lm` shows a
+  warning.
+- Install the package in the same environment as `mlx-lm` (an editable install
+  is sufficient). After you add or change an entry point, install the package
+  again.
+
 ### Large Models
 
 > [!NOTE]

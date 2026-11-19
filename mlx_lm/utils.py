@@ -41,6 +41,8 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Local imports
+from mlx_lm import plugins
+
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
 
@@ -71,7 +73,7 @@ MODEL_REMAPPING = {
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
-    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
+    "BailingMoeV3ForCausalLM": "bailing_moe_v3",
 }
 
 MAX_FILE_SIZE_GB = 5
@@ -208,16 +210,29 @@ def _transform_awq_weights(
 
 
 def model_package(config: dict) -> str:
-    """The package in ``mlx_lm.models`` of the model of a configuration."""
+    """The package of the model of a configuration: built-in, else a plug-in's.
+
+    Raises:
+        ValueError: If no package runs the model.
+    """
+    return plugins.module_name("models", _model_name(config))
+
+
+def _model_name(config: dict) -> str:
+    """The package name of a configuration's model, after the remappings."""
+    for architecture in _architectures(config):
+        if architecture in MODEL_ARCHITECTURE_REMAPPING:
+            return MODEL_ARCHITECTURE_REMAPPING[architecture]
     model_type = config["model_type"]
+    return MODEL_REMAPPING.get(model_type, model_type)
+
+
+def _architectures(config: dict) -> tuple[str, ...]:
+    """The Hugging Face architectures of a configuration."""
     architectures = config.get("architectures") or ()
     if isinstance(architectures, str):
-        architectures = (architectures,)
-    for architecture in architectures:
-        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
-        if remapped is not None:
-            return remapped
-    return MODEL_REMAPPING.get(model_type, model_type)
+        return (architectures,)
+    return tuple(architectures)
 
 
 def _get_classes(config: dict):
@@ -229,14 +244,11 @@ def _get_classes(config: dict):
 
     Returns:
         A tuple containing the Model class and the ModelArgs class.
-    """
-    model_type = model_package(config)
-    try:
-        arch = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported."
-        raise ValueError(msg) from e
 
+    Raises:
+        ValueError: If no package runs the model.
+    """
+    arch = importlib.import_module(model_package(config))
     return arch.Model, arch.ModelArgs
 
 
@@ -652,9 +664,9 @@ def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
     """The TOKENIZER_DEFAULTS of the model package, if any."""
     try:
         package = model_package(load_config(model_path))
-        module = importlib.import_module(f"mlx_lm.models.{package}")
-    except (FileNotFoundError, KeyError, ValueError, ImportError):
+    except (FileNotFoundError, KeyError, ValueError):
         return None
+    module = importlib.import_module(package)
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 

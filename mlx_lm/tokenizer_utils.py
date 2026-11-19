@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from mlx_lm import plugins
+
 
 class StreamingDetokenizer(abc.ABC):
     """The streaming detokenizer interface so that we can detokenize one token at a time.
@@ -749,7 +751,8 @@ def load(
         "chat_template_type", defaults.get("chat_template_type")
     )
     if chat_template_type:
-        module = importlib.import_module(f"mlx_lm.chat_templates.{chat_template_type}")
+        name = plugins.module_name("chat_templates", chat_template_type)
+        module = importlib.import_module(name)
         # A template in the checkpoint replaces only the default template.
         if "chat_template_type" in tokenizer_config or tokenizer.chat_template is None:
             chat_template = module.apply_chat_template
@@ -762,7 +765,8 @@ def load(
         tool_parser_type = _infer_tool_parser(tokenizer)
 
     if tool_parser_type is not None:
-        tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
+        name = plugins.module_name("tool_parsers", tool_parser_type)
+        tool_module = importlib.import_module(name)
         tool_parser = tool_module.parse_tool_call
         tool_call_start = tool_module.tool_call_start
         tool_call_end = tool_module.tool_call_end

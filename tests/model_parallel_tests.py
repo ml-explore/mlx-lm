@@ -164,7 +164,7 @@ class TestModelParallel(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
+                arch = importlib.import_module(model_package(config))
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
@@ -264,7 +264,7 @@ class TestModelParallel(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
+                arch = importlib.import_module(model_package(config))
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
