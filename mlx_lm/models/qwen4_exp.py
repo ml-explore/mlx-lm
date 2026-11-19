@@ -753,6 +753,19 @@ class Model(nn.Module):
                 v = 1.0 + v
             out[k] = v
 
+        # The FP8 checkpoint stores each routed expert alone, in e4m3 with a
+        # scale per block.
+        for k in [k for k in out if k.endswith("mlp.experts.0.down_proj.weight")]:
+            base = k[: -len("experts.0.down_proj.weight")]
+            for proj in ("gate_proj", "up_proj", "down_proj"):
+                keys = [
+                    f"{base}experts.{e}.{proj}.weight"
+                    for e in range(self.args.text.num_experts)
+                ]
+                weight = mx.stack([out.pop(key) for key in keys])
+                scale = mx.stack([out.pop(key + "_scale_inv") for key in keys])
+                out[f"{base}switch_mlp.{proj}.weight"] = _from_fp8(weight, scale)
+
         # Merge the checkpoint's block inject into the mix down.
         for k in [k for k in out if k.endswith("block_inject_weight.weight")]:
             p = k[: -len("block_inject_weight.weight")]
@@ -765,6 +778,11 @@ class Model(nn.Module):
             n = sum(q.startswith(p + "shards.") and q.endswith(".weight") for q in out)
             layer = int(k.split(".layers.")[1].split(".")[0])
             sizes = self.model.layers[layer].ple.ple_embedding.head_vocab_sizes
+            # The FP8 checkpoint stores the table in e4m3 with one scale.
+            if (scale := out.pop(p + "weight_scale", None)) is not None:
+                for i in range(n):
+                    key = f"{p}shards.{i}.weight"
+                    out[key] = _from_fp8(out[key], scale.reshape(1, 1))
             # A quantized table splits its scales and biases by the same rows.
             for name in ("weight", "scales", "biases"):
                 if f"{p}shards.0.{name}" in out:
@@ -825,6 +843,18 @@ def _merge_linears(
             weights[f"{target}.{name}"] = mx.concatenate(
                 [weights.pop(k) for k in keys], axis=-2
             )
+
+
+def _from_fp8(weight: mx.array, scale: mx.array) -> mx.array:
+    """Dequantize an e4m3 `weight` to bfloat16. The last two axes of `scale`
+    tile the last two of `weight` into equal blocks, one scale each."""
+    *lead, rows, cols = weight.shape
+    grid_rows, grid_cols = scale.shape[-2:]
+    blocks = mx.from_fp8(weight, dtype=mx.float32).reshape(
+        *lead, grid_rows, rows // grid_rows, grid_cols, cols // grid_cols
+    )
+    blocks = blocks * scale.astype(mx.float32)[..., :, None, :, None]
+    return blocks.reshape(weight.shape).astype(mx.bfloat16)
 
 
 def _split_rows(shards: list[mx.array], sizes: list[int]) -> list[mx.array]:

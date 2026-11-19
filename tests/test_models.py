@@ -911,6 +911,41 @@ class TestModels(unittest.TestCase):
             for k, v in weights.items():
                 self.assertTrue(mx.array_equal(out[k], v), (pre, k))
 
+        # The FP8 checkpoint stores each routed expert alone, in e4m3 with a scale
+        # per block, and the n-gram table in e4m3 with one scale. The layouts above
+        # cover the HF prefix and norms, so this one keeps the mlx-lm names.
+        def fp8(shape, grid):
+            q = mx.to_fp8(mx.random.normal(shape))
+            scale = mx.random.uniform(0.5, 2.0, (*shape[:-2], *grid))
+            scale = scale.astype(mx.bfloat16)
+            full = mx.repeat(scale.astype(mx.float32), shape[-2] // grid[0], axis=-2)
+            full = mx.repeat(full, shape[-1] // grid[1], axis=-1)
+            values = (mx.from_fp8(q, dtype=mx.float32) * full).astype(mx.bfloat16)
+            return q, scale, values
+
+        params = dict(tree_flatten(model.parameters()))
+        ckpt, expected = dict(params), dict(params)
+        for k in [k for k in params if ".switch_mlp." in k]:
+            del ckpt[k]
+            q, scale, expected[k] = fp8(params[k].shape, (2, 4))
+            for e in range(q.shape[0]):
+                key = k.replace("switch_mlp", f"experts.{e}")
+                ckpt[key], ckpt[key + "_scale_inv"] = q[e], scale[e]
+        p = "model.layers.1.ple.ple_embedding.ngram_embedding."
+        sizes = model.model.layers[1].ple.ple_embedding.head_vocab_sizes
+        for h in range(len(sizes)):
+            del ckpt[f"{p}{h}.weight"]
+        q, scale, table = fp8((sum(sizes), params[p + "0.weight"].shape[1]), (1, 1))
+        ckpt[p + "shard_0.weight"] = q
+        ckpt[p + "weight_scale"] = scale.reshape(1)
+        for h, rows in enumerate(qwen4_exp._split_rows([table], sizes)):
+            expected[f"{p}{h}.weight"] = rows
+        out = model.sanitize(ckpt)
+        self.assertEqual(set(out), set(expected))
+        for k, v in expected.items():
+            self.assertEqual(out[k].dtype, v.dtype, k)
+            self.assertTrue(mx.array_equal(out[k], v), k)
+
         # The checkpoint's n-gram hash constants are checked, then dropped.
         key = "model.layers.1.ple.ple_embedding.layer_multipliers"
         mults = model.model.layers[1].ple.ple_embedding._mults
