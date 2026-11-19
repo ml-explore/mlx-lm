@@ -357,6 +357,46 @@ class TestUtils(unittest.TestCase):
                     (derived_bits, group_size, derived_mode),
                 )
 
+    def test_load_model_with_pipeline_stage_files(self):
+        # A pipeline stage downloads only the files that hold its layers. A
+        # file shared with the previous stage can bring that stage's scales
+        # without the weight they belong to.
+        from mlx_lm.models import llama
+
+        args = llama.ModelArgs(
+            model_type="llama",
+            hidden_size=64,
+            num_hidden_layers=2,
+            intermediate_size=128,
+            num_attention_heads=4,
+            rms_norm_eps=1e-5,
+            vocab_size=64,
+        )
+        model, config = utils.quantize_model(
+            llama.Model(args), dataclasses.asdict(args), group_size=32, bits=4
+        )
+        weights = dict(tree_flatten(model.parameters()))
+        split = "model.layers.0.mlp.down_proj"
+        local = {
+            k: v
+            for k, v in weights.items()
+            if not k.startswith("model.layers.0.") or k.startswith(split + ".")
+        }
+        del local[split + ".weight"]
+
+        with tempfile.TemporaryDirectory(dir=self.test_dir) as mlx_path:
+            mx.save_safetensors(os.path.join(mlx_path, "model.safetensors"), local)
+            utils.save_config(config, os.path.join(mlx_path, "config.json"))
+
+            loaded, _ = utils.load_model(Path(mlx_path), lazy=True, strict=False)
+
+            down_proj = loaded.model.layers[1].mlp.down_proj
+            self.assertTrue(
+                mx.array_equal(
+                    down_proj.weight, weights["model.layers.1.mlp.down_proj.weight"]
+                )
+            )
+
 
 CUSTOM_MODEL_FILE = """\
 from pathlib import Path
