@@ -1,6 +1,7 @@
 # Copyright © 2023 Apple Inc.
 
 import argparse
+import json
 
 import mlx.core as mx
 
@@ -89,6 +90,12 @@ def setup_arg_parser():
         help="System prompt to be used for the chat template",
     )
     parser.add_argument(
+        "--chat-template-config",
+        help="Additional config for `apply_chat_template`. Should be a dictionary of"
+        " string keys to values represented as a JSON decodable string.",
+        default=None,
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
@@ -124,6 +131,10 @@ def main():
             trust_remote_code=args.trust_remote_code,
         )
 
+    template_kwargs = {}
+    if args.chat_template_config is not None:
+        template_kwargs = json.loads(args.chat_template_config)
+
     with ChatUI(args, rank=rank) as ui:
         prompt_cache = make_prompt_cache(model, args.max_kv_size)
         while True:
@@ -145,6 +156,7 @@ def main():
             prompt = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
+                **template_kwargs,
             )
             last_response = None
             for response in stream_generate(
