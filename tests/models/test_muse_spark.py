@@ -107,7 +107,7 @@ def hf_checkpoint(model: muse_spark.Model, weights: dict) -> dict:
             name = "post_attention" if ".add_attn_" in k else "post_feedforward"
             prefix = k.rsplit(".", 1)[0]
             hf[f"{prefix}.{name}_residual_gate.gate"] = mx.zeros(v.shape)
-        elif k.endswith(muse_spark._ZERO_CENTERED_NORMS):
+        elif k.endswith(muse_spark.checkpoint._ZERO_CENTERED_NORMS):
             hf[k] = v - 1
         elif k.endswith("mlp.experts.gate_proj.weight"):
             up = weights[k.replace("gate_proj", "up_proj")]
@@ -138,7 +138,7 @@ class TestMuseSpark(unittest.TestCase):
         vision = {**VISION_CONFIG, "num_hidden_layers": 6, "layer_types": None}
         window, full = "window_attention", "full_attention"
         self.assertEqual(
-            muse_spark.VisionArgs.from_dict(vision).layer_types,
+            muse_spark.config.VisionArgs.from_dict(vision).layer_types,
             [window, window, window, full, window, full],
         )
 

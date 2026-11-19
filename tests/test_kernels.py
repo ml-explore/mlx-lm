@@ -6,16 +6,16 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.kernels import (
-    expert_routing,
+from mlx_lm.kernels import sparse_mla
+from mlx_lm.kernels.expert_routing import expert_routing
+from mlx_lm.kernels.sparse_mla import sparse_mla_attention
+from mlx_lm.models.muse_spark.kernels import (
     norm_add_norm,
     post_expert_norm_combine,
     pre_norm,
     qk_norm,
     qk_norm_rope,
     rms_norm_sigmoid_gate,
-    sparse_mla,
-    sparse_mla_attention,
 )
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
