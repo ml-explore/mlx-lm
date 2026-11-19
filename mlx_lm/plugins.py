@@ -28,8 +28,11 @@ def _plugin_module(group: str, found: list[EntryPoint]) -> str:
     """The module of the one valid entry point for a name; ValueError if invalid."""
     ep = found[0]
     if len(found) > 1:
-        packages = " and ".join(e.dist.name for e in found)
-        raise ValueError(f"Both {packages} give {ep.name} in {group}.")
+        first, second = found[0].dist.name, found[1].dist.name
+        raise ValueError(
+            f"{len(found)} packages give {ep.name} in {group}, for example "
+            f"{first} and {second}."
+        )
     if ep.attr is not None:
         raise ValueError(
             f"The entry point {ep.name} in {group} of {ep.dist.name} must be a "

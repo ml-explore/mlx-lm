@@ -271,13 +271,13 @@ entry points in its `pyproject.toml`:
 
 ```toml
 [project.entry-points."mlx_lm.models"]
-acme = "acme_lm.models.acme"
+test = "test_lm.models.test"
 
 [project.entry-points."mlx_lm.tool_parsers"]
-acme = "acme_lm.tool_parsers.acme"
+test = "test_lm.tool_parsers.test"
 
 [project.entry-points."mlx_lm.chat_templates"]
-acme = "acme_lm.chat_templates.acme"
+test = "test_lm.chat_templates.test"
 ```
 
 - The name is the `model_type` in `config.json`, or the `tool_parser_type` or

@@ -17,7 +17,7 @@ PROCESSOR = (
     "    def from_config(cls, config):\n"
     "        return cls()\n"
 )
-ACME = {"model_type": "acme"}
+TEST = {"model_type": "test"}
 
 
 class TestPlugins(unittest.TestCase):
@@ -25,26 +25,28 @@ class TestPlugins(unittest.TestCase):
         self.root = tempfile.TemporaryDirectory()
         sys.path.insert(0, self.root.name)
         self.install(
-            "acme_lm",
+            "test_lm",
             {
                 "mlx_lm.models": {
-                    "acme": "acme_lm.models.acme",
-                    "llama": "acme_lm.models.llama",
+                    "test": "test_lm.models.test",
+                    "llama": "test_lm.models.llama",
+                    "solo": "test_lm.solo",
                 },
-                "mlx_lm.tool_parsers": {"acme": "acme_lm.tool_parsers.acme"},
-                "mlx_lm.chat_templates": {"acme": "acme_lm.chat_templates.acme"},
+                "mlx_lm.tool_parsers": {"test": "test_lm.tool_parsers.test"},
+                "mlx_lm.chat_templates": {"test": "test_lm.chat_templates.test"},
             },
             {
-                "acme_lm/models/acme/__init__.py": MODEL,
-                "acme_lm/models/acme/processor.py": PROCESSOR,
-                "acme_lm/models/llama/__init__.py": MODEL,
+                "test_lm/models/test/__init__.py": MODEL,
+                "test_lm/models/test/processor.py": PROCESSOR,
+                "test_lm/models/llama/__init__.py": MODEL,
+                "test_lm/solo.py": MODEL,
             },
         )
 
     def tearDown(self):
         sys.path.remove(self.root.name)
         for name in list(sys.modules):
-            if name.split(".")[0] in ("acme_lm", "other_lm"):
+            if name.split(".")[0] in ("test_lm", "other_lm"):
                 del sys.modules[name]
         plugins._entry_points.cache_clear()
         self.root.cleanup()
@@ -72,10 +74,10 @@ class TestPlugins(unittest.TestCase):
         plugins._entry_points.cache_clear()
 
     def test_new_model(self):
-        package = utils.model_package(ACME)
-        self.assertEqual(package, "acme_lm.models.acme")
+        package = utils.model_package(TEST)
+        self.assertEqual(package, "test_lm.models.test")
         self.assertNotIn(package, sys.modules)
-        model_class, _ = utils._get_classes(ACME)
+        model_class, _ = utils._get_classes(TEST)
         self.assertEqual(model_class.__module__, package)
 
     def test_builtin_model_wins(self):
@@ -91,21 +93,25 @@ class TestPlugins(unittest.TestCase):
             utils.model_package({"model_type": "unknown"})
 
     def test_processor(self):
-        processor = load_processor({**ACME, "vision_config": {"patch_size": 16}})
-        self.assertEqual(type(processor).__module__, "acme_lm.models.acme.processor")
+        processor = load_processor({**TEST, "vision_config": {"patch_size": 16}})
+        self.assertEqual(type(processor).__module__, "test_lm.models.test.processor")
+
+    def test_module_without_processor(self):
+        config = {"model_type": "solo", "vision_config": {"patch_size": 16}}
+        self.assertIsNone(load_processor(config))
 
     def test_tool_parser_and_chat_template(self):
         for kind in ("tool_parsers", "chat_templates"):
-            name = plugins.module_name(kind, "acme")
-            self.assertEqual(name, f"acme_lm.{kind}.acme")
+            name = plugins.module_name(kind, "test")
+            self.assertEqual(name, f"test_lm.{kind}.test")
 
     def test_two_packages_give_the_same_name(self):
-        self.install("other_lm", {"mlx_lm.models": {"acme": "other_lm.acme"}}, {})
+        self.install("other_lm", {"mlx_lm.models": {"test": "other_lm.test"}}, {})
         with self.assertRaises(ValueError):
-            utils.model_package(ACME)
+            utils.model_package(TEST)
 
     def test_entry_point_must_be_a_module(self):
-        entry_points = {"mlx_lm.models": {"other": "other_lm.acme:Model"}}
+        entry_points = {"mlx_lm.models": {"other": "other_lm.test:Model"}}
         self.install("other_lm", entry_points, {})
         with self.assertRaises(ValueError):
             utils.model_package({"model_type": "other"})

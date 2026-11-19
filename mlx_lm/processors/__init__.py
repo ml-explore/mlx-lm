@@ -30,9 +30,12 @@ def load_processor(config: dict[str, Any]) -> Processor | None:
         package = f"mlx_lm.models.{config['processor_type']}"
     else:
         package = model_package(config)
-    name = f"{package}.processor"
     # Imported here: the package holds the whole model.
-    if importlib.util.find_spec(name) is None:
+    module = importlib.import_module(package)
+    # A plug-in model can be a single module, without a processor.
+    if not hasattr(module, "__path__"):
         return None
-    module = importlib.import_module(name)
-    return module.Processor.from_config(config)
+    if importlib.util.find_spec(f"{package}.processor") is None:
+        return None
+    processor = importlib.import_module(f"{package}.processor")
+    return processor.Processor.from_config(config)
