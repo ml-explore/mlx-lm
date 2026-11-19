@@ -560,7 +560,17 @@ class RotatingKVCache(_BaseCache):
             window_size = window_size or self.max_size
             offset = min(self.max_size - 1, self.offset)
             if offset + N > window_size or return_array:
-                return create_causal_mask(N, offset, window_size=window_size)
+                # A different attention window must not force the prefix visible.
+                if self.keep == 0 or window_size != self.max_size:
+                    return create_causal_mask(N, offset, window_size=window_size)
+                # The prefix uses `keep` slots; recent tokens use the remaining slots.
+                rinds = mx.arange(offset + N)[None]
+                linds = mx.arange(offset, offset + N)[:, None]
+                # Apply causality once to both regions, including a partial prefix.
+                # This also avoids a second full-size causal mask.
+                return (linds >= rinds) & (
+                    (rinds < self.keep) | (linds < rinds + window_size - self.keep)
+                )
             else:
                 return "causal"
         else:
