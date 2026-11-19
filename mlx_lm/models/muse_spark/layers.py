@@ -34,7 +34,6 @@ __all__ = [
     "row_parallel_linear",
 ]
 
-
 # Added to the sum of the top-k router scores.
 _ROUTER_SCORE_EPS = 1e-15
 

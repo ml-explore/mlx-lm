@@ -13,7 +13,6 @@ __all__ = [
     "gated_delta_kernel_xtree",
 ]
 
-
 # For the shapes it supports, the packed kernel is bitwise-identical by
 # construction to an explicit-tree comparator kernel that the tests pin it
 # against (see _make_gated_delta_packed_kernel). Every other shape (masks,

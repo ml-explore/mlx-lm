@@ -16,7 +16,6 @@ __all__ = [
     "TransformerBlock",
 ]
 
-
 # Activation function mapping
 _ACT2FN = {
     "silu": nn.silu,

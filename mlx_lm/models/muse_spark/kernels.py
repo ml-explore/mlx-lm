@@ -16,7 +16,6 @@ __all__ = [
     "rms_norm_sigmoid_gate",
 ]
 
-
 _BLOCK_SUM_ONCE_HEADER = """
 template <int TG>
 inline float block_sum_once(float v, threadgroup float* buf, uint lane, uint sg) {

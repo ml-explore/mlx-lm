@@ -8,7 +8,6 @@ __all__ = [
     "attn_res_combine",
 ]
 
-
 _ATTN_RES_SOURCE = """
     constexpr int NACC = K + 2;
     constexpr int NSIMD = THREADS / 32;

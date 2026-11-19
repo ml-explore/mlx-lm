@@ -24,7 +24,6 @@ __all__ = [
     "shard_experts_inplace",
 ]
 
-
 # TODO: mx.contiguous of a slice fails on arrays this large; copy in chunks.
 _MAX_COPY_ELEMENTS = 1 << 31
 

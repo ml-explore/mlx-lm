@@ -11,7 +11,6 @@ __all__ = [
     "VisionArgs",
 ]
 
-
 # For checkpoints without them. Stop on <|eot|>, not on <|eom|>.
 TOKENIZER_DEFAULTS = {
     "chat_template_type": "muse_spark",

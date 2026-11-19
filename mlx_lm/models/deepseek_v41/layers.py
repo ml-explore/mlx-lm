@@ -28,7 +28,6 @@ __all__ = [
     "collapse",
 ]
 
-
 _FP4_LUT = mx.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=mx.float32)
 
 

@@ -12,7 +12,6 @@ __all__ = [
     "sanitize",
 ]
 
-
 # Norm weights the checkpoint stores centered at zero; sanitize stores the gain.
 _ZERO_CENTERED_NORMS = (
     "input_layernorm.weight",
@@ -21,7 +20,6 @@ _ZERO_CENTERED_NORMS = (
     "mlp.pre_expert_norm.weight",
     "mlp.experts.post_expert_norm.weight",
 )
-
 
 _NVFP4_E2M1_MAX = 6.0
 _NVFP4_E4M3_MAX = 448.0

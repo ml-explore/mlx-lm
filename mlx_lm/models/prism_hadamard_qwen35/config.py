@@ -9,7 +9,6 @@ __all__ = [
     "ModelArgs",
 ]
 
-
 # Schema 1 is a text-only pack keyed like qwen3_5.TextModel, schema 2 a
 # vision-language pack keyed like the mlx-vlm qwen3_5 model. The text weights
 # and the transform are the same in both.

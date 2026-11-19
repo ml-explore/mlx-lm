@@ -8,7 +8,6 @@ __all__ = [
     "sanitize",
 ]
 
-
 _DROP_PREFIXES = ("vision.", "aligner.", "image_", "mtp.")
 _EXPERT_KEY = r"layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)"
 _EXPERT_PROJ = {"w1": "gate_proj", "w2": "down_proj", "w3": "up_proj"}

@@ -22,7 +22,6 @@ __all__ = [
     "TextModel",
 ]
 
-
 # The shared state that grows each step, kept in the LayerCache field of that name.
 _CACHE_FIELDS = ("compress_kv", "index_k")
 
