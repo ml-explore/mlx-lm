@@ -2959,6 +2959,16 @@ class TestModels(unittest.TestCase):
         model.set_dtype(mx.bfloat16)
         self.assertEqual(model(x).dtype, mx.bfloat16)
 
+        # An fp8 output layer is an Fp8Linear too.
+        model = mistral3.Model(args)
+        head = {
+            "lm_head.weight": mx.to_fp8(mx.random.normal((128, h))),
+            "lm_head.weight_scale_inv": mx.array(0.03, dtype=mx.bfloat16),
+        }
+        weights = model.sanitize({**fp8_weights, **head})
+        model.load_weights(list(weights.items()), strict=True)
+        self.assertIsInstance(model.lm_head, ministral3.layers.Fp8Linear)
+
     def test_gemma2(self):
         from mlx_lm.models import gemma2
 
@@ -6146,6 +6156,19 @@ class TestVLSanitize(unittest.TestCase):
         ):
             with self.subTest(layout=name):
                 self.assertEqual(sorted(model.sanitize(weights)), sorted(current))
+
+    def test_mistral3_shard_output_layer(self):
+        # Only Ministral 3 shards its output layer.
+        from mlx_lm.models import mistral3
+
+        model = mistral3.Model(
+            mistral3.ModelArgs.from_dict(
+                {"model_type": "mistral3", "text_config": self._text_config("mistral")}
+            )
+        )
+        model.shard(mx.distributed.init())
+        self.assertIsInstance(model.lm_head, nn.Linear)
+        self.assertIsNone(model.sharding_group)
 
     def test_mistral3_mistral_defaults(self):
         # transformers leaves Mistral's defaults out of the text_config it saves:

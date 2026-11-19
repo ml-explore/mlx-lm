@@ -9,10 +9,11 @@ from mlx_lm.models.ministral3.layers import Fp8Linear, FusedGLU
 __all__ = [
     "sanitize",
     "sanitize_language_model",
+    "use_fp8_linears",
 ]
 
 
-def _use_fp8_linears(
+def use_fp8_linears(
     module: nn.Module, weights: dict[str, mx.array], prefix: str
 ) -> None:
     """Swap the linear layers that have an fp8 output scale for Fp8Linear."""
@@ -105,7 +106,7 @@ def sanitize_language_model(language_model, weights, prefix):
             layer.mlp = FusedGLU(in_dims, out_dims)
 
     _fp8_as_mxfp8(weights)
-    _use_fp8_linears(language_model, weights, prefix)
+    use_fp8_linears(language_model, weights, prefix)
     return weights
 
 
@@ -114,5 +115,5 @@ def sanitize(model, weights):
     if model.args.tie_word_embeddings:
         weights.pop("lm_head.weight", None)
     # The output layer is outside the language model.
-    _use_fp8_linears(model, weights, prefix="")
+    use_fp8_linears(model, weights, prefix="")
     return weights

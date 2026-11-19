@@ -653,7 +653,7 @@ def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
     try:
         package = model_package(load_config(model_path))
         module = importlib.import_module(f"mlx_lm.models.{package}")
-    except (FileNotFoundError, KeyError, ImportError):
+    except (FileNotFoundError, KeyError, ValueError, ImportError):
         return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 

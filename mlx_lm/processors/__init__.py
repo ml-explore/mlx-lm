@@ -21,10 +21,8 @@ ENCODER_CONFIGS = ("vision_config", "audio_config")
 
 
 class Processor(Protocol):
-    def __call__(
-        self, prompt: str, **media: Sequence[Any]
-    ) -> tuple[str, dict[str, Any]]:
-        """The prompt with the placeholders expanded, and the encoder inputs."""
+    def __call__(self, text: str, **media: Sequence[Any]) -> tuple[str, dict[str, Any]]:
+        """The text with the placeholders expanded, and the encoder inputs."""
 
 
 def load_processor(config: dict) -> Processor | None:

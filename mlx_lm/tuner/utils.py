@@ -12,6 +12,7 @@ import mlx.optimizers as opt
 from mlx.utils import tree_flatten, tree_unflatten
 
 from mlx_lm.layers.moe import QuantizedSwitchLinear, SwitchLinear
+from mlx_lm.models.checkpoint import from_llava_layout, from_text_layout
 
 from ..cli_ui import rprint
 from ..utils import get_total_parameters
@@ -125,6 +126,17 @@ def linear_to_lora_layers(
         model.update_modules(tree_unflatten(lora_modules))
 
 
+def _current_name(name: str, names: set[str] | dict[str, mx.array]) -> str:
+    """The model's name for a name of an older multimodal layout, outside the layers."""
+    if name in names:
+        return name
+    # The dot lets a module's own name match the prefix mappings.
+    current = from_text_layout(from_llava_layout(name + ".")).removesuffix(".")
+    if current in names:
+        return current
+    return name
+
+
 def _layer_place(name: str) -> tuple[int, str] | None:
     """The layer index and the path inside the layer of a layer's parameter."""
     match = _LAYER_PARAMETER.search(name)
@@ -144,8 +156,11 @@ def _match_by_layer(
             by_place.setdefault(place, []).append(name)
     matched: dict[str, mx.array] = {}
     for name, w in weights.items():
-        if name not in allowed:
-            candidates = by_place.get(_layer_place(name), [])
+        place = _layer_place(name)
+        if place is None:
+            name = _current_name(name, allowed)
+        elif name not in allowed:
+            candidates = by_place.get(place, [])
             if len(candidates) == 1 and candidates[0] not in weights:
                 name = candidates[0]
         matched[name] = w
@@ -201,10 +216,15 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
         config = types.SimpleNamespace(**json.load(fid))
     fine_tune_type = getattr(config, "fine_tune_type", "lora")
     if fine_tune_type != "full":
+        lora_parameters = dict(config.lora_parameters)
+        keys = lora_parameters.get("keys")
+        if keys is not None:
+            modules = {name for name, _ in model.named_modules()}
+            lora_parameters["keys"] = [_current_name(k, modules) for k in keys]
         linear_to_lora_layers(
             model,
             config.num_layers,
-            config.lora_parameters,
+            lora_parameters,
             use_dora=(fine_tune_type == "dora"),
         )
     load_adapter_weights(

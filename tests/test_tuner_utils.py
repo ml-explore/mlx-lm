@@ -156,10 +156,24 @@ def _mistral3_lora_weights() -> dict[str, mx.array]:
 
 
 def _older_names(weights: dict[str, mx.array]) -> dict[str, mx.array]:
-    return {
-        k.replace("model.language_model.", "language_model.model.", 1): v
-        for k, v in weights.items()
+    older = {}
+    for k, v in weights.items():
+        if k.startswith("lm_head."):
+            k = "language_model." + k
+        older[k.replace("model.language_model.", "language_model.model.", 1)] = v
+    return older
+
+
+def _mistral3_adapter(weights: dict[str, mx.array], lora_parameters: dict) -> Path:
+    path = Path(tempfile.mkdtemp())
+    config = {
+        "fine_tune_type": "lora",
+        "num_layers": 2,
+        "lora_parameters": lora_parameters,
     }
+    (path / "adapter_config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(path / "adapters.safetensors"), weights)
+    return path
 
 
 class TestLoadAdapters(unittest.TestCase):
@@ -234,15 +248,21 @@ class TestLoadAdapters(unittest.TestCase):
 
     def test_adapter_saved_under_older_layer_names_loads(self):
         adapters = _mistral3_lora_weights()
-        path = Path(tempfile.mkdtemp())
-        config = {
-            "fine_tune_type": "lora",
-            "num_layers": 2,
-            "lora_parameters": LORA_PARAMETERS,
-        }
-        (path / "adapter_config.json").write_text(json.dumps(config))
-        mx.save_safetensors(str(path / "adapters.safetensors"), _older_names(adapters))
+        path = _mistral3_adapter(_older_names(adapters), LORA_PARAMETERS)
+        loaded = dict(tree_flatten(load_adapters(_mistral3(), path).parameters()))
+        for k, v in adapters.items():
+            self.assertTrue(mx.array_equal(loaded[k], v), k)
 
+    def test_lm_head_adapter_saved_under_older_names_loads(self):
+        model = _mistral3()
+        linear_to_lora_layers(model, 2, {**LORA_PARAMETERS, "keys": ["lm_head"]})
+        adapters = {
+            k: mx.random.normal(v.shape)
+            for k, v in tree_flatten(model.parameters())
+            if k.endswith(("lora_a", "lora_b"))
+        }
+        older_keys = {**LORA_PARAMETERS, "keys": ["language_model.lm_head"]}
+        path = _mistral3_adapter(_older_names(adapters), older_keys)
         loaded = dict(tree_flatten(load_adapters(_mistral3(), path).parameters()))
         for k, v in adapters.items():
             self.assertTrue(mx.array_equal(loaded[k], v), k)

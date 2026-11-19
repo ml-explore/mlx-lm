@@ -24,6 +24,7 @@ __all__ = [
     "LanguageModel",
     "Model",
     "shard_layers",
+    "shard_lm_head",
 ]
 
 
@@ -136,6 +137,15 @@ class LanguageModel(PipelineMixin, nn.Module):
                 break
 
 
+def shard_lm_head(
+    lm_head: nn.Module, vocab_size: int, group: mx.distributed.Group
+) -> nn.Module:
+    """Each rank computes a slice of the vocabulary."""
+    N = group.size()
+    assert vocab_size % N == 0, f"group size {N} must divide vocab_size {vocab_size}"
+    return _shard_linear(lm_head, "all-to-sharded", group)
+
+
 def shard_layers(layers, group: mx.distributed.Group):
     """Shard the decoder layers for tensor parallelism."""
     N = group.size()
@@ -199,12 +209,8 @@ class Model(nn.Module):
 
     def shard(self, group: Optional[mx.distributed.Group] = None):
         group = group or mx.distributed.init()
-        N = group.size()
-
         if not self.args.tie_word_embeddings:
-            vocab = self.args.vocab_size
-            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
-            self.lm_head = _shard_linear(self.lm_head, "all-to-sharded", group)
+            self.lm_head = shard_lm_head(self.lm_head, self.args.vocab_size, group)
             self.sharding_group = group
 
         shard_layers(self.model.layers, group)

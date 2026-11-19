@@ -1,5 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
+from mlx_lm.models import ministral3
 from mlx_lm.models.checkpoint import from_llava_layout, from_text_layout
 from mlx_lm.models.mistral3.config import language_model_package
 
@@ -20,6 +21,10 @@ def sanitize(model, weights):
     if model.args.text.tie_word_embeddings:
         weights.pop("lm_head.weight", None)
     package = language_model_package(model.args.text.model_type)
-    return package.checkpoint.sanitize_language_model(
+    weights = package.checkpoint.sanitize_language_model(
         model.model.language_model, weights, prefix="model.language_model."
     )
+    if package is ministral3:
+        # The output layer is outside the language model.
+        ministral3.checkpoint.use_fp8_linears(model, weights, prefix="")
+    return weights

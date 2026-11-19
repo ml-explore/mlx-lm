@@ -4,7 +4,6 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_linear
 
 from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
 from mlx_lm.models import llama, ministral3, mistral4
@@ -82,11 +81,10 @@ class Model(nn.Module):
         group = group or mx.distributed.init()
         package = language_model_package(self.args.text.model_type)
         package.model.shard_layers(self.model.language_model.layers, group)
-        if not self.args.text.tie_word_embeddings:
-            N, vocab = group.size(), self.args.text.vocab_size
-            assert vocab % N == 0, f"group size {N} must divide vocab_size {vocab}"
-            # Each rank computes a slice of the vocabulary.
-            self.lm_head = shard_linear(self.lm_head, "all-to-sharded", group=group)
+        # Only Ministral 3 shards its output layer.
+        if package is ministral3 and not self.args.text.tie_word_embeddings:
+            vocab = self.args.text.vocab_size
+            self.lm_head = ministral3.model.shard_lm_head(self.lm_head, vocab, group)
             self.sharding_group = group
 
     @property
