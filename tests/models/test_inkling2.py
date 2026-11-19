@@ -265,6 +265,13 @@ class TestInkling2(unittest.TestCase):
         self.assertTrue(mx.all(pixels[:, :5] == 1.0).item())
         self.assertTrue(mx.allclose(pixels[:, 5:], mx.array((-1 / 255 - 0.5) / 0.5)))
 
+        rgba = np.zeros((16, 16, 4), dtype=np.uint8)
+        rgba[:, 8:, 3] = 255
+        rgb = inkling2_processor._composite_alpha(rgba)
+        self.assertEqual(rgb[0, 0].tolist(), [204] * 3)
+        self.assertEqual(rgb[8, 0].tolist(), [153] * 3)
+        self.assertEqual(rgb[0, 8].tolist(), [0] * 3)
+
         token = inkling2_processor.IMAGE_TOKEN
         text, pixel_values = processor(f"A {token} B", images=[image])
         self.assertEqual(text, f"A {token * 4} B")
