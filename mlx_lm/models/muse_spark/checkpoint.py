@@ -25,7 +25,6 @@ _NVFP4_E2M1_MAX = 6.0
 _NVFP4_E4M3_MAX = 448.0
 _NVFP4_SCALE_2_TO_GLOBAL = _NVFP4_E2M1_MAX * _NVFP4_E4M3_MAX
 
-
 _UNUSED_QUANT_TENSORS = (
     "mlp.experts.gate_up_proj_input_scale",
     "mlp.experts.down_proj_input_scale",

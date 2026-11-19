@@ -37,7 +37,6 @@ __all__ = [
 # Added to the sum of the top-k router scores.
 _ROUTER_SCORE_EPS = 1e-15
 
-
 POOLED_TP_MAX_TOKENS = 8
 
 

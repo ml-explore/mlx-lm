@@ -31,7 +31,6 @@ inline float block_sum_once(float v, threadgroup float* buf, uint lane, uint sg)
 }
 """
 
-
 _HEAD = """
     constexpr int R = (D + TG - 1) / TG;
     threadgroup float buf[2][32];
@@ -51,7 +50,6 @@ _PRE_NORM = """
         }
     }
 """
-
 
 _NORM_ADD_INPUTS = ["branch", "stream", "alpha", "beta", "post_w", "post_eps"]
 
@@ -191,7 +189,6 @@ _norm_gate_kernel = mx.fast.metal_kernel(
     ensure_row_contiguous=False,
 )
 
-
 # Only the pre-norm, with the same sums as in norm_add_norm.
 _PRE_NORM_ONLY = _HEAD + """
     float v[R], pw[R];
@@ -215,7 +212,6 @@ _pre_norm_kernel = mx.fast.metal_kernel(
     source=_PRE_NORM_ONLY,
     header=_BLOCK_SUM_ONCE_HEADER,
 )
-
 
 # This kernel inputs [tokens * k, D]:
 # normalises each input token x_i / sqrt(sum(x_i)**2) * w_i -- rms norm

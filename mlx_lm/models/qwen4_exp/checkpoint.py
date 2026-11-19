@@ -29,6 +29,22 @@ _NGRAM_CONSTANTS = (
 _NGRAM_SHARD_RE = re.compile(r"\.ngram_embedding\.shard_(\d+)\.")
 
 
+def _check_ngram_constant(model, key: str, value: mx.array) -> None:
+    layer = int(key.split(".layers.")[1].split(".")[0])
+    table = model.model.layers[layer].ple.ple_embedding
+    rebuilt = {
+        "layer_multipliers": table._mults,
+        "ngram_heads_vocab_sizes": table._sizes,
+        "ngram_heads_offsets": table._offsets,
+    }[key.rsplit(".", 1)[1]]
+    if not mx.array_equal(rebuilt, value.astype(rebuilt.dtype)):
+        raise ValueError(
+            f"{key}: the n-gram hash constants rebuilt from the config do "
+            f"not match the checkpoint ({rebuilt.tolist()} vs "
+            f"{value.tolist()}); check `seed` and the hash parameters"
+        )
+
+
 def _merge_linears(
     weights: dict[str, mx.array], parts: list[str], *, target: str
 ) -> None:
@@ -83,7 +99,7 @@ def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
 
         # The n-gram hash constants: check them against the config, then drop.
         if k.endswith(_NGRAM_CONSTANTS):
-            model._check_ngram_constant(k, v)
+            _check_ngram_constant(model, k, v)
             continue
 
         # Rename the n-gram shards to `shards.{i}`, as mlx-vlm saves them.

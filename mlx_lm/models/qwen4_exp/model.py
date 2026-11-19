@@ -78,21 +78,6 @@ class Model(nn.Module):
             return self.model.embed_tokens.as_linear(out)
         return self.lm_head(out)
 
-    def _check_ngram_constant(self, key: str, value: mx.array) -> None:
-        layer = int(key.split(".layers.")[1].split(".")[0])
-        table = self.model.layers[layer].ple.ple_embedding
-        rebuilt = {
-            "layer_multipliers": table._mults,
-            "ngram_heads_vocab_sizes": table._sizes,
-            "ngram_heads_offsets": table._offsets,
-        }[key.rsplit(".", 1)[1]]
-        if not mx.array_equal(rebuilt, value.astype(rebuilt.dtype)):
-            raise ValueError(
-                f"{key}: the n-gram hash constants rebuilt from the config do "
-                f"not match the checkpoint ({rebuilt.tolist()} vs "
-                f"{value.tolist()}); check `seed` and the hash parameters"
-            )
-
     def sanitize(self, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         return checkpoint.sanitize(self, weights)
 

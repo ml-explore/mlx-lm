@@ -25,7 +25,6 @@ __all__ = [
 # The shared state that grows each step, kept in the LayerCache field of that name.
 _CACHE_FIELDS = ("compress_kv", "index_k")
 
-
 # A view at a byte offset that is not a multiple of its item size reads the
 # wrong bytes, so each part of a message starts at a multiple of 8 bytes.
 _ALIGN = 8
