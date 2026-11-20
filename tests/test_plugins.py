@@ -4,13 +4,13 @@ import importlib
 import sys
 import tempfile
 import unittest
-import warnings
 from pathlib import Path
 
 from mlx_lm import plugins, utils
 from mlx_lm.processors import load_processor
 
 MODEL = "class Model:\n    pass\n\n\nclass ModelArgs:\n    pass\n"
+DEFAULTS = 'TOKENIZER_DEFAULTS = {"chat_template_type": "test"}\n'
 PROCESSOR = (
     "class Processor:\n"
     "    @classmethod\n"
@@ -36,7 +36,7 @@ class TestPlugins(unittest.TestCase):
                 "mlx_lm.chat_templates": {"test": "test_lm.chat_templates.test"},
             },
             {
-                "test_lm/models/test/__init__.py": MODEL,
+                "test_lm/models/test/__init__.py": MODEL + DEFAULTS,
                 "test_lm/models/test/processor.py": PROCESSOR,
                 "test_lm/models/llama/__init__.py": MODEL,
                 "test_lm/solo.py": MODEL,
@@ -59,17 +59,21 @@ class TestPlugins(unittest.TestCase):
     ) -> None:
         """Write an installed distribution with its entry points and files."""
         root = Path(self.root.name)
-        dist_info = root / f"{name}-0.dist-info"
-        dist_info.mkdir()
-        (dist_info / "METADATA").write_text(f"Name: {name}\nVersion: 0\n")
+        for path, text in files.items():
+            (root / path).parent.mkdir(parents=True, exist_ok=True)
+            (root / path).write_text(text)
         lines = []
         for group, entries in entry_points.items():
             lines.append(f"[{group}]")
             lines.extend(f"{key} = {value}" for key, value in entries.items())
-        (dist_info / "entry_points.txt").write_text("\n".join(lines) + "\n")
-        for path, text in files.items():
-            (root / path).parent.mkdir(parents=True, exist_ok=True)
-            (root / path).write_text(text)
+        self.write_metadata(name, "\n".join(lines) + "\n")
+
+    def write_metadata(self, name: str, entry_points_text: str) -> None:
+        """Write the metadata of an installed distribution."""
+        dist_info = Path(self.root.name) / f"{name}-0.dist-info"
+        dist_info.mkdir()
+        (dist_info / "METADATA").write_text(f"Name: {name}\nVersion: 0\n")
+        (dist_info / "entry_points.txt").write_text(entry_points_text)
         importlib.invalidate_caches()
         plugins._entry_points.cache_clear()
 
@@ -81,12 +85,13 @@ class TestPlugins(unittest.TestCase):
         self.assertEqual(model_class.__module__, package)
 
     def test_builtin_model_wins(self):
-        # assertWarns reads sys.modules, which imports transformers' lazy modules.
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            package = utils.model_package({"model_type": "llama"})
+        package = utils.model_package({"model_type": "llama"})
         self.assertEqual(package, "mlx_lm.models.llama")
-        self.assertEqual(len(caught), 1)
+
+    def test_broken_package_does_not_break_builtins(self):
+        self.write_metadata("broken_lm", "[mlx_lm.models]\nno equals sign\n")
+        package = utils.model_package({"model_type": "llama"})
+        self.assertEqual(package, "mlx_lm.models.llama")
 
     def test_unknown_model(self):
         with self.assertRaises(ValueError):
@@ -95,6 +100,12 @@ class TestPlugins(unittest.TestCase):
     def test_processor(self):
         processor = load_processor({**TEST, "vision_config": {"patch_size": 16}})
         self.assertEqual(type(processor).__module__, "test_lm.models.test.processor")
+
+    def test_tokenizer_defaults_follow_the_given_config(self):
+        with tempfile.TemporaryDirectory() as path:
+            (Path(path) / "config.json").write_text('{"model_type": "llama"}')
+            defaults = utils._tokenizer_defaults(Path(path), TEST)
+        self.assertEqual(defaults, {"chat_template_type": "test"})
 
     def test_module_without_processor(self):
         config = {"model_type": "solo", "vision_config": {"patch_size": 16}}

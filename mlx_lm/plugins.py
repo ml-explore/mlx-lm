@@ -2,7 +2,6 @@
 
 import functools
 import importlib.util
-import warnings
 from importlib.metadata import EntryPoint, entry_points
 from typing import Literal
 
@@ -14,11 +13,10 @@ Kind = Literal["models", "tool_parsers", "chat_templates"]
 def module_name(kind: Kind, name: str) -> str:
     """The built-in module for ``name``, else the plug-in's; ValueError if none."""
     builtin = f"mlx_lm.{kind}.{name}"
-    found = _entry_points(kind).get(name, [])
+    # Built-ins never read other packages' metadata.
     if importlib.util.find_spec(builtin) is not None:
-        if found:
-            warnings.warn(f"{builtin} hides the plug-in module {found[0].value}.")
         return builtin
+    found = _entry_points(kind).get(name, [])
     if not found:
         raise ValueError(f"No {builtin} and no plug-in gives {name} in mlx_lm.{kind}.")
     return _plugin_module(f"mlx_lm.{kind}", found)

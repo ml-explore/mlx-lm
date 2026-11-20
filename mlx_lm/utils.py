@@ -582,9 +582,17 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     return _load_adapters(model, adapter_path)
 
 
-def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
+def load_tokenizer(
+    model_path,
+    tokenizer_config_extra=None,
+    eos_token_ids=None,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
+
+    ``config`` is the model's configuration, by default the one in ``model_path``.
     """
     model_path = _download(
         model_path,
@@ -603,14 +611,18 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
-        defaults=_tokenizer_defaults(model_path),
+        defaults=_tokenizer_defaults(model_path, config),
     )
 
 
-def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
+def _tokenizer_defaults(
+    model_path: Path, config: Optional[Dict[str, Any]] = None
+) -> Optional[Dict[str, Any]]:
     """The TOKENIZER_DEFAULTS of the model package, if any."""
     try:
-        package = model_package(load_config(model_path))
+        if config is None:
+            config = load_config(model_path)
+        package = model_package(config)
     except (FileNotFoundError, KeyError, ValueError):
         return None
     module = importlib.import_module(package)
@@ -669,7 +681,10 @@ def load(
         model = load_adapters(model, adapter_path)
         model.eval()
     tokenizer = load_tokenizer(
-        model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
+        model_path,
+        tokenizer_config,
+        eos_token_ids=config.get("eos_token_id", None),
+        config=config,
     )
 
     if return_config:
@@ -770,6 +785,7 @@ def sharded_load(
         model_path,
         tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
+        config=config,
     )
     model, _ = load_model(
         model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
