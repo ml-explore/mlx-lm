@@ -266,8 +266,11 @@ model, tokenizer = load(
 
 #### Models from Other Packages
 
-Another installed project can add models, tool parsers and chat templates, with
-entry points in its `pyproject.toml`:
+> [!NOTE]
+> Plug-ins are experimental. Their API can change from one release to the next.
+
+An installed project can add models, tool parsers and chat templates with entry
+points:
 
 ```toml
 [project.entry-points."mlx_lm.models"]
@@ -280,14 +283,9 @@ test = "test_lm.tool_parsers.test"
 test = "test_lm.chat_templates.test"
 ```
 
-- The name is the `model_type` in `config.json`, or the `tool_parser_type` or
-  `chat_template_type`. Names are matched in lower case, with `_` for `-`.
-- The value is a module like the built-in ones in `mlx_lm/models`,
-  `mlx_lm/tool_parsers` or `mlx_lm/chat_templates`.
-- A name that `mlx-lm` already knows, including the model types in
-  `MODEL_REMAPPING`, always goes to the built-in.
-- Install the project in the same environment as `mlx-lm`. After you change an
-  entry point, install it again.
+The name is the `model_type`, `tool_parser_type` or `chat_template_type` it
+serves, and the value is a module like the built-in ones. Built-in names always
+win.
 
 ### Large Models
 
