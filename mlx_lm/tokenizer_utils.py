@@ -796,8 +796,12 @@ def load(
         tool_call_start = None
         tool_call_end = None
 
-    think_start = tokenizer_config.get("think_start", defaults.get("think_start"))
-    think_end = tokenizer_config.get("think_end", defaults.get("think_end"))
+    if "think_start" in tokenizer_config or "think_end" in tokenizer_config:
+        think_start = tokenizer_config.get("think_start")
+        think_end = tokenizer_config.get("think_end")
+    else:
+        think_start = defaults.get("think_start")
+        think_end = defaults.get("think_end")
 
     return TokenizerWrapper(
         tokenizer,
