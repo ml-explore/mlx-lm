@@ -1,19 +1,127 @@
 # Copyright © 2026 Apple Inc.
 
-"""Causal flash attention with a relative position bias and a sink logit per
-query."""
-
 import mlx.core as mx
 
-from ._common import scalar
+from mlx_lm.kernels.common import row_threads, scalar
 
+__all__ = [
+    "depth_attention",
+    "relative_attention",
+]
+
+
+# Attention of learned queries over the depth sources of each token, in one
+# kernel.
+_DEPTH_ATTENTION_SOURCE = """
+    constexpr int N = K + 1;
+    uint row = threadgroup_position_in_grid.x;
+    uint rows = threadgroups_per_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint lane = thread_index_in_simdgroup;
+    uint sg = simdgroup_index_in_threadgroup;
+
+    float acc[N * Q];
+    for (int i = 0; i < N * Q; i++) {
+        acc[i] = 0.0f;
+    }
+    for (int d = tid; d < D; d += TG) {
+        float x[N];
+        for (int i = 0; i < K; i++) {
+            x[i] = blocks[(size_t(i) * rows + row) * D + d];
+        }
+        x[K] = partial[size_t(row) * D + d];
+        for (int j = 0; j < Q; j++) {
+            float qv = queries[j * D + d];
+            for (int i = 0; i < N; i++) {
+                acc[i * Q + j] += x[i] * qv;
+            }
+        }
+    }
+
+    threadgroup float buf[N * Q][TG / 32];
+    for (int i = 0; i < N * Q; i++) {
+        float v = simd_sum(acc[i]);
+        if (lane == 0) {
+            buf[i][sg] = v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float w[N * Q];
+    for (int i = 0; i < N * Q; i++) {
+        float t = 0.0f;
+        for (int s = 0; s < TG / 32; s++) {
+            t += buf[i][s];
+        }
+        w[i] = t * scale;
+    }
+    for (int j = 0; j < Q; j++) {
+        float m = -INFINITY;
+        for (int i = 0; i < N; i++) {
+            m = max(m, w[i * Q + j]);
+        }
+        float z = 0.0f;
+        for (int i = 0; i < N; i++) {
+            w[i * Q + j] = metal::exp(w[i * Q + j] - m);
+            z += w[i * Q + j];
+        }
+        for (int i = 0; i < N; i++) {
+            w[i * Q + j] /= z;
+        }
+    }
+
+    for (int d = tid; d < D; d += TG) {
+        float x[N];
+        for (int i = 0; i < K; i++) {
+            x[i] = blocks[(size_t(i) * rows + row) * D + d];
+        }
+        x[K] = partial[size_t(row) * D + d];
+        for (int j = 0; j < Q; j++) {
+            float o = 0.0f;
+            for (int i = 0; i < N; i++) {
+                o += w[i * Q + j] * x[i];
+            }
+            out[(size_t(row) * Q + j) * D + d] = o;
+        }
+    }
+"""
+
+_depth_attention_kernel = mx.fast.metal_kernel(
+    name="depth_attention",
+    input_names=["blocks", "partial", "queries", "scale"],
+    output_names=["out"],
+    source=_DEPTH_ATTENTION_SOURCE,
+)
+
+
+def depth_attention(
+    blocks: mx.array, partial: mx.array, queries: mx.array, *, scale: float
+) -> mx.array:
+    """blocks: (K, ..., D) and partial: (..., D), float32, also the values.
+    queries: float32 (Q, D). Returns (..., Q, D)."""
+    D = partial.shape[-1]
+    Q = queries.shape[0]
+    TG = row_threads(D)
+    return _depth_attention_kernel(
+        inputs=[blocks, partial, queries, scalar(scale)],
+        template=[("K", blocks.shape[0]), ("D", D), ("Q", Q), ("TG", TG)],
+        grid=(partial.size // D * TG, 1, 1),
+        threadgroup=(TG, 1, 1),
+        output_shapes=[partial.shape[:-1] + (Q, D)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+# Causal flash attention with a relative position bias and a sink logit per
+# query.
 # Queries per threadgroup, 8 for each of its 4 simdgroups.
 _BQ = 32
+
 _TG = 128
 
 # The online softmax of each row starts from its sink logit, so the zero-value
 # sink needs no key.
-_SOURCE = """
+_RELATIVE_ATTENTION_SOURCE = """
     constexpr float LOG2E = 1.4426950408889634f;
     constexpr int BK = 16;
     constexpr int LDK = BK + 8;
@@ -160,11 +268,11 @@ _SOURCE = """
     }
 """
 
-_kernel = mx.fast.metal_kernel(
+_relative_attention_kernel = mx.fast.metal_kernel(
     name="relative_attention",
     input_names=["q", "k", "v", "rel", "sinks", "key_start", "sizes", "scale"],
     output_names=["out"],
-    source=_SOURCE,
+    source=_RELATIVE_ATTENTION_SOURCE,
     ensure_row_contiguous=False,
 )
 
@@ -186,7 +294,7 @@ def relative_attention(
     (B, L, Hq, D)."""
     B, Hq, L, D = q.shape
     Hkv, S = k.shape[1], k.shape[2]
-    return _kernel(
+    return _relative_attention_kernel(
         inputs=[
             q,
             k,

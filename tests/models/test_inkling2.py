@@ -12,7 +12,7 @@ from mlx.utils import tree_flatten, tree_unflatten
 
 from mlx_lm.generate import BatchGenerator, generate_step
 from mlx_lm.models import inkling2
-from mlx_lm.processors import inkling2 as inkling2_processor
+from mlx_lm.models.inkling2 import processor as inkling2_processor
 from mlx_lm.processors import load_processor
 from mlx_lm.utils import load_model, quantize_model
 
@@ -273,14 +273,14 @@ class TestInkling2(unittest.TestCase):
         self.assertEqual(rgb[0, 8].tolist(), [0] * 3)
 
         token = inkling2_processor.IMAGE_TOKEN
-        text, pixel_values = processor(f"A {token} B", images=[image])
+        text, media_inputs = processor(f"A {token} B", images=[image])
         self.assertEqual(text, f"A {token * 4} B")
-        self.assertEqual(len(pixel_values), 1)
+        self.assertEqual(len(media_inputs["pixel_values"]), 1)
         with self.assertRaisesRegex(ValueError, "for 2 images"):
             processor(f"A {token}", images=[image, image])
 
         config = {**CONFIG, "vision_config": VISION_CONFIG}
-        processor = load_processor(create_model(vision=True), config)
+        processor = load_processor(config)
         self.assertIsInstance(processor, inkling2_processor.Processor)
         self.assertEqual(processor.block_size, 4)
 

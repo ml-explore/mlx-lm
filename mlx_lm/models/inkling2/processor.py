@@ -9,6 +9,11 @@ from typing import BinaryIO, ClassVar, Sequence
 import mlx.core as mx
 import numpy as np
 
+__all__ = [
+    "IMAGE_TOKEN",
+    "Processor",
+]
+
 IMAGE_TOKEN = "<|unused_200054|>"
 
 
@@ -67,7 +72,7 @@ class Processor:
 
     def __call__(
         self, text: str, *, images: Sequence[np.ndarray]
-    ) -> tuple[str, list[mx.array]]:
+    ) -> tuple[str, dict[str, list[mx.array]]]:
         parts = text.split(IMAGE_TOKEN)
         if len(parts) - 1 != len(images):
             raise ValueError(
@@ -80,4 +85,4 @@ class Processor:
             pixels, num_tokens = self.preprocess_image(image)
             expanded += [IMAGE_TOKEN * num_tokens, part]
             pixel_values.append(pixels)
-        return "".join(expanded), pixel_values
+        return "".join(expanded), {"pixel_values": pixel_values}

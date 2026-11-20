@@ -7,10 +7,10 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from mlx_lm.kernels import sparse_mla
-from mlx_lm.kernels.depth_attention import depth_attention
 from mlx_lm.kernels.expert_routing import expert_routing
-from mlx_lm.kernels.relative_attention import relative_attention
 from mlx_lm.kernels.sparse_mla import sparse_mla_attention
+from mlx_lm.models.inkling2.kernels import depth_attention, relative_attention
+from mlx_lm.models.inkling2.layers import _attention_reference
 from mlx_lm.models.muse_spark.kernels import (
     norm_add_norm,
     post_expert_norm_combine,
@@ -19,7 +19,6 @@ from mlx_lm.models.muse_spark.kernels import (
     qk_norm_rope,
     rms_norm_sigmoid_gate,
 )
-from mlx_lm.models.inkling2 import _attention_reference
 
 TOL = {mx.float32: 1e-5, mx.bfloat16: 1e-2}
 
