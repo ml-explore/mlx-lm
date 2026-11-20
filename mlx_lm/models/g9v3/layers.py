@@ -1,77 +1,24 @@
 # Copyright © 2026 Apple Inc.
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import mlx.core as mx
-from mlx import nn
+import mlx.nn as nn
 
-from .activations import swiglu
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .rope_utils import initialize_rope
-from .switch_layers import SwitchGLU
+from mlx_lm.layers.attention import scaled_dot_product_attention
+from mlx_lm.layers.common import swiglu
+from mlx_lm.layers.moe import SwitchGLU
+from mlx_lm.layers.rope import initialize_rope
+from mlx_lm.models.g9v3.config import ModelArgs
 
-
-@mx.compile
-def group_expert_select(
-    gates,
-    e_score_correction_bias,
-    top_k,
-    n_group,
-    topk_group,
-    routed_scaling_factor,
-    norm_topk_prob,
-):
-
-    scores = mx.sigmoid(gates.astype(mx.float32))
-    orig_scores = scores
-    scores = scores + e_score_correction_bias
-    if n_group > 1:
-        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
-        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
-        k = n_group - topk_group
-        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
-        scores = mx.put_along_axis(
-            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
-        )
-        scores = mx.flatten(scores, -2, -1)
-
-    k = top_k
-    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
-    inds = mx.stop_gradient(inds)
-    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
-    if top_k > 1 and norm_topk_prob:
-        denominator = scores.sum(axis=-1, keepdims=True)
-        scores = scores / (denominator + 1e-20)
-    scores = scores * routed_scaling_factor
-
-    return inds, scores
-
-
-@dataclass
-class ModelArgs(BaseModelArgs):
-    model_type: str = "g9v3"
-    vocab_size: int = 130560
-    hidden_size: int = 2048
-    num_attention_heads: int = 32
-    head_dim: int = 128
-    num_key_value_heads: int = 2
-    use_gated_attention: Optional[bool] = False
-    rope_theta: int = 5000000
-    rope_scaling: Optional[Dict] = None
-    first_k_dense_replace: int = 1
-    intermediate_size: int = 8192
-    n_routed_experts: int = 320
-    num_experts_per_tok: int = 32
-    routed_scaling_factor: float = 3.66
-    n_group: Optional[int] = 1
-    topk_group: Optional[int] = 1
-    norm_topk_prob: Optional[bool] = True
-    moe_intermediate_size: int = 512
-    n_shared_experts: int = 1
-    rms_norm_eps: float = 1e-06
-    num_hidden_layers: int = 38
-    max_position_embeddings: int = 131072
+__all__ = [
+    "G9v3Attention",
+    "G9v3MLP",
+    "G9v3TopkRouter",
+    "G9v3MoE",
+    "G9v3DecodeLayer",
+    "group_expert_select",
+]
 
 
 class G9v3Attention(nn.Module):
@@ -286,75 +233,37 @@ class G9v3DecodeLayer(nn.Module):
         return hidden_states
 
 
-class G9v3Model(nn.Module):
+@mx.compile
+def group_expert_select(
+    gates,
+    e_score_correction_bias,
+    top_k,
+    n_group,
+    topk_group,
+    routed_scaling_factor,
+    norm_topk_prob,
+):
 
-    def __init__(self, config: ModelArgs):
-        super().__init__()
+    scores = mx.sigmoid(gates.astype(mx.float32))
+    orig_scores = scores
+    scores = scores + e_score_correction_bias
+    if n_group > 1:
+        scores = mx.unflatten(scores, axis=-1, shape=(n_group, -1))
+        group_scores = mx.topk(scores, 2, axis=-1).sum(axis=-1, keepdims=True)
+        k = n_group - topk_group
+        group_idx = mx.argpartition(group_scores, kth=k - 1, axis=-2)[..., :k, :]
+        scores = mx.put_along_axis(
+            scores, mx.stop_gradient(group_idx), mx.array(0.0), axis=-2
+        )
+        scores = mx.flatten(scores, -2, -1)
 
-        self.vocab_size = config.vocab_size
+    k = top_k
+    inds = mx.argpartition(-scores, kth=k - 1, axis=-1)[..., :k]
+    inds = mx.stop_gradient(inds)
+    scores = mx.take_along_axis(orig_scores, inds, axis=-1)
+    if top_k > 1 and norm_topk_prob:
+        denominator = scores.sum(axis=-1, keepdims=True)
+        scores = scores / (denominator + 1e-20)
+    scores = scores * routed_scaling_factor
 
-        self.embed_tokens = nn.Embedding(self.vocab_size, dims=config.hidden_size)
-        self.layers = [
-            G9v3DecodeLayer(layer_idx=idx, config=config)
-            for idx in range(config.num_hidden_layers)
-        ]
-
-        self.norm = nn.RMSNorm(dims=config.hidden_size, eps=config.rms_norm_eps)
-
-    def __call__(
-        self, hidden_states: mx.array, cache: Optional[Any] = None
-    ) -> mx.array:
-
-        hidden_states = self.embed_tokens(hidden_states)
-
-        if cache is None:
-            cache = [None] * len(self.layers)
-
-        mask = create_attention_mask(hidden_states, cache[0])
-
-        for c, block in zip(cache, self.layers):
-            hidden_states = block(hidden_states=hidden_states, cache=c, mask=mask)
-
-        return self.norm(hidden_states)
-
-
-class Model(nn.Module):
-
-    def __init__(self, config: ModelArgs):
-        super().__init__()
-        self.args = config
-        self.model_type = config.model_type
-        self.model = G9v3Model(config=config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-
-    def __call__(
-        self, hidden_states: mx.array, cache: Optional[Any] = None
-    ) -> mx.array:
-
-        hidden_states = self.model(hidden_states=hidden_states, cache=cache)
-        return self.lm_head(hidden_states)
-
-    def sanitize(self, weights):
-        for layer_idx in range(self.args.num_hidden_layers):
-
-            if layer_idx < self.args.first_k_dense_replace:
-                continue
-
-            prefix = f"model.layers.{layer_idx}.mlp.experts"
-
-            for name in ["gate_proj", "up_proj", "down_proj"]:
-                key = f"{prefix}.0.{name}.weight"
-                if key not in weights:
-                    continue
-
-                expert_weights = [
-                    weights.pop(f"{prefix}.{expert_idx}.{name}.weight")
-                    for expert_idx in range(self.args.n_routed_experts)
-                ]
-                weights[f"{prefix}.{name}.weight"] = mx.stack(expert_weights)
-
-        return weights
-
-    @property
-    def layers(self):
-        return self.model.layers
+    return inds, scores
