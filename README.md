@@ -281,10 +281,11 @@ test = "test_lm.chat_templates.test"
 ```
 
 - The name is the `model_type` in `config.json`, or the `tool_parser_type` or
-  `chat_template_type`.
+  `chat_template_type`. Names are matched in lower case, with `_` for `-`.
 - The value is a module like the built-in ones in `mlx_lm/models`,
   `mlx_lm/tool_parsers` or `mlx_lm/chat_templates`.
-- A built-in with the same name wins.
+- A name that `mlx-lm` already knows, including the model types in
+  `MODEL_REMAPPING`, always goes to the built-in.
 - Install the package in the same environment as `mlx-lm`. After you change an
   entry point, install it again.
 

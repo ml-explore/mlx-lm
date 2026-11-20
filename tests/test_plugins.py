@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from mlx_lm import plugins, utils
+from mlx_lm.plugins import discovery
 from mlx_lm.processors import load_processor
 
 MODEL = "class Model:\n    pass\n\n\nclass ModelArgs:\n    pass\n"
@@ -31,6 +32,10 @@ class TestPlugins(unittest.TestCase):
                     "test": "test_lm.models.test",
                     "llama": "test_lm.models.llama",
                     "solo": "test_lm.solo",
+                    "Solo-LM": "test_lm.solo",
+                    "extras": "test_lm.solo [cuda]",
+                    "ghost": "test_lm.missing",
+                    "orphan": "no_such_package.model",
                 },
                 "mlx_lm.tool_parsers": {"test": "test_lm.tool_parsers.test"},
                 "mlx_lm.chat_templates": {"test": "test_lm.chat_templates.test"},
@@ -40,6 +45,8 @@ class TestPlugins(unittest.TestCase):
                 "test_lm/models/test/processor.py": PROCESSOR,
                 "test_lm/models/llama/__init__.py": MODEL,
                 "test_lm/solo.py": MODEL,
+                "test_lm/tool_parsers/test.py": "",
+                "test_lm/chat_templates/test.py": "",
             },
         )
 
@@ -48,7 +55,7 @@ class TestPlugins(unittest.TestCase):
         for name in list(sys.modules):
             if name.split(".")[0] in ("test_lm", "other_lm"):
                 del sys.modules[name]
-        plugins._entry_points.cache_clear()
+        discovery._entry_points.cache_clear()
         self.root.cleanup()
 
     def install(
@@ -75,7 +82,7 @@ class TestPlugins(unittest.TestCase):
         (dist_info / "METADATA").write_text(f"Name: {name}\nVersion: 0\n")
         (dist_info / "entry_points.txt").write_text(entry_points_text)
         importlib.invalidate_caches()
-        plugins._entry_points.cache_clear()
+        discovery._entry_points.cache_clear()
 
     def test_new_model(self):
         package = utils.model_package(TEST)
@@ -110,6 +117,24 @@ class TestPlugins(unittest.TestCase):
     def test_module_without_processor(self):
         config = {"model_type": "solo", "vision_config": {"patch_size": 16}}
         self.assertIsNone(load_processor(config))
+
+    def test_names_are_normalized(self):
+        for model_type in ("solo_lm", "Solo-LM"):
+            package = utils.model_package({"model_type": model_type})
+            self.assertEqual(package, "test_lm.solo")
+
+    def test_entry_point_with_extras(self):
+        package = utils.model_package({"model_type": "extras"})
+        self.assertEqual(package, "test_lm.solo")
+
+    def test_entry_point_to_missing_module(self):
+        for model_type in ("ghost", "orphan"):
+            with self.assertRaisesRegex(ValueError, f"test_lm gives {model_type}"):
+                utils.model_package({"model_type": model_type})
+
+    def test_invalid_name(self):
+        with self.assertRaisesRegex(ValueError, "not a valid name"):
+            utils.model_package({"model_type": "a.b"})
 
     def test_tool_parser_and_chat_template(self):
         for kind in ("tool_parsers", "chat_templates"):

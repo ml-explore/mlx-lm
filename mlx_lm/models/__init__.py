@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Any
 
+from mlx_lm.plugins import normalize_name
+
 __all__ = [
     "MODEL_ARCHITECTURE_REMAPPING",
     "MODEL_REMAPPING",
@@ -44,7 +46,7 @@ def package_name(config: dict[str, Any]) -> str:
     for architecture in _architectures(config):
         if architecture in MODEL_ARCHITECTURE_REMAPPING:
             return MODEL_ARCHITECTURE_REMAPPING[architecture]
-    model_type = config["model_type"].lower().replace("-", "_")
+    model_type = normalize_name(config["model_type"])
     return MODEL_REMAPPING.get(model_type, model_type)
 
 
