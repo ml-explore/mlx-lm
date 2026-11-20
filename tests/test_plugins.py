@@ -26,7 +26,7 @@ class TestPlugins(unittest.TestCase):
         self.root = tempfile.TemporaryDirectory()
         sys.path.insert(0, self.root.name)
         self.install(
-            "test_lm",
+            "test-lm",
             {
                 "mlx_lm.models": {
                     "test": "test_lm.models.test",
@@ -64,7 +64,7 @@ class TestPlugins(unittest.TestCase):
         entry_points: dict[str, dict[str, str]],
         files: dict[str, str],
     ) -> None:
-        """Write an installed distribution with its entry points and files."""
+        """Write an installed project with its entry points and files."""
         root = Path(self.root.name)
         for path, text in files.items():
             (root / path).parent.mkdir(parents=True, exist_ok=True)
@@ -76,8 +76,8 @@ class TestPlugins(unittest.TestCase):
         self.write_metadata(name, "\n".join(lines) + "\n")
 
     def write_metadata(self, name: str, entry_points_text: str) -> None:
-        """Write the metadata of an installed distribution."""
-        dist_info = Path(self.root.name) / f"{name}-0.dist-info"
+        """Write the metadata of an installed project, as a wheel does."""
+        dist_info = Path(self.root.name) / f"{name.replace('-', '_')}-0.dist-info"
         dist_info.mkdir()
         (dist_info / "METADATA").write_text(f"Name: {name}\nVersion: 0\n")
         (dist_info / "entry_points.txt").write_text(entry_points_text)
@@ -96,7 +96,7 @@ class TestPlugins(unittest.TestCase):
         self.assertEqual(package, "mlx_lm.models.llama")
 
     def test_broken_package_does_not_break_builtins(self):
-        self.write_metadata("broken_lm", "[mlx_lm.models]\nno equals sign\n")
+        self.write_metadata("broken-lm", "[mlx_lm.models]\nno equals sign\n")
         package = utils.model_package({"model_type": "llama"})
         self.assertEqual(package, "mlx_lm.models.llama")
 
@@ -129,12 +129,16 @@ class TestPlugins(unittest.TestCase):
 
     def test_entry_point_to_missing_module(self):
         for model_type in ("ghost", "orphan"):
-            with self.assertRaisesRegex(ValueError, f"test_lm gives {model_type}"):
+            with self.assertRaisesRegex(ValueError, f"test-lm gives {model_type}"):
                 utils.model_package({"model_type": model_type})
 
     def test_invalid_name(self):
-        with self.assertRaisesRegex(ValueError, "not a valid name"):
+        with self.assertRaisesRegex(ValueError, "not a valid identifier"):
             utils.model_package({"model_type": "a.b"})
+
+    def test_unknown_kind(self):
+        with self.assertRaisesRegex(ValueError, "is not one of"):
+            plugins.module_name("layers", "test")
 
     def test_tool_parser_and_chat_template(self):
         for kind in ("tool_parsers", "chat_templates"):
@@ -142,13 +146,13 @@ class TestPlugins(unittest.TestCase):
             self.assertEqual(name, f"test_lm.{kind}.test")
 
     def test_two_packages_give_the_same_name(self):
-        self.install("other_lm", {"mlx_lm.models": {"test": "other_lm.test"}}, {})
+        self.install("other-lm", {"mlx_lm.models": {"test": "other_lm.test"}}, {})
         with self.assertRaises(ValueError):
             utils.model_package(TEST)
 
     def test_entry_point_must_be_a_module(self):
         entry_points = {"mlx_lm.models": {"other": "other_lm.test:Model"}}
-        self.install("other_lm", entry_points, {})
+        self.install("other-lm", entry_points, {})
         with self.assertRaises(ValueError):
             utils.model_package({"model_type": "other"})
 

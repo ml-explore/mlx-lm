@@ -266,7 +266,7 @@ model, tokenizer = load(
 
 #### Models from Other Packages
 
-Another installed package can add models, tool parsers and chat templates, with
+Another installed project can add models, tool parsers and chat templates, with
 entry points in its `pyproject.toml`:
 
 ```toml
@@ -286,7 +286,7 @@ test = "test_lm.chat_templates.test"
   `mlx_lm/tool_parsers` or `mlx_lm/chat_templates`.
 - A name that `mlx-lm` already knows, including the model types in
   `MODEL_REMAPPING`, always goes to the built-in.
-- Install the package in the same environment as `mlx-lm`. After you change an
+- Install the project in the same environment as `mlx-lm`. After you change an
   entry point, install it again.
 
 ### Large Models
