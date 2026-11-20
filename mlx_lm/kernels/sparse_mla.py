@@ -34,6 +34,17 @@ from typing import Optional
 
 import mlx.core as mx
 
+__all__ = [
+    "SIMDGROUP_MATRIX",
+    "TENSOR_OPS",
+    "VARIANTS",
+    "Variant",
+    "default_variant",
+    "is_available",
+    "sparse_mla_attention",
+    "supports",
+]
+
 # Shared by both variants. A variant defines SmlaFrag: the fragment size and lane layout,
 # which rows and columns of the cache a lane loads for Q.K^T, and the matrix products.
 _HEADER = r"""
