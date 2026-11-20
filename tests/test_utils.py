@@ -235,7 +235,7 @@ class TestUtils(unittest.TestCase):
             bits=4,
         )
 
-        config["quantization"]["language_model.model.per_layer_model_projection"] = {
+        config["quantization"]["model.language_model.per_layer_model_projection"] = {
             "group_size": 32,
             "bits": 4,
         }
@@ -247,7 +247,7 @@ class TestUtils(unittest.TestCase):
             loaded, loaded_config = utils.load_model(Path(mlx_path))
 
             self.assertIn(
-                "language_model.model.per_layer_model_projection",
+                "model.language_model.per_layer_model_projection",
                 loaded_config["quantization"],
             )
 
@@ -256,7 +256,7 @@ class TestUtils(unittest.TestCase):
             self.assertEqual(logits.shape, (1, 3, args.vocab_size))
 
     def test_infer_quant_config(self):
-        from mlx_lm.models.mla import MultiLinear
+        from mlx_lm.layers.attention import MultiLinear
 
         for mode, bits, group_size in [
             ("affine", 3, 64),

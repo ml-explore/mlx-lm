@@ -6,18 +6,18 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.kernels import (
-    depth_attention,
-    expert_routing,
+from mlx_lm.kernels import sparse_mla
+from mlx_lm.kernels.depth_attention import depth_attention
+from mlx_lm.kernels.expert_routing import expert_routing
+from mlx_lm.kernels.relative_attention import relative_attention
+from mlx_lm.kernels.sparse_mla import sparse_mla_attention
+from mlx_lm.models.muse_spark.kernels import (
     norm_add_norm,
     post_expert_norm_combine,
     pre_norm,
     qk_norm,
     qk_norm_rope,
-    relative_attention,
     rms_norm_sigmoid_gate,
-    sparse_mla,
-    sparse_mla_attention,
 )
 from mlx_lm.models.inkling2 import _attention_reference
 
