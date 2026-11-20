@@ -967,7 +967,8 @@ class TextStateMachine:
     ``normal`` text is the content, ``reasoning`` text the reasoning and each
     visit to ``tool`` one tool call. ``stop`` ends the text: the reader is
     then ``stopped``. The text of ``header``, for the headers of a response
-    format, is dropped.
+    format, is dropped. So are the newlines after a reasoning block or a tool
+    call.
 
     Example:
 
@@ -1007,11 +1008,18 @@ class TextStateMachine:
             self._held = ""
             self._tool = ""
             self._previous = state
+            self._after_block = False
+            self._stop_word: str | None = None
             self._enter(state)
 
         @property
         def stopped(self) -> bool:
             return self._state == "stop"
+
+        @property
+        def stop_word(self) -> str | None:
+            """The marker that moved the reader to ``stop``; None before."""
+            return self._stop_word
 
         def _enter(self, state: TextState) -> None:
             self._state = state
@@ -1022,6 +1030,10 @@ class TextStateMachine:
             self, delta: "TextStateMachine.Delta", text: str
         ) -> "TextStateMachine.Delta":
             if self._state == "normal":
+                if self._after_block:
+                    text = text.lstrip("\r\n")
+                    if text:
+                        self._after_block = False
                 return delta + TextStateMachine.Delta(content=text)
             if self._state == "reasoning":
                 return delta + TextStateMachine.Delta(reasoning=text)
@@ -1039,6 +1051,8 @@ class TextStateMachine:
             if state != self._state:
                 if self._state == "tool":
                     delta = self._close_tool_call(delta)
+                blocks = ("reasoning", "tool")
+                self._after_block = state == "normal" and self._state in blocks
                 self._previous = self._state
             self._enter(state)
             return delta
@@ -1069,6 +1083,8 @@ class TextStateMachine:
                     before = text[begin : i + 1 - len(match[0])]
                     delta = self._add(delta, before)
                     delta = self._move(delta, self._next[match[1]])
+                    if self.stopped:
+                        self._stop_word = "".join(match[0])
                     begin = i + 1
             end = len(text) - self._node.get("__depth__", 0)
             delta = self._add(delta, text[begin:end])
@@ -1106,8 +1122,14 @@ class TextStateMachine:
         return cls({"normal": [(w, "stop") for w in stop_words]})
 
     @classmethod
-    def from_tokenizer(cls, tokenizer: TokenizerWrapper) -> "TextStateMachine":
-        """A TextStateMachine with the markers of a tokenizer."""
+    def from_tokenizer(
+        cls, tokenizer: TokenizerWrapper, *, tool_calls: bool = True
+    ) -> "TextStateMachine":
+        """A TextStateMachine with the markers of a tokenizer.
+
+        With ``tool_calls=False``, ``tool_call_start`` does not start a tool
+        call, but the transitions of a response format still can.
+        """
         transitions = {}
 
         if tokenizer.has_thinking:
@@ -1121,11 +1143,11 @@ class TextStateMachine:
             targets = set()
             for edges in tokenizer.response_transitions.values():
                 targets.update(dst for _, dst in edges)
-            if "tool" not in targets:
+            if tool_calls and "tool" not in targets:
                 transitions.setdefault("normal", []).append(
                     (tokenizer.tool_call_start, "tool")
                 )
-            if tokenizer.has_thinking:
+            if tool_calls and tokenizer.has_thinking:
                 transitions["reasoning"].append((tokenizer.tool_call_start, "tool"))
             # Back to the state the tool call started in.
             transitions["tool"] = (
