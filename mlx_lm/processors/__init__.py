@@ -26,7 +26,10 @@ def load_processor(config: dict[str, Any]) -> Processor | None:
     """The processor of the model of a configuration, or None if it takes only text."""
     if not any(config.get(key) for key in ENCODER_CONFIGS):
         return None
-    package = model_package(config)
+    try:
+        package = model_package(config)
+    except ValueError:
+        return None
     # Imported here: the package holds the whole model.
     module = importlib.import_module(package)
     # A plug-in model can be a single module, without a processor.

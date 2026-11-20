@@ -19,8 +19,9 @@ def module_name(kind: PluginKind, name: str) -> str:
         raise ValueError(f"{name!r} is not a valid identifier.")
 
     builtin = f"mlx_lm.{kind}.{name}"
-    # Built-ins never read other packages' metadata.
-    if importlib.util.find_spec(builtin) is not None:
+    # Built-ins never read other packages' metadata. Namespace folders have no origin.
+    spec = importlib.util.find_spec(builtin)
+    if spec is not None and spec.origin is not None:
         return builtin
 
     group = f"mlx_lm.{kind}"
@@ -52,16 +53,18 @@ def _plugin_module(group: str, found: list[EntryPoint]) -> str:
             f"{len(found)} projects give {ep.name} in {group}, for example "
             f"{ep.dist.name} and {rest[0].dist.name}."
         )
-    if ep.attr is not None:
+    match = ep.pattern.match(ep.value)
+    if match is None or match["attr"] is not None:
         raise ValueError(
             f"The entry point {ep.name} in {group} of {ep.dist.name} must be a "
-            f"module, not {ep.value}."
+            f"module, not {ep.value!r}."
         )
-    if not _exists(ep.module):
+    module = match["module"]
+    if not _exists(module):
         raise ValueError(
-            f"{ep.dist.name} gives {ep.name} in {group}, but {ep.module} does not exist."
+            f"{ep.dist.name} gives {ep.name} in {group}, but {module} does not exist."
         )
-    return ep.module
+    return module
 
 
 def _exists(module: str) -> bool:

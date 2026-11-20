@@ -5,8 +5,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from mlx_lm import plugins, utils
+from mlx_lm import models, plugins, utils
 from mlx_lm.plugins import discovery
 from mlx_lm.processors import load_processor
 
@@ -100,6 +101,14 @@ class TestPlugins(unittest.TestCase):
         package = utils.model_package({"model_type": "llama"})
         self.assertEqual(package, "mlx_lm.models.llama")
 
+    def test_folder_without_init_is_not_a_builtin(self):
+        # Left behind by a branch switch.
+        leftover = Path(self.root.name) / "leftover"
+        (leftover / "test" / "__pycache__").mkdir(parents=True)
+        path = [*models.__path__, str(leftover)]
+        with mock.patch.object(models, "__path__", path):
+            self.assertEqual(utils.model_package(TEST), "test_lm.models.test")
+
     def test_unknown_model(self):
         with self.assertRaises(ValueError):
             utils.model_package({"model_type": "unknown"})
@@ -118,10 +127,12 @@ class TestPlugins(unittest.TestCase):
         self.assertEqual(package, "test_lm.solo")
 
     def test_entry_point_must_be_a_module(self):
-        entry_points = {"mlx_lm.models": {"other": "other_lm.test:Model"}}
-        self.install("other-lm", entry_points, {})
-        with self.assertRaises(ValueError):
-            utils.model_package({"model_type": "other"})
+        values = ("other_lm.test:Model", "other_lm.test:", "other-lm.test")
+        entry_points = {f"bad{i}": value for i, value in enumerate(values)}
+        self.install("other-lm", {"mlx_lm.models": entry_points}, {})
+        for model_type in entry_points:
+            with self.assertRaisesRegex(ValueError, "of other-lm must be a module"):
+                utils.model_package({"model_type": model_type})
 
     def test_entry_point_to_missing_module(self):
         for model_type in ("ghost", "orphan"):
@@ -148,6 +159,10 @@ class TestPlugins(unittest.TestCase):
 
     def test_module_without_processor(self):
         config = {"model_type": "solo", "vision_config": {"patch_size": 16}}
+        self.assertIsNone(load_processor(config))
+
+    def test_unknown_model_has_no_processor(self):
+        config = {"model_type": "unknown", "vision_config": {"patch_size": 16}}
         self.assertIsNone(load_processor(config))
 
     def test_tokenizer_defaults_follow_the_given_config(self):
