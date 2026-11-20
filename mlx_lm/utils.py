@@ -625,6 +625,7 @@ def _tokenizer_defaults(
         package = model_package(config)
     except (FileNotFoundError, KeyError, ValueError):
         return None
+
     module = importlib.import_module(package)
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 

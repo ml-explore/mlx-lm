@@ -12,6 +12,13 @@ __all__ = [
     "package_name",
 ]
 
+MODEL_ARCHITECTURE_REMAPPING: Mapping[str, str] = MappingProxyType(
+    {
+        # Ling-3.x reuses Ling-2.6's model type.
+        "BailingMoeV3ForCausalLM": "bailing_moe_v3",
+    }
+)
+
 MODEL_REMAPPING: Mapping[str, str] = MappingProxyType(
     {
         "mistral": "llama",
@@ -33,19 +40,13 @@ MODEL_REMAPPING: Mapping[str, str] = MappingProxyType(
     }
 )
 
-MODEL_ARCHITECTURE_REMAPPING: Mapping[str, str] = MappingProxyType(
-    {
-        # Ling-3.x reuses Ling-2.6's model type.
-        "BailingMoeV3ForCausalLM": "bailing_moe_v3",
-    }
-)
-
 
 def package_name(config: dict[str, Any]) -> str:
-    """The name of the package, built-in or plug-in, that runs a config's model."""
+    """The lookup name of the package that runs a configuration's model."""
     for architecture in _architectures(config):
         if architecture in MODEL_ARCHITECTURE_REMAPPING:
             return MODEL_ARCHITECTURE_REMAPPING[architecture]
+
     model_type = lookup_name(config["model_type"])
     return MODEL_REMAPPING.get(model_type, model_type)
 

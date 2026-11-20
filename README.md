@@ -284,11 +284,15 @@ test = "test_lm.chat_templates.test"
 ```
 
 The name is the `model_type`, `tool_parser_type` or `chat_template_type` it
-serves, and the value is a module like the built-in ones. Built-in names always
-win.
+serves, and the value is a module like the built-in ones. Built-in names and
+their aliases always win, so a plug-in model needs its own `model_type`.
 
-A model's `TOKENIZER_DEFAULTS` can set `tool_parser_type`, `chat_template_type`,
-`think_start` and `think_end`, unless `tokenizer_config.json` sets them.
+A model's `TOKENIZER_DEFAULTS` can set `eos_token_ids`, `tool_parser_type`,
+`chat_template_type`, `think_start` and `think_end`, unless the checkpoint sets
+them.
+
+The project must be installed (an editable install is fine): `PYTHONPATH` is
+not enough. Reinstall it after you change its entry points.
 
 ### Large Models
 

@@ -5,14 +5,9 @@ import importlib.util
 from importlib.metadata import EntryPoint, entry_points
 from typing import Literal, get_args
 
-__all__ = ["Kind", "lookup_name", "module_name"]
+__all__ = ["Kind", "module_name", "lookup_name"]
 
 Kind = Literal["models", "tool_parsers", "chat_templates"]
-
-
-def lookup_name(name: str) -> str:
-    """The module name form of a lookup name: lower case, with ``_`` for ``-``."""
-    return name.lower().replace("-", "_")
 
 
 def module_name(kind: Kind, name: str) -> str:
@@ -22,14 +17,31 @@ def module_name(kind: Kind, name: str) -> str:
     name = lookup_name(name)
     if not name.isidentifier():
         raise ValueError(f"{name!r} is not a valid identifier.")
+
     builtin = f"mlx_lm.{kind}.{name}"
     # Built-ins never read other packages' metadata.
     if importlib.util.find_spec(builtin) is not None:
         return builtin
-    found = _entry_points(kind).get(name, [])
+
+    group = f"mlx_lm.{kind}"
+    found = _entry_points(group).get(name, [])
     if not found:
-        raise ValueError(f"No {builtin} and no plug-in gives {name} in mlx_lm.{kind}.")
-    return _plugin_module(f"mlx_lm.{kind}", found)
+        raise ValueError(f"No {builtin} and no plug-in gives {name} in {group}.")
+    return _plugin_module(group, found)
+
+
+def lookup_name(name: str) -> str:
+    """``name`` in lower case, with ``_`` for ``-``."""
+    return name.lower().replace("-", "_")
+
+
+@functools.cache
+def _entry_points(group: str) -> dict[str, list[EntryPoint]]:
+    """The entry points of ``group``, by lookup name."""
+    found = {}
+    for ep in entry_points(group=group):
+        found.setdefault(lookup_name(ep.name), []).append(ep)
+    return found
 
 
 def _plugin_module(group: str, found: list[EntryPoint]) -> str:
@@ -57,17 +69,7 @@ def _exists(module: str) -> bool:
     try:
         return importlib.util.find_spec(module) is not None
     except ModuleNotFoundError as e:
-        # Only a missing parent means the module does not exist; any other
-        # missing module is an import error of the plug-in itself.
+        # Only a missing parent means no module; others are the plug-in's errors.
         if e.name is not None and (module + ".").startswith(e.name + "."):
             return False
         raise
-
-
-@functools.cache
-def _entry_points(kind: Kind) -> dict[str, list[EntryPoint]]:
-    """The entry points of the ``mlx_lm.{kind}`` group, by name."""
-    found = {}
-    for ep in entry_points(group=f"mlx_lm.{kind}"):
-        found.setdefault(lookup_name(ep.name), []).append(ep)
-    return found

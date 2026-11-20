@@ -104,57 +104,57 @@ class TestPlugins(unittest.TestCase):
         with self.assertRaises(ValueError):
             utils.model_package({"model_type": "unknown"})
 
-    def test_processor(self):
-        processor = load_processor({**TEST, "vision_config": {"patch_size": 16}})
-        self.assertEqual(type(processor).__module__, "test_lm.models.test.processor")
-
-    def test_tokenizer_defaults_follow_the_given_config(self):
-        with tempfile.TemporaryDirectory() as path:
-            (Path(path) / "config.json").write_text('{"model_type": "llama"}')
-            defaults = utils._tokenizer_defaults(Path(path), TEST)
-        self.assertEqual(defaults, {"chat_template_type": "test"})
-
-    def test_module_without_processor(self):
-        config = {"model_type": "solo", "vision_config": {"patch_size": 16}}
-        self.assertIsNone(load_processor(config))
-
     def test_names_are_normalized(self):
         for model_type in ("solo_lm", "Solo-LM"):
             package = utils.model_package({"model_type": model_type})
             self.assertEqual(package, "test_lm.solo")
 
-    def test_entry_point_with_extras(self):
-        package = utils.model_package({"model_type": "extras"})
-        self.assertEqual(package, "test_lm.solo")
-
-    def test_entry_point_to_missing_module(self):
-        for model_type in ("ghost", "orphan"):
-            with self.assertRaisesRegex(ValueError, f"test-lm gives {model_type}"):
-                utils.model_package({"model_type": model_type})
-
     def test_invalid_name(self):
         with self.assertRaisesRegex(ValueError, "not a valid identifier"):
             utils.model_package({"model_type": "a.b"})
 
-    def test_unknown_kind(self):
-        with self.assertRaisesRegex(ValueError, "is not one of"):
-            plugins.module_name("layers", "test")
-
-    def test_tool_parser_and_chat_template(self):
-        for kind in ("tool_parsers", "chat_templates"):
-            name = plugins.module_name(kind, "test")
-            self.assertEqual(name, f"test_lm.{kind}.test")
-
-    def test_two_packages_give_the_same_name(self):
-        self.install("other-lm", {"mlx_lm.models": {"test": "other_lm.test"}}, {})
-        with self.assertRaises(ValueError):
-            utils.model_package(TEST)
+    def test_entry_point_with_extras(self):
+        package = utils.model_package({"model_type": "extras"})
+        self.assertEqual(package, "test_lm.solo")
 
     def test_entry_point_must_be_a_module(self):
         entry_points = {"mlx_lm.models": {"other": "other_lm.test:Model"}}
         self.install("other-lm", entry_points, {})
         with self.assertRaises(ValueError):
             utils.model_package({"model_type": "other"})
+
+    def test_entry_point_to_missing_module(self):
+        for model_type in ("ghost", "orphan"):
+            with self.assertRaisesRegex(ValueError, f"test-lm gives {model_type}"):
+                utils.model_package({"model_type": model_type})
+
+    def test_two_packages_give_the_same_name(self):
+        self.install("other-lm", {"mlx_lm.models": {"test": "other_lm.test"}}, {})
+        with self.assertRaises(ValueError):
+            utils.model_package(TEST)
+
+    def test_tool_parser_and_chat_template(self):
+        for kind in ("tool_parsers", "chat_templates"):
+            name = plugins.module_name(kind, "test")
+            self.assertEqual(name, f"test_lm.{kind}.test")
+
+    def test_unknown_kind(self):
+        with self.assertRaisesRegex(ValueError, "is not one of"):
+            plugins.module_name("layers", "test")
+
+    def test_processor(self):
+        processor = load_processor({**TEST, "vision_config": {"patch_size": 16}})
+        self.assertEqual(type(processor).__module__, "test_lm.models.test.processor")
+
+    def test_module_without_processor(self):
+        config = {"model_type": "solo", "vision_config": {"patch_size": 16}}
+        self.assertIsNone(load_processor(config))
+
+    def test_tokenizer_defaults_follow_the_given_config(self):
+        with tempfile.TemporaryDirectory() as path:
+            (Path(path) / "config.json").write_text('{"model_type": "llama"}')
+            defaults = utils._tokenizer_defaults(Path(path), TEST)
+        self.assertEqual(defaults, {"chat_template_type": "test"})
 
 
 if __name__ == "__main__":

@@ -394,6 +394,7 @@ class TokenizerWrapper:
         self._eos_token_ids = set(eos_token_ids or [])
         if tokenizer.eos_token_id is not None:
             self._eos_token_ids.add(tokenizer.eos_token_id)
+
         if (think_start is None) != (think_end is None):
             raise ValueError("Give both think_start and think_end, or neither.")
         if think_start is None:
@@ -408,6 +409,7 @@ class TokenizerWrapper:
             self._think_end = think_end
             self._think_start_tokens = _marker_tokens(tokenizer, think_start)
             self._think_end_tokens = _marker_tokens(tokenizer, think_end)
+
         self._structural_markers = _infer_structural_markers(tokenizer)
         self._response_format = response_format or {}
 
