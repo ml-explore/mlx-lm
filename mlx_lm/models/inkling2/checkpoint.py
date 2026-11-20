@@ -28,6 +28,11 @@ _RENAMES = [
     (r"\.attn\.wo_ud\.", ".self_attn.o_proj."),
     (r"\.attn\.gate_attn\.", ".self_attn.gate_proj."),
     (r"\.attn\.attn_sink_proj\.", ".self_attn.sink_proj."),
+    (r"\.controllers\.attn\.", ".q_message_gate."),
+    (r"\.controllers\.(k|v|mlp)\.", r".\1_message_gate."),
+    (r"_message_gate\.down_weight$", "_message_gate.down_proj.weight"),
+    (r"_message_gate\.forget_weight$", "_message_gate.forget_gate_proj.weight"),
+    (r"_message_gate\.gain_weight$", "_message_gate.message_gate_proj.weight"),
     (r"\.attn\.", ".self_attn."),
     (r"\.attn_sconv\.", ".post_attention_convolution."),
     (r"\.mlp_sconv\.", ".post_mlp_convolution."),
@@ -65,6 +70,7 @@ def _rename(key: str) -> str:
 def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
     experts = re.compile(r"^(.+\.mlp\.experts)\.(w13|w2)_weight(\w*)$")
     amax, denominator = {}, {}
+    message_queries = {}
     sanitized = {}
     for k, v in weights.items():
         if k.startswith(("model.llm.", "model.visual.")):
@@ -73,7 +79,16 @@ def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
                 v = v.swapaxes(1, 2)
         if k.startswith("model.vision_tower.") and model.args.vision is None:
             continue
-        if k.endswith(".mlp.gate.weight"):
+        if k.endswith(("cross_pass_queries", "cross_pass_kv_queries")):
+            message_queries["kv" if "_kv_" in k else "q"] = v
+            continue
+        if k.endswith(
+            (
+                ".mlp.gate.weight",
+                ".forget_gate_proj.weight",
+                ".message_gate_proj.weight",
+            )
+        ):
             v = v.astype(mx.float32)
         elif m := experts.match(k):
             prefix, which, suffix = m.groups()
@@ -88,6 +103,14 @@ def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
                 sanitized[f"{name}.weight"] = v.view(mx.uint32)
             continue
         sanitized[k] = v
+
+    if message_queries:
+        # The checkpoint has [query, mlp] and [key, value] rows per looped layer.
+        dims = message_queries["q"].shape[-1]
+        q = message_queries["q"].reshape(-1, 2, dims)
+        kv = message_queries["kv"].reshape(-1, 2, dims)
+        query = mx.concatenate([q[:, :1], kv, q[:, 1:]], axis=1)
+        sanitized["model.language_model.message_input.query"] = query
 
     # Pipeline stages can miss the files of the other layers.
     for name in amax.keys() & denominator.keys():

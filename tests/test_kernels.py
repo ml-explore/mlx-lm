@@ -204,7 +204,7 @@ class TestKernels(unittest.TestCase):
 
     def test_depth_attention(self):
         mx.random.seed(4)
-        for num_blocks, num_queries in ((1, 1), (4, 3), (8, 1)):
+        for num_blocks, num_queries in ((1, 1), (1, 4), (4, 3), (8, 1)):
             blocks = mx.random.normal((num_blocks, 2, 3, 1000))
             partial = mx.random.normal((2, 3, 1000))
             queries = 0.1 * mx.random.normal((num_queries, 1000))

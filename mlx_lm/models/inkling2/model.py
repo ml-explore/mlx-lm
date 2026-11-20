@@ -15,6 +15,7 @@ from mlx_lm.models.inkling2.layers import (
     BlockAttentionResidual,
     DecoderLayer,
     FullDecoderLayer,
+    MessageInput,
     ShortConvolution,
     SlidingDecoderLayer,
     unweighted_rms_norm,
@@ -46,9 +47,60 @@ class TextModel(PipelineMixin, nn.Module):
         ]
         self.final_input = BlockAttentionResidual(args.hidden_size)
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        if args.loop_config is not None:
+            self.message_input = MessageInput(args.hidden_size, len(args.loop_core))
 
     def embed(self, inputs: mx.array) -> mx.array:
         return self.embed_norm(self.embed_tokens(inputs))
+
+    @property
+    def layer_visits(self) -> list[DecoderLayer]:
+        if self.args.loop_config is None:
+            return self.pipeline_layers
+        core = self.args.loop_core
+        passes = self.args.loop_config["num_passes"]
+        layers = self.layers
+        return (
+            layers[: core.start]
+            + layers[core.start : core.stop] * passes
+            + layers[core.stop :]
+        )
+
+    def pipeline(self, group, split=None) -> None:
+        if self.args.loop_config is not None:
+            raise ValueError("Pipeline parallel does not support looped models.")
+        super().pipeline(group, split)
+
+    def _run_loop(self, hidden_states, cache, conv_mask):
+        core = self.args.loop_core
+        caches = iter(cache)
+
+        def run(layers, hidden_states, block_states, bank=None):
+            for i, layer in enumerate(layers):
+                messages = None if bank is None else self.message_input(bank, i)
+                hidden_states, block_states = layer(
+                    hidden_states,
+                    block_states,
+                    cache=next(caches),
+                    conv_mask=conv_mask,
+                    messages=messages,
+                )
+            return hidden_states, block_states
+
+        prelude = run(self.layers[: core.start], hidden_states, None)
+        hidden_states, block_states = prelude
+        for loop_pass in range(self.args.loop_config["num_passes"]):
+            bank = None
+            if loop_pass > 0:
+                bank = (
+                    block_states[prelude[1].shape[0] + 1 :],
+                    unweighted_rms_norm(hidden_states.astype(mx.float32)),
+                )
+                hidden_states, block_states = prelude
+            hidden_states, block_states = run(
+                self.layers[core.start : core.stop], hidden_states, block_states, bank
+            )
+        return run(self.layers[core.stop :], hidden_states, block_states)
 
     def __call__(
         self,
@@ -63,7 +115,7 @@ class TextModel(PipelineMixin, nn.Module):
 
         layers = self.pipeline_layers
         if cache is None:
-            cache = [None] * len(layers)
+            cache = [None] * len(self.layer_visits)
         conv_mask = None
         if cache[0] is not None:
             conv_mask = cache[0][1].make_mask(hidden_states.shape[1])
@@ -76,9 +128,14 @@ class TextModel(PipelineMixin, nn.Module):
             states = mx.distributed.recv_like(states, rank + 1)
             hidden_states, block_states = states[0].astype(dtype), states[1:]
 
-        for layer, c in zip(layers, cache):
-            hidden_states, block_states = layer(
-                hidden_states, block_states, cache=c, conv_mask=conv_mask
+        if self.args.loop_config is None:
+            for layer, c in zip(layers, cache):
+                hidden_states, block_states = layer(
+                    hidden_states, block_states, cache=c, conv_mask=conv_mask
+                )
+        else:
+            hidden_states, block_states = self._run_loop(
+                hidden_states, cache, conv_mask
             )
 
         if rank != 0:
@@ -240,7 +297,9 @@ class Model(nn.Module):
     def quant_predicate(self) -> Callable[[str, nn.Module], bool]:
 
         def predicate(path: str, module: nn.Module) -> bool:
-            return not path.startswith("model.vision_tower.")
+            return not path.startswith("model.vision_tower.") and (
+                "_message_gate." not in path
+            )
 
         return predicate
 
@@ -249,7 +308,13 @@ class Model(nn.Module):
 
         def predicate(k: str) -> bool:
             return not k.endswith(
-                (".query", ".mlp.gate.weight", ".mlp.gate.e_score_correction_bias")
+                (
+                    ".query",
+                    ".mlp.gate.weight",
+                    ".mlp.gate.e_score_correction_bias",
+                    ".forget_gate_proj.weight",
+                    ".message_gate_proj.weight",
+                )
             )
 
         return predicate
@@ -269,5 +334,5 @@ class Model(nn.Module):
                 ),
                 ArraysCache(4),
             )
-            for layer in self.layers
+            for layer in self.model.language_model.layer_visits
         ]

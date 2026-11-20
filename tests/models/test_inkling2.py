@@ -61,12 +61,27 @@ VISION_CONFIG = {
     "projection_hidden_dim": 48,
 }
 
+LOOP_CONFIG = {
+    **CONFIG,
+    "model_type": "inkling2_loop",
+    "text_config": {
+        **CONFIG["text_config"],
+        "loop_config": {
+            "core_start": 3,
+            "core_end": 6,
+            "num_passes": 3,
+            "gate_rank": 8,
+            "is_varloop": False,
+        },
+    },
+}
+
 UNPADDED_VOCAB = CONFIG["text_config"]["unpadded_vocab_size"]
 
 
-def create_model(vision: bool = False) -> inkling2.Model:
+def create_model(vision: bool = False, config: dict = CONFIG) -> inkling2.Model:
     mx.random.seed(0)
-    config = {**CONFIG, "vision_config": VISION_CONFIG} if vision else CONFIG
+    config = {**config, "vision_config": VISION_CONFIG} if vision else config
     model = inkling2.Model(inkling2.ModelArgs.from_dict(config))
     weights = []
     for k, v in tree_flatten(model.parameters()):
@@ -106,6 +121,11 @@ _CHECKPOINT_NAMES = [
     (r"\.self_attn\.gate_proj\.", ".attn.gate_attn."),
     (r"\.self_attn\.sink_proj\.", ".attn.attn_sink_proj."),
     (r"\.self_attn\.", ".attn."),
+    (r"\.q_message_gate\.", ".controllers.attn."),
+    (r"\.(k|v|mlp)_message_gate\.", r".controllers.\1."),
+    (r"(\.controllers\.\w+)\.down_proj\.weight$", r"\1.down_weight"),
+    (r"(\.controllers\.\w+)\.forget_gate_proj\.weight$", r"\1.forget_weight"),
+    (r"(\.controllers\.\w+)\.message_gate_proj\.weight$", r"\1.gain_weight"),
     (r"\.post_attention_convolution\.", ".attn_sconv."),
     (r"\.post_mlp_convolution\.", ".mlp_sconv."),
     (r"\.conv1d\.weight$", ".weight"),
@@ -133,6 +153,11 @@ def checkpoint(model: inkling2.Model) -> dict:
     ckpt = {}
     denominator = mx.array([7.5])
     for k, v in weights.items():
+        if k.endswith(".message_input.query"):
+            q, kv = mx.concatenate([v[:, :1], v[:, 3:]], axis=1), v[:, 1:3]
+            ckpt["model.llm.middle_cycle_cross_pass_queries"] = q.flatten(0, 1)
+            ckpt["model.llm.middle_cycle_cross_pass_kv_queries"] = kv.flatten(0, 1)
+            continue
         if m := re.match(r"(.+\.mlp\.experts)\.(gate_up|down)_proj\.(\w+)$", k):
             prefix, name, param = m.groups()
             prefix = prefix.replace("model.language_model.", "model.llm.")
@@ -241,6 +266,27 @@ class TestInkling2(unittest.TestCase):
             (path / "hf_quant_config.json").write_text(json.dumps(quant))
             loaded, _ = load_model(path)
         self.assertTrue(mx.allclose(loaded(tokens), expected, rtol=1e-4, atol=1e-4))
+
+    def test_loop(self):
+        model = create_model(config=LOOP_CONFIG)
+        quantize_experts(model)
+        tokens = mx.random.randint(0, UNPADDED_VOCAB, (2, 20))
+        full = model(tokens)
+
+        cache = model.make_cache()
+        self.assertEqual(len(cache), 14)
+        steps = [model(tokens[:, :6], cache=cache), model(tokens[:, 6:12], cache=cache)]
+        steps += [model(tokens[:, i : i + 1], cache=cache) for i in range(12, 20)]
+        self.assertTrue(
+            mx.allclose(mx.concatenate(steps, axis=1), full, rtol=1e-4, atol=1e-4)
+        )
+
+        with tempfile.TemporaryDirectory() as path:
+            path = Path(path)
+            mx.save_safetensors(str(path / "model.safetensors"), checkpoint(model))
+            (path / "config.json").write_text(json.dumps(LOOP_CONFIG))
+            loaded, _ = load_model(path)
+        self.assertTrue(mx.allclose(loaded(tokens), full, rtol=1e-4, atol=1e-4))
 
     def test_embed_inputs(self):
         model = create_model(vision=True)
