@@ -287,6 +287,9 @@ The name is the `model_type`, `tool_parser_type` or `chat_template_type` it
 serves, and the value is a module like the built-in ones. Built-in names always
 win.
 
+A model's `TOKENIZER_DEFAULTS` can set `tool_parser_type`, `chat_template_type`,
+`think_start` and `think_end`, unless `tokenizer_config.json` sets them.
+
 ### Large Models
 
 > [!NOTE]

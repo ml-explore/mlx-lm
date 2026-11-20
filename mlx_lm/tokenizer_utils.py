@@ -318,6 +318,14 @@ def _infer_thinking(tokenizer):
     return (None, None, None, None)
 
 
+def _marker_tokens(tokenizer, marker: str) -> tuple[int, ...]:
+    """The tokens of ``marker`` without end whitespace, which can merge."""
+    tokens = tuple(tokenizer.encode(marker.strip(), add_special_tokens=False))
+    if not tokens:
+        raise ValueError(f"The marker {marker!r} has no tokens.")
+    return tokens
+
+
 def _is_xtml_vocab(vocab):
     return all(
         t in vocab for t in ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
@@ -377,6 +385,8 @@ class TokenizerWrapper:
         tool_call_end=None,
         tool_parser=None,
         response_format: Optional[Dict[str, Any]] = None,
+        think_start: str | None = None,
+        think_end: str | None = None,
     ):
         self._tokenizer = tokenizer
         # Built once, since building the token map is expensive.
@@ -384,12 +394,20 @@ class TokenizerWrapper:
         self._eos_token_ids = set(eos_token_ids or [])
         if tokenizer.eos_token_id is not None:
             self._eos_token_ids.add(tokenizer.eos_token_id)
-        (
-            self._think_start,
-            self._think_end,
-            self._think_start_tokens,
-            self._think_end_tokens,
-        ) = _infer_thinking(tokenizer)
+        if (think_start is None) != (think_end is None):
+            raise ValueError("Give both think_start and think_end, or neither.")
+        if think_start is None:
+            (
+                self._think_start,
+                self._think_end,
+                self._think_start_tokens,
+                self._think_end_tokens,
+            ) = _infer_thinking(tokenizer)
+        else:
+            self._think_start = think_start
+            self._think_end = think_end
+            self._think_start_tokens = _marker_tokens(tokenizer, think_start)
+            self._think_end_tokens = _marker_tokens(tokenizer, think_end)
         self._structural_markers = _infer_structural_markers(tokenizer)
         self._response_format = response_format or {}
 
@@ -776,6 +794,9 @@ def load(
         tool_call_start = None
         tool_call_end = None
 
+    think_start = tokenizer_config.get("think_start", defaults.get("think_start"))
+    think_end = tokenizer_config.get("think_end", defaults.get("think_end"))
+
     return TokenizerWrapper(
         tokenizer,
         detokenizer_class,
@@ -785,6 +806,8 @@ def load(
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
         response_format=response_format,
+        think_start=think_start,
+        think_end=think_end,
     )
 
 
