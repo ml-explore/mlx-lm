@@ -4,9 +4,10 @@ import unittest
 from unittest.mock import patch
 
 import mlx.core as mx
+import mlx.nn as nn
 
+from mlx_lm.layers import attention
 from mlx_lm.models import deepseek_v32 as D
-from mlx_lm.models import dsa
 from mlx_lm.models import glm_moe_dsa as G
 from mlx_lm.models.cache import make_prompt_cache
 
@@ -84,6 +85,7 @@ class _SparsePrefillTests:
             self.module.ModelArgs.from_dict(self.config)
         ).model.layers
         self.assertTrue(all(layer.self_attn.sparse_prefill for layer in layers))
+        self.assertTrue(all(layer.self_attn.sparse_prefill_fused for layer in layers))
 
     def test_sparse_prefill_matches_dense(self):
         mx.random.seed(0)
@@ -102,7 +104,7 @@ class _SparsePrefillTests:
         self.assertTrue(bool(mx.all(mx.argmax(dense, -1) == mx.argmax(sparse, -1))))
 
     def test_blocked_topk_matches_indexer(self):
-        from mlx_lm.models.base import create_causal_mask
+        from mlx_lm.layers.attention import create_causal_mask
 
         model = self.module.Model(self._args())
         mx.eval(model.parameters())
@@ -111,7 +113,7 @@ class _SparsePrefillTests:
         qr = mx.random.normal((1, 64, 32))
         mask = create_causal_mask(64)
         stock = indexer(x, qr, mask)
-        blocked = dsa.blocked_topk(indexer, x, qr, mask, None, block=16)
+        blocked = attention.blocked_topk(indexer, x, qr, mask, None, block=16)
         # Rows with fewer than index_topk causal keys also select masked keys.
         rows = slice(indexer.index_topk - 1, None)
         self.assertTrue(
@@ -168,7 +170,7 @@ class _SparsePrefillTests:
             layer.self_attn.sparse_prefill_min_context = 0
         tokens = mx.random.randint(0, 256, (1, 128))
         whole = self._prefill(model, tokens, 64)
-        with patch.object(dsa, "SPARSE_QUERY_BLOCK", 24):
+        with patch.object(attention, "SPARSE_QUERY_BLOCK", 24):
             blocked = self._prefill(model, tokens, 64)
         self.assertTrue(bool(mx.array_equal(whole, blocked)))
 
@@ -186,6 +188,83 @@ class _SparsePrefillTests:
         out = model(mx.array([[5]]), cache=cache)
         mx.eval(out)
         self.assertEqual(out.shape, (1, 1, 256))
+
+    @unittest.skipIf(not mx.metal.is_available(), "The kernel needs the Metal backend")
+    def test_training_uses_gather_path(self):
+        # The fused kernel has no vjp, so training keeps the gather path and its minimum.
+        mx.set_default_device(mx.gpu)
+        mx.random.seed(0)
+        config = {
+            **self.config,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "kv_lora_rank": 64,
+            "qk_rope_head_dim": 16,
+        }
+        model = self.module.Model(self.module.ModelArgs.from_dict(config))
+        model.set_dtype(mx.bfloat16)
+        attn = model.model.layers[0].self_attn
+        shapes = [(1, 16, 64, 16), (1, 1, 64, 64), (1, 1, 64, 16)]
+        inputs = [mx.zeros(s, mx.bfloat16) for s in shapes]  # q_pe, kv_latent, k_pe
+        model.train()
+        self.assertEqual(
+            attention.min_context(attn, *inputs), attn.sparse_prefill_min_context
+        )
+        model.eval()
+        self.assertEqual(attention.min_context(attn, *inputs), 0)
+
+        for layer in model.model.layers:
+            layer.self_attn.sparse_prefill_min_context = 0
+        tokens = mx.random.randint(0, 256, (1, 64))  # more keys than index_topk
+        loss = lambda model: model(tokens).astype(mx.float32).mean()
+        fused = attention.fused_sparse_attention
+        with patch.object(attention, "fused_sparse_attention", wraps=fused) as fused:
+            model.train()
+            mx.eval(nn.value_and_grad(model, loss)(model))
+            fused.assert_not_called()
+            model.eval()
+            mx.eval(model(tokens))
+            fused.assert_called()
+
+    @unittest.skipIf(not mx.metal.is_available(), "The kernel needs the Metal backend")
+    def test_fused_matches_gather_path(self):
+        # The kernel inside the model against the gather path, on the GPU: two head groups,
+        # and chunks whose first queries see fewer keys than index_topk, so the mask matters.
+        mx.set_default_device(mx.gpu)
+        mx.random.seed(0)
+        config = {
+            **self.config,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 32,
+            "kv_lora_rank": 64,
+            "qk_rope_head_dim": 16,
+            "index_topk": 32,
+        }
+        model = self.module.Model(self.module.ModelArgs.from_dict(config))
+        model.set_dtype(mx.bfloat16)
+        model.eval()
+        for layer in model.model.layers:
+            layer.self_attn.sparse_prefill_min_context = 0
+        tokens = mx.random.randint(0, 256, (1, 96))
+
+        ran = []
+        fused = attention.fused_sparse_attention
+
+        def record(*args):
+            out = fused(*args)
+            ran.append(out is not None)
+            return out
+
+        with patch.object(attention, "fused_sparse_attention", record):
+            out = self._prefill(model, tokens, 24)
+        for layer in model.model.layers:
+            layer.self_attn.sparse_prefill_fused = False
+        ref = self._prefill(model, tokens, 24)
+        self.assertTrue(ran and all(ran))
+        # bf16 rounding stays well below these; a dropped mask or a wrong scale doesn't.
+        diff = mx.abs(out - ref).astype(mx.float32)
+        self.assertLess(float(diff.max()), 0.25)
+        self.assertLess(float(diff.mean()), 0.014)
 
 
 class TestGlmSparsePrefill(_SparsePrefillTests, unittest.TestCase):

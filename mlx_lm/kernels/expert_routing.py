@@ -4,7 +4,11 @@
 
 import mlx.core as mx
 
-from ._common import scalar
+from mlx_lm.kernels.common import scalar
+
+__all__ = [
+    "expert_routing",
+]
 
 _ROUTING_SOURCE = """
     constexpr int R = (E + 31) / 32;
