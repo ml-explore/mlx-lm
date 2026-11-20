@@ -2936,7 +2936,7 @@ class TestModels(unittest.TestCase):
             model_type="mistral_large4", text_config=text_config
         )
         model = mistral_large4.Model(args)
-        self.assertEqual(model.text_args.no_rope_layers, [1, 1, 1, 0, 1, 1, 1, 0])
+        self.assertEqual(args.text.no_rope_layers, [1, 1, 1, 0, 1, 1, 1, 0])
 
         # KV-sharing layers keep only the indexer cache, shared-indexer layers
         # only the latent cache.
@@ -2987,7 +2987,7 @@ class TestModels(unittest.TestCase):
         out = model.sanitize(native())
         p = "model.layers.3.self_attn"
         q_proj = model.layers[3].self_attn.q_proj
-        self.assertIsInstance(q_proj, mistral_large4.Fp8Linear)
+        self.assertIsInstance(q_proj, mistral_large4.layers.Fp8Linear)
         self.assertEqual(out[f"{p}.q_proj.scales"].dtype, mx.uint8)
         self.assertTrue(mx.all(mxfp8(out, f"{p}.q_proj") == 0.5).item())
         self.assertEqual(out[f"{p}.embed_q.weight"].shape, (4, 32, 32))
@@ -2996,7 +2996,8 @@ class TestModels(unittest.TestCase):
         self.assertIn(f"{p}.indexer.softmax_scaling.bias", out)
         w1 = "model.layers.1.mlp.switch_mlp.gate_proj"
         self.assertIsInstance(
-            model.layers[1].mlp.switch_mlp.gate_proj, mistral_large4.Fp8SwitchLinear
+            model.layers[1].mlp.switch_mlp.gate_proj,
+            mistral_large4.layers.Fp8SwitchLinear,
         )
         self.assertEqual(out[f"{w1}.scales"].shape, (4, 64, 4))
         self.assertTrue(mx.all(mxfp8(out, w1) == 2.0).item())
@@ -3004,7 +3005,9 @@ class TestModels(unittest.TestCase):
         self.assertEqual(len(out), 9)
 
         # The last 128x128 block can be smaller.
-        w, s = mistral_large4._fp8_as_mxfp8(fp8[:192], mx.array([[0.5], [2.0]]))
+        w, s = mistral_large4.checkpoint._fp8_as_mxfp8(
+            fp8[:192], mx.array([[0.5], [2.0]])
+        )
         w = mx.dequantize(w, s, group_size=32, bits=8, mode="mxfp8")
         self.assertTrue(mx.all(w[:128] == 0.5).item())
         self.assertTrue(mx.all(w[128:] == 2.0).item())
