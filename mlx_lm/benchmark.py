@@ -105,6 +105,7 @@ class BenchmarkResult:
 def run_benchmark(
     model: str | None = None,
     *,
+    prompt: str | None = None,
     prompt_tokens: int = 512,
     generation_tokens: int = 1024,
     batch_size: int = 1,
@@ -117,6 +118,9 @@ def run_benchmark(
     verbose: bool = False,
 ) -> BenchmarkResult:
     """Benchmark model inference using synthetic token IDs."""
+    if prompt is not None:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("prompt must be a non-empty string")
 
     # Step 1: Validate the input parameters.
     for name, value in (
@@ -126,6 +130,7 @@ def run_benchmark(
         ("num_trials", num_trials),
         ("prefill_step_size", prefill_step_size),
     ):
+
         if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
 
@@ -164,14 +169,24 @@ def run_benchmark(
     # Avoid stopping generation early on EOS.
     tokenizer._eos_token_ids = {}
 
-    # Step 4: Create synthetic input tokens.
-    vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+    # Step 4: Prepare input tokens.
+    if prompt is not None:
+        token_ids = tokenizer.encode(prompt)
 
-    prompts = mx.random.randint(
-        0,
-        vocab_size,
-        (batch_size, prompt_tokens),
-    ).tolist()
+        if not token_ids:
+            raise ValueError("prompt produced no tokens")
+
+        prompt_tokens = len(token_ids)
+        prompts = [list(token_ids) for _ in range(batch_size)]
+
+    else:
+        vocab_size = config.get("vocab_size") or config["text_config"]["vocab_size"]
+
+        prompts = mx.random.randint(
+            0,
+            vocab_size,
+            (batch_size, prompt_tokens),
+        ).tolist()
 
     # Step 5: Inference for a single prompt.
     def single_bench():
