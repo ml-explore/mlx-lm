@@ -70,8 +70,9 @@ curl localhost:8080/v1/chat/completions \
 - `role_mapping`: (Optional) A dictionary to customize the role prefixes in
   the generated prompt. If not provided, the default mappings are used.
 
-- `stop`: (Optional) An array of strings or a single string. These are
-  sequences of tokens on which the generation should stop.
+- `stop`: (Optional) An array of strings or a single string. The generation
+  stops when one of these strings appears in the generated text, reasoning and
+  tool calls included. The string is not returned.
 
 - `max_tokens`: (Optional) An integer specifying the maximum number of tokens
   to generate. Defaults to `512`.

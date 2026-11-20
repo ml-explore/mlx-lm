@@ -21,6 +21,7 @@ from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
     build_schedule,
     linear_to_lora_layers,
+    load_adapter_weights,
     load_adapters,
     print_trainable_parameters,
 )
@@ -256,7 +257,11 @@ def train_model(
     # Resume from weights if provided
     if args.resume_adapter_file is not None:
         rprint(f"Loading fine-tuned weights from {args.resume_adapter_file}")
-        model.load_weights(args.resume_adapter_file, strict=False)
+        load_adapter_weights(
+            model,
+            path=args.resume_adapter_file,
+            fine_tune_type=args.fine_tune_type,
+        )
 
     if mx.distributed.init().rank() == 0:
         print_lora_run_header(make_console(), args)
@@ -280,6 +285,7 @@ def train_model(
         max_seq_length=args.max_seq_length,
         grad_checkpoint=args.grad_checkpoint,
         grad_accumulation_steps=args.grad_accumulation_steps,
+        clear_cache_threshold=args.clear_cache_threshold,
     )
 
     # Initialize the selected optimizer
