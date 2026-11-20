@@ -49,9 +49,10 @@ def _plugin_module(group: str, found: list[EntryPoint]) -> str:
     """The module of the one valid entry point for a name; ValueError if invalid."""
     ep, *rest = found
     if rest:
+        sources = ", ".join(sorted(f"{e.name} from {e.dist.name}" for e in found))
         raise ValueError(
-            f"{len(found)} projects give {ep.name} in {group}, for example "
-            f"{ep.dist.name} and {rest[0].dist.name}."
+            f"{len(found)} entry points in {group} give {lookup_name(ep.name)}: "
+            f"{sources}."
         )
     match = ep.pattern.match(ep.value)
     if match is None or match["attr"] is not None:

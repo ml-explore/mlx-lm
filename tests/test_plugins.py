@@ -139,10 +139,20 @@ class TestPlugins(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, f"test-lm gives {model_type}"):
                 utils.model_package({"model_type": model_type})
 
-    def test_two_packages_give_the_same_name(self):
-        self.install("other-lm", {"mlx_lm.models": {"test": "other_lm.test"}}, {})
-        with self.assertRaises(ValueError):
-            utils.model_package(TEST)
+    def test_two_entry_points_give_the_same_name(self):
+        entry_points = {
+            "test": "other_lm.test",
+            "dup": "other_lm.a",
+            "DUP": "other_lm.b",
+        }
+        self.install("other-lm", {"mlx_lm.models": entry_points}, {})
+        cases = {
+            "test": "test from other-lm, test from test-lm",
+            "dup": "DUP from other-lm, dup from other-lm",
+        }
+        for model_type, sources in cases.items():
+            with self.assertRaisesRegex(ValueError, sources):
+                utils.model_package({"model_type": model_type})
 
     def test_tool_parser_and_chat_template(self):
         for kind in ("tool_parsers", "chat_templates"):
