@@ -299,12 +299,20 @@ class TestModelParallel(unittest.TestCase):
                     self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
 
     def test_inkling2(self):
-        from models.test_inkling2 import UNPADDED_VOCAB, create_model, quantize_experts
+        from models.test_inkling2 import (
+            CONFIG,
+            LOOP_CONFIG,
+            UNPADDED_VOCAB,
+            create_model,
+            quantize_experts,
+        )
 
-        for parallel in ("tensor", "pipeline"):
+        cases = [(CONFIG, "tensor"), (CONFIG, "pipeline"), (LOOP_CONFIG, "tensor")]
+        for config, parallel in cases:
             for quantized in (False, True):
-                with self.subTest(parallel=parallel, quantized=quantized):
-                    model = create_model()
+                loop = config is LOOP_CONFIG
+                with self.subTest(parallel=parallel, quantized=quantized, loop=loop):
+                    model = create_model(config=config)
                     if quantized:
                         quantize_experts(model)
                     x = mx.random.randint(0, UNPADDED_VOCAB, shape=(2, 13))
@@ -323,6 +331,10 @@ class TestModelParallel(unittest.TestCase):
                         model.model.pipeline(mx.distributed.init())
                     for e, out in zip(expected, run()):
                         self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
+
+        model = create_model(config=LOOP_CONFIG)
+        with self.assertRaisesRegex(ValueError, "Pipeline parallel"):
+            model.model.pipeline(mx.distributed.init())
 
     def test_pipeline_layer_assignment(self):
         def assignment(num_layers, size, split=None):

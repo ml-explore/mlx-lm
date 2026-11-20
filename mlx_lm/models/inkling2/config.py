@@ -41,6 +41,11 @@ class TextArgs(BaseModelArgs):
     mlp_up_softcap: float
     route_scale: float
     final_logit_softcapping: float
+    loop_config: dict | None = None
+
+    def __post_init__(self):
+        loop = self.loop_config or {}
+        self.loop_core = range(loop.get("core_start", 0), loop.get("core_end", 0))
 
 
 @dataclass

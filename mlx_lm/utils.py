@@ -62,6 +62,7 @@ MODEL_REMAPPING = {
     "qwen3_5_moe": "qwen3_5",
     "qwen3_vl_moe": "qwen3_vl",
     "solar_open": "glm4_moe",
+    "inkling2_loop": "inkling2",
     # Package names cannot have hyphens.
     "lfm2-vl": "lfm2_vl",
     "lille-130m": "lille_130m",
