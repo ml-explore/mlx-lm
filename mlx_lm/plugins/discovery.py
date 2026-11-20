@@ -5,15 +5,15 @@ import importlib.util
 from importlib.metadata import EntryPoint, entry_points
 from typing import Literal, get_args
 
-__all__ = ["Kind", "module_name", "lookup_name"]
+__all__ = ["PluginKind", "module_name", "lookup_name"]
 
-Kind = Literal["models", "tool_parsers", "chat_templates"]
+PluginKind = Literal["models", "tool_parsers", "chat_templates"]
 
 
-def module_name(kind: Kind, name: str) -> str:
+def module_name(kind: PluginKind, name: str) -> str:
     """The built-in module for ``name``, else the plug-in's; ValueError if none."""
-    if kind not in get_args(Kind):
-        raise ValueError(f"{kind!r} is not one of {', '.join(get_args(Kind))}.")
+    if kind not in get_args(PluginKind):
+        raise ValueError(f"{kind!r} is not one of {', '.join(get_args(PluginKind))}.")
     name = lookup_name(name)
     if not name.isidentifier():
         raise ValueError(f"{name!r} is not a valid identifier.")
