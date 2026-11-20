@@ -105,6 +105,14 @@ class TestRendering(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no tokens"):
             rendering.from_text(self.chat_tokenizer, "", params=PARAMS)
 
+    def test_newline_after_the_marker(self):
+        # The newline can merge into the last token of the marker.
+        template = "{{ messages[-1].content + '<think>\\n' }}"
+        tokenizer = helpers.load_tokenizer(chat_template=template)
+        messages = [{"role": "user", "content": "Hi"}]
+        result = rendering.from_messages(tokenizer, messages, params=PARAMS)
+        self.assertEqual(result.text_state, "reasoning")
+
 
 if __name__ == "__main__":
     unittest.main()

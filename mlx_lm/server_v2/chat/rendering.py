@@ -120,11 +120,9 @@ def _ends_in_think_block(
     tokenizer: tokenizer_utils.TokenizerWrapper, tokens: Sequence[int]
 ) -> bool:
     """Whether the prompt ends in a reasoning block that is still open."""
-    start = tokenizer.rfind_think_start(tokens)
-    if start <= tokenizer.rfind_think_end(tokens):
-        return False
-    # A marker in the user text is not at the end.
-    return tokenizer.decode(tokens[start:]).strip() == tokenizer.think_start
+    # Text, since a newline after the marker can merge into its last token.
+    text = tokenizer.decode(tokens).rstrip()
+    return text.endswith(tokenizer.think_start.rstrip())
 
 
 def _checkpoints(
