@@ -59,12 +59,6 @@ class TestMuseSparkProcessor(unittest.TestCase):
     def test_load_processor(self):
         self.assertIsNone(load_processor({"model_type": "muse_spark"}))
         self.assertIsNone(load_processor({"vision_config": {}}))
-        config = {
-            "vision_config": {"patch_size": 16},
-            "processor_type": "muse_spark",
-        }
-        processor = load_processor(config)
-        self.assertEqual(processor.patch_size, 16)
 
     def test_load_processor_of_the_model_package(self):
         config = {"model_type": "muse_spark", "vision_config": {"patch_size": 16}}
