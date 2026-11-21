@@ -16,6 +16,7 @@ from mlx_lm.models.cache import (
     BatchRotatingKVCache,
     CacheList,
     ChunkedKVCache,
+    ConcatenateKVCache,
     KVCache,
     QuantizedKVCache,
     RotatingKVCache,
@@ -262,6 +263,30 @@ class TestPromptCache(unittest.TestCase):
         # Trim more tokens than remain
         num_trimmed = trim_prompt_cache(cache, 4)
         self.assertEqual(num_trimmed, 3)
+
+    def test_trim_concatenate_cache(self):
+        cache = ConcatenateKVCache()
+        x = mx.arange(5, dtype=mx.float32).reshape(1, 1, 5, 1)
+        cache.update_and_fetch(x, x)
+
+        self.assertEqual(cache.trim(2), 2)
+        self.assertEqual(cache.offset, 3)
+        keys, values = cache.keys_and_values()
+        self.assertEqual(keys.reshape(-1).tolist(), [0.0, 1.0, 2.0])
+        self.assertEqual(values.reshape(-1).tolist(), [0.0, 1.0, 2.0])
+
+        # The trimmed entries do not come back with the next update
+        y = mx.full((1, 1, 1, 1), 9.0)
+        keys, values = cache.update_and_fetch(y, y)
+        self.assertEqual(cache.offset, 4)
+        self.assertEqual(keys.reshape(-1).tolist(), [0.0, 1.0, 2.0, 9.0])
+        self.assertEqual(values.reshape(-1).tolist(), [0.0, 1.0, 2.0, 9.0])
+
+        # Trim more tokens than remain
+        self.assertEqual(cache.trim(10), 4)
+        self.assertEqual(cache.offset, 0)
+        keys, _ = cache.update_and_fetch(y, y)
+        self.assertEqual(keys.reshape(-1).tolist(), [9.0])
 
     def test_trim_cache_with_generate(self):
         model, tokenizer = self.model, self.tokenizer
