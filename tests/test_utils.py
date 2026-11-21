@@ -75,6 +75,32 @@ class TestUtils(unittest.TestCase):
             utils.load_config(model_path)["time_step_limit"], config["time_step_limit"]
         )
 
+    def test_transformers_weights(self):
+        from mlx_lm.models import llama
+
+        config = {
+            "model_type": "llama",
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "intermediate_size": 64,
+            "num_attention_heads": 4,
+            "rms_norm_eps": 1e-5,
+            "vocab_size": 64,
+            "transformers_weights": "consolidated.safetensors.index.json",
+        }
+        path = Path(self.test_dir) / "transformers-weights"
+        path.mkdir()
+        model = llama.Model(llama.ModelArgs.from_dict(config))
+        weights = dict(tree_flatten(model.parameters()))
+        mx.save_safetensors(str(path / "consolidated.safetensors"), weights)
+        index = {"weight_map": {k: "consolidated.safetensors" for k in weights}}
+        (path / config["transformers_weights"]).write_text(json.dumps(index))
+        (path / "config.json").write_text(json.dumps(config))
+
+        _, config = utils.load_model(path)
+        utils.save_config(config, path / "config.json")
+        self.assertNotIn("transformers_weights", utils.load_config(path))
+
     def test_make_shards(self):
         from mlx_lm.models import llama
 
