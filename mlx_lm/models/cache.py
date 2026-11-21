@@ -233,6 +233,9 @@ class ConcatenateKVCache(_BaseCache):
     def trim(self, n):
         n = min(self.offset, n)
         self.offset -= n
+        if n > 0:
+            self.keys = self.keys[..., : self.offset, :]
+            self.values = self.values[..., : self.offset, :]
         return n
 
     def make_mask(self, *args, **kwargs):
