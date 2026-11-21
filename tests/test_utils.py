@@ -138,6 +138,43 @@ class TestUtils(unittest.TestCase):
         self.assertEqual(config["quantization"]["group_size"], 64)
         self.assertEqual(config["quantization"]["bits"], 4)
 
+    def test_mixed_quant_predicate_lfm2(self):
+        from mlx_lm.convert import mixed_quant_predicate_builder
+        from mlx_lm.models import lfm2
+
+        args = lfm2.ModelArgs(
+            model_type="lfm2",
+            hidden_size=128,
+            num_hidden_layers=8,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            norm_eps=1e-5,
+            vocab_size=1000,
+            full_attn_idxs=[3, 5],
+            rope_theta=10000,
+            block_dim=128,
+            block_ffn_dim_multiplier=1.0,
+            block_auto_adjust_ff_dim=False,
+            block_ff_dim=256,
+            block_multiple_of=256,
+            max_position_embeddings=1000,
+            conv_bias=False,
+            conv_L_cache=3,
+        )
+        model = lfm2.Model(args)
+        predicate = mixed_quant_predicate_builder("mixed_4_6", model)
+        model, config = utils.quantize_model(
+            model, {}, 64, 4, quant_predicate=predicate
+        )
+        quant = config["quantization"]
+        # Layers 0, 3, 6 and 7 use the high bits for w2 and v_proj
+        self.assertEqual(quant["model.layers.0.feed_forward.w2"]["bits"], 6)
+        self.assertEqual(quant["model.layers.7.feed_forward.w2"]["bits"], 6)
+        self.assertEqual(quant["model.layers.0.feed_forward.w1"]["bits"], 4)
+        self.assertEqual(quant["model.layers.1.feed_forward.w2"]["bits"], 4)
+        self.assertEqual(quant["model.layers.3.self_attn.v_proj"]["bits"], 6)
+        self.assertEqual(quant["model.layers.5.self_attn.v_proj"]["bits"], 4)
+
     def test_convert(self):
         mlx_path = os.path.join(self.test_dir, "mlx_model")
 
