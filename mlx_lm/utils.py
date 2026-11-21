@@ -538,7 +538,9 @@ def load_model(
             from mlx_lm.layers.common import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
-        elif quant_method == "mxfp4":
+        elif (
+            quant_method == "mxfp4" or quantization_config.get("store_dtype") == "mxfp4"
+        ):
             quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
             config["quantization"] = quantization
             config["quantization_config"] = quantization
