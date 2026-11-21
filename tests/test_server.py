@@ -333,6 +333,26 @@ class TestServer(unittest.TestCase):
             response = requests.post(url, json={"prompt": "hi", "stop": stop})
             self.assertEqual(response.status_code, 400)
 
+    def test_completions_single_item_list_prompt(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        body = {"max_tokens": 5, "temperature": 0.0}
+        expected = requests.post(url, json={**body, "prompt": "Once upon a time"})
+        response = requests.post(url, json={**body, "prompt": ["Once upon a time"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["choices"][0]["text"],
+            expected.json()["choices"][0]["text"],
+        )
+
+    def test_completions_invalid_prompt_is_rejected(self):
+        url = f"http://localhost:{self.port}/v1/completions"
+        for prompt in (["a", "b"], [], [1, 2, 3], [[1, 2]], 5, None, {"a": 1}):
+            response = requests.post(url, json={"prompt": prompt, "max_tokens": 5})
+            self.assertEqual(response.status_code, 400, prompt)
+        # The generation thread must survive the bad requests
+        response = requests.post(url, json={"prompt": "hi", "max_tokens": 5})
+        self.assertEqual(response.status_code, 200)
+
     def test_handle_completions(self):
         url = f"http://localhost:{self.port}/v1/completions"
 
