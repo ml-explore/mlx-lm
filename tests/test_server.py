@@ -978,6 +978,48 @@ class TestModelSwapClearsCache(unittest.TestCase):
         provider._load("model-b")
         self.assertGreaterEqual(clear_cache.call_count, 2)
 
+class TestModelProviderAdapterMapping(unittest.TestCase):
+    def _provider(self, *, model="model-a", adapter_path=None):
+        import argparse
+
+        from mlx_lm.server import ModelProvider
+
+        args = argparse.Namespace(
+            adapter_path=adapter_path,
+            chat_template=None,
+            draft_model=None,
+            model=model,
+            pipeline=False,
+            trust_remote_code=False,
+        )
+        provider = ModelProvider(args)
+        provider._load = mock.Mock()
+        return provider
+
+    @mock.patch("mlx_lm.server.mx.distributed.init")
+    def test_adapter_path_applies_to_configured_model_name(self, init):
+        init.return_value.size.return_value = 1
+
+        provider = self._provider(adapter_path="adapter-a")
+        provider.load("model-a")
+        provider._load.assert_called_once_with("model-a", "adapter-a", None)
+
+    @mock.patch("mlx_lm.server.mx.distributed.init")
+    def test_request_adapter_overrides_mapped_cli_adapter(self, init):
+        init.return_value.size.return_value = 1
+
+        provider = self._provider(adapter_path="adapter-a")
+        provider.load("model-a", "adapter-b")
+        provider._load.assert_called_once_with("model-a", "adapter-b", None)
+
+    @mock.patch("mlx_lm.server.mx.distributed.init")
+    def test_request_adapter_used_when_cli_adapter_absent(self, init):
+        init.return_value.size.return_value = 1
+
+        provider = self._provider(adapter_path=None)
+        provider.load("model-a", "adapter-b")
+        provider._load.assert_called_once_with("model-a", "adapter-b", None)
+
 
 class FailingModelProvider:
     def load_default(self):
