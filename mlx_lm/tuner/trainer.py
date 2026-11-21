@@ -96,7 +96,10 @@ def default_loss(model, batch, lengths):
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
-    ce = ce.astype(mx.float32).sum() / ntoks
+    # A batch whose loss mask is empty (e.g. every prompt longer than
+    # max_seq_length) would otherwise produce 0 / 0 = NaN and poison the
+    # optimizer state for the rest of the run.
+    ce = ce.astype(mx.float32).sum() / mx.maximum(ntoks, 1)
 
     return ce, ntoks
 
@@ -162,12 +165,16 @@ def iterate_batches(
 
             batch_arr = np.zeros((batch_size // step, max_length_in_batch), np.int32)
 
+            offsets = list(offsets)
             for j in range(batch_size // step):
                 truncated_length = min(lengths[j], max_seq_length)
                 batch_arr[j, :truncated_length] = batch[j][:truncated_length]
                 lengths[j] = (
                     truncated_length  # Update lengths to match truncated lengths
                 )
+                # The loss mask covers offset..length, so an offset past the
+                # truncated length would yield an empty mask and a 0/0 loss.
+                offsets[j] = min(offsets[j], truncated_length)
             batch = mx.array(batch_arr)
             yield batch, mx.array(list(zip(offsets, lengths)))
 
