@@ -29,6 +29,88 @@ from mlx_lm.utils import load
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
+class TestQuantizedKVCache(unittest.TestCase):
+
+    def test_update_and_fetch_packed_width(self):
+        for bits in (2, 3, 4, 5, 6, 8):
+            for k_dim, v_dim in (
+                (64, 64),
+                (128, 128),
+                (256, 256),
+                (64, 256),
+                (256, 64),
+            ):
+                with self.subTest(bits=bits, k_dim=k_dim, v_dim=v_dim):
+                    cache = QuantizedKVCache(group_size=64, bits=bits)
+                    keys = (mx.arange(2 * 259 * k_dim) % 37).reshape(1, 2, 259, k_dim)
+                    values = (mx.arange(2 * 259 * v_dim) % 29).reshape(1, 2, 259, v_dim)
+                    keys = (keys / 17).astype(mx.float16)
+                    values = (values / 13).astype(mx.float16)
+                    expected = [
+                        mx.quantize(x, group_size=64, bits=bits) for x in (keys, values)
+                    ]
+                    mx.eval(expected)
+
+                    start = 0
+                    for end in (1, 256, 257, 259):
+                        actual = cache.update_and_fetch(
+                            keys[..., start:end, :], values[..., start:end, :]
+                        )
+                        mx.eval(actual)
+                        self.assertEqual(cache.offset, end)
+                        for got, want in zip(actual, expected):
+                            for component, reference in zip(got, want):
+                                reference = reference[..., :end, :]
+                                self.assertEqual(component.shape, reference.shape)
+                                self.assertEqual(component.dtype, reference.dtype)
+                                self.assertTrue(
+                                    mx.array_equal(component, reference).item()
+                                )
+                        start = end
+
+    def test_converted_cache_packed_width(self):
+        for bits in (2, 3, 4, 5, 6, 8):
+            with self.subTest(bits=bits):
+                cache = KVCache()
+                keys = (mx.arange(257 * 128) % 37).reshape(1, 1, 257, 128)
+                values = (mx.arange(257 * 256) % 29).reshape(1, 1, 257, 256)
+                keys = (keys / 17).astype(mx.float16)
+                values = (values / 13).astype(mx.float16)
+                cache.update_and_fetch(keys[..., :1, :], values[..., :1, :])
+                cache = cache.to_quantized(group_size=64, bits=bits)
+                actual = cache.update_and_fetch(keys[..., 1:, :], values[..., 1:, :])
+                expected = [
+                    mx.quantize(x, group_size=64, bits=bits) for x in (keys, values)
+                ]
+                mx.eval(actual, expected)
+                self.assertEqual(cache.offset, 257)
+                for got, want in zip(actual, expected):
+                    for component, reference in zip(got, want):
+                        self.assertEqual(component.shape, reference.shape)
+                        self.assertEqual(component.dtype, reference.dtype)
+                        self.assertTrue(mx.array_equal(component, reference).item())
+
+    def test_save_load_packed_width(self):
+        for bits in (2, 3, 4, 5, 6, 8):
+            with self.subTest(bits=bits), tempfile.TemporaryDirectory() as directory:
+                keys = (mx.arange(256) % 37).reshape(1, 1, 1, 256).astype(mx.float16)
+                values = (mx.arange(128) % 29).reshape(1, 1, 1, 128).astype(mx.float16)
+                cache = QuantizedKVCache(group_size=64, bits=bits)
+                cache.update_and_fetch(keys, values)
+                path = os.path.join(directory, "cache.safetensors")
+                save_prompt_cache(path, [cache])
+                loaded = load_prompt_cache(path)[0]
+                self.assertEqual(loaded.bits, bits)
+                self.assertEqual(loaded.group_size, 64)
+                actual = loaded.update_and_fetch(keys, values)
+                expected = cache.update_and_fetch(keys, values)
+                mx.eval(actual, expected)
+                self.assertEqual(loaded.offset, 2)
+                for got, want in zip(actual, expected):
+                    for component, reference in zip(got, want):
+                        self.assertTrue(mx.array_equal(component, reference).item())
+
+
 class TestPromptCache(unittest.TestCase):
 
     @classmethod
