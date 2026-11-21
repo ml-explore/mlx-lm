@@ -3,15 +3,18 @@
 import http
 import io
 import json
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from queue import Queue
 from types import SimpleNamespace
 from unittest import mock
 
 import mlx.core as mx
 import requests
+from huggingface_hub.errors import CacheNotFound
 
 from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
@@ -486,6 +489,32 @@ class TestServer(unittest.TestCase):
         self.assertIn("id", model)
         self.assertEqual(model["object"], "model")
         self.assertIn("created", model)
+
+    def test_handle_models_without_hf_cache(self):
+        # A machine with no Hugging Face cache used to get a 200 with an empty
+        # body: the status was sent before scan_cache_dir() raised.
+        url = f"http://localhost:{self.port}/v1/models"
+        missing = CacheNotFound("no cache", cache_dir="/nonexistent/hub")
+        with mock.patch("mlx_lm.server.scan_cache_dir", side_effect=missing):
+            response = requests.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"object": "list", "data": []})
+
+    def test_handle_models_without_hf_cache_lists_local_model(self):
+        # The model given as a local path is still listed when there is no cache.
+        url = f"http://localhost:{self.port}/v1/models"
+        missing = CacheNotFound("no cache", cache_dir="/nonexistent/hub")
+        cli_args = self.response_generator.model_provider.cli_args
+        with tempfile.TemporaryDirectory() as model_dir:
+            cli_args.model = model_dir
+            try:
+                with mock.patch("mlx_lm.server.scan_cache_dir", side_effect=missing):
+                    response = requests.get(url)
+            finally:
+                cli_args.model = None
+            self.assertEqual(response.status_code, 200)
+            ids = [m["id"] for m in response.json()["data"]]
+            self.assertEqual(ids, [str(Path(model_dir).resolve())])
 
     def test_health_endpoint(self):
         url = f"http://localhost:{self.port}/health"
