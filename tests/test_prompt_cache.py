@@ -836,5 +836,47 @@ class TestPromptCache(unittest.TestCase):
         self.assertTrue(mx.array_equal(mask, expected))
 
 
+class TestLRUPromptCacheKeyAlignment(unittest.TestCase):
+    def _make_cache(self, length):
+        c = KVCache()
+        kv = mx.zeros((1, 1, length, 8), mx.float16)
+        c.update_and_fetch(kv, kv)
+        return c
+
+    def test_insert_clamps_tokens_to_cache_length(self):
+        # A generation can emit more tokens than the KV cache holds (e.g.
+        # the speculative decoding bonus token). The stored key must be
+        # clamped to the cache, otherwise a forking fetch over-trims.
+        from mlx_lm.models.cache import LRUPromptCache
+
+        model = object()
+        cache = self._make_cache(18)
+
+        lru = LRUPromptCache()
+        # 20 emitted tokens but KV for only 18.
+        lru.insert_cache(model, list(range(20)), [cache])
+
+        # A request sharing the first 13 tokens must restart exactly at the
+        # shared prefix boundary.
+        query = list(range(13)) + [100, 101, 102]
+        fetched, rest = lru.fetch_nearest_cache(model, query)
+        self.assertEqual(fetched[0].offset, 13)
+        self.assertEqual(rest, [100, 101, 102])
+
+    def test_exact_continuation_processes_next_token(self):
+        # With the key clamped to the cache, a request that extends the
+        # stored prompt re-processes from the true KV frontier, so the
+        # previously unprocessed final token gets its KV computed.
+        from mlx_lm.models.cache import LRUPromptCache
+
+        model = object()
+        lru = LRUPromptCache()
+        lru.insert_cache(model, list(range(18)), [self._make_cache(18)])
+
+        fetched, rest = lru.fetch_nearest_cache(model, list(range(18)) + [99])
+        self.assertEqual(fetched[0].offset, 18)
+        self.assertEqual(rest, [99])
+
+
 if __name__ == "__main__":
     unittest.main()
