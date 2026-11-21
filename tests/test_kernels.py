@@ -5,8 +5,9 @@ from unittest.mock import patch
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
-from mlx_lm.kernels import sparse_mla
+from mlx_lm.kernels import bitlinear, sparse_mla
 from mlx_lm.kernels.expert_routing import expert_routing
 from mlx_lm.kernels.sparse_mla import sparse_mla_attention
 from mlx_lm.models.muse_spark.kernels import (
@@ -89,6 +90,54 @@ def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
     probs = mx.softmax(scores, axis=-1)
     values = kv[rows].astype(mx.float32)  # [L, K, r]
     return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
+
+
+class TestBitLinear(unittest.TestCase):
+    def test_non_metal_fallback(self):
+        weights = np.array(
+            [
+                [1, 1, 0, 0],
+                [0, 1, 1, -1],
+                [0, 1, 1, -1],
+                [1, -1, 0, 1],
+                [-1, 0, -1, 1],
+                [0, -1, 0, -1],
+                [1, 1, 0, -1],
+                [0, 0, 1, 1],
+            ],
+            dtype=np.float32,
+        )
+        # Each byte holds four interleaved output rows for one input column.
+        packed = sum(
+            (weights[i * 2 : (i + 1) * 2] + 1).astype(np.uint8) << (2 * i)
+            for i in range(4)
+        )
+        values = np.array([[[256, 1, -1, 0], [-1, 2, 3, -4]]], dtype=np.float32)
+        with (
+            mx.stream(mx.cpu),
+            patch.object(mx.metal, "is_available", return_value=False),
+            patch.object(
+                bitlinear,
+                "_bitlinear_kernel",
+                side_effect=AssertionError("Metal kernel invoked"),
+            ),
+        ):
+            for dtype in (mx.float32, mx.bfloat16):
+                for invert, scale in ((False, 1.5), (True, 3.0)):
+                    with self.subTest(dtype=dtype, invert=invert):
+                        out = bitlinear.bitlinear_matmul(
+                            mx.array(values, dtype=dtype),
+                            mx.array(packed),
+                            mx.array([scale], dtype=dtype),
+                            out_features=8,
+                            invert_weight_scales=invert,
+                        )
+                        want = (values @ weights.T) * (1 / scale if invert else scale)
+                        self.assertEqual(out.dtype, dtype)
+                        self.assertEqual(out.shape, (1, 2, 8))
+                        self.assertTrue(
+                            mx.array_equal(out, mx.array(want, dtype=dtype))
+                        )
 
 
 @unittest.skipIf(not mx.metal.is_available(), "The kernels need the Metal backend")

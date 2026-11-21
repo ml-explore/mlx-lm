@@ -83,23 +83,31 @@ def bitlinear_matmul(
 
     dtype = weight_scale.dtype
     assert x.dtype == dtype, "Wrong type for input."
-    out = _bitlinear_kernel(
-        inputs=[
-            x,
-            packed_weights,
-            weight_scale,
-        ],
-        template=[
-            ("T", dtype),
-            ("invert_weight_scales", invert_weight_scales),
-            ("in_features", in_features),
-            ("out_features", out_features),
-        ],
-        grid=(32, total_batch_elements * out_features // 4, 1),
-        threadgroup=(32, 1, 1),  # SIMD width is 32 threads
-        output_shapes=[(total_batch_elements, out_features)],
-        output_dtypes=[dtype],
-    )[0]
+    if mx.metal.is_available():
+        out = _bitlinear_kernel(
+            inputs=[
+                x,
+                packed_weights,
+                weight_scale,
+            ],
+            template=[
+                ("T", dtype),
+                ("invert_weight_scales", invert_weight_scales),
+                ("in_features", in_features),
+                ("out_features", out_features),
+            ],
+            grid=(32, total_batch_elements * out_features // 4, 1),
+            threadgroup=(32, 1, 1),  # SIMD width is 32 threads
+            output_shapes=[(total_batch_elements, out_features)],
+            output_dtypes=[dtype],
+        )[0]
+    else:
+        fields = mx.stack([(packed_weights >> shift) & 3 for shift in (0, 2, 4, 6)])
+        weights = (fields.astype(mx.float32) - 1).reshape(out_features, in_features)
+        scale = weight_scale[0].astype(mx.float32)
+        if invert_weight_scales:
+            scale = mx.reciprocal(scale)
+        out = (x.astype(mx.float32) @ weights.T * scale).astype(dtype)
 
     if len(original_shape) > 2:
         out = out.reshape(*original_shape[:-1], out_features)
