@@ -101,12 +101,11 @@ def _conv_input(
     conv_mask: mx.array | None,
     kernel_size: int,
 ) -> mx.array:
-    hidden_states = hidden_states.astype(mx.float32)
     if conv_mask is not None:
         hidden_states = mx.where(conv_mask[..., None], hidden_states, 0)
     if conv_state is None:
         shape = (hidden_states.shape[0], kernel_size - 1, hidden_states.shape[-1])
-        conv_state = mx.zeros(shape, mx.float32)
+        conv_state = mx.zeros(shape, hidden_states.dtype)
     return mx.concatenate([conv_state, hidden_states], axis=1)
 
 
