@@ -909,6 +909,29 @@ class TestToolParsing(unittest.TestCase):
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"], {"path": "a>b"})
 
+    def test_json_tools_misordered_closing_brackets(self):
+        test_case = (
+            '{"name": "gtm_upsert_entity", "arguments": {'
+            '"parameter": [{"key": "html", "type": "template", '
+            '"value": "<!-- Custom HTML beacon -->"}}]}}'
+        )
+        tool_call = json_tools.parse_tool_call(test_case)
+        self.assertEqual(
+            tool_call,
+            {
+                "name": "gtm_upsert_entity",
+                "arguments": {
+                    "parameter": [
+                        {
+                            "key": "html",
+                            "type": "template",
+                            "value": "<!-- Custom HTML beacon -->",
+                        }
+                    ]
+                },
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
