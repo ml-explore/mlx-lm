@@ -189,7 +189,7 @@ class TestTunerTrainer(unittest.TestCase):
 
     def test_switch_layers_backward(self):
         # indices.size >= 64 takes the sorted branch, which indexes with argsort output.
-        from mlx_lm.models.switch_layers import SwitchGLU, SwitchMLP
+        from mlx_lm.layers.moe import SwitchGLU, SwitchMLP
 
         for cls in (SwitchGLU, SwitchMLP):
             with self.subTest(layer=cls.__name__):
@@ -219,7 +219,7 @@ class TestTunerTrainer(unittest.TestCase):
             "nemotron_h",
         ):
             with self.subTest(model=name):
-                module = importlib.import_module(f"mlx_lm.models.{name}")
+                module = importlib.import_module(f"mlx_lm.models.{name}.layers")
                 select = module.group_expert_select
 
                 def loss_fn(gates):
@@ -229,7 +229,7 @@ class TestTunerTrainer(unittest.TestCase):
                 mx.eval(mx.grad(loss_fn)(mx.random.normal((2, 3, 8))))
 
     def test_mistral4_expert_select_backward(self):
-        from mlx_lm.models.mistral4 import mistral4_expert_select
+        from mlx_lm.models.mistral4.layers import mistral4_expert_select
 
         for n_group in (1, 2):
             with self.subTest(n_group=n_group):
@@ -243,7 +243,7 @@ class TestTunerTrainer(unittest.TestCase):
     def test_minimax_m3_vl_backward(self):
         from mlx_lm.models import minimax_m3_vl
 
-        args = minimax_m3_vl.TextArgs(
+        args = minimax_m3_vl.config.TextArgs(
             hidden_size=16,
             intermediate_size=8,
             shared_intermediate_size=8,
@@ -261,7 +261,7 @@ class TestTunerTrainer(unittest.TestCase):
             index_topk_blocks=1,
             index_local_blocks=0,
         )
-        layer = minimax_m3_vl.DecoderLayer(args, 0)
+        layer = minimax_m3_vl.layers.DecoderLayer(args, 0)
         # Three key blocks exceed the top-1 budget and exercise sparse selection.
         inputs = mx.random.normal((1, 6, args.hidden_size))
 

@@ -4,13 +4,13 @@ import unittest
 
 import mlx.core as mx
 
-import mlx_lm.models.gated_delta as gated_delta
-from mlx_lm.models.gated_delta import (
+from mlx_lm.kernels import gated_delta
+from mlx_lm.kernels.gated_delta import (
     gated_delta_kernel,
     gated_delta_kernel_unpacked,
     gated_delta_kernel_xtree,
-    gated_delta_ops,
 )
+from mlx_lm.layers.recurrent import gated_delta_ops
 
 
 def _normed(shape, D, dtype):

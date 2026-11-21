@@ -48,6 +48,7 @@ from .tokenizer_utils import load as _load_tokenizer
 MODEL_REMAPPING = {
     "mistral": "llama",
     "llava": "mistral3",
+    "pixtral": "mistral3",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
     "joyai_llm_flash": "deepseek_v3",
@@ -58,6 +59,15 @@ MODEL_REMAPPING = {
     "xverse": "llama",
     "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
     "deepseek_v41_text": "deepseek_v41",
+    "qwen3_5_moe": "qwen3_5",
+    "qwen3_vl_moe": "qwen3_vl",
+    "solar_open": "glm4_moe",
+    # Package names cannot have hyphens.
+    "lfm2-vl": "lfm2_vl",
+    "lille-130m": "lille_130m",
+    "nemotron-nas": "nemotron_nas",
+    # Package names are lower case.
+    "Klear": "klear",
 }
 
 MODEL_ARCHITECTURE_REMAPPING = {
@@ -197,6 +207,19 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
+def model_package(config: dict) -> str:
+    """The package in ``mlx_lm.models`` of the model of a configuration."""
+    model_type = config["model_type"]
+    architectures = config.get("architectures") or ()
+    if isinstance(architectures, str):
+        architectures = (architectures,)
+    for architecture in architectures:
+        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
+        if remapped is not None:
+            return remapped
+    return MODEL_REMAPPING.get(model_type, model_type)
+
+
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -207,17 +230,7 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = config["model_type"]
-    architectures = config.get("architectures") or ()
-    if isinstance(architectures, str):
-        architectures = (architectures,)
-    for architecture in architectures:
-        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
-        if remapped is not None:
-            model_type = remapped
-            break
-    else:
-        model_type = MODEL_REMAPPING.get(model_type, model_type)
+    model_type = model_package(config)
     try:
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError as e:
@@ -522,7 +535,7 @@ def load_model(
         # Handle legacy quantization config
         quant_method = quantization_config["quant_method"]
         if quant_method == "bitnet":
-            from .models.bitlinear_layers import bitnet_quantize
+            from mlx_lm.layers.common import bitnet_quantize
 
             model = bitnet_quantize(model, quantization_config)
         elif quant_method == "mxfp4":
@@ -636,12 +649,12 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
 
 
 def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
-    """The TOKENIZER_DEFAULTS of the model module, if any."""
+    """The TOKENIZER_DEFAULTS of the model package, if any."""
     try:
-        model_class, _ = _get_classes(load_config(model_path))
-    except (FileNotFoundError, KeyError, ValueError):
+        package = model_package(load_config(model_path))
+        module = importlib.import_module(f"mlx_lm.models.{package}")
+    except (FileNotFoundError, KeyError, ValueError, ImportError):
         return None
-    module = importlib.import_module(model_class.__module__)
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 
@@ -1100,7 +1113,7 @@ def dequantize_model(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
-    from .models.switch_layers import QuantizedSwitchLinear, SwitchLinear
+    from mlx_lm.layers.moe import QuantizedSwitchLinear, SwitchLinear
 
     dequantize_layers = []
     for name, module in model.named_modules():
