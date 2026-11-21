@@ -531,5 +531,38 @@ class TestTrainModel(unittest.TestCase):
         self.assertEqual(training_args.clear_cache_threshold, 1 << 30)
 
 
+class TestDefaultModel(unittest.TestCase):
+    def _main(self, argv, config=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            if config is not None:
+                path = f"{tmp}/config.yaml"
+                with open(path, "w") as f:
+                    f.write(config)
+                argv = argv + ["--config", path]
+            with (
+                patch("sys.argv", ["mlx_lm.lora"] + argv),
+                patch.object(lora, "run") as run,
+                patch("builtins.print") as printed,
+            ):
+                lora.main()
+        lines = [" ".join(map(str, c.args)) for c in printed.call_args_list]
+        return run.call_args.args[0], lines
+
+    def test_says_when_the_default_model_is_used(self):
+        args, lines = self._main([], config="train: true\n")
+        self.assertEqual(args.model, lora.CONFIG_DEFAULTS["model"])
+        self.assertTrue(any("default " + args.model in l for l in lines))
+
+    def test_quiet_when_a_model_is_given(self):
+        args, lines = self._main(["--model", "some/model"])
+        self.assertEqual(args.model, "some/model")
+        self.assertFalse(any("default" in l for l in lines))
+
+    def test_config_model_counts_as_given(self):
+        args, lines = self._main([], config="model: some/model\n")
+        self.assertEqual(args.model, "some/model")
+        self.assertFalse(any("default" in l for l in lines))
+
+
 if __name__ == "__main__":
     unittest.main()
