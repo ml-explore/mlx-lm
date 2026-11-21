@@ -547,6 +547,34 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache_a.offset.tolist(), [6, 7, 6, 1, 4])
         self.assertEqual(cache_a.left_padding.tolist(), [2, 1, 2, 7, 4])
 
+    def test_batch_rotating_wrapped_multi_token_matches_single_row(self):
+        # A padded row must attend to the same keys as the row alone.
+        W, pad = 8, 6
+        mx.random.seed(0)
+        chunks = [7, 1, 1, 1, 3, 1, 3]
+        T = sum(chunks)
+        k, v, q = (mx.random.normal((2, 1, T, 4)) for _ in range(3))
+        batch = BatchRotatingKVCache(max_size=W, left_padding=[pad, 0])
+        alone = RotatingKVCache(max_size=W)
+        s = 0
+        for n in chunks:
+            mask = batch.make_mask(n, return_array=True)
+            bk, bv = batch.update_and_fetch(k[:, :, s : s + n], v[:, :, s : s + n])
+            out = mx.fast.scaled_dot_product_attention(
+                q[:, :, s : s + n], bk, bv, scale=1.0, mask=mask
+            )
+            lo = max(s, pad)
+            if s + n > lo:
+                amask = alone.make_mask(s + n - lo, return_array=True, window_size=W)
+                ak, av = alone.update_and_fetch(
+                    k[:1, :, lo : s + n], v[:1, :, lo : s + n]
+                )
+                ref = mx.fast.scaled_dot_product_attention(
+                    q[:1, :, lo : s + n], ak, av, scale=1.0, mask=amask
+                )
+                self.assertTrue(mx.allclose(out[:1, :, lo - s :], ref, atol=1e-3))
+            s += n
+
     def test_batch_rotating_kv_cache(self):
         cache = BatchRotatingKVCache(max_size=4, left_padding=[2, 0])
         mask = cache.make_mask(4)
@@ -611,10 +639,11 @@ class TestPromptCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
 
         mask = cache.make_mask(2)
+        # The update drops one padding slot, so the first real key is column 2.
         expected = mx.array(
             [
-                [False, False, False, True, True, True, True, True, False],
-                [False, False, False, True, True, True, True, True, True],
+                [False, False, True, True, True, True, True, True, False],
+                [False, False, True, True, True, True, True, True, True],
             ]
         )
         self.assertTrue(mx.array_equal(mask.squeeze(), expected))
