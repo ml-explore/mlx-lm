@@ -7,6 +7,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.kimi_k3 import checkpoint
@@ -300,13 +301,13 @@ class Model(nn.Module):
 
             if isinstance(layer.mlp, KimiK3SparseMoE):
                 layer.mlp.sharding_group = group
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
                 if layer.mlp.shared_experts is not None:

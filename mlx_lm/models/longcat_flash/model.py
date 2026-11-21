@@ -4,9 +4,10 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear
+from mlx.nn.layers.distributed import shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.longcat_flash import checkpoint
 from mlx_lm.models.longcat_flash.config import ModelArgs
@@ -116,9 +117,15 @@ class Model(nn.Module):
                 )
 
             layer.mlp.sharding_group = group
-            shard_inplace(layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group)
+            shard_switch_linear(
+                layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
+            )
+            shard_switch_linear(
+                layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
+            )
+            shard_switch_linear(
+                layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
+            )
 
     @property
     def layers(self):

@@ -7,6 +7,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.step3p5 import checkpoint
 from mlx_lm.models.step3p5.config import ModelArgs
@@ -148,13 +149,13 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.share_expert.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
 

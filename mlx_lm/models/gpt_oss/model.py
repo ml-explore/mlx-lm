@@ -4,9 +4,10 @@ from typing import Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear
+from mlx.nn.layers.distributed import shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.gpt_oss import checkpoint
 from mlx_lm.models.gpt_oss.config import ModelArgs
@@ -113,10 +114,14 @@ class Model(nn.Module):
                 * (R + 1)
             ]
 
-            shard_inplace(layer.mlp.experts.gate_proj, "all-to-sharded", group=group)
-            shard_inplace(layer.mlp.experts.down_proj, "sharded-to-all", group=group)
+            shard_switch_linear(
+                layer.mlp.experts.gate_proj, "all-to-sharded", group=group
+            )
+            shard_switch_linear(
+                layer.mlp.experts.down_proj, "sharded-to-all", group=group
+            )
             layer.mlp.experts.down_proj.bias /= N
-            shard_inplace(
+            shard_switch_linear(
                 layer.mlp.experts.up_proj, sharding="all-to-sharded", group=group
             )
 

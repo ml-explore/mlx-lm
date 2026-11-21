@@ -8,6 +8,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.distributed import PipelineMixin
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.deepseek_v2 import checkpoint
 from mlx_lm.models.deepseek_v2.config import ModelArgs
 from mlx_lm.models.deepseek_v2.layers import DeepseekV2DecoderLayer, DeepseekV2MLP
@@ -128,13 +129,13 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.shared_experts.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 

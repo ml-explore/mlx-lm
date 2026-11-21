@@ -7,6 +7,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.models.flint import checkpoint
 from mlx_lm.models.flint.config import ModelArgs
@@ -121,10 +122,13 @@ class Model(nn.Module):
             else:
                 moe = layer.mlp
                 moe.sharding_group = group
-                for m in [moe.switch_mlp, moe.shared_expert]:
-                    shard_inplace(m.gate_proj, "all-to-sharded", group=group)
-                    shard_inplace(m.down_proj, "sharded-to-all", group=group)
-                    shard_inplace(m.up_proj, "all-to-sharded", group=group)
+                for m, shard_fn in (
+                    (moe.switch_mlp, shard_switch_linear),
+                    (moe.shared_expert, shard_inplace),
+                ):
+                    shard_fn(m.gate_proj, "all-to-sharded", group=group)
+                    shard_fn(m.down_proj, "sharded-to-all", group=group)
+                    shard_fn(m.up_proj, "all-to-sharded", group=group)
 
     @property
     def layers(self):
