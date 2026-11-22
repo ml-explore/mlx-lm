@@ -5463,6 +5463,39 @@ class TestModels(unittest.TestCase):
                     "full_attention",
                 ],
             },
+            {
+                "model_type": "aion_instruct",
+                "vocab_size": 1000,
+                "hidden_size": 128,
+                "num_hidden_layers": 4,
+                "intermediate_size": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "sliding_window": 8,
+                "max_position_embeddings": 256,
+                "layer_types": [
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                    "sliding_attention",
+                ],
+                "rope_parameters": {
+                    "full_attention": {
+                        "rope_type": "yarn",
+                        "rope_theta": 32000.0,
+                        "factor": 4.0,
+                        "original_max_position_embeddings": 64,
+                        "beta_fast": 32.0,
+                        "beta_slow": 1.0,
+                    },
+                    "sliding_attention": {
+                        "rope_type": "default",
+                        "rope_theta": 32000.0,
+                    },
+                },
+            },
         ]
         for config in test_configs:
             model_type = config["model_type"]
@@ -6081,6 +6114,132 @@ class TestModels(unittest.TestCase):
         from_chunked = model(last, cache=chunked_cache)
         from_oneshot = model(last, cache=oneshot_cache)
         self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
+
+    def _aion_instruct_args(self, **overrides):
+        from mlx_lm.models import aion_instruct
+
+        config = dict(
+            model_type="aion_instruct",
+            vocab_size=1000,
+            hidden_size=128,
+            num_hidden_layers=4,
+            intermediate_size=256,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            head_dim=16,
+            rms_norm_eps=1e-6,
+            sliding_window=16,
+            max_position_embeddings=256,
+            layer_types=[
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "sliding_attention",
+            ],
+            rope_parameters={
+                "full_attention": {
+                    "rope_type": "yarn",
+                    "rope_theta": 32000.0,
+                    "factor": 4.0,
+                    "original_max_position_embeddings": 64,
+                    "beta_fast": 32.0,
+                    "beta_slow": 1.0,
+                },
+                "sliding_attention": {"rope_type": "default", "rope_theta": 32000.0},
+            },
+        )
+        config.update(overrides)
+        return aion_instruct.ModelArgs(**config)
+
+    def test_aion_instruct(self):
+        from mlx_lm.models import aion_instruct
+        from mlx_lm.models.cache import KVCache, RotatingKVCache
+
+        args = self._aion_instruct_args()
+        model = aion_instruct.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+        # Sliding layers need a bounded cache, full layers an unbounded one.
+        caches = model.make_cache()
+        for layer, cache in zip(model.layers, caches):
+            expected = RotatingKVCache if layer.is_sliding else KVCache
+            self.assertIsInstance(cache, expected)
+
+    def test_aion_instruct_chunked_vs_oneshot_prefill(self):
+        from mlx_lm.models import aion_instruct
+
+        # sliding_window=16 with 40 tokens makes the rotating cache wrap.
+        args = self._aion_instruct_args()
+        model = aion_instruct.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+
+        ids = mx.array([list(range(40))])
+        oneshot_cache = make_prompt_cache(model)
+        oneshot = model(ids, cache=oneshot_cache)
+
+        chunked_cache = make_prompt_cache(model)
+        c1 = model(ids[:, :20], cache=chunked_cache)
+        c2 = model(ids[:, 20:], cache=chunked_cache)
+        chunked = mx.concatenate([c1, c2], axis=1)
+        self.assertTrue(
+            mx.allclose(chunked, oneshot, rtol=1e-4, atol=1e-4),
+            f"chunked/oneshot mismatch: max {mx.max(mx.abs(chunked - oneshot))}",
+        )
+
+        last = mx.argmax(oneshot[0, -1:, :], keepdims=True)
+        from_chunked = model(last, cache=chunked_cache)
+        from_oneshot = model(last, cache=oneshot_cache)
+        self.assertTrue(mx.allclose(from_chunked, from_oneshot, rtol=1e-4, atol=1e-4))
+
+    def test_aion_instruct_sliding_window_size(self):
+        from mlx_lm.models import aion_instruct
+
+        # A query at position w is the first one that can tell window w
+        # from window w + 1.
+        w = 16
+        ids = mx.array([list(range(40))])
+        outs = []
+        for window in (w, w + 1):
+            mx.random.seed(0)
+            model = aion_instruct.Model(self._aion_instruct_args(sliding_window=window))
+            model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+            outs.append(model(ids))
+        self.assertTrue(mx.allclose(outs[0][:, :w], outs[1][:, :w], atol=1e-5))
+        self.assertFalse(mx.allclose(outs[0][:, w], outs[1][:, w], atol=1e-3))
+
+    def test_aion_instruct_step_decode_matches_prefill(self):
+        from mlx_lm.models import aion_instruct
+
+        # Decode one token at a time until the rotating cache wraps twice.
+        args = self._aion_instruct_args(sliding_window=8)
+        model = aion_instruct.Model(args)
+        model.update(tree_map(lambda p: p.astype(mx.float32), model.parameters()))
+        ids = mx.array([list(range(30))])
+        oneshot = model(ids)
+
+        cache = make_prompt_cache(model)
+        steps = [model(ids[:, :4], cache=cache)]
+        for i in range(4, 30):
+            steps.append(model(ids[:, i : i + 1], cache=cache))
+        stepped = mx.concatenate(steps, axis=1)
+        self.assertTrue(
+            mx.allclose(stepped, oneshot, rtol=1e-4, atol=1e-4),
+            f"step/oneshot mismatch: max {mx.max(mx.abs(stepped - oneshot))}",
+        )
+
+    def test_aion_instruct_invalid_config(self):
+        with self.assertRaises(ValueError):
+            self._aion_instruct_args(layer_types=["full_attention"] * 3)
+        with self.assertRaises(ValueError):
+            self._aion_instruct_args(
+                layer_types=["full_attention", "chunked_attention"] * 2
+            )
+        with self.assertRaises(ValueError):
+            self._aion_instruct_args(
+                rope_parameters={"full_attention": {"rope_theta": 10000.0}}
+            )
 
 
 class TestVLSanitize(unittest.TestCase):
