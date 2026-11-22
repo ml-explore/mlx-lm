@@ -131,7 +131,7 @@ class Attention(nn.Module):
         queries = queries.transpose(0, 2, 1, 3)
         queries = self.rope(queries, offset=offset)
 
-        if cache is not None:
+        if shared_kv is None and cache is not None:
             keys, values = cache.update_and_fetch(keys, values)
 
         output = scaled_dot_product_attention(
