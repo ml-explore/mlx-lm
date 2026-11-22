@@ -81,11 +81,19 @@ def create_model(vision: bool = False) -> inkling2.Model:
     return model
 
 
-def quantize_experts(model: inkling2.Model) -> None:
+NVFP4_RELEASE = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+MXFP8_RELEASE = {
+    "quant_method": "fp8",
+    "weight_block_size": [1, 32],
+    "scale_fmt": "ue8m0",
+}
+
+
+def quantize_experts(model: inkling2.Model, mxfp8_only: bool = False) -> None:
     def predicate(path, module):
         if ".mlp.experts." not in path:
             return False
-        if ".layers.7." in path:
+        if mxfp8_only or ".layers.7." in path:
             return {"group_size": 32, "bits": 8, "mode": "mxfp8"}
         return {"group_size": 16, "bits": 4, "mode": "nvfp4", "global_scale": True}
 
@@ -227,20 +235,23 @@ class TestInkling2(unittest.TestCase):
             self.assertTrue(mx.array_equal(sanitized[k], v), k)
 
     def test_load_checkpoint(self):
-        model = create_model(vision=True)
-        quantize_experts(model)
         tokens = mx.array([[5, 6, 7, 8]])
-        expected = model(tokens)
-
-        with tempfile.TemporaryDirectory() as path:
-            path = Path(path)
-            mx.save_safetensors(str(path / "model.safetensors"), checkpoint(model))
-            config = {**CONFIG, "vision_config": VISION_CONFIG}
-            (path / "config.json").write_text(json.dumps(config))
-            quant = {"quant_method": "inkling2"}
-            (path / "hf_quant_config.json").write_text(json.dumps(quant))
-            loaded, _ = load_model(path)
-        self.assertTrue(mx.allclose(loaded(tokens), expected, rtol=1e-4, atol=1e-4))
+        for release, mxfp8_only in ((NVFP4_RELEASE, False), (MXFP8_RELEASE, True)):
+            with self.subTest(release["quant_method"]):
+                model = create_model(vision=True)
+                quantize_experts(model, mxfp8_only)
+                expected = model(tokens)
+                with tempfile.TemporaryDirectory() as path:
+                    path = Path(path)
+                    weights = checkpoint(model)
+                    mx.save_safetensors(str(path / "model.safetensors"), weights)
+                    config = {**CONFIG, "vision_config": VISION_CONFIG}
+                    config["quantization_config"] = release
+                    (path / "config.json").write_text(json.dumps(config))
+                    loaded, _ = load_model(path)
+                self.assertTrue(
+                    mx.allclose(loaded(tokens), expected, rtol=1e-4, atol=1e-4)
+                )
 
     def test_embed_inputs(self):
         model = create_model(vision=True)

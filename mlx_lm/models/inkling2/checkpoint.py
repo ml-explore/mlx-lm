@@ -3,9 +3,6 @@
 import re
 
 import mlx.core as mx
-from mlx.utils import tree_unflatten
-
-from mlx_lm.layers.moe import SwitchLinear
 
 __all__ = [
     "sanitize",
@@ -95,27 +92,4 @@ def sanitize(model, weights: dict[str, mx.array]) -> dict[str, mx.array]:
         scale = scale / denominator[name].astype(mx.float32)
         sanitized[f"{name}.global_scale"] = amax[name].astype(mx.float32) * scale
 
-    # mlx-lm does not read this quantization config, so set the experts here.
-    modes = {(4, 16): "nvfp4", (4, 32): "mxfp4", (8, 32): "mxfp8"}
-    quantized = []
-    for path, module in model.named_modules():
-        scales = sanitized.get(f"{path}.scales")
-        if not isinstance(module, SwitchLinear) or scales is None:
-            continue
-        if scales.dtype != mx.uint8:
-            continue
-        in_dims = module.weight.shape[-1]
-        group_size = in_dims // scales.shape[-1]
-        bits = sanitized[f"{path}.weight"].shape[-1] * 32 // in_dims
-        if (bits, group_size) not in modes:
-            continue
-        ql = module.to_quantized(
-            group_size,
-            bits,
-            mode=modes[bits, group_size],
-            global_scale=f"{path}.global_scale" in sanitized,
-        )
-        quantized.append((path, ql))
-    if quantized:
-        model.update_modules(tree_unflatten(quantized))
     return sanitized

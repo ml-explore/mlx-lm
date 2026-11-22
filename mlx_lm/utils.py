@@ -551,10 +551,11 @@ def load_model(
         elif (
             quant_method == "fp8"
             and quantization_config.get("scale_fmt") == "ue8m0"
-            and list(quantization_config.get("weight_block_size", ())) == [32, 32]
+            and list(quantization_config.get("weight_block_size", ()))
+            in ([32, 32], [1, 32])
         ):
-            # Power-of-two scales over 32x32 blocks are mxfp8, so the weights
-            # stay packed. Other fp8 checkpoints dequantize in their sanitize.
+            # Power-of-two scales over 32x32 or 1x32 blocks are mxfp8, so the
+            # weights stay packed. Other fp8 checkpoints dequantize in sanitize.
             quantization = {"group_size": 32, "bits": 8, "mode": "mxfp8"}
             config["quantization"] = quantization
             config["quantization_config"] = quantization
