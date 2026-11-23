@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 import mlx_lm.models
-from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING, package_name
+from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING, model_package
 
 MODELS = Path(mlx_lm.models.__file__).parent
 PACKAGES: list[str] = sorted(
@@ -72,7 +72,7 @@ class TestModelPackages(unittest.TestCase):
             "phi-msft",
         ):
             with self.subTest(model_type=model_type):
-                self.assertIn(package_name({"model_type": model_type}), PACKAGES)
+                self.assertIn(model_package({"model_type": model_type}), PACKAGES)
         # Keys in another form match no model type.
         for key in MODEL_REMAPPING:
             self.assertEqual(key, key.lower().replace("-", "_"))

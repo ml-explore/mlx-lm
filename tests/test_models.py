@@ -20,13 +20,13 @@ from mlx_lm.layers.recurrent import (
     ssm_attn,
     ssm_update,
 )
+from mlx_lm.models import model_package
 from mlx_lm.models.cache import (
     BatchKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
 )
-from mlx_lm.utils import model_package
 
 
 class TestModels(unittest.TestCase):
@@ -1327,7 +1327,7 @@ class TestModels(unittest.TestCase):
             ("qwen3_5_moe", "mtp.fc.weight"),
         ):
             package = model_package({"model_type": model_type})
-            module = importlib.import_module(package)
+            module = importlib.import_module(f"mlx_lm.models.{package}")
             args = module.ModelArgs.from_dict(
                 {
                     "model_type": model_type,
@@ -1411,7 +1411,7 @@ class TestModels(unittest.TestCase):
 
     def test_qwen3_5_moe_sanitize_stacks_experts(self):
         package = model_package({"model_type": "qwen3_5_moe"})
-        module = importlib.import_module(package)
+        module = importlib.import_module(f"mlx_lm.models.{package}")
         args = module.ModelArgs.from_dict(
             {
                 "model_type": "qwen3_5_moe",
@@ -5467,7 +5467,7 @@ class TestModels(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(model_package(config))
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 self.model_test_runner(

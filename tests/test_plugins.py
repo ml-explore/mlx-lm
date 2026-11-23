@@ -8,16 +8,29 @@ from pathlib import Path
 from unittest import mock
 
 from mlx_lm import models, plugins, utils
-from mlx_lm.plugins import discovery
 from mlx_lm.processors import load_processor
 
-MODEL = "class Model:\n    pass\n\n\nclass ModelArgs:\n    pass\n"
-DEFAULTS = 'TOKENIZER_DEFAULTS = {"chat_template_type": "test"}\n'
-PROCESSOR = (
-    "class Processor:\n"
+MODEL = (
+    "import mlx.nn as nn\n"
+    'TOKENIZER_DEFAULTS = {"chat_template_type": "test"}\n'
+    "class Model(nn.Module):\n"
+    "    pass\n"
+    "class ModelArgs:\n"
     "    @classmethod\n"
-    "    def from_config(cls, config):\n"
+    "    def from_dict(cls, config):\n"
     "        return cls()\n"
+    "class NotAModel:\n"
+    "    pass\n"
+)
+PARSER = (
+    "class Parser:\n"
+    '    tool_call_start = "<call>"\n'
+    '    tool_call_end = "</call>"\n'
+    "    @staticmethod\n"
+    "    def parse_tool_call(text, tools):\n"
+    '        return {"name": text}\n'
+    "class NotAParser:\n"
+    "    pass\n"
 )
 TEST = {"model_type": "test"}
 
@@ -26,28 +39,36 @@ class TestPlugins(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.TemporaryDirectory()
         sys.path.insert(0, self.root.name)
+        model = {
+            "test": "test_lm.models.test:Model",
+            "llama": "test_lm.models.test:Model",
+            "Solo-LM": "test_lm.solo:Model",
+            "extras": "test_lm.solo:Model [cuda]",
+            "ghost": "test_lm.missing:Model",
+            "orphan": "no_such_package.model:Model",
+            "no_attr": "test_lm.solo:Missing",
+            "half": "test_lm.solo:Model",
+            "split": "test_lm.solo:Model",
+            "not_a_model": "test_lm.solo:NotAModel",
+        }
+        args = {name: "test_lm.solo:ModelArgs" for name in model}
+        args.pop("half")
+        args.pop("split")
+        args["test"] = "test_lm.models.test:ModelArgs"
         self.install(
             "test-lm",
             {
-                "mlx_lm.models": {
-                    "test": "test_lm.models.test",
-                    "llama": "test_lm.models.llama",
-                    "solo": "test_lm.solo",
-                    "Solo-LM": "test_lm.solo",
-                    "extras": "test_lm.solo [cuda]",
-                    "ghost": "test_lm.missing",
-                    "orphan": "no_such_package.model",
+                "mlx_lm.models": model,
+                "mlx_lm.model_args": args,
+                "mlx_lm.tool_parsers": {
+                    "test": "test_lm.parsers:Parser",
+                    "not_a_parser": "test_lm.parsers:NotAParser",
                 },
-                "mlx_lm.tool_parsers": {"test": "test_lm.tool_parsers.test"},
-                "mlx_lm.chat_templates": {"test": "test_lm.chat_templates.test"},
             },
             {
-                "test_lm/models/test/__init__.py": MODEL + DEFAULTS,
-                "test_lm/models/test/processor.py": PROCESSOR,
-                "test_lm/models/llama/__init__.py": MODEL,
+                "test_lm/models/test/__init__.py": MODEL,
                 "test_lm/solo.py": MODEL,
-                "test_lm/tool_parsers/test.py": "",
-                "test_lm/chat_templates/test.py": "",
+                "test_lm/parsers.py": PARSER,
             },
         )
 
@@ -56,7 +77,6 @@ class TestPlugins(unittest.TestCase):
         for name in list(sys.modules):
             if name.split(".")[0] in ("test_lm", "other_lm"):
                 del sys.modules[name]
-        discovery._entry_points.cache_clear()
         self.root.cleanup()
 
     def install(
@@ -83,23 +103,20 @@ class TestPlugins(unittest.TestCase):
         (dist_info / "METADATA").write_text(f"Name: {name}\nVersion: 0\n")
         (dist_info / "entry_points.txt").write_text(entry_points_text)
         importlib.invalidate_caches()
-        discovery._entry_points.cache_clear()
 
     def test_new_model(self):
-        package = utils.model_package(TEST)
-        self.assertEqual(package, "test_lm.models.test")
-        self.assertNotIn(package, sys.modules)
-        model_class, _ = utils._get_classes(TEST)
-        self.assertEqual(model_class.__module__, package)
+        model, args = utils._get_classes(TEST)
+        self.assertEqual(model.__module__, "test_lm.models.test")
+        self.assertEqual(args.__module__, "test_lm.models.test")
 
     def test_builtin_model_wins(self):
-        package = utils.model_package({"model_type": "llama"})
-        self.assertEqual(package, "mlx_lm.models.llama")
+        model, _ = utils._get_classes({"model_type": "llama"})
+        self.assertEqual(model.__module__, "mlx_lm.models.llama.model")
 
     def test_broken_package_does_not_break_builtins(self):
         self.write_metadata("broken-lm", "[mlx_lm.models]\nno equals sign\n")
-        package = utils.model_package({"model_type": "llama"})
-        self.assertEqual(package, "mlx_lm.models.llama")
+        model, _ = utils._get_classes({"model_type": "llama"})
+        self.assertEqual(model.__module__, "mlx_lm.models.llama.model")
 
     def test_folder_without_init_is_not_a_builtin(self):
         # Left behind by a branch switch.
@@ -107,43 +124,44 @@ class TestPlugins(unittest.TestCase):
         (leftover / "test" / "__pycache__").mkdir(parents=True)
         path = [*models.__path__, str(leftover)]
         with mock.patch.object(models, "__path__", path):
-            self.assertEqual(utils.model_package(TEST), "test_lm.models.test")
+            model, _ = utils._get_classes(TEST)
+        self.assertEqual(model.__module__, "test_lm.models.test")
 
     def test_unknown_model(self):
         with self.assertRaises(ValueError):
-            utils.model_package({"model_type": "unknown"})
+            utils._get_classes({"model_type": "unknown"})
 
     def test_names_are_normalized(self):
         for model_type in ("solo_lm", "Solo-LM"):
-            package = utils.model_package({"model_type": model_type})
-            self.assertEqual(package, "test_lm.solo")
+            model, _ = utils._get_classes({"model_type": model_type})
+            self.assertEqual(model.__module__, "test_lm.solo")
 
     def test_invalid_name(self):
         with self.assertRaisesRegex(ValueError, "not a valid identifier"):
-            utils.model_package({"model_type": "a.b"})
+            utils._get_classes({"model_type": "a.b"})
 
     def test_entry_point_with_extras(self):
-        package = utils.model_package({"model_type": "extras"})
-        self.assertEqual(package, "test_lm.solo")
+        model, _ = utils._get_classes({"model_type": "extras"})
+        self.assertEqual(model.__module__, "test_lm.solo")
 
-    def test_entry_point_must_be_a_module(self):
-        values = ("other_lm.test:Model", "other_lm.test:", "other-lm.test")
+    def test_entry_point_must_name_an_object(self):
+        values = ("other_lm.test", "other_lm.test:", "other-lm.t:Model", ".lm.t:Model")
         entry_points = {f"bad{i}": value for i, value in enumerate(values)}
         self.install("other-lm", {"mlx_lm.models": entry_points}, {})
         for model_type in entry_points:
-            with self.assertRaisesRegex(ValueError, "of other-lm must be a module"):
-                utils.model_package({"model_type": model_type})
+            with self.assertRaisesRegex(ValueError, "of other-lm must name an object"):
+                utils._get_classes({"model_type": model_type})
 
-    def test_entry_point_to_missing_module(self):
-        for model_type in ("ghost", "orphan"):
+    def test_entry_point_to_missing_object(self):
+        for model_type in ("ghost", "orphan", "no_attr"):
             with self.assertRaisesRegex(ValueError, f"test-lm gives {model_type}"):
-                utils.model_package({"model_type": model_type})
+                utils._get_classes({"model_type": model_type})
 
     def test_two_entry_points_give_the_same_name(self):
         entry_points = {
-            "test": "other_lm.test",
-            "dup": "other_lm.a",
-            "DUP": "other_lm.b",
+            "test": "other_lm.test:Model",
+            "dup": "other_lm.a:Model",
+            "DUP": "other_lm.b:Model",
         }
         self.install("other-lm", {"mlx_lm.models": entry_points}, {})
         cases = {
@@ -152,34 +170,34 @@ class TestPlugins(unittest.TestCase):
         }
         for model_type, sources in cases.items():
             with self.assertRaisesRegex(ValueError, sources):
-                utils.model_package({"model_type": model_type})
+                utils._get_classes({"model_type": model_type})
 
-    def test_tool_parser_and_chat_template(self):
-        for kind in ("tool_parsers", "chat_templates"):
-            name = plugins.module_name(kind, "test")
-            self.assertEqual(name, f"test_lm.{kind}.test")
+    def test_model_and_args_come_from_one_project(self):
+        self.install(
+            "other-lm",
+            {"mlx_lm.model_args": {"split": "other_lm.args:ModelArgs"}},
+            {"other_lm/args.py": MODEL},
+        )
+        with self.assertRaisesRegex(ValueError, "in mlx_lm.model_args"):
+            utils._get_classes({"model_type": "half"})
+        with self.assertRaisesRegex(
+            ValueError, "one project, not test-lm and other-lm"
+        ):
+            utils._get_classes({"model_type": "split"})
 
-    def test_unknown_kind(self):
-        with self.assertRaisesRegex(ValueError, "is not one of"):
-            plugins.module_name("layers", "test")
+    def test_model_must_be_a_module(self):
+        with self.assertRaisesRegex(ValueError, "not an nn.Module"):
+            utils._get_classes({"model_type": "not_a_model"})
 
-    def test_processor(self):
-        processor = load_processor({**TEST, "vision_config": {"patch_size": 16}})
-        self.assertEqual(type(processor).__module__, "test_lm.models.test.processor")
+    def test_tool_parser(self):
+        self.assertEqual(plugins.load_tool_parser("test").__name__, "Parser")
+        with self.assertRaisesRegex(ValueError, "needs tool_call_start"):
+            plugins.load_tool_parser("not_a_parser")
 
-    def test_module_without_processor(self):
-        config = {"model_type": "solo", "vision_config": {"patch_size": 16}}
-        self.assertIsNone(load_processor(config))
-
-    def test_unknown_model_has_no_processor(self):
-        config = {"model_type": "unknown", "vision_config": {"patch_size": 16}}
-        self.assertIsNone(load_processor(config))
-
-    def test_tokenizer_defaults_follow_the_given_config(self):
-        with tempfile.TemporaryDirectory() as path:
-            (Path(path) / "config.json").write_text('{"model_type": "llama"}')
-            defaults = utils._tokenizer_defaults(Path(path), TEST)
-        self.assertEqual(defaults, {"chat_template_type": "test"})
+    def test_plugin_has_no_processor_or_tokenizer_defaults(self):
+        for config in (TEST, {"model_type": "unknown"}):
+            self.assertIsNone(load_processor({**config, "vision_config": {"a": 1}}))
+            self.assertIsNone(utils._tokenizer_defaults(Path(self.root.name), config))
 
 
 if __name__ == "__main__":

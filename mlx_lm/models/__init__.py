@@ -7,7 +7,7 @@ from mlx_lm.plugins import lookup_name
 __all__ = [
     "MODEL_ARCHITECTURE_REMAPPING",
     "MODEL_REMAPPING",
-    "package_name",
+    "model_package",
 ]
 
 # TODO: Make these tables read-only. Code outside mlx-lm still changes them.
@@ -37,8 +37,8 @@ MODEL_REMAPPING = {
 }
 
 
-def package_name(config: dict[str, Any]) -> str:
-    """The lookup name of the package that runs a configuration's model."""
+def model_package(config: dict[str, Any]) -> str:
+    """The name of a configuration's model: a built-in package or a plug-in's entry."""
     model_type = lookup_name(config["model_type"])
     architectures = config.get("architectures") or ()
     if isinstance(architectures, str):

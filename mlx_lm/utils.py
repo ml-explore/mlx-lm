@@ -183,11 +183,6 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
-def model_package(config: dict[str, Any]) -> str:
-    """The module, built-in or plug-in, that runs a configuration's model."""
-    return plugins.module_name("models", models.package_name(config))
-
-
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -198,8 +193,7 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    arch = importlib.import_module(model_package(config))
-    return arch.Model, arch.ModelArgs
+    return plugins.load_model(models.model_package(config))
 
 
 def get_total_parameters(model):
@@ -621,18 +615,24 @@ def load_tokenizer(
 def _tokenizer_defaults(
     model_path: Path, config: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
-    """The TOKENIZER_DEFAULTS of the model, if any.
+    """The TOKENIZER_DEFAULTS of a built-in model, if any.
 
     ``config`` is the model's configuration, by default the one in ``model_path``.
     """
     try:
         if config is None:
             config = load_config(model_path)
-        package = model_package(config)
-    except (FileNotFoundError, KeyError, ValueError):
+        package = f"mlx_lm.models.{models.model_package(config)}"
+    except (FileNotFoundError, KeyError):
         return None
 
-    module = importlib.import_module(package)
+    try:
+        module = importlib.import_module(package)
+    except ModuleNotFoundError as e:
+        # Not a built-in model.
+        if e.name != package and not package.startswith(f"{e.name}."):
+            raise
+        return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 
 

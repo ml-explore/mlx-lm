@@ -6,9 +6,9 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.layers.distributed import PipelineMixin
-from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models import model_package, muse_spark, qwen2, qwen3_moe, qwen3_next
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.utils import model_package, quantize_model
+from mlx_lm.utils import quantize_model
 
 MUSE_SPARK_OPEN = {
     "model_type": "muse_spark",
@@ -164,7 +164,7 @@ class TestModelParallel(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(model_package(config))
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
@@ -264,7 +264,7 @@ class TestModelParallel(unittest.TestCase):
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(model_package(config))
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
