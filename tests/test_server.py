@@ -3,6 +3,7 @@
 import http
 import io
 import json
+import socket
 import threading
 import time
 import unittest
@@ -25,6 +26,7 @@ from mlx_lm.server import (
     ToolCallFormatter,
     _apply_stop_words,
     _make_sampler,
+    run,
 )
 from mlx_lm.tool_parsers import json_tools, pythonic
 from mlx_lm.utils import load
@@ -297,6 +299,27 @@ class TestToolCallFormatter(unittest.TestCase):
         self.assertEqual(
             [(tc["function"]["name"], tc["index"]) for tc in tool_calls], [("g", 0)]
         )
+
+
+class TestServerStartup(unittest.TestCase):
+    def test_listen_backlog(self):
+        class CustomServer(http.server.ThreadingHTTPServer):
+            request_queue_size = 17
+
+        address = ("127.0.0.1", 0)
+        for options, backlog in (
+            ({}, socket.SOMAXCONN),
+            ({"server_class": CustomServer}, CustomServer.request_queue_size),
+        ):
+            with (
+                self.subTest(backlog=backlog),
+                mock.patch("mlx_lm.server.ResponseGenerator"),
+                mock.patch.object(socket, "socket") as make_socket,
+                mock.patch.object(http.server.ThreadingHTTPServer, "serve_forever"),
+            ):
+                make_socket.return_value.getsockname.return_value = address
+                run(*address, mock.Mock(), **options)
+                make_socket.return_value.listen.assert_called_once_with(backlog)
 
 
 class TestServer(unittest.TestCase):
