@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-import importlib.util
+import importlib
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -30,12 +30,12 @@ def load_processor(config: dict[str, Any]) -> Processor | None:
         package = model_package(config)
     except ValueError:
         return None
-    # Imported here: the package holds the whole model.
-    module = importlib.import_module(package)
-    # A plug-in model can be a single module, without a processor.
-    if not hasattr(module, "__path__"):
+    name = f"{package}.processor"
+    try:
+        module = importlib.import_module(name)
+    except ModuleNotFoundError as e:
+        # The model has no processor, or is a single module.
+        if e.name != name:
+            raise
         return None
-    if importlib.util.find_spec(f"{package}.processor") is None:
-        return None
-    processor = importlib.import_module(f"{package}.processor")
-    return processor.Processor.from_config(config)
+    return module.Processor.from_config(config)
