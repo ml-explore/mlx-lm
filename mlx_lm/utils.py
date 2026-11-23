@@ -184,7 +184,7 @@ def _transform_awq_weights(
 
 
 def model_package(config: dict[str, Any]) -> str:
-    """The package, built-in or plug-in, that runs a configuration's model."""
+    """The module, built-in or plug-in, that runs a configuration's model."""
     return plugins.module_name("models", models.package_name(config))
 
 
@@ -590,7 +590,7 @@ def load_tokenizer(
     tokenizer_config_extra=None,
     eos_token_ids=None,
     *,
-    config: Optional[Dict[str, Any]] = None,
+    config: dict[str, Any] | None = None,
 ):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
@@ -619,9 +619,12 @@ def load_tokenizer(
 
 
 def _tokenizer_defaults(
-    model_path: Path, config: Optional[Dict[str, Any]] = None
-) -> Optional[Dict[str, Any]]:
-    """The TOKENIZER_DEFAULTS of the model package, if any."""
+    model_path: Path, config: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """The TOKENIZER_DEFAULTS of the model, if any.
+
+    ``config`` is the model's configuration, by default the one in ``model_path``.
+    """
     try:
         if config is None:
             config = load_config(model_path)

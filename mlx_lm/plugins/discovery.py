@@ -19,7 +19,8 @@ def module_name(kind: PluginKind, name: str) -> str:
         raise ValueError(f"{name!r} is not a valid identifier.")
 
     builtin = f"mlx_lm.{kind}.{name}"
-    # Built-ins never read other packages' metadata. Namespace folders have no origin.
+    # Built-ins come first, so other packages' metadata cannot break them.
+    # A folder without __init__.py has no origin.
     spec = importlib.util.find_spec(builtin)
     if spec is not None and spec.origin is not None:
         return builtin

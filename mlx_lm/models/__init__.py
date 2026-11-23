@@ -11,12 +11,13 @@ __all__ = [
 ]
 
 # TODO: Make these tables read-only. Code outside mlx-lm still changes them.
-MODEL_ARCHITECTURE_REMAPPING: dict[tuple[str, str], str] = {
+# Keys are lookup names: lower case, with _ for -.
+MODEL_ARCHITECTURE_REMAPPING = {
     # Ling-3.x reuses Ling-2.6's model type.
     ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
 }
 
-MODEL_REMAPPING: dict[str, str] = {
+MODEL_REMAPPING = {
     "mistral": "llama",
     "llava": "mistral3",
     "pixtral": "mistral3",
