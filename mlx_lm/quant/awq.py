@@ -7,11 +7,12 @@ from typing import Any, Callable, Dict
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_map_with_path
+from mlx.utils import tree_flatten, tree_map, tree_map_with_path, tree_unflatten
 from tqdm import tqdm
 
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.switch_layers import SwitchLinear
+from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.common import ZeroCenteredRMSNorm
+from mlx_lm.layers.moe import SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     load,
@@ -34,7 +35,6 @@ class AWQConfig:
     lm_head: str
     no_clip: list[str]
     scale_configs: list[ScaleConfig]
-    lm_key: str | None = None
 
 
 def update(cfg, **kwargs):
@@ -45,7 +45,7 @@ def update(cfg, **kwargs):
 
 
 llama_awq = AWQConfig(
-    embed="embed_tokens",
+    embed="model.embed_tokens",
     lm_head="lm_head",
     no_clip=["q_proj", "k_proj"],
     scale_configs=[
@@ -65,7 +65,7 @@ llama_awq = AWQConfig(
 )
 
 gemma3_text_awq = AWQConfig(
-    embed="embed_tokens",
+    embed="model.embed_tokens",
     lm_head="lm_head",
     no_clip=["q_proj", "k_proj"],
     scale_configs=[
@@ -84,10 +84,10 @@ gemma3_text_awq = AWQConfig(
     ],
 )
 
-gemma3_awq = update(gemma3_text_awq, lm_key="language_model")
+gemma3_awq = update(gemma3_text_awq, embed="model.language_model.embed_tokens")
 
 deepseek_v2_awq = AWQConfig(
-    embed="embed_tokens",
+    embed="model.embed_tokens",
     lm_head="lm_head",
     no_clip=["q_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"],
     scale_configs=[
@@ -141,10 +141,13 @@ deepseek_v2_awq = AWQConfig(
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
+    "ministral3": llama_awq,
+    "mistral3": update(llama_awq, embed="model.language_model.embed_tokens"),
+    "llava": update(llama_awq, embed="model.language_model.embed_tokens"),
     "qwen2": llama_awq,
     "qwen3": llama_awq,
     "gemma3_text": gemma3_text_awq,
-    "gemma3": update(gemma3_text_awq, lm_key="language_model"),
+    "gemma3": gemma3_awq,
     "deepseek_v2": deepseek_v2_awq,
 }
 
@@ -256,7 +259,7 @@ def apply_scale(prev_op, layers, scales):
             prev_op.bias = prev_op.bias / scales
         for layer in layers:
             layer.weight = layer.weight * scales
-    elif prev_op.__class__.__name__ == "RMSNorm":  # For gemma models
+    elif isinstance(prev_op, ZeroCenteredRMSNorm):
         dt = prev_op.weight.dtype
         prev_op.weight = (
             (1.0 + prev_op.weight.astype(mx.float32)) / scales - 1.0
@@ -404,9 +407,6 @@ def awq_quantize(
     embed_bits: int = 4,
     n_grid: int = 20,
 ):
-    if awq_config.lm_key is not None:
-        model = model[awq_config.lm_key]
-
     group = mx.distributed.init()
 
     def quantize_func(w):
@@ -415,11 +415,11 @@ def awq_quantize(
 
     mask = create_attention_mask(inputs)
 
-    embed_key = awq_config.embed
-    model.model[embed_key] = model.model[embed_key].to_quantized(
+    embed = dict(model.named_modules())[awq_config.embed].to_quantized(
         group_size=embed_group_size, bits=embed_bits
     )
-    inputs = model.model[embed_key](inputs)
+    model.update_modules(tree_unflatten([(awq_config.embed, embed)]))
+    inputs = embed(inputs)
 
     def capture(module):
         if not isinstance(module, (nn.Linear, SwitchLinear)):

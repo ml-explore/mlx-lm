@@ -58,6 +58,26 @@ class TestSampleUtils(unittest.TestCase):
             actual_probs.tolist(), [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]
         )
 
+    def test_apply_top_p_keeps_top_token_at_tiny_thresholds(self):
+        probs = mx.array([0.9, 0.0, 0.0, 0.1])[None]
+        logits = mx.log(probs)
+        for top_p in (1e-8, 1e-6, 1e-4):
+            actual_probs = mx.softmax(apply_top_p(logits, top_p).squeeze())
+            self.assertEqual(actual_probs.tolist(), [1.0, 0.0, 0.0, 0.0])
+
+        mx.random.seed(0)
+        logits = mx.random.normal((2, 4096)) * 3
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        for dtype in (mx.float32, mx.float16, mx.bfloat16):
+            x = logprobs.astype(dtype)
+            for top_p in (1e-8, 1e-4, 1e-3):
+                filtered = apply_top_p(x, top_p)
+                kept = (filtered > -float("inf")).sum(axis=-1)
+                self.assertTrue((kept > 0).all().item())
+                self.assertEqual(
+                    filtered.max(axis=-1).tolist(), x.max(axis=-1).tolist()
+                )
+
     def test_apply_min_p(self):
         probs = mx.array([0.9, 0.0, 0.0, 0.1])[None]
         logits = mx.log(probs)

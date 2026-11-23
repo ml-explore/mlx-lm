@@ -14,7 +14,7 @@ import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 from tqdm import tqdm
 
-from mlx_lm.models.switch_layers import SwitchLinear
+from mlx_lm.layers.moe import SwitchLinear
 from mlx_lm.quant.utils import load_data
 from mlx_lm.utils import (
     compute_bits_per_weight,
@@ -123,8 +123,10 @@ def gptq_quantize(
 
                 e = gptq_error(w, d, scales, biases)
 
-                W[..., k : k + j] -= e @ Hinv[k : k + 1, k : k + j]
-                err[..., k : k + 1] = e
+                # Update the remaining columns of this group now; the
+                # columns after the group are updated once per group below.
+                W[..., k:j] -= e @ Hinv[k : k + 1, k:j]
+                err[..., k - i : k - i + 1] = e
                 mx.eval(err, W)
 
             W[..., j:] -= err @ Hinv[i:j, j:]

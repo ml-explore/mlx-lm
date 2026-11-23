@@ -5,8 +5,34 @@ import unittest
 
 import mlx.core as mx
 
-from mlx_lm.models import qwen3_moe
-from mlx_lm.models.pipeline import PipelineMixin
+from mlx_lm.layers.distributed import PipelineMixin
+from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.utils import model_package, quantize_model
+
+MUSE_SPARK_OPEN = {
+    "model_type": "muse_spark",
+    "text_config": {
+        "vocab_size": 128,
+        "hidden_size": 64,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "rms_norm_eps": 1e-5,
+        "post_norm_eps": 1e-8,
+        "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+        "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+        "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+        "sliding_window": 8,
+        "final_logit_softcapping": 20.0,
+        "output_multiplier": 1.0,
+        "num_local_experts": 4,
+        "num_experts_per_tok": 2,
+        "moe_hidden_size": 64,
+        "moe_intermediate_size": 128,
+    },
+}
 
 
 class Group:
@@ -132,12 +158,13 @@ class TestModelParallel(unittest.TestCase):
                 "max_position_embeddings": 256,
                 "tie_word_embeddings": False,
             },
+            MUSE_SPARK_OPEN,
         ]
         mx.random.seed(0)
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
@@ -169,12 +196,75 @@ class TestModelParallel(unittest.TestCase):
                 "max_position_embeddings": 256,
                 "tie_word_embeddings": False,
             },
+            {
+                "model_type": "deepseek_v32",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "index_head_dim": 16,
+                "index_n_heads": 2,
+                "index_topk": 4,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "n_shared_experts": 1,
+                "n_routed_experts": 4,
+                "kv_lora_rank": 8,
+                "q_lora_rank": 8,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+                "qk_nope_head_dim": 16,
+                "num_experts_per_tok": 2,
+                "first_k_dense_replace": 1,
+                "max_position_embeddings": 256,
+            },
+            {
+                "model_type": "qwen2",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "max_position_embeddings": 256,
+                "tie_word_embeddings": False,
+            },
+            {
+                "model_type": "qwen3_next",
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "intermediate_size": 128,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "linear_num_value_heads": 4,
+                "linear_num_key_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 4,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "decoder_sparse_step": 1,
+                "shared_expert_intermediate_size": 32,
+                "mlp_only_layers": [0],
+                "moe_intermediate_size": 32,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "partial_rotary_factor": 0.25,
+                "max_position_embeddings": 256,
+                "full_attention_interval": 4,
+            },
+            MUSE_SPARK_OPEN,
         ]
         mx.random.seed(0)
         for config in test_configs:
             model_type = config["model_type"]
             with self.subTest(f"Testing {model_type}", model_type=model_type):
-                arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+                arch = importlib.import_module(f"mlx_lm.models.{model_package(config)}")
                 args = arch.ModelArgs.from_dict(config)
                 model = arch.Model(args)
                 vocab_size = args.vocab_size
@@ -183,6 +273,30 @@ class TestModelParallel(unittest.TestCase):
                 model.model.pipeline(mx.distributed.init())
                 out = model(x)
                 self.assertTrue(mx.allclose(expected, out, rtol=1e-3, atol=1e-3))
+
+    def test_muse_spark_decode(self):
+        # Prefill uses the whole pooler; decode steps of one token use the
+        # row-split pooler and unpooler.
+        for mode in (None, "nvfp4"):
+            with self.subTest(mode=mode):
+                mx.random.seed(0)
+                args = muse_spark.ModelArgs.from_dict(MUSE_SPARK_OPEN)
+                model = muse_spark.Model(args)
+                if mode is not None:
+                    quantize_model(model, {}, None, None, mode=mode, global_scale=True)
+                x = mx.random.randint(0, args.text.vocab_size, shape=(1, 13))
+
+                def run():
+                    cache = make_prompt_cache(model)
+                    outputs = [model(x[:, :10], cache=cache)]
+                    for i in range(10, 13):
+                        outputs.append(model(x[:, i : i + 1], cache=cache))
+                    return outputs
+
+                expected = run()
+                model.shard()
+                for e, out in zip(expected, run()):
+                    self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
 
     def test_pipeline_layer_assignment(self):
         def assignment(num_layers, size, split=None):
@@ -246,15 +360,83 @@ class TestModelParallel(unittest.TestCase):
         }
 
         size = 2
-        args = qwen3_moe.ModelArgs.from_dict(config)
-        assigned = []
+        qwen2_config = {
+            "model_type": "qwen2",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 7,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "max_position_embeddings": 256,
+            "tie_word_embeddings": False,
+        }
+        qwen3_next_config = {
+            "model_type": "qwen3_next",
+            "vocab_size": 128,
+            "hidden_size": 64,
+            "num_hidden_layers": 7,
+            "intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "linear_num_value_heads": 4,
+            "linear_num_key_heads": 2,
+            "linear_key_head_dim": 16,
+            "linear_value_head_dim": 16,
+            "linear_conv_kernel_dim": 4,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1,
+            "shared_expert_intermediate_size": 32,
+            "mlp_only_layers": [0],
+            "moe_intermediate_size": 32,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.25,
+            "max_position_embeddings": 256,
+            "full_attention_interval": 4,
+        }
+        for arch, arch_config in (
+            (qwen3_moe, config),
+            (qwen2, qwen2_config),
+            (qwen3_next, qwen3_next_config),
+        ):
+            with self.subTest(model_type=arch_config["model_type"]):
+                args = arch.ModelArgs.from_dict(arch_config)
+                assigned = []
+                for rank in range(size):
+                    model = arch.Model(args)
+                    model.model.pipeline(Group(rank, size))
+                    assigned.extend(
+                        i for i, l in enumerate(model.model.layers) if l is not None
+                    )
+                self.assertEqual(sorted(assigned), list(range(7)))
+
+        # Hybrid edge case: 7 layers on 2 ranks puts layers 0-2 (all linear,
+        # full_attention_interval=4) on the last rank; its rescan must leave
+        # fa_idx as None rather than pointing at a wrong layer. Rank 0 holds
+        # layers 3-6, so its full-attention layer sits at local index 0.
+        args = qwen3_next.ModelArgs.from_dict(qwen3_next_config)
+        model = qwen3_next.Model(args)
+        model.model.pipeline(Group(1, size))
+        self.assertIsNone(model.model.fa_idx)
+        self.assertEqual(model.model.ssm_idx, 0)
+        model = qwen3_next.Model(args)
+        model.model.pipeline(Group(0, size))
+        self.assertEqual(model.model.fa_idx, 0)
+        self.assertEqual(model.model.ssm_idx, 1)
+
+        args = qwen3_next.ModelArgs.from_dict(
+            {**qwen3_next_config, "full_attention_interval": 1}
+        )
         for rank in range(size):
-            model = qwen3_moe.Model(args)
+            model = qwen3_next.Model(args)
             model.model.pipeline(Group(rank, size))
-            assigned.extend(
-                i for i, l in enumerate(model.model.layers) if l is not None
-            )
-        self.assertEqual(sorted(assigned), list(range(7)))
+            self.assertIsNone(model.model.ssm_idx)
+            self.assertEqual(model.model.fa_idx, 0)
 
 
 if __name__ == "__main__":
