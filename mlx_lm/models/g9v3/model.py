@@ -8,7 +8,7 @@ import mlx.nn as nn
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.models.g9v3 import checkpoint
 from mlx_lm.models.g9v3.config import ModelArgs
-from mlx_lm.models.g9v3.layers import G9v3DecodeLayer
+from mlx_lm.models.g9v3.layers import DecodeLayer
 
 __all__ = [
     "G9v3Model",
@@ -25,7 +25,7 @@ class G9v3Model(nn.Module):
 
         self.embed_tokens = nn.Embedding(self.vocab_size, dims=config.hidden_size)
         self.layers = [
-            G9v3DecodeLayer(layer_idx=idx, config=config)
+            DecodeLayer(layer_idx=idx, config=config)
             for idx in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(dims=config.hidden_size, eps=config.rms_norm_eps)

@@ -12,16 +12,16 @@ from mlx_lm.layers.rope import initialize_rope
 from mlx_lm.models.g9v3.config import ModelArgs
 
 __all__ = [
-    "G9v3Attention",
-    "G9v3MLP",
-    "G9v3TopkRouter",
-    "G9v3MoE",
-    "G9v3DecodeLayer",
+    "Attention",
+    "MLP",
+    "TopkRouter",
+    "MoE",
+    "DecodeLayer",
     "group_expert_select",
 ]
 
 
-class G9v3Attention(nn.Module):
+class Attention(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -116,7 +116,7 @@ class G9v3Attention(nn.Module):
         return self.o_proj(outputs)
 
 
-class G9v3MLP(nn.Module):
+class MLP(nn.Module):
 
     def __init__(self, config: ModelArgs, intermediate_size: Optional[int] = None):
         super().__init__()
@@ -139,7 +139,7 @@ class G9v3MLP(nn.Module):
         )
 
 
-class G9v3TopkRouter(nn.Module):
+class TopkRouter(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -165,7 +165,7 @@ class G9v3TopkRouter(nn.Module):
         )
 
 
-class G9v3MoE(nn.Module):
+class MoE(nn.Module):
 
     def __init__(self, config: ModelArgs):
         super().__init__()
@@ -175,8 +175,8 @@ class G9v3MoE(nn.Module):
             hidden_dims=config.moe_intermediate_size,
             num_experts=config.n_routed_experts,
         )
-        self.gate = G9v3TopkRouter(config=config)
-        self.shared_experts = G9v3MLP(
+        self.gate = TopkRouter(config=config)
+        self.shared_experts = MLP(
             config=config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
         )
@@ -195,17 +195,17 @@ class G9v3MoE(nn.Module):
         return expert_outputs
 
 
-class G9v3DecodeLayer(nn.Module):
+class DecodeLayer(nn.Module):
 
     def __init__(self, layer_idx: int, config: ModelArgs):
         super().__init__()
 
-        self.self_attn = G9v3Attention(config=config)
+        self.self_attn = Attention(config=config)
 
         if layer_idx >= config.first_k_dense_replace:
-            self.mlp = G9v3MoE(config=config)
+            self.mlp = MoE(config=config)
         else:
-            self.mlp = G9v3MLP(config=config)
+            self.mlp = MLP(config=config)
 
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(
