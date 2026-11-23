@@ -1006,5 +1006,54 @@ class TestGenerationThreadDeath(unittest.TestCase):
             rg._await_response(Queue())
 
 
+class TestServerListenBacklog(unittest.TestCase):
+    def test_default_server_uses_somaxconn_backlog(self):
+        import socket
+
+        from mlx_lm.server import _ThreadingHTTPServer
+
+        self.assertEqual(_ThreadingHTTPServer.request_queue_size, socket.SOMAXCONN)
+        with _ThreadingHTTPServer(("127.0.0.1", 0), APIHandler) as httpd:
+            self.assertEqual(httpd.request_queue_size, socket.SOMAXCONN)
+
+    def test_concurrent_connections_do_not_reset(self):
+        import socket
+        from concurrent.futures import ThreadPoolExecutor
+        from http.server import BaseHTTPRequestHandler
+
+        from mlx_lm.server import _ThreadingHTTPServer
+
+        class _OkHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, format, *args):
+                pass
+
+        with _ThreadingHTTPServer(("127.0.0.1", 0), _OkHandler) as httpd:
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            try:
+
+                def fetch(_):
+                    with socket.create_connection(("127.0.0.1", port), timeout=5) as s:
+                        s.sendall(
+                            b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+                        )
+                        return s.recv(64)
+
+                with ThreadPoolExecutor(max_workers=32) as pool:
+                    replies = list(pool.map(fetch, range(32)))
+                self.assertEqual(len(replies), 32)
+                self.assertTrue(all(b"200 OK" in r for r in replies))
+            finally:
+                httpd.shutdown()
+                t.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()
