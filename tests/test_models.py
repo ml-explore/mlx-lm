@@ -4086,6 +4086,59 @@ class TestModels(unittest.TestCase):
         err = mx.abs(got[uids[1]] - alone).max().item()
         self.assertLess(err, 1e-5)
 
+    def test_nemotron_h_padded_batch(self):
+        from mlx_lm.generate import BatchGenerator, generate_step
+        from mlx_lm.models import nemotron_h
+
+        mx.random.seed(0)
+        args = nemotron_h.ModelArgs.from_dict(
+            {
+                "model_type": "nemotron_h",
+                "vocab_size": 128,
+                "hidden_size": 128,
+                "intermediate_size": 128,
+                "num_hidden_layers": 4,
+                "max_position_embeddings": 256,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "attention_bias": False,
+                "mamba_num_heads": 8,
+                "mamba_head_dim": 64,
+                "mamba_proj_bias": False,
+                "ssm_state_size": 64,
+                "conv_kernel": 4,
+                "n_groups": 4,
+                "mlp_bias": False,
+                "layer_norm_epsilon": 1e-5,
+                "use_bias": False,
+                "use_conv_bias": True,
+                "hybrid_override_pattern": ["M", "*", "M", "*"],
+            }
+        )
+        model = nemotron_h.Model(args)
+        model.eval()
+        for layer in model.layers:
+            if layer.block_type == "M":
+                layer.mixer.A_log = mx.full(layer.mixer.A_log.shape, -4.0)
+                layer.mixer.conv1d.weight = layer.mixer.conv1d.weight * 30
+
+        prompts = [list(range(1, 13)), [7, 8, 9], [21, 22, 23, 24, 25]]
+        alone = [
+            next(generate_step(mx.array(p), model, max_tokens=1))[1] for p in prompts
+        ]
+
+        gen = BatchGenerator(model, max_tokens=1)
+        uids = gen.insert(prompts)
+        got = {}
+        while len(got) < len(prompts):
+            for r in gen.next_generated():
+                got[r.uid] = r.logprobs
+        gen.close()
+
+        for uid, ref in zip(uids, alone):
+            err = mx.abs(got[uid] - ref).max().item()
+            self.assertLess(err, 1e-4)
+
     def test_laguna_sanitize(self):
         from mlx_lm.models import laguna
 
