@@ -43,6 +43,9 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 # Local imports
 from mlx_lm import models, plugins
 
+# Re-exported: code outside mlx-lm imports them from here.
+from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING  # noqa: F401
+
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
 
