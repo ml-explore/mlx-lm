@@ -124,11 +124,12 @@ class Gemma4TextModel(nn.Module):
             )
         ):
             kvs, offset = intermediates[prev_idx]
+            layer_cache = cache[prev_idx] if kvs is not None else c
 
             h, kvs, offset = layer(
                 h,
                 mask,
-                c,
+                layer_cache,
                 per_layer_input=per_layer_input,
                 shared_kv=kvs,
                 offset=offset,

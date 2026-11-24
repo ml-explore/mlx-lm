@@ -30,7 +30,9 @@ from transformers import PreTrainedTokenizer
 
 from .generate_utils import BatchCounters, BatchCountersSnapshot, BatchStats
 from .models.cache import (
+    BatchRotatingKVCache,
     QuantizedKVCache,
+    RotatingKVCache,
     TokenBuffer,
     can_trim_prompt_cache,
     load_prompt_cache,
@@ -316,7 +318,19 @@ class GenerationResponse:
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
     if kv_bits is None:
         return
+    has_quantizable_layer = any(
+        isinstance(c, QuantizedKVCache)
+        or (
+            hasattr(c, "to_quantized")
+            and not isinstance(c, (RotatingKVCache, BatchRotatingKVCache))
+        )
+        for c in prompt_cache
+    )
     for e, c in enumerate(prompt_cache):
+        if has_quantizable_layer and isinstance(
+            c, (RotatingKVCache, BatchRotatingKVCache)
+        ):
+            continue
         if hasattr(c, "to_quantized") and c.offset >= quantized_kv_start:
             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
 
