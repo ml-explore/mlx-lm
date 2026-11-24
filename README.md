@@ -282,7 +282,7 @@ my_parser = "my_lm.tool_parser:ToolParser"
 The name is the `model_type` or `tool_parser_type`; built-in names win. A model
 is an `nn.Module` like the built-in ones, with `model_args = ModelArgs` in the
 class body. A tool parser has `tool_call_start`, `tool_call_end` and
-`parse_tool_call(text, tools)`, which returns
+`parse_tool_call(text, tools)`, a `@staticmethod` in a class, which returns
 `{"name": ..., "arguments": {...}}` or a list of them.
 
 A checkpoint sets its tool parser and thinking markers in
