@@ -202,6 +202,35 @@ class TestToolParsing(unittest.TestCase):
             {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
         )
 
+    def test_glm47_string_arg_keeps_whitespace(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string"},
+                            "content": {"type": "string"},
+                        },
+                    },
+                },
+            }
+        ]
+        # A string-typed argument keeps its leading indentation and trailing
+        # newline; the value is not stripped.
+        content = "    return x\n"
+        test_case = (
+            "write_file"
+            "<arg_key>path</arg_key><arg_value>a.py</arg_value>"
+            f"<arg_key>content</arg_key><arg_value>{content}</arg_value>"
+        )
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "write_file", "arguments": {"path": "a.py", "content": content}},
+        )
+
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
         test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
