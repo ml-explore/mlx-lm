@@ -525,6 +525,23 @@ def _make_logits_processors(args):
     )
 
 
+def _align_cache_to_tokens(cache: List[Any], tokens: List[int]) -> List[int]:
+    """Make every layer of `cache` hold exactly the returned prefix of `tokens`.
+
+    LRUPromptCache trims a reused cache by ``len(tokens) - prefix``, so it
+    assumes the cache holds one entry per token in its key. Speculative
+    decoding breaks that: the last yielded token is never fed back, and the
+    draft cache can lag the main cache. Trimming by the key length then cuts
+    one token too many, and the next request that reuses the cache is missing
+    a token from its prompt.
+    """
+    n = min(len(tokens), *(c.offset for c in cache))
+    for c in cache:
+        if c.offset > n:
+            c.trim(c.offset - n)
+    return tokens[:n]
+
+
 def _format_top_logprobs(logprobs, top_n, tokenizer) -> Tuple[Dict[str, Any]]:
     """Returns info dicts for the top `top_n` tokens from `logprobs`"""
     if top_n <= 0:
@@ -1153,6 +1170,8 @@ class ResponseGenerator:
             rqueue.put(None)
 
             # Save the KV cache again
+            if draft_model is not None:
+                cache_key = _align_cache_to_tokens(cache, cache_key)
             self.prompt_cache.insert_cache(
                 self.model_provider.model_key, cache_key, cache
             )

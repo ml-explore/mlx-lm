@@ -23,6 +23,7 @@ from mlx_lm.server import (
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
+    _align_cache_to_tokens,
     _apply_stop_words,
     _make_sampler,
 )
@@ -211,6 +212,42 @@ class TestTextStateMachine(unittest.TestCase):
             TextStateMachine({"normal": [("<x>", "other")]})
         with self.assertRaises(ValueError):
             TextStateMachine({}).reader(state="other")
+
+
+class TestAlignCacheToTokens(unittest.TestCase):
+    @staticmethod
+    def _filled_cache(n):
+        c = KVCache()
+        kv = mx.zeros((1, 1, n, 4))
+        c.update_and_fetch(kv, kv)
+        return c
+
+    def test_speculative_cache_reuse_keeps_every_prompt_token(self):
+        # After speculative decoding the main cache is one token behind the
+        # yielded tokens and the draft cache is two behind.
+        tokens = list(range(12))
+        main = [self._filled_cache(11) for _ in range(2)]
+        draft = [self._filled_cache(10) for _ in range(2)]
+        cache = main + draft
+
+        key = _align_cache_to_tokens(cache, tokens)
+        self.assertEqual(key, tokens[:10])
+        self.assertEqual([c.offset for c in cache], [10, 10, 10, 10])
+
+        # A follow-up request that shares a prefix must get a cache that,
+        # together with the rest of its tokens, covers its whole prompt.
+        prompt_cache = LRUPromptCache()
+        prompt_cache.insert_cache("model", key, cache)
+        query = tokens[:8] + [100, 101]
+        reused, rest = prompt_cache.fetch_nearest_cache("model", query)
+        for c in reused:
+            self.assertEqual(c.offset + len(rest), len(query))
+
+    def test_aligned_cache_is_unchanged(self):
+        tokens = list(range(5))
+        cache = [self._filled_cache(5)]
+        self.assertEqual(_align_cache_to_tokens(cache, tokens), tokens)
+        self.assertEqual(cache[0].offset, 5)
 
 
 class TestApplyStopWords(unittest.TestCase):
