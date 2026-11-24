@@ -48,7 +48,6 @@ def load_tool_parser(name: str) -> Any:
     end = getattr(parser, "tool_call_end", None)
     is_valid_parser = (
         isinstance(start, str)
-        and start != ""
         and isinstance(end, str)
         and callable(getattr(parser, "parse_tool_call", None))
     )
