@@ -21,6 +21,7 @@ def main():
         "dynamic_quant",
         "gptq",
         "server",
+        "server_v2",
         "upload",
         "share",
     )
