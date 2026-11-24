@@ -30,6 +30,7 @@ from typing import (
     Tuple,
     Union,
 )
+from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
 import mlx.core as mx
@@ -546,6 +547,9 @@ class ResponseGenerator:
         self.requests = Queue()
 
         self._time_budget = TimeBudget()
+        self._request_timeout = getattr(
+            getattr(model_provider, "cli_args", None), "request_timeout", None
+        )
         self._is_distributed = mx.distributed.init().size() > 1
         self._rank = mx.distributed.init().rank()
         self._stop = False
@@ -573,6 +577,24 @@ class ResponseGenerator:
     @property
     def is_healthy(self):
         return self.generation_available()
+
+    def probe_health(self) -> bool:
+        """Verify that the generation thread is alive and MLX compute is responsive."""
+        if not self.generation_available():
+            return False
+        try:
+            mx.eval(mx.array([1], dtype=mx.float32) + 1)
+            model = self.model_provider.model
+            if model is not None and hasattr(model, "parameters"):
+                from mlx.utils import tree_flatten
+
+                params = tree_flatten(model.parameters())
+                if params:
+                    mx.eval(params[0][1])
+            return True
+        except Exception as e:
+            logging.warning(f"Health probe failed: {e}")
+            return False
 
     def _log_cache_stats(self):
         n_sequences = len(self.prompt_cache)
@@ -1163,12 +1185,29 @@ class ResponseGenerator:
     def _await_response(self, response_queue):
         # Wherever the request was when the thread died, nothing more will be
         # put on its queue, so give up rather than block forever.
+        deadline = (
+            time.monotonic() + self._request_timeout
+            if self._request_timeout is not None and self._request_timeout > 0
+            else None
+        )
         while True:
+            wait = 1.0
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Inference request timed out after {self._request_timeout}s"
+                    )
+                wait = min(wait, remaining)
             try:
-                return response_queue.get(timeout=1.0)
+                return response_queue.get(timeout=wait)
             except QueueEmpty:
                 if not self.generation_available():
                     raise RuntimeError("generation thread died") from None
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Inference request timed out after {self._request_timeout}s"
+                    ) from None
 
     def generate(
         self,
@@ -1591,6 +1630,11 @@ class APIHandler(BaseHTTPRequestHandler):
                 args,
                 progress_callback=keepalive_callback,
             )
+        except TimeoutError as e:
+            self._set_completion_headers(504)
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode())
+            return
         except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
@@ -1777,20 +1821,30 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path.startswith("/v1/models"):
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/v1/models"):
             self.handle_models_request()
-        elif self.path == "/health":
-            self.handle_health_check()
+        elif parsed.path == "/health":
+            probe = parse_qs(parsed.query).get("probe", ["false"])[0].lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            self.handle_health_check(probe=probe)
         else:
             self._set_completion_headers(404)
             self.end_headers()
             self.wfile.write(b"Not Found")
 
-    def handle_health_check(self):
+    def handle_health_check(self, probe: bool = False):
         """
         Handle a GET request for the /health endpoint.
         """
-        is_healthy = self.response_generator.is_healthy
+        is_healthy = (
+            self.response_generator.probe_health()
+            if probe
+            else self.response_generator.is_healthy
+        )
         status_code = 200 if is_healthy else 503
         status = "ok" if is_healthy else "unavailable"
 
@@ -2064,6 +2118,12 @@ def main():
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for inference requests (default: None)",
     )
     args = parser.parse_args()
     _ = maybe_set_recommended_wired_limit()
