@@ -75,15 +75,21 @@ class APIError(Exception):
 
     @classmethod
     def from_validation_error(
-        cls, e: fastapi.exceptions.RequestValidationError | pydantic.ValidationError
+        cls,
+        e: fastapi.exceptions.RequestValidationError | pydantic.ValidationError,
+        *,
+        names: Mapping[str, str] | None = None,
     ) -> Self:
-        """The 400 for the first error of a request body or of a value in it."""
+        """The 400 for the first error of a request body or of a value in it.
+
+        ``names`` maps the name of a value to the name of its request field.
+        """
         error, *_ = e.errors()
         if error["type"] == "json_invalid":
             return cls(400, "The request body is not valid JSON.")
 
-        # E.g. "stop.str": the field, then a union member.
-        loc = [str(p) for p in error["loc"]]
+        # E.g. "stop.str": the field, then a union member; "list[...]" labels go.
+        loc = [str(p) for p in error["loc"] if "[" not in str(p)]
         # The errors of a request body start at "body".
         if isinstance(e, fastapi.exceptions.RequestValidationError):
             loc = loc[1:]
@@ -94,6 +100,7 @@ class APIError(Exception):
             )
             return cls(400, message)
 
+        loc[0] = (names or {}).get(loc[0], loc[0])
         return cls(400, f"{'.'.join(loc)}: {error['msg']}", param=loc[0])
 
     def to_response(self, body: dict[str, Any]) -> responses.JSONResponse:

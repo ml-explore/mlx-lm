@@ -62,6 +62,62 @@ class TestRendering(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "template failed"):
                 rendering.from_messages(self.tokenizer, user, params=PARAMS)
 
+    def test_system_turns(self):
+        line = "{{ m.role }}: {{ m.content }}\n"
+        shows = "{% for m in messages %}" + line + "{% endfor %}"
+        drops = "{% for m in messages if m.role != 'system' %}" + line + "{% endfor %}"
+        # As in Gemma 3: a later system message breaks the user/assistant order.
+        alternates = (
+            "{% set first = 1 if messages[0].role == 'system' else 0 %}"
+            "{% if first %}{{ messages[0].content }}{% endif %}"
+            "{% for m in messages[first:] %}"
+            "{% if (m.role == 'user') != (loop.index0 % 2 == 0) %}"
+            "{{ raise_exception('Conversation roles must alternate.') }}"
+            "{% endif %}" + line + "{% endfor %}"
+        )
+        # As in DeepSeek-R1-Distill.
+        last_only = (
+            "{% for m in messages if m.role == 'system' %}{% if loop.last %}"
+            + line
+            + "{% endif %}{% endfor %}"
+            + drops
+        )
+        # As in Devstral: a user message cannot follow a tool result.
+        no_user_after_tool = (
+            "{% for m in messages %}"
+            "{% if m.role == 'user' and loop.index0 and loop.previtem.role == 'tool' %}"
+            "{{ raise_exception('Roles must alternate.') }}"
+            "{% endif %}{% if m.role != 'system' %}" + line + "{% endif %}{% endfor %}"
+        )
+        messages = [
+            {"role": "user", "content": "Hi"},
+            {"role": "system", "content": "Be brief."},
+            {"role": "assistant", "content": "Yo"},
+        ]
+        merged = [{"role": "user", "content": "Hi\n\nBe brief."}, messages[2]]
+        top = {"role": "system", "content": "Sys"}
+        user, system, _ = messages
+        call = {"role": "assistant", "content": "Look."}
+        tool = {"role": "tool", "content": "Sun"}
+        after_tool = [user, call, tool, system]
+        as_user = [user, call, tool, {**system, "role": "user"}]
+        joined = [user, call, {**tool, "content": "Sun\n\nBe brief."}]
+        for template, chat, expected in [
+            (shows, messages, messages),
+            (alternates, messages, merged),
+            (last_only, [top, *messages], [top, *merged]),
+            (drops, [user, user], [user, user]),
+            (drops, after_tool, as_user),
+            (no_user_after_tool, after_tool, joined),
+        ]:
+            with self.subTest(template=template):
+                tokenizer = helpers.load_tokenizer(chat_template=template)
+                result = rendering.from_messages(tokenizer, chat, params=PARAMS)
+                tokens = tokenizer.apply_chat_template(
+                    expected, add_generation_prompt=True
+                )
+                self.assertEqual(result.tokens, tuple(tokens))
+
     def test_from_messages_without_checkpoints(self):
         messages = [{"role": "user", "content": "Hi"}]
         apply_template = mock.Mock(side_effect=[[1, 2, 3], ValueError])
