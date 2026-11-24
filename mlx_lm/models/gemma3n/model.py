@@ -145,6 +145,8 @@ class LanguageModel(nn.Module):
         # One position offset for the whole forward pass, so KV-shared layers
         # do not read a cache their owner has already advanced.
         offset = cache[0].offset if cache is not None and cache[0] is not None else 0
+        # Keep each layer's KV for the KV-shared layers.
+        kvs = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
             per_layer_input = per_layer_inputs[:, :, i, :]
 
@@ -155,12 +157,14 @@ class LanguageModel(nn.Module):
             else:
                 mask = sliding_window_mask
 
-            h = layer(
+            cache_idx = self.layer_idx_to_cache_idx[i]
+            h, kvs[i] = layer(
                 h,
                 mask,
-                cache[self.layer_idx_to_cache_idx[i]],
+                cache[cache_idx],
                 per_layer_input,
                 offset=offset,
+                shared_kv=kvs[cache_idx],
             )
 
         # Per-layer inputs to single output
