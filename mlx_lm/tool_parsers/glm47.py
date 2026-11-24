@@ -223,8 +223,8 @@ def parse_tool_call(text: str, tools: list[Any] | None = None):
     arg_dct = {}
     for match in _func_arg_regex.finditer(text):
         arg_key = match.group(1).strip()
-        arg_val = match.group(2).strip()
+        arg_val = match.group(2)
         if arg_key not in string_args:
-            arg_val = _deserialize(arg_val)
+            arg_val = _deserialize(arg_val.strip())
         arg_dct[arg_key] = arg_val
     return dict(name=func_name, arguments=arg_dct)
