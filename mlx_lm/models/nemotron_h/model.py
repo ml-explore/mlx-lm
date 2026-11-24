@@ -70,6 +70,8 @@ class NemotronHModel(nn.Module):
 
 
 class Model(nn.Module):
+    model_args = ModelArgs
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

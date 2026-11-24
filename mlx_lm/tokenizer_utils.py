@@ -6,12 +6,15 @@ import functools
 import importlib
 import inspect
 import json
+import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from mlx_lm.plugins.discovery import TOOL_PARSERS, UnknownNameError
 
 
 class StreamingDetokenizer(abc.ABC):
@@ -316,6 +319,14 @@ def _infer_thinking(tokenizer):
     return (None, None, None, None)
 
 
+def _marker_tokens(tokenizer: PreTrainedTokenizerBase, marker: str) -> tuple[int, ...]:
+    """The tokens of the stripped ``marker``: outer whitespace can merge with text."""
+    tokens = tuple(tokenizer.encode(marker.strip(), add_special_tokens=False))
+    if not tokens:
+        raise ValueError(f"The marker {marker!r} has no tokens.")
+    return tokens
+
+
 def _is_xtml_vocab(vocab):
     return all(
         t in vocab for t in ("<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>")
@@ -375,6 +386,8 @@ class TokenizerWrapper:
         tool_call_end=None,
         tool_parser=None,
         response_format: Optional[Dict[str, Any]] = None,
+        think_start: str | None = None,
+        think_end: str | None = None,
     ):
         self._tokenizer = tokenizer
         # Built once, since building the token map is expensive.
@@ -382,12 +395,22 @@ class TokenizerWrapper:
         self._eos_token_ids = set(eos_token_ids or [])
         if tokenizer.eos_token_id is not None:
             self._eos_token_ids.add(tokenizer.eos_token_id)
-        (
-            self._think_start,
-            self._think_end,
-            self._think_start_tokens,
-            self._think_end_tokens,
-        ) = _infer_thinking(tokenizer)
+
+        if (think_start is None) != (think_end is None):
+            raise ValueError("Give both think_start and think_end, or neither.")
+        if think_start is None:
+            (
+                self._think_start,
+                self._think_end,
+                self._think_start_tokens,
+                self._think_end_tokens,
+            ) = _infer_thinking(tokenizer)
+        else:
+            self._think_start = think_start
+            self._think_end = think_end
+            self._think_start_tokens = _marker_tokens(tokenizer, think_start)
+            self._think_end_tokens = _marker_tokens(tokenizer, think_end)
+
         self._structural_markers = _infer_structural_markers(tokenizer)
         self._response_format = response_format or {}
 
@@ -695,6 +718,18 @@ def _infer_tool_parser(tokenizer):
     return None
 
 
+def _load_tool_parser(name: str | None) -> Any:
+    """The tool parser ``name``, or None if there is no name or no such parser."""
+    if name is None:
+        return None
+    try:
+        return TOOL_PARSERS.load(name)
+    except UnknownNameError as error:
+        # Text generation does not need the parser.
+        warnings.warn(f"{error} Tool calls are off.")
+        return None
+
+
 def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
@@ -761,16 +796,23 @@ def load(
     if tool_parser_type is None:
         tool_parser_type = _infer_tool_parser(tokenizer)
 
-    if tool_parser_type is not None:
-        tool_module = importlib.import_module(f"mlx_lm.tool_parsers.{tool_parser_type}")
-        tool_parser = tool_module.parse_tool_call
-        tool_call_start = tool_module.tool_call_start
-        tool_call_end = tool_module.tool_call_end
+    parser = _load_tool_parser(tool_parser_type)
+    if parser is not None:
+        tool_parser = parser.parse_tool_call
+        tool_call_start = parser.tool_call_start
+        tool_call_end = parser.tool_call_end
         tokenizer_config["tool_parser_type"] = tool_parser_type
     else:
         tool_parser = None
         tool_call_start = None
         tool_call_end = None
+
+    if "think_start" in tokenizer_config or "think_end" in tokenizer_config:
+        think_start = tokenizer_config.get("think_start")
+        think_end = tokenizer_config.get("think_end")
+    else:
+        think_start = defaults.get("think_start")
+        think_end = defaults.get("think_end")
 
     return TokenizerWrapper(
         tokenizer,
@@ -781,6 +823,8 @@ def load(
         tool_call_start=tool_call_start,
         tool_call_end=tool_call_end,
         response_format=response_format,
+        think_start=think_start,
+        think_end=think_end,
     )
 
 

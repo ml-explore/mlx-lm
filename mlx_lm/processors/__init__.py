@@ -1,19 +1,16 @@
 # Copyright © 2026 Apple Inc.
 
-import importlib
 from collections.abc import Sequence
 from typing import Any, Protocol
 
-from mlx_lm.utils import model_package
+from mlx_lm.models import model_package
+from mlx_lm.plugins.discovery import MODELS, import_if_exists
 
 __all__ = [
     "ENCODER_CONFIGS",
-    "PROCESSORS",
     "Processor",
     "load_processor",
 ]
-
-PROCESSORS = ("muse_spark",)
 
 # A checkpoint converted without its encoders has none of these, and takes
 # only text.
@@ -25,16 +22,14 @@ class Processor(Protocol):
         """The text with the placeholders expanded, and the encoder inputs."""
 
 
-def load_processor(config: dict) -> Processor | None:
-    """The processor of the model of a configuration, or None if it takes only text."""
+def load_processor(config: dict[str, Any]) -> Processor | None:
+    """The processor of a built-in model, or None if it has none or takes only text."""
     if not any(config.get(key) for key in ENCODER_CONFIGS):
         return None
-    if "processor_type" in config:
-        name = config["processor_type"]
-    else:
-        name = model_package(config)
-    if name not in PROCESSORS:
+    package = MODELS.builtin_module(model_package(config))
+    if package is None:
         return None
-    # Imported here: the package holds the whole model.
-    module = importlib.import_module(f"mlx_lm.models.{name}.processor")
+    module = import_if_exists(f"{package.__name__}.processor")
+    if module is None:
+        return None
     return module.Processor.from_config(config)

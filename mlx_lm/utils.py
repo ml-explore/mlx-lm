@@ -41,39 +41,16 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Local imports
+from mlx_lm import models
+
+# Re-exported: code outside mlx-lm imports them from here.
+from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING  # noqa: F401
+from mlx_lm.plugins.discovery import MODELS
+
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
 
 # Constants
-MODEL_REMAPPING = {
-    "mistral": "llama",
-    "llava": "mistral3",
-    "pixtral": "mistral3",
-    "phi-msft": "phixtral",
-    "falcon_mamba": "mamba",
-    "joyai_llm_flash": "deepseek_v3",
-    "kimi_k2": "deepseek_v3",
-    "qwen2_5_vl": "qwen2_vl",
-    "minimax_m2": "minimax",
-    "iquestcoder": "llama",
-    "xverse": "llama",
-    "gemma4_unified": "gemma4",  # encoder-free multimodal variant; vision/audio weights stripped by sanitize()
-    "deepseek_v41_text": "deepseek_v41",
-    "qwen3_5_moe": "qwen3_5",
-    "qwen3_vl_moe": "qwen3_vl",
-    "solar_open": "glm4_moe",
-    # Package names cannot have hyphens.
-    "lfm2-vl": "lfm2_vl",
-    "lille-130m": "lille_130m",
-    "nemotron-nas": "nemotron_nas",
-    # Package names are lower case.
-    "Klear": "klear",
-}
-
-MODEL_ARCHITECTURE_REMAPPING = {
-    ("bailing_hybrid", "BailingMoeV3ForCausalLM"): "bailing_moe_v3",
-}
-
 MAX_FILE_SIZE_GB = 5
 
 
@@ -207,19 +184,6 @@ def _transform_awq_weights(
     return new_weights, mlx_quantization
 
 
-def model_package(config: dict) -> str:
-    """The package in ``mlx_lm.models`` of the model of a configuration."""
-    model_type = config["model_type"]
-    architectures = config.get("architectures") or ()
-    if isinstance(architectures, str):
-        architectures = (architectures,)
-    for architecture in architectures:
-        remapped = MODEL_ARCHITECTURE_REMAPPING.get((model_type, architecture))
-        if remapped is not None:
-            return remapped
-    return MODEL_REMAPPING.get(model_type, model_type)
-
-
 def _get_classes(config: dict):
     """
     Retrieve the model and model args classes based on the configuration.
@@ -230,14 +194,8 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model_type = model_package(config)
-    try:
-        arch = importlib.import_module(f"mlx_lm.models.{model_type}")
-    except ImportError as e:
-        msg = f"Model type {model_type} not supported."
-        raise ValueError(msg) from e
-
-    return arch.Model, arch.ModelArgs
+    model = MODELS.load(models.model_package(config))
+    return model, model.model_args
 
 
 def get_total_parameters(model):
@@ -623,9 +581,17 @@ def load_adapters(model: nn.Module, adapter_path: str) -> nn.Module:
     return _load_adapters(model, adapter_path)
 
 
-def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
+def load_tokenizer(
+    model_path,
+    tokenizer_config_extra=None,
+    eos_token_ids=None,
+    *,
+    config: dict[str, Any] | None = None,
+):
     """Load a huggingface tokenizer and try to infer the type of streaming
     detokenizer to use.
+
+    ``config`` is the model's configuration, by default the one in ``model_path``.
     """
     model_path = _download(
         model_path,
@@ -644,16 +610,26 @@ def load_tokenizer(model_path, tokenizer_config_extra=None, eos_token_ids=None):
         model_path,
         tokenizer_config_extra,
         eos_token_ids=eos_token_ids,
-        defaults=_tokenizer_defaults(model_path),
+        defaults=_tokenizer_defaults(model_path, config),
     )
 
 
-def _tokenizer_defaults(model_path: Path) -> Optional[Dict[str, Any]]:
-    """The TOKENIZER_DEFAULTS of the model package, if any."""
+def _tokenizer_defaults(
+    model_path: Path, config: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """The TOKENIZER_DEFAULTS of a built-in model, if any.
+
+    ``config`` is the model's configuration, by default the one in ``model_path``.
+    """
     try:
-        package = model_package(load_config(model_path))
-        module = importlib.import_module(f"mlx_lm.models.{package}")
-    except (FileNotFoundError, KeyError, ValueError, ImportError):
+        if config is None:
+            config = load_config(model_path)
+        name = models.model_package(config)
+    except (FileNotFoundError, KeyError):
+        return None
+
+    module = MODELS.builtin_module(name)
+    if module is None:
         return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 
@@ -710,7 +686,10 @@ def load(
         model = load_adapters(model, adapter_path)
         model.eval()
     tokenizer = load_tokenizer(
-        model_path, tokenizer_config, eos_token_ids=config.get("eos_token_id", None)
+        model_path,
+        tokenizer_config,
+        eos_token_ids=config.get("eos_token_id", None),
+        config=config,
     )
 
     if return_config:
@@ -811,6 +790,7 @@ def sharded_load(
         model_path,
         tokenizer_config or {"trust_remote_code": True},
         eos_token_ids=config.get("eos_token_id", None),
+        config=config,
     )
     model, _ = load_model(
         model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code

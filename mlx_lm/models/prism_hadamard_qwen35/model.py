@@ -18,6 +18,8 @@ __all__ = [
 
 
 class Model(qwen3_5.Model):
+    model_args = ModelArgs
+
     def __init__(self, args: ModelArgs):
         super().__init__(args)
         modules = dict(self.named_modules())

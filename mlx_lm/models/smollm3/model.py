@@ -18,6 +18,8 @@ __all__ = [
 class Model(nn.Module):
     """Wrapper around Llama that respects NoPE layers in SmolLM-3."""
 
+    model_args = ModelArgs
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

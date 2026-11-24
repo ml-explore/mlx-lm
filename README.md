@@ -264,6 +264,34 @@ model, tokenizer = load(
 )
 ```
 
+#### Models from Other Packages
+
+> [!NOTE]
+> Plug-ins are experimental. Their API can change from one release to the next.
+
+An installed project can add models and tool parsers with entry points:
+
+```toml
+[project.entry-points."mlx_lm.models"]
+my_model = "my_lm.model:Model"
+
+[project.entry-points."mlx_lm.tool_parsers"]
+my_parser = "my_lm.tool_parser:ToolParser"
+```
+
+The name is the `model_type` or `tool_parser_type`; built-in names win. A model
+is an `nn.Module` like the built-in ones, with `model_args = ModelArgs` in the
+class body, where `ModelArgs.from_dict(config)` makes its arguments from
+`config.json`. A tool parser has `tool_call_start`, `tool_call_end` and
+`parse_tool_call(text, tools)`, a `@staticmethod` in a class, which returns
+`{"name": ..., "arguments": {...}}` or a list of them.
+
+A checkpoint sets its tool parser and thinking markers in
+`tokenizer_config.json` with `tool_parser_type`, `think_start` and `think_end`.
+
+`mlx_lm plugin list` shows the plug-ins of each project, and an error under each
+one that mlx-lm cannot use, for example because a built-in has the same name.
+
 ### Large Models
 
 > [!NOTE]

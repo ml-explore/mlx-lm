@@ -44,6 +44,8 @@ class PlamoModel(nn.Module):
 
 
 class Model(nn.Module):
+    model_args = ModelArgs
+
     def __init__(self, args: ModelArgs) -> None:
         super().__init__()
         self.model_type = args.model_type

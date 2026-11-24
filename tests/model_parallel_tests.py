@@ -6,9 +6,9 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.layers.distributed import PipelineMixin
-from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models import model_package, muse_spark, qwen2, qwen3_moe, qwen3_next
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.utils import model_package, quantize_model
+from mlx_lm.utils import quantize_model
 
 MUSE_SPARK_OPEN = {
     "model_type": "muse_spark",

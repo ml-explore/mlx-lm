@@ -20,13 +20,13 @@ from mlx_lm.layers.recurrent import (
     ssm_attn,
     ssm_update,
 )
+from mlx_lm.models import model_package
 from mlx_lm.models.cache import (
     BatchKVCache,
     KVCache,
     RotatingKVCache,
     make_prompt_cache,
 )
-from mlx_lm.utils import model_package
 
 
 class TestModels(unittest.TestCase):

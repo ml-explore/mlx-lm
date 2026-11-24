@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 import mlx_lm.models
-from mlx_lm.utils import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING
+from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING, model_package
 
 MODELS = Path(mlx_lm.models.__file__).parent
 PACKAGES: list[str] = sorted(
@@ -46,6 +46,7 @@ class TestModelPackages(unittest.TestCase):
                 prefix = f"mlx_lm.models.{package}"
                 self.assertEqual(module.ModelArgs.__module__, f"{prefix}.config")
                 self.assertEqual(module.Model.__module__, f"{prefix}.model")
+                self.assertIs(module.Model.model_args, module.ModelArgs)
 
     def test_all(self) -> None:
         for package in PACKAGES:
@@ -62,6 +63,22 @@ class TestModelPackages(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertIn(target, PACKAGES)
+                # The lookup can apply the aliases twice, so no target is an alias.
+                self.assertNotIn(target, MODEL_REMAPPING)
+
+    def test_model_types_that_are_not_package_names(self) -> None:
+        for model_type in (
+            "Klear",
+            "lfm2-vl",
+            "lille-130m",
+            "nemotron-nas",
+            "phi-msft",
+        ):
+            with self.subTest(model_type=model_type):
+                self.assertIn(model_package({"model_type": model_type}), PACKAGES)
+        # Keys in another form match no model type.
+        for key in MODEL_REMAPPING:
+            self.assertEqual(key, key.lower().replace("-", "_"))
 
 
 if __name__ == "__main__":

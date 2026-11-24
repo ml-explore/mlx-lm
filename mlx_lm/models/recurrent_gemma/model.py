@@ -5,6 +5,7 @@ import mlx.nn as nn
 
 from mlx_lm.models.cache import ArraysCache, RotatingKVCache
 from mlx_lm.models.recurrent_gemma import checkpoint
+from mlx_lm.models.recurrent_gemma.config import ModelArgs
 from mlx_lm.models.recurrent_gemma.layers import Griffin
 
 __all__ = [
@@ -13,6 +14,8 @@ __all__ = [
 
 
 class Model(nn.Module):
+
+    model_args = ModelArgs
 
     def __init__(self, config):
         self.args = config

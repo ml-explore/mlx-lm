@@ -7,6 +7,7 @@ from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 from mlx_lm.models.falcon_h1 import checkpoint
+from mlx_lm.models.falcon_h1.config import ModelArgs
 from mlx_lm.models.falcon_h1.layers import FalconH1DecoderLayer
 
 __all__ = [
@@ -73,6 +74,8 @@ class FalconH1Model(nn.Module):
 
 
 class Model(nn.Module):
+
+    model_args = ModelArgs
 
     def __init__(self, args):
         super().__init__()

@@ -1,11 +1,14 @@
 # Copyright © 2024 Apple Inc.
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
+from mlx_lm import tokenizer_utils
 from mlx_lm.chat_templates import deepseek_v32
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
@@ -179,6 +182,24 @@ class TestTokenizers(unittest.TestCase):
         tokenizer = make_tokenizer([], chat_template="{{ '<think>' }}")
         self.assertEqual(tokenizer.think_start, "<think>")
         self.assertEqual(tokenizer.think_end, "</think>")
+
+    def test_thinking_markers_from_config(self):
+        markers = {"think_start": "[THINK]\n", "think_end": "[/THINK]"}
+        with tempfile.TemporaryDirectory() as path:
+            vocab = ["<think>", "</think>", "[THINK]", "[/THINK]"]
+            make_tokenizer(vocab).save_pretrained(path)
+            # The defaults win over the vocab, and the marker tokens drop the newline.
+            tokenizer = tokenizer_utils.load(Path(path), defaults=markers)
+            self.assertEqual(tokenizer.think_start, "[THINK]\n")
+            self.assertEqual(tokenizer.think_start_tokens, (3,))
+
+            config = {"think_start": "<think>", "think_end": "</think>"}
+            tokenizer = tokenizer_utils.load(Path(path), config, defaults=markers)
+            self.assertEqual(tokenizer.think_start, "<think>")
+
+            for bad in ({"think_start": "[THINK]"}, {**markers, "think_start": " "}):
+                with self.assertRaises(ValueError):
+                    tokenizer_utils.load(Path(path), defaults=bad)
 
     def test_thinking_kwarg_from_template(self):
         messages = [{"role": "user", "content": "hi"}]
