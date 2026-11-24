@@ -784,7 +784,7 @@ def load(
         tool_parser_type = _infer_tool_parser(tokenizer)
 
     if tool_parser_type is not None:
-        parser = plugins.load_tool_parser(tool_parser_type)
+        parser = plugins.PluginKind.TOOL_PARSERS.load(tool_parser_type)
         tool_parser = parser.parse_tool_call
         tool_call_start = parser.tool_call_start
         tool_call_end = parser.tool_call_end

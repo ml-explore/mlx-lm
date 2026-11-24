@@ -288,8 +288,9 @@ class body. A tool parser has `tool_call_start`, `tool_call_end` and
 A checkpoint sets its tool parser and thinking markers in
 `tokenizer_config.json` with `tool_parser_type`, `think_start` and `think_end`.
 
-`mlx_lm plugins list` shows the entry points, and `mlx_lm plugins check` loads
-them and checks these contracts.
+`mlx_lm plugins list` shows the plug-ins of each project, and an error under
+each one that mlx-lm cannot use, for example because a built-in has the same
+name.
 
 ### Large Models
 

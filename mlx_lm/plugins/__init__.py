@@ -1,24 +1,19 @@
 # Copyright © 2026 Apple Inc.
 
+from mlx_lm.plugins.cli import main
 from mlx_lm.plugins.discovery import (
+    Plugin,
+    PluginKind,
     import_if_exists,
-    load_model_class,
-    load_tool_parser,
+    installed_plugins,
     lookup_name,
 )
 
 __all__ = [
+    "Plugin",
+    "PluginKind",
     "import_if_exists",
-    "load_model_class",
-    "load_tool_parser",
+    "installed_plugins",
     "lookup_name",
     "main",
 ]
-
-
-def main() -> None:
-    """Run the ``mlx_lm plugins`` command."""
-    # Import late: the command imports mlx_lm.models, which imports this package.
-    from mlx_lm.plugins import cli
-
-    cli.main()

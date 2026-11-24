@@ -193,7 +193,7 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model = plugins.load_model_class(models.model_package(config))
+    model = plugins.PluginKind.MODELS.load(models.model_package(config))
     return model, model.model_args
 
 

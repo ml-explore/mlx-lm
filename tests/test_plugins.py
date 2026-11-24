@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from mlx_lm import models, plugins, utils
+from mlx_lm.plugins import cli
 from mlx_lm.processors import load_processor
 
 MODEL = (
@@ -22,8 +23,6 @@ MODEL = (
     "        return cls()\n"
     "class Model(nn.Module):\n"
     "    model_args = ModelArgs\n"
-    "class NoArgs(nn.Module):\n"
-    "    pass\n"
 )
 PARSER = (
     "class Parser:\n"
@@ -32,8 +31,6 @@ PARSER = (
     "    @staticmethod\n"
     "    def parse_tool_call(text, tools):\n"
     '        return {"name": text}\n'
-    "class NotAParser:\n"
-    "    pass\n"
 )
 TEST = {"model_type": "test"}
 
@@ -46,16 +43,12 @@ class TestPlugins(unittest.TestCase):
             "test": "test_lm.models.test:Model",
             "llama": "test_lm.models.test:Model",
             "Solo-LM": "test_lm.solo:Model",
-            "no_args": "test_lm.solo:NoArgs",
         }
         self.install(
             "test-lm",
             {
                 "mlx_lm.models": model,
-                "mlx_lm.tool_parsers": {
-                    "test": "test_lm.parsers:Parser",
-                    "not_a_parser": "test_lm.parsers:NotAParser",
-                },
+                "mlx_lm.tool_parsers": {"test": "test_lm.parsers:Parser"},
             },
             {
                 "test_lm/models/test/__init__.py": MODEL,
@@ -95,6 +88,27 @@ class TestPlugins(unittest.TestCase):
         (dist_info / "METADATA").write_text(f"Name: {name}\nVersion: 0\n")
         (dist_info / "entry_points.txt").write_text(entry_points_text)
         importlib.invalidate_caches()
+
+    def run_command(self, *args: str) -> tuple[int, str]:
+        """The exit code and output of ``mlx_lm plugins`` with ``args``."""
+        output = io.StringIO()
+        code = 0
+        with redirect_stdout(output):
+            try:
+                cli.main(list(args))
+            except SystemExit as error:
+                code = error.code
+        return code, output.getvalue()
+
+    def install_other_lm(self) -> None:
+        """Install entries that an alias shadows, that give one name, or that fail."""
+        entry_points = {
+            "mistral": "test_lm.solo:Model",
+            "dup": "other_lm.a:Model",
+            "DUP": "other_lm.a:Model",
+            "ghost": "other_lm.b:Model",
+        }
+        self.install("other-lm", {"mlx_lm.models": entry_points}, {})
 
     def test_new_model(self):
         model, args = utils._get_classes(TEST)
@@ -144,68 +158,50 @@ class TestPlugins(unittest.TestCase):
                 utils._get_classes({"model_type": model_type})
 
     def test_tool_parser(self):
-        self.assertEqual(plugins.load_tool_parser("test").__name__, "Parser")
+        self.assertEqual(
+            plugins.PluginKind.TOOL_PARSERS.load("test").__name__, "Parser"
+        )
 
     def test_plugin_has_no_processor_or_tokenizer_defaults(self):
         for config in (TEST, {"model_type": "unknown"}):
             self.assertIsNone(load_processor({**config, "vision_config": {"a": 1}}))
             self.assertIsNone(utils._tokenizer_defaults(Path(self.root.name), config))
 
-    def run_command(self, *args: str) -> tuple[int, str]:
-        """The exit code and output of ``mlx_lm plugins`` with ``args``."""
-        output = io.StringIO()
-        code = 0
-        argv = ["mlx_lm.plugins", *args]
-        with mock.patch.object(sys, "argv", argv), redirect_stdout(output):
-            try:
-                plugins.main()
-            except SystemExit as error:
-                code = error.code
-        return code, output.getvalue()
-
-    def install_other_lm(self) -> None:
-        """Install entries that an alias shadows or that give one name; none load."""
-        entry_points = {
-            "mistral": "other_lm.a:Model",
-            "dup": "other_lm.a:Model",
-            "DUP": "other_lm.b:Model",
-        }
-        self.install("other-lm", {"mlx_lm.models": entry_points}, {})
-
     def test_list_command(self):
+        self.install_other_lm()
         code, output = self.run_command("list")
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         project = (
             "test-lm 0\n"
-            "  models: llama, no_args, Solo-LM, test\n"
-            "  tool_parsers: not_a_parser, test\n"
+            "  models\n"
+            "    test = test_lm.models.test:Model\n"
+            "    llama = test_lm.models.test:Model\n"
+            "      shadowed by built-in llama\n"
+            "    Solo-LM = test_lm.solo:Model\n"
+            "  tool_parsers\n"
+            "    test = test_lm.parsers:Parser\n"
         )
         self.assertIn(project, output)
+        for error in (
+            "    mistral = test_lm.solo:Model\n      shadowed by built-in llama\n",
+            "    dup = other_lm.a:Model\n"
+            "      ValueError: 2 entry points in mlx_lm.models give dup",
+            "    ghost = other_lm.b:Model\n"
+            "      ModuleNotFoundError: No module named 'other_lm'\n",
+        ):
+            self.assertIn(error, output)
 
         code, output = self.run_command("list", "--json")
-        self.assertEqual(code, 0)
-        project = {
-            "name": "test-lm",
-            "version": "0",
-            "models": ["llama", "no_args", "Solo-LM", "test"],
-            "tool_parsers": ["not_a_parser", "test"],
-        }
-        self.assertIn(project, json.loads(output))
-
-    def test_check_command(self):
-        self.install_other_lm()
-        code, output = self.run_command("check")
         self.assertEqual(code, 1)
-        for problem in (
-            "] mistral = other_lm.a:Model (other-lm 0): shadowed by built-in",
-            "] dup = other_lm.a:Model (other-lm 0): 2 entries give dup",
-            "] no_args = test_lm.solo:NoArgs (test-lm 0): no model_args with from_dict",
-            "] not_a_parser = test_lm.parsers:NotAParser (test-lm 0): parse_tool_call",
-        ):
-            self.assertIn(problem, output)
-        self.assertEqual(
-            self.run_command("check", "test", "solo-lm"), (0, "No problems found.\n")
-        )
+        parser = {
+            "project": "test-lm",
+            "version": "0",
+            "kind": "tool_parsers",
+            "name": "test",
+            "value": "test_lm.parsers:Parser",
+            "error": None,
+        }
+        self.assertIn(parser, json.loads(output))
 
 
 if __name__ == "__main__":
