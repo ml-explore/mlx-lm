@@ -167,8 +167,11 @@ class TestPlugins(unittest.TestCase):
         with tempfile.TemporaryDirectory() as path:
             tokenizer.save_pretrained(path)
             wrapper = tokenizer_utils.load(Path(path), {"tool_parser_type": "test"})
+            with self.assertWarnsRegex(UserWarning, "Tool calls are off"):
+                plain = tokenizer_utils.load(Path(path), {"tool_parser_type": "ghost"})
         self.assertEqual(wrapper.tool_call_start, "<call>")
         self.assertEqual(wrapper.tool_parser("x", None), {"name": "x"})
+        self.assertIsNone(plain.tool_parser)
 
     def test_plugin_has_no_processor_or_tokenizer_defaults(self):
         for config in (TEST, {"model_type": "unknown"}):

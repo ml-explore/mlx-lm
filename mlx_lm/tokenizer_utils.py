@@ -6,6 +6,7 @@ import functools
 import importlib
 import inspect
 import json
+import warnings
 from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Tuple
@@ -13,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from mlx_lm.plugins.discovery import TOOL_PARSERS
+from mlx_lm.plugins.discovery import TOOL_PARSERS, UnknownNameError
 
 
 class StreamingDetokenizer(abc.ABC):
@@ -717,6 +718,18 @@ def _infer_tool_parser(tokenizer):
     return None
 
 
+def _load_tool_parser(name: str | None) -> Any:
+    """The tool parser ``name``, or None if there is no name or no such parser."""
+    if name is None:
+        return None
+    try:
+        return TOOL_PARSERS.load(name)
+    except UnknownNameError as error:
+        # Text generation does not need the parser.
+        warnings.warn(f"{error} Tool calls are off.")
+        return None
+
+
 def load(
     model_path,
     tokenizer_config_extra: Optional[Dict[str, Any]] = None,
@@ -783,8 +796,8 @@ def load(
     if tool_parser_type is None:
         tool_parser_type = _infer_tool_parser(tokenizer)
 
-    if tool_parser_type is not None:
-        parser = TOOL_PARSERS.load(tool_parser_type)
+    parser = _load_tool_parser(tool_parser_type)
+    if parser is not None:
         tool_parser = parser.parse_tool_call
         tool_call_start = parser.tool_call_start
         tool_call_end = parser.tool_call_end

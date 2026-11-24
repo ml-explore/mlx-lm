@@ -15,9 +15,14 @@ __all__ = [
     "REGISTRIES",
     "TOOL_PARSERS",
     "Registry",
+    "UnknownNameError",
     "import_if_exists",
     "list_plugins",
 ]
+
+
+class UnknownNameError(ValueError):
+    """No built-in or plug-in gives the name."""
 
 
 # Hashed by identity, since the aliases are a dict.
@@ -50,7 +55,7 @@ class Registry:
         ]
 
         if not matches:
-            raise ValueError(
+            raise UnknownNameError(
                 f"{name} is not built in, and no plug-in gives it in {self._package}."
             )
         if len(matches) > 1:
