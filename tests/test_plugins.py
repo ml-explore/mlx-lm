@@ -1,9 +1,12 @@
 # Copyright © 2026 Apple Inc.
 
 import importlib
+import io
+import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -20,8 +23,6 @@ MODEL = (
     "class Model(nn.Module):\n"
     "    model_args = ModelArgs\n"
     "class NoArgs(nn.Module):\n"
-    "    pass\n"
-    "class NotAModel:\n"
     "    pass\n"
 )
 PARSER = (
@@ -45,8 +46,6 @@ class TestPlugins(unittest.TestCase):
             "test": "test_lm.models.test:Model",
             "llama": "test_lm.models.test:Model",
             "Solo-LM": "test_lm.solo:Model",
-            "not_a_model": "test_lm.solo:NotAModel",
-            "a_module": "test_lm.solo",
             "no_args": "test_lm.solo:NoArgs",
         }
         self.install(
@@ -144,22 +143,69 @@ class TestPlugins(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, sources):
                 utils._get_classes({"model_type": model_type})
 
-    def test_model_contract(self):
-        for model_type in ("not_a_model", "a_module"):
-            with self.assertRaisesRegex(ValueError, "not an nn.Module"):
-                utils._get_classes({"model_type": model_type})
-        with self.assertRaisesRegex(ValueError, "no model_args"):
-            utils._get_classes({"model_type": "no_args"})
-
     def test_tool_parser(self):
         self.assertEqual(plugins.load_tool_parser("test").__name__, "Parser")
-        with self.assertRaisesRegex(ValueError, "is not a tool parser"):
-            plugins.load_tool_parser("not_a_parser")
 
     def test_plugin_has_no_processor_or_tokenizer_defaults(self):
         for config in (TEST, {"model_type": "unknown"}):
             self.assertIsNone(load_processor({**config, "vision_config": {"a": 1}}))
             self.assertIsNone(utils._tokenizer_defaults(Path(self.root.name), config))
+
+    def run_command(self, *args: str) -> tuple[int, str]:
+        """The exit code and output of ``mlx_lm plugins`` with ``args``."""
+        output = io.StringIO()
+        code = 0
+        argv = ["mlx_lm.plugins", *args]
+        with mock.patch.object(sys, "argv", argv), redirect_stdout(output):
+            try:
+                plugins.main()
+            except SystemExit as error:
+                code = error.code
+        return code, output.getvalue()
+
+    def install_other_lm(self) -> None:
+        """Install entries that an alias shadows or that give one name; none load."""
+        entry_points = {
+            "mistral": "other_lm.a:Model",
+            "dup": "other_lm.a:Model",
+            "DUP": "other_lm.b:Model",
+        }
+        self.install("other-lm", {"mlx_lm.models": entry_points}, {})
+
+    def test_list_command(self):
+        code, output = self.run_command("list")
+        self.assertEqual(code, 0)
+        project = (
+            "test-lm 0\n"
+            "  models: llama, no_args, Solo-LM, test\n"
+            "  tool_parsers: not_a_parser, test\n"
+        )
+        self.assertIn(project, output)
+
+        code, output = self.run_command("list", "--json")
+        self.assertEqual(code, 0)
+        project = {
+            "name": "test-lm",
+            "version": "0",
+            "models": ["llama", "no_args", "Solo-LM", "test"],
+            "tool_parsers": ["not_a_parser", "test"],
+        }
+        self.assertIn(project, json.loads(output))
+
+    def test_check_command(self):
+        self.install_other_lm()
+        code, output = self.run_command("check")
+        self.assertEqual(code, 1)
+        for problem in (
+            "] mistral = other_lm.a:Model (other-lm 0): shadowed by built-in",
+            "] dup = other_lm.a:Model (other-lm 0): 2 entries give dup",
+            "] no_args = test_lm.solo:NoArgs (test-lm 0): no model_args with from_dict",
+            "] not_a_parser = test_lm.parsers:NotAParser (test-lm 0): parse_tool_call",
+        ):
+            self.assertIn(problem, output)
+        self.assertEqual(
+            self.run_command("check", "test", "solo-lm"), (0, "No problems found.\n")
+        )
 
 
 if __name__ == "__main__":

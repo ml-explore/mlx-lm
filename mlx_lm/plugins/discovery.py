@@ -12,51 +12,22 @@ __all__ = ["import_if_exists", "load_model_class", "load_tool_parser", "lookup_n
 
 
 def load_model_class(name: str) -> type[nn.Module]:
-    """The Model class for ``name``; ValueError if none or invalid."""
+    """The Model class for ``name``; ValueError if none."""
     name = lookup_name(name)
     # Built-ins come first and never read package metadata.
     module = import_if_exists(f"mlx_lm.models.{name}")
     if module is not None:
         return module.Model
-
-    ep = _entry_point("mlx_lm.models", name)
-    model = ep.load()
-
-    if not (isinstance(model, type) and issubclass(model, nn.Module)):
-        raise ValueError(
-            f"{ep.value} from {ep.dist.name} is not an nn.Module subclass."
-        )
-    model_args = getattr(model, "model_args", None)
-    if not hasattr(model_args, "from_dict"):
-        raise ValueError(
-            f"{ep.value} from {ep.dist.name} has no model_args with from_dict."
-        )
-    return model
+    return _entry_point("mlx_lm.models", name).load()
 
 
 def load_tool_parser(name: str) -> Any:
-    """The tool parser for ``name``; ValueError if none or invalid."""
+    """The tool parser for ``name``; ValueError if none."""
     name = lookup_name(name)
     module = import_if_exists(f"mlx_lm.tool_parsers.{name}")
     if module is not None:
         return module
-
-    ep = _entry_point("mlx_lm.tool_parsers", name)
-    parser = ep.load()
-
-    start = getattr(parser, "tool_call_start", None)
-    end = getattr(parser, "tool_call_end", None)
-    is_valid_parser = (
-        isinstance(start, str)
-        and isinstance(end, str)
-        and callable(getattr(parser, "parse_tool_call", None))
-    )
-    if not is_valid_parser:
-        raise ValueError(
-            f"{ep.value} from {ep.dist.name} is not a tool parser "
-            "(tool_call_start, tool_call_end, parse_tool_call)."
-        )
-    return parser
+    return _entry_point("mlx_lm.tool_parsers", name).load()
 
 
 def lookup_name(name: str) -> str:

@@ -16,6 +16,7 @@ def main():
         "lora",
         "manage",
         "perplexity",
+        "plugins",
         "awq",
         "dwq",
         "dynamic_quant",
