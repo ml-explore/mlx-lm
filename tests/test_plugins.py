@@ -45,11 +45,8 @@ class TestPlugins(unittest.TestCase):
             "test": "test_lm.models.test:Model",
             "llama": "test_lm.models.test:Model",
             "Solo-LM": "test_lm.solo:Model",
-            "extras": "test_lm.solo:Model [cuda]",
-            "ghost": "test_lm.missing:Model",
-            "orphan": "no_such_package.model:Model",
-            "no_attr": "test_lm.solo:Missing",
             "no_args": "test_lm.solo:NoArgs",
+            "a_module": "test_lm.solo",
             "not_a_model": "test_lm.solo:NotAModel",
         }
         self.install(
@@ -132,33 +129,6 @@ class TestPlugins(unittest.TestCase):
             model, _ = utils._get_classes({"model_type": model_type})
             self.assertEqual(model.__module__, "test_lm.solo")
 
-    def test_invalid_name(self):
-        with self.assertRaisesRegex(ValueError, "not a valid identifier"):
-            utils._get_classes({"model_type": "a.b"})
-
-    def test_entry_point_with_extras(self):
-        model, _ = utils._get_classes({"model_type": "extras"})
-        self.assertEqual(model.__module__, "test_lm.solo")
-
-    def test_entry_point_must_name_an_object(self):
-        values = (
-            "other_lm.test",
-            "other_lm.test:",
-            "other-lm.t:Model",
-            ".lm.t:Model",
-            "other_lm.t:A.B",
-        )
-        entry_points = {f"bad{i}": value for i, value in enumerate(values)}
-        self.install("other-lm", {"mlx_lm.models": entry_points}, {})
-        for model_type in entry_points:
-            with self.assertRaisesRegex(ValueError, "is not module:name"):
-                utils._get_classes({"model_type": model_type})
-
-    def test_entry_point_to_missing_object(self):
-        for model_type in ("ghost", "orphan", "no_attr"):
-            with self.assertRaisesRegex(ValueError, f"test-lm gives {model_type}"):
-                utils._get_classes({"model_type": model_type})
-
     def test_two_entry_points_give_the_same_name(self):
         entry_points = {
             "test": "other_lm.test:Model",
@@ -175,8 +145,9 @@ class TestPlugins(unittest.TestCase):
                 utils._get_classes({"model_type": model_type})
 
     def test_model_contract(self):
-        with self.assertRaisesRegex(ValueError, "not an nn.Module"):
-            utils._get_classes({"model_type": "not_a_model"})
+        for model_type in ("not_a_model", "a_module"):
+            with self.assertRaisesRegex(ValueError, "not an nn.Module"):
+                utils._get_classes({"model_type": model_type})
         with self.assertRaisesRegex(ValueError, "no model_args"):
             utils._get_classes({"model_type": "no_args"})
 

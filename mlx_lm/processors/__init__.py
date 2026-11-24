@@ -26,8 +26,12 @@ def load_processor(config: dict[str, Any]) -> Processor | None:
     """The processor of the model of a configuration, or None if it takes only text."""
     if not any(config.get(key) for key in ENCODER_CONFIGS):
         return None
-    module = import_if_exists(f"mlx_lm.models.{model_package(config)}.processor")
+    package = import_if_exists(f"mlx_lm.models.{model_package(config)}")
+    if package is None:
+        # Not a built-in model.
+        return None
+    module = import_if_exists(f"{package.__name__}.processor")
     if module is None:
-        # Not a built-in model, or one without a processor.
+        # A built-in model without a processor.
         return None
     return module.Processor.from_config(config)
