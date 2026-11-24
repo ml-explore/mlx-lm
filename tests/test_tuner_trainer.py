@@ -5,8 +5,14 @@ import unittest
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from mlx.utils import tree_flatten
 
-from mlx_lm.tuner.trainer import iterate_batches
+from mlx_lm.tuner.lora import LoRALinear
+from mlx_lm.tuner.trainer import (
+    default_loss,
+    get_chunked_loss,
+    iterate_batches,
+)
 
 
 class MockDistributedGroup:
@@ -78,6 +84,84 @@ class TestTunerTrainer(unittest.TestCase):
         loss, gradients = nn.value_and_grad(model, loss_fn)(model, tokens)
         mx.eval(loss, gradients)
         self.assertTrue(mx.isfinite(loss).item())
+
+    def _llama(self, tie_word_embeddings):
+        from mlx_lm.models import llama
+
+        mx.random.seed(0)
+        return llama.Model(
+            llama.ModelArgs(
+                model_type="llama",
+                hidden_size=32,
+                num_hidden_layers=2,
+                intermediate_size=64,
+                num_attention_heads=4,
+                rms_norm_eps=1e-5,
+                vocab_size=100,
+                tie_word_embeddings=tie_word_embeddings,
+            )
+        )
+
+    def test_chunked_loss(self):
+        batch = mx.random.randint(0, 100, (3, 18))
+        lengths = mx.array([[0, 17], [4, 12], [2, 17]])
+        for tie in (False, True):
+            model = self._llama(tie)
+            # Train the head too, so its gradient goes through the chunks.
+            model.freeze()
+            model.model.layers[0].unfreeze()
+            (model.model.embed_tokens if tie else model.lm_head).unfreeze()
+            loss = get_chunked_loss(model, chunk_size=5)
+            self.assertIsNot(loss, default_loss)
+
+            expected, expected_grads = nn.value_and_grad(model, default_loss)(
+                model, batch, lengths
+            )
+            # 51 tokens in chunks of 5 leaves a short last chunk.
+            actual, actual_grads = nn.value_and_grad(model, loss)(model, batch, lengths)
+            self.assertEqual(expected[1].item(), actual[1].item())
+            self.assertTrue(mx.allclose(expected[0], actual[0], atol=1e-5))
+            expected_grads = dict(tree_flatten(expected_grads))
+            actual_grads = dict(tree_flatten(actual_grads))
+            self.assertEqual(expected_grads.keys(), actual_grads.keys())
+            for k, g in expected_grads.items():
+                self.assertTrue(mx.allclose(g, actual_grads[k], atol=1e-5), k)
+
+    def test_chunked_loss_lora_head(self):
+        batch = mx.random.randint(0, 100, (3, 18))
+        lengths = mx.array([[0, 17], [4, 12], [2, 17]])
+        model = self._llama(False)
+        model.freeze()
+        model.lm_head = LoRALinear.from_base(model.lm_head, r=4)
+        model.lm_head.lora_b = 0.1 * mx.random.normal(model.lm_head.lora_b.shape)
+        loss = get_chunked_loss(model, chunk_size=5)
+        self.assertIsNot(loss, default_loss)
+
+        expected, expected_grads = nn.value_and_grad(model, default_loss)(
+            model, batch, lengths
+        )
+        actual, actual_grads = nn.value_and_grad(model, loss)(model, batch, lengths)
+        self.assertTrue(mx.allclose(expected[0], actual[0], atol=1e-5))
+        expected_grads = dict(tree_flatten(expected_grads))
+        actual_grads = dict(tree_flatten(actual_grads))
+        self.assertEqual(set(actual_grads), {"lm_head.lora_a", "lm_head.lora_b"})
+        for k, g in expected_grads.items():
+            self.assertTrue(mx.abs(g).max().item() > 0, k)
+            self.assertTrue(mx.allclose(g, actual_grads[k], atol=1e-5), k)
+
+        # The head keeps its own parameters after a plain forward pass.
+        before = dict(tree_flatten(model.lm_head.trainable_parameters()))
+        mx.eval(loss(model, batch, lengths))
+        after = dict(tree_flatten(model.lm_head.trainable_parameters()))
+        self.assertTrue(all(before[k] is after[k] for k in before))
+
+    def test_chunked_loss_unsupported_model(self):
+        class Scaled(type(self._llama(False))):
+            def __call__(self, inputs):
+                return 2 * super().__call__(inputs)
+
+        model = Scaled(self._llama(False).args)
+        self.assertIs(get_chunked_loss(model, chunk_size=5), default_loss)
 
     def test_qwen3_moe_backward(self):
         from mlx_lm.models import qwen3_moe
