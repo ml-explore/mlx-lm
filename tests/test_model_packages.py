@@ -46,6 +46,7 @@ class TestModelPackages(unittest.TestCase):
                 prefix = f"mlx_lm.models.{package}"
                 self.assertEqual(module.ModelArgs.__module__, f"{prefix}.config")
                 self.assertEqual(module.Model.__module__, f"{prefix}.model")
+                self.assertIs(module.Model.model_args, module.ModelArgs)
 
     def test_all(self) -> None:
         for package in PACKAGES:

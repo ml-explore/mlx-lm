@@ -69,6 +69,8 @@ def make_cache(layers):
 
 
 class Model(nn.Module):
+    model_args = ModelArgs
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

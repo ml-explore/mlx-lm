@@ -43,6 +43,8 @@ class Plamo3Model(nn.Module):
 
 
 class Model(nn.Module):
+    model_args = ModelArgs
+
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
         self.config = config

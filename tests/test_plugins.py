@@ -13,12 +13,14 @@ from mlx_lm.processors import load_processor
 MODEL = (
     "import mlx.nn as nn\n"
     'TOKENIZER_DEFAULTS = {"chat_template_type": "test"}\n'
-    "class Model(nn.Module):\n"
-    "    pass\n"
     "class ModelArgs:\n"
     "    @classmethod\n"
     "    def from_dict(cls, config):\n"
     "        return cls()\n"
+    "class Model(nn.Module):\n"
+    "    model_args = ModelArgs\n"
+    "class NoArgs(nn.Module):\n"
+    "    pass\n"
     "class NotAModel:\n"
     "    pass\n"
 )
@@ -47,19 +49,13 @@ class TestPlugins(unittest.TestCase):
             "ghost": "test_lm.missing:Model",
             "orphan": "no_such_package.model:Model",
             "no_attr": "test_lm.solo:Missing",
-            "half": "test_lm.solo:Model",
-            "split": "test_lm.solo:Model",
+            "no_args": "test_lm.solo:NoArgs",
             "not_a_model": "test_lm.solo:NotAModel",
         }
-        args = {name: "test_lm.solo:ModelArgs" for name in model}
-        args.pop("half")
-        args.pop("split")
-        args["test"] = "test_lm.models.test:ModelArgs"
         self.install(
             "test-lm",
             {
                 "mlx_lm.models": model,
-                "mlx_lm.model_args": args,
                 "mlx_lm.tool_parsers": {
                     "test": "test_lm.parsers:Parser",
                     "not_a_parser": "test_lm.parsers:NotAParser",
@@ -145,11 +141,17 @@ class TestPlugins(unittest.TestCase):
         self.assertEqual(model.__module__, "test_lm.solo")
 
     def test_entry_point_must_name_an_object(self):
-        values = ("other_lm.test", "other_lm.test:", "other-lm.t:Model", ".lm.t:Model")
+        values = (
+            "other_lm.test",
+            "other_lm.test:",
+            "other-lm.t:Model",
+            ".lm.t:Model",
+            "other_lm.t:A.B",
+        )
         entry_points = {f"bad{i}": value for i, value in enumerate(values)}
         self.install("other-lm", {"mlx_lm.models": entry_points}, {})
         for model_type in entry_points:
-            with self.assertRaisesRegex(ValueError, "of other-lm must name an object"):
+            with self.assertRaisesRegex(ValueError, "is not module:name"):
                 utils._get_classes({"model_type": model_type})
 
     def test_entry_point_to_missing_object(self):
@@ -172,26 +174,15 @@ class TestPlugins(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, sources):
                 utils._get_classes({"model_type": model_type})
 
-    def test_model_and_args_come_from_one_project(self):
-        self.install(
-            "other-lm",
-            {"mlx_lm.model_args": {"split": "other_lm.args:ModelArgs"}},
-            {"other_lm/args.py": MODEL},
-        )
-        with self.assertRaisesRegex(ValueError, "in mlx_lm.model_args"):
-            utils._get_classes({"model_type": "half"})
-        with self.assertRaisesRegex(
-            ValueError, "one project, not test-lm and other-lm"
-        ):
-            utils._get_classes({"model_type": "split"})
-
-    def test_model_must_be_a_module(self):
+    def test_model_contract(self):
         with self.assertRaisesRegex(ValueError, "not an nn.Module"):
             utils._get_classes({"model_type": "not_a_model"})
+        with self.assertRaisesRegex(ValueError, "no model_args"):
+            utils._get_classes({"model_type": "no_args"})
 
     def test_tool_parser(self):
         self.assertEqual(plugins.load_tool_parser("test").__name__, "Parser")
-        with self.assertRaisesRegex(ValueError, "needs tool_call_start"):
+        with self.assertRaisesRegex(ValueError, "is not a tool parser"):
             plugins.load_tool_parser("not_a_parser")
 
     def test_plugin_has_no_processor_or_tokenizer_defaults(self):

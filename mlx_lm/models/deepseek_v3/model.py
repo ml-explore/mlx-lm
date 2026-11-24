@@ -125,6 +125,8 @@ def shard_layers(layers, group: mx.distributed.Group):
 
 
 class Model(nn.Module):
+    model_args = ModelArgs
+
     def __init__(self, config: ModelArgs):
         super().__init__()
         self.args = config

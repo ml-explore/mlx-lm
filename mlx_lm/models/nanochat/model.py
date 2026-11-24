@@ -52,6 +52,8 @@ def softcap(logits, cap=15.0):
 
 
 class Model(nn.Module):
+    model_args = ModelArgs
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args

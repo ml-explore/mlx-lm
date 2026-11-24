@@ -193,7 +193,8 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    return plugins.load_model(models.model_package(config))
+    model = plugins.load_model_class(models.model_package(config))
+    return model, model.model_args
 
 
 def get_total_parameters(model):
@@ -626,12 +627,9 @@ def _tokenizer_defaults(
     except (FileNotFoundError, KeyError):
         return None
 
-    try:
-        module = importlib.import_module(package)
-    except ModuleNotFoundError as e:
+    module = plugins.import_if_exists(package)
+    if module is None:
         # Not a built-in model.
-        if e.name != package and not package.startswith(f"{e.name}."):
-            raise
         return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 
