@@ -1,7 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
 import dataclasses
-import enum
 import importlib
 import importlib.util
 import types
@@ -10,13 +9,13 @@ from importlib import metadata
 
 from mlx_lm.models import MODEL_REMAPPING, lookup_name
 
-__all__ = ["PluginKind", "import_if_exists"]
+__all__ = ["KINDS", "MODELS", "TOOL_PARSERS", "PluginKind", "import_if_exists"]
 
 
 # Hashed by identity, since the aliases are a dict.
 @dataclasses.dataclass(frozen=True, eq=False)
-class _Settings:
-    """The settings of a ``PluginKind``.
+class PluginKind:
+    """A kind of plug-in, and the lookup of its built-ins and entry points.
 
     A built-in gives its ``attribute`` (None: the module itself). ``aliases`` maps
     names to other built-ins.
@@ -26,18 +25,6 @@ class _Settings:
     _: dataclasses.KW_ONLY
     attribute: str | None = None
     aliases: Mapping[str, str] = dataclasses.field(default_factory=dict)
-
-
-class PluginKind(enum.Enum):
-    """A kind of plug-in, and the lookup of its built-ins and entry points."""
-
-    MODELS = _Settings("models", attribute="Model", aliases=MODEL_REMAPPING)
-    TOOL_PARSERS = _Settings("tool_parsers")
-
-    def __init__(self, settings: _Settings):
-        self.label = settings.label
-        self.attribute = settings.attribute
-        self.aliases = settings.aliases
 
     @property
     def package(self) -> str:
@@ -116,6 +103,11 @@ class PluginKind(enum.Enum):
     def entry_points(self) -> metadata.EntryPoints:
         """The plug-in entry points."""
         return metadata.entry_points(group=self.package)
+
+
+MODELS = PluginKind("models", attribute="Model", aliases=MODEL_REMAPPING)
+TOOL_PARSERS = PluginKind("tool_parsers")
+KINDS = (MODELS, TOOL_PARSERS)
 
 
 def import_if_exists(module: str) -> types.ModuleType | None:

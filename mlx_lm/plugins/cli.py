@@ -7,7 +7,7 @@ import sys
 from importlib import metadata
 from typing import NoReturn
 
-from mlx_lm.plugins.discovery import PluginKind
+from mlx_lm.plugins.discovery import KINDS, PluginKind
 
 __all__ = ["build_parser", "list_command", "main"]
 
@@ -39,7 +39,7 @@ def list_command(*, as_json: bool = False) -> int:
     """Print the plug-ins; return 1 if one has an error, else 0."""
     plugins = [
         _to_json(kind, entry_point)
-        for kind in PluginKind
+        for kind in KINDS
         for entry_point in kind.entry_points()
     ]
     plugins.sort(key=lambda plugin: plugin["project"])

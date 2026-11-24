@@ -4,7 +4,7 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 from mlx_lm.models import model_package
-from mlx_lm.plugins.discovery import PluginKind, import_if_exists
+from mlx_lm.plugins.discovery import MODELS, import_if_exists
 
 __all__ = [
     "ENCODER_CONFIGS",
@@ -26,7 +26,7 @@ def load_processor(config: dict[str, Any]) -> Processor | None:
     """The processor of a built-in model, or None if it has none or takes only text."""
     if not any(config.get(key) for key in ENCODER_CONFIGS):
         return None
-    package = PluginKind.MODELS.builtin_module(model_package(config))
+    package = MODELS.builtin_module(model_package(config))
     if package is None:
         return None
     module = import_if_exists(f"{package.__name__}.processor")

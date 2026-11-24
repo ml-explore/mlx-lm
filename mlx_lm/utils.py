@@ -45,7 +45,7 @@ from mlx_lm import models
 
 # Re-exported: code outside mlx-lm imports them from here.
 from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING  # noqa: F401
-from mlx_lm.plugins.discovery import PluginKind
+from mlx_lm.plugins.discovery import MODELS
 
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
@@ -194,7 +194,7 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model = PluginKind.MODELS.load(models.model_package(config))
+    model = MODELS.load(models.model_package(config))
     return model, model.model_args
 
 
@@ -628,7 +628,7 @@ def _tokenizer_defaults(
     except (FileNotFoundError, KeyError):
         return None
 
-    module = PluginKind.MODELS.builtin_module(name)
+    module = MODELS.builtin_module(name)
     if module is None:
         return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)
