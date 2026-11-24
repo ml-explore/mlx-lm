@@ -10,6 +10,7 @@ from functools import partial
 from json import JSONDecodeError
 from typing import Any, Dict, List, Optional, Tuple
 
+from huggingface_hub.errors import StrictDataclassError
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -739,9 +740,18 @@ def load(
     chat_template = None
     response_format = None
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_path, **(tokenizer_config_extra or {})
-    )
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
+    except (ValueError, KeyError, StrictDataclassError):
+        # Transformers may not know the model's config yet (new architectures);
+        # the tokenizer files alone are enough.
+        if not tokenizer_file.exists():
+            raise
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(
+            model_path, **(tokenizer_config_extra or {})
+        )
 
     tokenizer_config = tokenizer.init_kwargs
 
