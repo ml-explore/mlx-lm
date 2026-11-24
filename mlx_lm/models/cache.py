@@ -119,23 +119,6 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
     return all(c.is_trimmable() for c in cache)
 
 
-def prompt_cache_length(prompt_cache: List[Any]) -> Optional[int]:
-    """
-    Return the sequence length of the prompt cache's first layer, if it can
-    be determined, otherwise ``None``.
-
-    The first layer belongs to the target model, also when draft caches are
-    appended for speculative decoding, so this is the number of tokens whose
-    KV the cache actually holds.
-    """
-    if len(prompt_cache) == 0:
-        return None
-    offset = getattr(prompt_cache[0], "offset", None)
-    if isinstance(offset, int):
-        return offset
-    return None
-
-
 def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
     """
     Trim the model's cache by the given number of tokens.
@@ -1696,21 +1679,6 @@ class LRUPromptCache:
         *,
         cache_type: str = "assistant",
     ):
-        # The generation loop can finish with emitted tokens whose KV was
-        # never computed, e.g. the speculative decoding bonus token which is
-        # only processed at the start of the next draft/verify round. Never
-        # store a token list longer than the cache it describes:
-        # fetch_nearest_cache trims stored entries by ``len(key) - prefix``,
-        # so a key longer than the cache makes requests that fork from this
-        # entry drop the last shared token's KV and shift the positions of
-        # every following token (https://github.com/ml-explore/mlx-lm/issues/1494
-        # reports the same key/KV mismatch class for windowed caches).
-        n = prompt_cache_length(prompt_cache)
-        if n is not None and len(tokens) > n:
-            tokens = tokens[:n]
-        if not tokens:
-            return
-
         # Make the cache entry
         entry = LRUPromptCache.CacheEntry(
             prompt_cache, sum(c.nbytes for c in prompt_cache), cache_type

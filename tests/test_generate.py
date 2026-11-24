@@ -164,6 +164,72 @@ class TestGenerate(unittest.TestCase):
                 )
                 self.assertEqual([t for t, _, _ in gen], expected)
 
+    def test_speculative_cache_holds_all_yielded_tokens(self):
+        # The server stores the yielded tokens next to the prompt cache and
+        # sizes later trims from the token count. Every yielded token must be
+        # in the target and the draft cache, also when the bonus token is
+        # last or the caller stops the generator early.
+        model = self.model
+        prompt = mx.array(self.tokenizer.encode("Write a story about Einstein"))
+        n_layers = len(model.layers)
+
+        # Always proposes token 0, so the target rejects the drafts.
+        class RejectedDraft:
+            layers = model.layers
+
+            def __call__(self, inputs, cache=None):
+                return model(inputs, cache=cache).at[..., 0].add(1e4)
+
+        # (draft, num_draft_tokens, max_tokens): the generation stops on the
+        # bonus token (2, 3), on the last accepted draft (2, 2) and (3, 4),
+        # and on a bonus token after a rejected draft.
+        cases = [(model, 2, 3), (model, 2, 2), (model, 3, 4), (RejectedDraft(), 2, 2)]
+        for draft, num_draft_tokens, max_tokens in cases:
+            for stop_after in [None, *range(1, max_tokens + 1)]:
+                with self.subTest(
+                    draft=type(draft).__name__,
+                    num_draft_tokens=num_draft_tokens,
+                    max_tokens=max_tokens,
+                    stop_after=stop_after,
+                ):
+                    # The target layers come first, the draft layers after
+                    cache = [KVCache() for _ in range(2 * n_layers)]
+                    gen = speculative_generate_step(
+                        prompt,
+                        model,
+                        draft,
+                        prompt_cache=cache,
+                        num_draft_tokens=num_draft_tokens,
+                        max_tokens=max_tokens,
+                    )
+                    tokens = []
+                    for i, (token, _, _) in enumerate(gen):
+                        tokens.append(token)
+                        if i + 1 == stop_after:
+                            break
+                    gen.close()
+
+                    for c in cache:
+                        self.assertEqual(c.offset, len(prompt) + len(tokens))
+
+                    # With max_tokens 0 the cache holds the KV of the input
+                    reference = [KVCache() for _ in range(n_layers)]
+                    list(
+                        generate_step(
+                            mx.array(prompt.tolist() + tokens),
+                            model,
+                            max_tokens=0,
+                            prompt_cache=reference,
+                        )
+                    )
+                    # Chunked and single-token passes differ by about 1e-5,
+                    # the KV of two tokens by about 10.
+                    for i, c in enumerate(cache):
+                        keys, values = c.keys_and_values()
+                        ref_keys, ref_values = reference[i % n_layers].keys_and_values()
+                        self.assertLess(mx.abs(keys - ref_keys).max().item(), 0.1)
+                        self.assertLess(mx.abs(values - ref_values).max().item(), 0.1)
+
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler
 

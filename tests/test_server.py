@@ -76,6 +76,8 @@ class DummyModelProvider:
             self.draft_model, _ = load(HF_MODEL_PATH)
             self.draft_model_key = HF_MODEL_PATH
             self.cli_args.draft_model = HF_MODEL_PATH
+            # A model with a draft model is served sequentially
+            self.is_batchable = False
 
     def load(self, model, adapter=None, draft_model=None):
         assert model in ["default_model", "chat_model"]
@@ -645,6 +647,48 @@ class TestServerWithDraftModel(unittest.TestCase):
         # Ensure both generated content
         self.assertIsNotNone(first_response_body["choices"][0]["message"]["content"])
         self.assertIsNotNone(second_response_body["choices"][0]["message"]["content"])
+
+    def test_prompt_cache_holds_all_tokens_with_draft_model(self):
+        # fetch_nearest_cache trims a stored entry by its token count, so the
+        # target and the draft cache must hold every token of the key.
+        url = f"http://localhost:{self.port}/v1/completions"
+        text = "A B C D E F G"
+        tokenizer = self.response_generator.model_provider.tokenizer
+        prompt = tokenizer.encode(text)
+        # The generation stops on the bonus token (4), on the last accepted
+        # draft (3) and on a fork of the two entries before (5).
+        max_tokens_list = [4, 3, 5]
+        inserted = []
+        stored = threading.Semaphore(0)
+        insert_cache = self.response_generator.prompt_cache.insert_cache
+
+        def record(model, tokens, cache, **kwargs):
+            insert_cache(model, tokens, cache, **kwargs)
+            if tokens[: len(prompt)] == prompt:
+                inserted.append((tokens, cache))
+                stored.release()
+
+        self.response_generator.prompt_cache.insert_cache = record
+        try:
+            for max_tokens in max_tokens_list:
+                post_data = {
+                    "model": "default_model",
+                    "prompt": text,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.0,
+                    "top_p": 1.0,
+                }
+                response = requests.post(url, json=post_data)
+                self.assertEqual(response.status_code, 200)
+                # The generation thread stores the cache after the response.
+                self.assertTrue(stored.acquire(timeout=10))
+        finally:
+            del self.response_generator.prompt_cache.insert_cache
+
+        self.assertEqual(len(inserted), len(max_tokens_list))
+        for tokens, cache in inserted:
+            for c in cache:
+                self.assertEqual(c.offset, len(tokens))
 
 
 class TestServerKVCacheQuantization(unittest.TestCase):

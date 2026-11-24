@@ -527,6 +527,7 @@ def speculative_generate_step(
           logits. Default: ``None``.
         prompt_cache (List[Any], optional): A pre-computed prompt cache. Note, if
           provided, the cache will be updated in place. The cache must be trimmable.
+          When the generator stops, the cache holds every yielded token.
         prefill_step_size (int): Step size for processing the prompt.
         kv_bits (int, optional): Number of bits to use for KV cache quantization.
           None implies no cache quantization. Default: ``None``.
@@ -605,6 +606,12 @@ def speculative_generate_step(
             mx.clear_cache()
         return y
 
+    def _feed(model, cache, y):
+        """Read y into the cache and discard the logits."""
+        model(y[None], cache=cache)
+        quantize_cache_fn(cache)
+        mx.eval([c.state for c in cache])
+
     def _rewind_cache(num_draft, num_accept):
         trim_prompt_cache(model_cache, num_draft - num_accept)
         trim_prompt_cache(draft_cache, max(num_draft - num_accept - 1, 0))
@@ -627,6 +634,8 @@ def speculative_generate_step(
         # Set these so the finally block doesn't raise
         num_draft = 0
         n = 0
+        # Bonus token that was yielded but not read by the models yet
+        bonus = None
         try:
             while True:
                 num_draft = min(max_tokens - ntoks, num_draft_tokens)
@@ -637,6 +646,7 @@ def speculative_generate_step(
                     ]
                 y = mx.concatenate([y, draft_tokens])
                 tokens, logprobs = _step(model, model_cache, y, num_draft + 1)
+                bonus = None
                 mx.eval(tokens, draft_tokens)
                 draft_tokens = draft_tokens.tolist()
                 tokens = tokens.tolist()
@@ -652,7 +662,8 @@ def speculative_generate_step(
                         break
                 if ntoks < max_tokens:
                     ntoks += 1
-                    yield tokens[n], logprobs[n], False
+                    bonus = tokens[n]
+                    yield bonus, logprobs[n], False
 
                 if ntoks == max_tokens:
                     break
@@ -673,6 +684,16 @@ def speculative_generate_step(
                 _rewind_cache(num_draft, n)
         finally:
             _rewind_cache(num_draft, n)
+            # Read the tokens that were yielded but not processed yet, so the
+            # cache holds every yielded token as generate_step does
+            # If all drafts were accepted, the draft model has not read the
+            # last one
+            unread = draft_tokens[-1:] if num_draft > 0 and n == num_draft else []
+            if bonus is not None:
+                _feed(model, model_cache, mx.array([bonus], mx.uint32))
+                unread.append(bonus)
+            if unread:
+                _feed(draft_model, draft_cache, mx.array(unread, mx.uint32))
 
 
 def stream_generate(
