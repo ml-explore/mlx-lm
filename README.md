@@ -269,27 +269,26 @@ model, tokenizer = load(
 > [!NOTE]
 > Plug-ins are experimental. Their API can change from one release to the next.
 
-An installed project can add models, tool parsers and chat templates with entry
-points:
+An installed project can add models and tool parsers with entry points:
 
 ```toml
 [project.entry-points."mlx_lm.models"]
-test = "test_lm.models.test"
+my_model = "my_lm.model:Model"
 
 [project.entry-points."mlx_lm.tool_parsers"]
-test = "test_lm.tool_parsers.test"
-
-[project.entry-points."mlx_lm.chat_templates"]
-test = "test_lm.chat_templates.test"
+my_parser = "my_lm.tool_parser:ToolParser"
 ```
 
-The name is the `model_type`, `tool_parser_type` or `chat_template_type` it
-serves, and the value is a module like the built-in ones. Built-in names and
-their aliases always win, so a plug-in model needs its own `model_type`.
+The name is the `model_type` or `tool_parser_type`. Built-in names and their
+aliases win, so a plug-in model needs its own `model_type`.
 
-A model's `TOKENIZER_DEFAULTS` can set `eos_token_ids`, `tool_parser_type`,
-`chat_template_type`, `think_start` and `think_end`, unless the checkpoint sets
-them.
+A model is an `nn.Module` like the built-in ones, with `model_args = ModelArgs`
+in the class body. A tool parser has `tool_call_start`, `tool_call_end` (`""` if
+a call runs to the end of the reply) and `parse_tool_call(text, tools)`, which
+returns `{"name": ..., "arguments": {...}}` or a list of them.
+
+A checkpoint selects its tool parser and thinking markers in
+`tokenizer_config.json`, with `tool_parser_type`, `think_start` and `think_end`.
 
 The project must be installed (an editable install is fine): `PYTHONPATH` is
 not enough. Reinstall it after you change its entry points.
