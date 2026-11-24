@@ -24,7 +24,6 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 from mlx.utils import tree_reduce
 from transformers import PreTrainedTokenizer
 
@@ -37,7 +36,7 @@ from .models.cache import (
     make_prompt_cache,
     trim_prompt_cache,
 )
-from .processors import load_processor
+from .processors import load_image, load_processor
 from .sample_utils import LogitsProcessor, Sampler, greedy_sampler, make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import (
@@ -2198,9 +2197,7 @@ def main():
         processor = load_processor(config)
         if processor is None:
             raise ValueError(f"The model {model_path} does not take images.")
-        from PIL import Image
-
-        images = [np.asarray(Image.open(f).convert("RGB")) for f in args.image]
+        images = [load_image(processor, f) for f in args.image]
         prompt, media_inputs = processor(prompt, images=images)
     else:
         media_inputs = {}

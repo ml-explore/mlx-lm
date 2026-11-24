@@ -2,7 +2,9 @@
 
 import importlib
 from collections.abc import Sequence
-from typing import Any, Protocol
+from typing import Any, BinaryIO, Protocol
+
+import numpy as np
 
 from mlx_lm.utils import model_package
 
@@ -10,10 +12,11 @@ __all__ = [
     "ENCODER_CONFIGS",
     "PROCESSORS",
     "Processor",
+    "load_image",
     "load_processor",
 ]
 
-PROCESSORS = ("muse_spark",)
+PROCESSORS = ("inkling2", "muse_spark")
 
 # A checkpoint converted without its encoders has none of these, and takes
 # only text.
@@ -38,3 +41,13 @@ def load_processor(config: dict) -> Processor | None:
     # Imported here: the package holds the whole model.
     module = importlib.import_module(f"mlx_lm.models.{name}.processor")
     return module.Processor.from_config(config)
+
+
+def load_image(processor: Processor, fp: str | BinaryIO) -> np.ndarray:
+    """A uint8 (H, W, 3) image for the processor."""
+    if hasattr(processor, "load_image"):
+        return processor.load_image(fp)
+    from PIL import Image
+
+    with Image.open(fp) as image:
+        return np.asarray(image.convert("RGB"))

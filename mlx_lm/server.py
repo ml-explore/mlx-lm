@@ -45,7 +45,7 @@ from .generate import (
     stream_generate,
 )
 from .models.cache import LRUPromptCache, make_prompt_cache
-from .processors import load_processor
+from .processors import load_image, load_processor
 from .sample_utils import make_logits_processors, make_sampler
 from .utils import (
     _parse_size,
@@ -168,14 +168,12 @@ def _inline_image_urls(messages: List[Dict[str, Any]]) -> None:
         part.update(type="image_url", image_url={"url": f"data:{mime};base64,{data}"})
 
 
-def _decode_image(url: str) -> np.ndarray:
+def _decode_image(processor: Any, url: str) -> np.ndarray:
     """An RGB uint8 image from a data URL."""
-    from PIL import Image
-
     if not url.startswith("data:"):
         raise ValueError("Images must be data URLs or http(s) URLs.")
     data = base64.b64decode(url.partition(",")[2])
-    return np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+    return load_image(processor, io.BytesIO(data))
 
 
 @dataclass
@@ -679,7 +677,7 @@ class ResponseGenerator:
                     )
                     # The prompt cache of this server tracks images only.
                     text, media_inputs = processor(
-                        text, images=[_decode_image(u) for u in urls]
+                        text, images=[_decode_image(processor, u) for u in urls]
                     )
                     prompt = tokenizer.encode(text, add_special_tokens=False)
                     vision = _make_vision(
