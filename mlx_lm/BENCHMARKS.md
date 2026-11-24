@@ -20,6 +20,118 @@ To get the package versions run:
 python -m mlx --version && python -m mlx_lm --version
 ```
 
+## Python API
+
+The `run_benchmark()` function allows developers to run LLM
+benchmarks directly from Python and access performance measurements
+as structured results.
+
+### Benchmark using a text prompt
+
+```python
+from mlx_lm.benchmark import run_benchmark
+
+result = run_benchmark(
+    model="mlx-community/SmolLM-135M-Instruct-4bit",
+    prompt="Write a quicksort in Python",
+    generation_tokens=8,
+    num_trials=2,
+)
+
+print("Generation speed:", result.generation_tps)
+print("Prompt processing speed:", result.prompt_tps)
+print("Peak memory (GB):", result.peak_memory)
+```
+
+The text is converted into token IDs using the model tokenizer.
+The function runs a warmup and then measures two inference trials, because (num_trials = 2).
+The function performs one warmup, followed by num_trials measured inference runs. In this example, num_trials=2, so it performs two measured trials.
+
+### Benchmark using synthetic input
+
+```python
+result = run_benchmark(
+    model="mlx-community/SmolLM-135M-Instruct-4bit",
+    prompt_tokens=100,
+    generation_tokens=50,
+    num_trials=3,
+)
+```
+
+When no text prompt is provided, the function generates random
+input token IDs of the requested length.
+
+If both `prompt` and `prompt_tokens` are provided, the text
+prompt takes priority and the actual tokenized length is used.
+
+### Parameter sweeps
+
+The same function can be called repeatedly with different settings.
+
+```python
+from mlx_lm.benchmark import run_benchmark
+
+for length in [16, 32, 64]:
+    result = run_benchmark(
+        model="mlx-community/SmolLM-135M-Instruct-4bit",
+        prompt_tokens=length,
+        generation_tokens=8,
+        num_trials=2,
+    )
+
+    print(length, result.generation_tps)
+```
+
+Developers can also vary compatible model paths, generation
+lengths, batch sizes, and supported quantization options.
+
+### Quantization options
+
+Developers can benchmark compatible quantized models,
+such as 4-bit model variants, to compare inference
+speed and memory usage.
+
+The `quantize_activations` option requests lower-precision
+intermediate calculations where supported by the model.
+
+This option does not enable or disable activations.
+It is only supported for compatible quantization modes.
+
+### Returned measurements
+
+`run_benchmark()` returns a `BenchmarkResult` object containing:
+
+- `prompt_tps`: Average prompt-processing tokens per second.
+- `generation_tps`: Average generation tokens per second.
+- `peak_memory`: Average reported peak memory in GB.
+- `prompt_tokens`: Number of input tokens used.
+- `generation_tokens`: Requested generation-token limit.
+- `batch_size`: Number of input sequences processed together.
+- `trials`: Individual `TrialMetrics` objects.
+- `model`: Name or path of the model being benchmarked.
+
+Each trial also contains `total_time` in seconds.
+
+The function returns benchmarking measurements rather than
+the generated response text.
+
+For text input, `batch_size > 1` repeats the supplied prompt
+across the batch.
+
+### CLI compatibility
+
+The Python benchmarking API preserves the existing command-line
+interface. The CLI continues to use synthetic input tokens and
+calls the same `run_benchmark()` function internally.
+
+Existing commands remain supported:
+
+```bash
+python -m mlx_lm.benchmark \
+  --model mlx-community/SmolLM-135M-Instruct-4bit \
+  -p 16 -g 8 -n 1
+
+
 ## Models
 
 <details>
