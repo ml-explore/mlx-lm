@@ -39,11 +39,10 @@ that package in `MODEL_REMAPPING` in `mlx_lm/models/__init__.py`.
 
 A package has `__init__.py` (exporting `Model` and `ModelArgs`), `config.py`
 (`ModelArgs`) and `model.py` (`Model`, with `model_args = ModelArgs` in the class
-body). Optionally, `layers.py` has the blocks,
-`checkpoint.py` the `sanitize` that converts checkpoint weights, `kernels.py` the
-Metal kernels only this model uses, and `processor.py` and `vision.py` the
-processor and the vision encoder of a model that takes images. Reuse the shared
-code in
+body). Optionally, `layers.py` has the blocks, `checkpoint.py` the `sanitize`
+that converts checkpoint weights, `kernels.py` the Metal kernels only this model
+uses, and `processor.py` and `vision.py` the processor and the vision encoder of
+a model that takes images. Reuse the shared code in
 [`mlx_lm/layers`](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/layers)
 and [`mlx_lm/kernels`](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/kernels).
 

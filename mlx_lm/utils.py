@@ -629,7 +629,6 @@ def _tokenizer_defaults(
 
     module = plugins.import_if_exists(package)
     if module is None:
-        # Not a built-in model.
         return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)
 

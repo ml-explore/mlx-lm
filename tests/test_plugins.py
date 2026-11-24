@@ -45,9 +45,9 @@ class TestPlugins(unittest.TestCase):
             "test": "test_lm.models.test:Model",
             "llama": "test_lm.models.test:Model",
             "Solo-LM": "test_lm.solo:Model",
-            "no_args": "test_lm.solo:NoArgs",
-            "a_module": "test_lm.solo",
             "not_a_model": "test_lm.solo:NotAModel",
+            "a_module": "test_lm.solo",
+            "no_args": "test_lm.solo:NoArgs",
         }
         self.install(
             "test-lm",

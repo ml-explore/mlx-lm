@@ -21,11 +21,13 @@ def load_model_class(name: str) -> type[nn.Module]:
 
     ep = _entry_point("mlx_lm.models", name)
     model = ep.load()
+
     if not (isinstance(model, type) and issubclass(model, nn.Module)):
         raise ValueError(
             f"{ep.value} from {ep.dist.name} is not an nn.Module subclass."
         )
-    if not callable(getattr(getattr(model, "model_args", None), "from_dict", None)):
+    model_args = getattr(model, "model_args", None)
+    if not hasattr(model_args, "from_dict"):
         raise ValueError(
             f"{ep.value} from {ep.dist.name} has no model_args with from_dict."
         )
@@ -35,27 +37,32 @@ def load_model_class(name: str) -> type[nn.Module]:
 def load_tool_parser(name: str) -> Any:
     """The tool parser for ``name``; ValueError if none or invalid."""
     name = lookup_name(name)
-    # Built-ins come first and never read package metadata.
     module = import_if_exists(f"mlx_lm.tool_parsers.{name}")
     if module is not None:
         return module
 
     ep = _entry_point("mlx_lm.tool_parsers", name)
     parser = ep.load()
+
     start = getattr(parser, "tool_call_start", None)
     end = getattr(parser, "tool_call_end", None)
-    is_parser = (
+    is_valid_parser = (
         isinstance(start, str)
         and start != ""
         and isinstance(end, str)
         and callable(getattr(parser, "parse_tool_call", None))
     )
-    if not is_parser:
+    if not is_valid_parser:
         raise ValueError(
             f"{ep.value} from {ep.dist.name} is not a tool parser "
             "(tool_call_start, tool_call_end, parse_tool_call)."
         )
     return parser
+
+
+def lookup_name(name: str) -> str:
+    """``name`` in lower case, with ``_`` for ``-``."""
+    return name.lower().replace("-", "_")
 
 
 def import_if_exists(module: str) -> ModuleType | None:
@@ -65,11 +72,6 @@ def import_if_exists(module: str) -> ModuleType | None:
     if spec is None or spec.origin is None:
         return None
     return importlib.import_module(module)
-
-
-def lookup_name(name: str) -> str:
-    """``name`` in lower case, with ``_`` for ``-``."""
-    return name.lower().replace("-", "_")
 
 
 def _entry_point(group: str, name: str) -> EntryPoint:
