@@ -33,19 +33,16 @@ class Registry:
     attribute: str | None = None
     aliases: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
-    @property
-    def package(self) -> str:
-        """The package of the built-ins, which is also the entry-point group."""
-        return f"mlx_lm.{self.label}"
-
-    def load(self, name: str) -> type | types.ModuleType:
+    def load(self, name: str) -> Any:
         """The built-in for ``name``, else the one plug-in for it, else ValueError."""
         # Built-ins come first and never read package metadata.
-        found = self.builtin(name)
-        if found is not None:
-            return found
+        module = self.builtin_module(name)
+        if module is not None:
+            if self.attribute is None:
+                return module
+            return getattr(module, self.attribute)
 
-        name = self.resolve(name)
+        name = self._canonical_name(name)
         matches = [
             entry_point
             for entry_point in self._entry_points()
@@ -54,7 +51,7 @@ class Registry:
 
         if not matches:
             raise ValueError(
-                f"{name} is not built in, and no plug-in gives it in {self.package}."
+                f"{name} is not built in, and no plug-in gives it in {self._package}."
             )
         if len(matches) > 1:
             sources = ", ".join(
@@ -64,11 +61,22 @@ class Registry:
                 )
             )
             raise ValueError(
-                f"{len(matches)} entry points in {self.package} give {name}: "
+                f"{len(matches)} entry points in {self._package} give {name}: "
                 f"{sources}."
             )
 
         return matches[0].load()
+
+    def builtin_module(self, name: str) -> types.ModuleType | None:
+        """The module of the built-in for ``name``, or None."""
+        module = import_if_exists(f"{self._package}.{self._canonical_name(name)}")
+        if module is None:
+            return None
+
+        # Helper modules, such as mlx_lm.models.cache, have no Model.
+        if self.attribute is not None and not hasattr(module, self.attribute):
+            return None
+        return module
 
     def plugins(self) -> list[dict[str, str | None]]:
         """The plug-ins as JSON records, with their errors. Imports their code."""
@@ -79,39 +87,26 @@ class Registry:
                 "kind": self.label,
                 "name": entry_point.name,
                 "value": entry_point.value,
-                "error": self._error(entry_point),
+                "error": self._load_error(entry_point),
             }
             for entry_point in self._entry_points()
         ]
 
-    def builtin(self, name: str) -> Any:
-        """The built-in for ``name``, or None."""
-        module = self.builtin_module(name)
-        if module is None or self.attribute is None:
-            return module
-        return getattr(module, self.attribute)
+    @property
+    def _package(self) -> str:
+        """The package of the built-ins, which is also the entry-point group."""
+        return f"mlx_lm.{self.label}"
 
-    def builtin_module(self, name: str) -> types.ModuleType | None:
-        """The module of the built-in for ``name``, or None."""
-        module = import_if_exists(f"{self.package}.{self.resolve(name)}")
-        if module is None:
-            return None
-
-        # Helper modules, such as mlx_lm.models.cache, have no Model.
-        if self.attribute is not None and not hasattr(module, self.attribute):
-            return None
-        return module
-
-    def resolve(self, name: str) -> str:
+    def _canonical_name(self, name: str) -> str:
         """``name`` as the lookup uses it: normalized, then through the aliases."""
         name = lookup_name(name)
         return self.aliases.get(name, name)
 
     def _entry_points(self) -> metadata.EntryPoints:
         """The plug-in entry points."""
-        return metadata.entry_points(group=self.package)
+        return metadata.entry_points(group=self._package)
 
-    def _error(self, entry_point: metadata.EntryPoint) -> str | None:
+    def _load_error(self, entry_point: metadata.EntryPoint) -> str | None:
         """Why ``load`` does not give ``entry_point``, or None. Imports its code."""
         try:
             found = self.load(entry_point.name)
@@ -122,7 +117,7 @@ class Registry:
 
         # Only a built-in can win over the one entry point that gives a name.
         if found is not given:
-            return f"shadowed by built-in {self.resolve(entry_point.name)}"
+            return f"shadowed by built-in {self._canonical_name(entry_point.name)}"
         return None
 
 
