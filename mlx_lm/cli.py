@@ -16,7 +16,7 @@ def main():
         "lora",
         "manage",
         "perplexity",
-        "plugins",
+        "plugin",
         "awq",
         "dwq",
         "dynamic_quant",
@@ -32,7 +32,7 @@ def main():
         "dwq": "quant.dwq",
         "dynamic_quant": "quant.dynamic_quant",
         "gptq": "quant.gptq",
-        "plugins": "plugins.cli",
+        "plugin": "plugins.cli",
     }
     if len(sys.argv) < 2:
         raise ValueError(f"CLI requires a subcommand in {subcommands}")

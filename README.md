@@ -289,9 +289,8 @@ class body, where `ModelArgs.from_dict(config)` makes its arguments from
 A checkpoint sets its tool parser and thinking markers in
 `tokenizer_config.json` with `tool_parser_type`, `think_start` and `think_end`.
 
-`mlx_lm plugins list` shows the plug-ins of each project, and an error under
-each one that mlx-lm cannot use, for example because a built-in has the same
-name.
+`mlx_lm plugin list` shows the plug-ins of each project, and an error under each
+one that mlx-lm cannot use, for example because a built-in has the same name.
 
 ### Large Models
 

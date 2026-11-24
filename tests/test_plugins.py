@@ -94,7 +94,7 @@ class TestPlugins(unittest.TestCase):
         importlib.invalidate_caches()
 
     def run_command(self, *args: str) -> tuple[int, str]:
-        """The exit code and output of ``mlx_lm plugins`` with ``args``."""
+        """The exit code and output of ``mlx_lm plugin`` with ``args``."""
         output = io.StringIO()
         code = 0
         with redirect_stdout(output):

@@ -55,7 +55,7 @@ def _render(plugins: list[Plugin]) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """The parser of ``mlx_lm plugins``."""
+    """The parser of ``mlx_lm plugin``."""
     parser = argparse.ArgumentParser(description="Commands for the plug-ins.")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -67,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Run ``mlx_lm plugins`` with ``argv`` (default: the command line)."""
+    """Run ``mlx_lm plugin`` with ``argv`` (default: the command line)."""
     args = build_parser().parse_args(argv)
 
     if args.command == "list":
