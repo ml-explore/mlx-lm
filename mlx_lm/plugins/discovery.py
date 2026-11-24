@@ -10,10 +10,10 @@ from importlib import metadata
 from mlx_lm.models import MODEL_REMAPPING, lookup_name
 
 __all__ = [
-    "KINDS",
     "MODELS",
+    "REGISTRIES",
     "TOOL_PARSERS",
-    "Plugin",
+    "Registry",
     "import_if_exists",
     "list_plugins",
 ]
@@ -21,11 +21,10 @@ __all__ = [
 
 # Hashed by identity, since the aliases are a dict.
 @dataclasses.dataclass(frozen=True, eq=False)
-class Plugin:
-    """A kind of plug-in, and the lookup of its built-ins and entry points.
+class Registry:
+    """The built-ins and plug-ins of one kind, such as models, by name.
 
-    A built-in gives its ``attribute`` (None: the module itself). ``aliases`` maps
-    names to other built-ins.
+    A built-in module gives its ``attribute``, or itself if that is None.
     """
 
     label: str
@@ -39,7 +38,7 @@ class Plugin:
         return f"mlx_lm.{self.label}"
 
     def load(self, name: str) -> type | types.ModuleType:
-        """The built-in for ``name``, else the plug-in; ValueError unless one."""
+        """The built-in for ``name``, else the one plug-in for it, else ValueError."""
         # Built-ins come first and never read package metadata.
         found = self.builtin(name)
         if found is not None:
@@ -48,7 +47,7 @@ class Plugin:
         name = self.resolve(name)
         matches = [
             entry_point
-            for entry_point in self.entry_points()
+            for entry_point in self._entry_points()
             if lookup_name(entry_point.name) == name
         ]
 
@@ -70,30 +69,19 @@ class Plugin:
 
         return matches[0].load()
 
-    def error(self, entry_point: metadata.EntryPoint) -> str | None:
-        """Why ``load`` does not give ``entry_point``, or None. Imports its code."""
-        try:
-            found = self.load(entry_point.name)
-            given = entry_point.load()
-        except Exception as exception:
-            # Plug-in code can raise any error when it is imported.
-            return f"{type(exception).__name__}: {exception}"
-
-        # Only a built-in can win over the one entry that gives a name.
-        if found is not given:
-            return f"shadowed by built-in {self.resolve(entry_point.name)}"
-        return None
-
-    def to_json(self, entry_point: metadata.EntryPoint) -> dict[str, str | None]:
-        """The JSON record of ``entry_point``, with its error. Imports its code."""
-        return {
-            "project": entry_point.dist.name,
-            "version": entry_point.dist.version,
-            "kind": self.label,
-            "name": entry_point.name,
-            "value": entry_point.value,
-            "error": self.error(entry_point),
-        }
+    def plugins(self) -> list[dict[str, str | None]]:
+        """The plug-ins as JSON records, with their errors. Imports their code."""
+        return [
+            {
+                "project": entry_point.dist.name,
+                "version": entry_point.dist.version,
+                "kind": self.label,
+                "name": entry_point.name,
+                "value": entry_point.value,
+                "error": self._error(entry_point),
+            }
+            for entry_point in self._entry_points()
+        ]
 
     def builtin(self, name: str) -> type | types.ModuleType | None:
         """The built-in for ``name``, or None."""
@@ -118,23 +106,35 @@ class Plugin:
         name = lookup_name(name)
         return self.aliases.get(name, name)
 
-    def entry_points(self) -> metadata.EntryPoints:
+    def _entry_points(self) -> metadata.EntryPoints:
         """The plug-in entry points."""
         return metadata.entry_points(group=self.package)
 
+    def _error(self, entry_point: metadata.EntryPoint) -> str | None:
+        """Why ``load`` does not give ``entry_point``, or None. Imports its code."""
+        try:
+            found = self.load(entry_point.name)
+            given = entry_point.load()
+        except Exception as exception:
+            # Plug-in code can raise any error when it is imported.
+            return f"{type(exception).__name__}: {exception}"
 
-MODELS = Plugin("models", attribute="Model", aliases=MODEL_REMAPPING)
-TOOL_PARSERS = Plugin("tool_parsers")
-KINDS = (MODELS, TOOL_PARSERS)
+        # Only a built-in can win over the one entry point that gives a name.
+        if found is not given:
+            return f"shadowed by built-in {self.resolve(entry_point.name)}"
+        return None
+
+
+MODELS = Registry("models", attribute="Model", aliases=MODEL_REMAPPING)
+TOOL_PARSERS = Registry("tool_parsers")
+REGISTRIES = (MODELS, TOOL_PARSERS)
 
 
 def list_plugins() -> list[dict[str, str | None]]:
-    """The plug-ins as JSON records, sorted by project. Imports their code."""
-    plugins = [
-        kind.to_json(entry_point)
-        for kind in KINDS
-        for entry_point in kind.entry_points()
-    ]
+    """The plug-ins of all registries, sorted by project. Imports their code."""
+    plugins = []
+    for registry in REGISTRIES:
+        plugins.extend(registry.plugins())
     plugins.sort(key=lambda plugin: plugin["project"])
     return plugins
 

@@ -188,7 +188,7 @@ class TestTokenizers(unittest.TestCase):
         with tempfile.TemporaryDirectory() as path:
             vocab = ["<think>", "</think>", "[THINK]", "[/THINK]"]
             make_tokenizer(vocab).save_pretrained(path)
-            # The defaults win over the vocab, and the search drops the newline.
+            # The defaults win over the vocab, and the marker tokens drop the newline.
             tokenizer = tokenizer_utils.load(Path(path), defaults=markers)
             self.assertEqual(tokenizer.think_start, "[THINK]\n")
             self.assertEqual(tokenizer.think_start_tokens, (3,))

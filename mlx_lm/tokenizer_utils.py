@@ -319,7 +319,7 @@ def _infer_thinking(tokenizer):
 
 
 def _marker_tokens(tokenizer: PreTrainedTokenizerBase, marker: str) -> tuple[int, ...]:
-    """The tokens of ``marker`` without the whitespace at its ends, which can merge."""
+    """The tokens of the stripped ``marker``: outer whitespace can merge with text."""
     tokens = tuple(tokenizer.encode(marker.strip(), add_special_tokens=False))
     if not tokens:
         raise ValueError(f"The marker {marker!r} has no tokens.")

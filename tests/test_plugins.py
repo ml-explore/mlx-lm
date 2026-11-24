@@ -105,7 +105,7 @@ class TestPlugins(unittest.TestCase):
         return code, output.getvalue()
 
     def install_other_lm(self) -> None:
-        """Install entries that an alias shadows, that give one name, or that fail."""
+        """Install entry points that an alias shadows, share a name, or fail."""
         entry_points = {
             "mistral": "test_lm.solo:Model",
             "dup": "other_lm.a:Model",
