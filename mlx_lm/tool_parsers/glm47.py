@@ -22,21 +22,36 @@ tool_call_start = "<tool_call>"
 tool_call_end = "</tool_call>"
 
 
-def _get_string_arg_names(tool_name: str, tools: list[Any] | None) -> set[str]:
+def _schema_types(schema: Any) -> set[str | None]:
+    # A schema with no type (for example a "$ref") is not a string.
+    if not isinstance(schema, dict):
+        return {None}
+    if "type" in schema:
+        t = schema["type"]
+        return set(t) if isinstance(t, list) else {t}
+    types = set()
+    for choice in schema.get("anyOf") or []:
+        types |= _schema_types(choice)
+    return types or {None}
+
+
+# Map each string argument name to True when it also accepts null.
+def _get_string_arg_names(tool_name: str, tools: list[Any] | None) -> dict[str, bool]:
     if tools is None:
-        return set()
+        return {}
     for tool in tools:
         func = tool.get("function")
         if not func or func.get("name") != tool_name:
             continue
         params = func.get("parameters") or {}
         properties = params.get("properties") or {}
-        return {
-            name
-            for name, schema in properties.items()
-            if schema.get("type") == "string"
-        }
-    return set()
+        string_args = {}
+        for name, schema in properties.items():
+            types = _schema_types(schema)
+            if types - {"null"} == {"string"}:
+                string_args[name] = "null" in types
+        return string_args
+    return {}
 
 
 def _deserialize(value: str) -> Any:
@@ -52,12 +67,19 @@ def _deserialize(value: str) -> Any:
     return value
 
 
+def _parse_arg_value(key: str, value: str, string_args: dict[str, bool]) -> Any:
+    if key not in string_args:
+        return _deserialize(value)
+    # The chat template renders None as "null".
+    return None if string_args[key] and value == "null" else value
+
+
 # Normalize argument values based on tool schema types.
 def _normalize_arguments(
     func_name: str,
     arguments: dict[str, Any],
     tools: list[Any] | None,
-    string_args: set[str] | None = None,
+    string_args: dict[str, bool] | None = None,
 ) -> dict[str, Any]:
     if string_args is None:
         string_args = _get_string_arg_names(func_name, tools)
@@ -65,7 +87,8 @@ def _normalize_arguments(
     for key, value in arguments.items():
         # Preserve declared string types; coerce others when values are strings.
         if key in string_args:
-            normalized[key] = value if isinstance(value, str) else str(value)
+            keep = isinstance(value, str) or (value is None and string_args[key])
+            normalized[key] = value if keep else str(value)
             continue
         if isinstance(value, str):
             normalized[key] = _deserialize(value)
@@ -128,7 +151,7 @@ def _parse_key_value_pairs(
     text: str,
     func_name: str,
     tools: list[Any] | None,
-    string_args: set[str] | None = None,
+    string_args: dict[str, bool] | None = None,
 ) -> dict[str, Any] | None:
     if "=" not in text:
         return None
@@ -151,10 +174,7 @@ def _parse_key_value_pairs(
         key = key.strip()
         if not key:
             return None
-        if key in string_args:
-            arguments[key] = value
-        else:
-            arguments[key] = _deserialize(value)
+        arguments[key] = _parse_arg_value(key, value, string_args)
     return arguments
 
 
@@ -224,7 +244,5 @@ def parse_tool_call(text: str, tools: list[Any] | None = None):
     for match in _func_arg_regex.finditer(text):
         arg_key = match.group(1).strip()
         arg_val = match.group(2).strip()
-        if arg_key not in string_args:
-            arg_val = _deserialize(arg_val)
-        arg_dct[arg_key] = arg_val
+        arg_dct[arg_key] = _parse_arg_value(arg_key, arg_val, string_args)
     return dict(name=func_name, arguments=arg_dct)

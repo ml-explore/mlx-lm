@@ -202,6 +202,37 @@ class TestToolParsing(unittest.TestCase):
             {"name": "get_weather", "arguments": {"postal_code": "123", "days": 3}},
         )
 
+    def test_glm47_nullable_string_args(self):
+        # Pydantic v2 makes Optional[str] an anyOf with null.
+        properties = {
+            "zip_code": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+            "note": {"type": ["string", "null"]},
+        }
+        tools = [
+            {"function": {"name": "lookup", "parameters": {"properties": properties}}}
+        ]
+        test_case = (
+            "lookup<arg_key>zip_code</arg_key><arg_value>12345</arg_value>"
+            "<arg_key>note</arg_key><arg_value>true</arg_value>"
+        )
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "lookup", "arguments": {"zip_code": "12345", "note": "true"}},
+        )
+        test_case = (
+            "lookup<arg_key>zip_code</arg_key><arg_value>null</arg_value>"
+            "<arg_key>note</arg_key><arg_value>null</arg_value>"
+        )
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "lookup", "arguments": {"zip_code": None, "note": None}},
+        )
+        test_case = '{"name": "lookup", "arguments": {"zip_code": null}}'
+        self.assertEqual(
+            glm47.parse_tool_call(test_case, tools),
+            {"name": "lookup", "arguments": {"zip_code": None}},
+        )
+
     def test_pythonic_single_quoted_args_with_commas(self):
         # LFM2.5 emits single-quoted strings; embedded commas must not truncate
         test_case = "[write(filePath='/tmp/hello.py', " "content='# Hello, world!')]"
