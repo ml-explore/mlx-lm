@@ -10,7 +10,11 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from mlx_lm import models, plugins, utils
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import PreTrainedTokenizerFast
+
+from mlx_lm import models, tokenizer_utils, utils
 from mlx_lm.plugins import cli
 from mlx_lm.processors import load_processor
 
@@ -158,9 +162,13 @@ class TestPlugins(unittest.TestCase):
                 utils._get_classes({"model_type": model_type})
 
     def test_tool_parser(self):
-        self.assertEqual(
-            plugins.PluginKind.TOOL_PARSERS.load("test").__name__, "Parser"
-        )
+        backend = Tokenizer(WordLevel({"<unk>": 0}, unk_token="<unk>"))
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="<unk>")
+        with tempfile.TemporaryDirectory() as path:
+            tokenizer.save_pretrained(path)
+            wrapper = tokenizer_utils.load(Path(path), {"tool_parser_type": "test"})
+        self.assertEqual(wrapper.tool_call_start, "<call>")
+        self.assertEqual(wrapper.tool_parser("x", None), {"name": "x"})
 
     def test_plugin_has_no_processor_or_tokenizer_defaults(self):
         for config in (TEST, {"model_type": "unknown"}):

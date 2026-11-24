@@ -63,6 +63,8 @@ class TestModelPackages(unittest.TestCase):
         for target in targets:
             with self.subTest(target=target):
                 self.assertIn(target, PACKAGES)
+                # The lookup can apply the aliases twice, so no target is an alias.
+                self.assertNotIn(target, MODEL_REMAPPING)
 
     def test_model_types_that_are_not_package_names(self) -> None:
         for model_type in (
