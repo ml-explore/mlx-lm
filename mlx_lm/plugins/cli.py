@@ -2,9 +2,10 @@
 
 import argparse
 import collections
+import dataclasses
 import json
 import sys
-import textwrap
+from typing import Any
 
 from mlx_lm.plugins.discovery import Plugin, installed_plugins
 
@@ -16,7 +17,7 @@ def list_command(*, as_json: bool = False) -> int:
     plugins = installed_plugins()
 
     if as_json:
-        message = json.dumps([plugin.to_json() for plugin in plugins], indent=2)
+        message = json.dumps([_to_json(plugin) for plugin in plugins], indent=2)
     elif plugins:
         message = _render(plugins)
     else:
@@ -27,6 +28,12 @@ def list_command(*, as_json: bool = False) -> int:
     if all(plugin.error is None for plugin in plugins):
         return 0
     return 1
+
+
+def _to_json(plugin: Plugin) -> dict[str, Any]:
+    """``plugin`` as JSON, with the kind as its label."""
+    fields = {"kind": plugin.kind.label, "error": plugin.error}
+    return dataclasses.asdict(plugin) | fields
 
 
 def _render(plugins: list[Plugin]) -> str:
@@ -41,7 +48,9 @@ def _render(plugins: list[Plugin]) -> str:
         for kind, kind_plugins in kinds.items():
             lines.append(f"  {kind.label}")
             for plugin in kind_plugins:
-                lines.append(textwrap.indent(plugin.render(), prefix="    "))
+                lines.append(f"    {plugin.name} = {plugin.value}")
+                if plugin.error is not None:
+                    lines.append(f"      {plugin.error}")
     return "\n".join(lines)
 
 

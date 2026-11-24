@@ -2,11 +2,10 @@
 
 from typing import Any
 
-from mlx_lm.plugins import lookup_name
-
 __all__ = [
     "MODEL_ARCHITECTURE_REMAPPING",
     "MODEL_REMAPPING",
+    "lookup_name",
     "model_package",
 ]
 
@@ -47,3 +46,8 @@ def model_package(config: dict[str, Any]) -> str:
         if (model_type, architecture) in MODEL_ARCHITECTURE_REMAPPING:
             return MODEL_ARCHITECTURE_REMAPPING[model_type, architecture]
     return MODEL_REMAPPING.get(model_type, model_type)
+
+
+def lookup_name(name: str) -> str:
+    """``name`` in lower case, with ``_`` for ``-``."""
+    return name.lower().replace("-", "_")

@@ -6,36 +6,34 @@ import functools
 import importlib
 import importlib.util
 import types
+from collections.abc import Mapping
 from importlib import metadata
 from typing import Any, Self
 
-__all__ = [
-    "Plugin",
-    "PluginKind",
-    "import_if_exists",
-    "installed_plugins",
-    "lookup_name",
-]
+from mlx_lm.models import MODEL_REMAPPING, lookup_name
+
+__all__ = ["Plugin", "PluginKind", "import_if_exists", "installed_plugins"]
 
 
-@dataclasses.dataclass(frozen=True)
+# Hashed by identity, since the aliases are a dict.
+@dataclasses.dataclass(frozen=True, eq=False)
 class _Settings:
     """The settings of a ``PluginKind``.
 
-    A built-in gives its ``attribute`` (None: the module itself). ``aliases`` names
-    the table in the kind's package that maps names to other built-ins.
+    A built-in gives its ``attribute`` (None: the module itself). ``aliases`` maps
+    names to other built-ins.
     """
 
     label: str
     _: dataclasses.KW_ONLY
     attribute: str | None = None
-    aliases: str | None = None
+    aliases: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 class PluginKind(enum.Enum):
     """A kind of plug-in, and the lookup of its built-ins and entry points."""
 
-    MODELS = _Settings("models", attribute="Model", aliases="MODEL_REMAPPING")
+    MODELS = _Settings("models", attribute="Model", aliases=MODEL_REMAPPING)
     TOOL_PARSERS = _Settings("tool_parsers")
 
     def __init__(self, settings: _Settings):
@@ -82,21 +80,26 @@ class PluginKind(enum.Enum):
 
     def builtin(self, name: str) -> Any:
         """The built-in for ``name``, or None."""
-        module = import_if_exists(f"{self.package}.{self.resolve(name)}")
+        module = self.builtin_module(name)
         if module is None or self.attribute is None:
             return module
+        return getattr(module, self.attribute)
+
+    def builtin_module(self, name: str) -> types.ModuleType | None:
+        """The module of the built-in for ``name``, or None."""
+        module = import_if_exists(f"{self.package}.{self.resolve(name)}")
+        if module is None:
+            return None
 
         # Helper modules, such as mlx_lm.models.cache, have no Model.
-        return getattr(module, self.attribute, None)
+        if self.attribute is not None and not hasattr(module, self.attribute):
+            return None
+        return module
 
     def resolve(self, name: str) -> str:
         """``name`` as the lookup uses it: normalized, then through the aliases."""
         name = lookup_name(name)
-        if self.aliases is None:
-            return name
-
-        aliases = getattr(importlib.import_module(self.package), self.aliases)
-        return aliases.get(name, name)
+        return self.aliases.get(name, name)
 
     def entries(self) -> list[metadata.EntryPoint]:
         """The plug-in entry points."""
@@ -145,18 +148,6 @@ class Plugin:
             return f"shadowed by built-in {self.kind.resolve(self.name)}"
         return None
 
-    def to_json(self) -> dict[str, Any]:
-        """The plug-in as JSON, with the kind as its label."""
-        fields = {"kind": self.kind.label, "error": self.error}
-        return dataclasses.asdict(self) | fields
-
-    def render(self) -> str:
-        """``name = value``, then the error, if any."""
-        text = f"{self.name} = {self.value}"
-        if self.error is not None:
-            text += f"\n  {self.error}"
-        return text
-
 
 def installed_plugins(kind: PluginKind | None = None) -> list[Plugin]:
     """The plug-ins of ``kind``, or of all kinds, sorted by project name."""
@@ -168,11 +159,6 @@ def installed_plugins(kind: PluginKind | None = None) -> list[Plugin]:
         for entry_point in plugin_kind.entries()
     )
     return sorted(plugins, key=lambda plugin: plugin.project)
-
-
-def lookup_name(name: str) -> str:
-    """``name`` in lower case, with ``_`` for ``-``."""
-    return name.lower().replace("-", "_")
 
 
 def import_if_exists(module: str) -> types.ModuleType | None:

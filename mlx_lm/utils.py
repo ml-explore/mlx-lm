@@ -41,10 +41,11 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 # Local imports
-from mlx_lm import models, plugins
+from mlx_lm import models
 
 # Re-exported: code outside mlx-lm imports them from here.
 from mlx_lm.models import MODEL_ARCHITECTURE_REMAPPING, MODEL_REMAPPING  # noqa: F401
+from mlx_lm.plugins.discovery import PluginKind
 
 from .tokenizer_utils import TokenizerWrapper
 from .tokenizer_utils import load as _load_tokenizer
@@ -193,7 +194,7 @@ def _get_classes(config: dict):
     Returns:
         A tuple containing the Model class and the ModelArgs class.
     """
-    model = plugins.PluginKind.MODELS.load(models.model_package(config))
+    model = PluginKind.MODELS.load(models.model_package(config))
     return model, model.model_args
 
 
@@ -623,11 +624,11 @@ def _tokenizer_defaults(
     try:
         if config is None:
             config = load_config(model_path)
-        package = f"mlx_lm.models.{models.model_package(config)}"
+        name = models.model_package(config)
     except (FileNotFoundError, KeyError):
         return None
 
-    module = plugins.import_if_exists(package)
+    module = PluginKind.MODELS.builtin_module(name)
     if module is None:
         return None
     return getattr(module, "TOKENIZER_DEFAULTS", None)

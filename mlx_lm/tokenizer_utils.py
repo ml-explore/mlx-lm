@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from transformers import AutoTokenizer, PreTrainedTokenizerFast
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from mlx_lm import plugins
+from mlx_lm.plugins.discovery import PluginKind
 
 
 class StreamingDetokenizer(abc.ABC):
@@ -784,7 +784,7 @@ def load(
         tool_parser_type = _infer_tool_parser(tokenizer)
 
     if tool_parser_type is not None:
-        parser = plugins.PluginKind.TOOL_PARSERS.load(tool_parser_type)
+        parser = PluginKind.TOOL_PARSERS.load(tool_parser_type)
         tool_parser = parser.parse_tool_call
         tool_call_start = parser.tool_call_start
         tool_call_end = parser.tool_call_end
