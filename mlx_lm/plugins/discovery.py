@@ -9,12 +9,19 @@ from importlib import metadata
 
 from mlx_lm.models import MODEL_REMAPPING, lookup_name
 
-__all__ = ["KINDS", "MODELS", "TOOL_PARSERS", "PluginKind", "import_if_exists"]
+__all__ = [
+    "KINDS",
+    "MODELS",
+    "TOOL_PARSERS",
+    "Plugin",
+    "import_if_exists",
+    "list_plugins",
+]
 
 
 # Hashed by identity, since the aliases are a dict.
 @dataclasses.dataclass(frozen=True, eq=False)
-class PluginKind:
+class Plugin:
     """A kind of plug-in, and the lookup of its built-ins and entry points.
 
     A built-in gives its ``attribute`` (None: the module itself). ``aliases`` maps
@@ -77,6 +84,17 @@ class PluginKind:
             return f"shadowed by built-in {self.resolve(entry_point.name)}"
         return None
 
+    def to_json(self, entry_point: metadata.EntryPoint) -> dict[str, str | None]:
+        """The JSON record of ``entry_point``, with its error. Imports its code."""
+        return {
+            "project": entry_point.dist.name,
+            "version": entry_point.dist.version,
+            "kind": self.label,
+            "name": entry_point.name,
+            "value": entry_point.value,
+            "error": self.error(entry_point),
+        }
+
     def builtin(self, name: str) -> type | types.ModuleType | None:
         """The built-in for ``name``, or None."""
         module = self.builtin_module(name)
@@ -105,9 +123,20 @@ class PluginKind:
         return metadata.entry_points(group=self.package)
 
 
-MODELS = PluginKind("models", attribute="Model", aliases=MODEL_REMAPPING)
-TOOL_PARSERS = PluginKind("tool_parsers")
+MODELS = Plugin("models", attribute="Model", aliases=MODEL_REMAPPING)
+TOOL_PARSERS = Plugin("tool_parsers")
 KINDS = (MODELS, TOOL_PARSERS)
+
+
+def list_plugins() -> list[dict[str, str | None]]:
+    """The plug-ins as JSON records, sorted by project. Imports their code."""
+    plugins = [
+        kind.to_json(entry_point)
+        for kind in KINDS
+        for entry_point in kind.entry_points()
+    ]
+    plugins.sort(key=lambda plugin: plugin["project"])
+    return plugins
 
 
 def import_if_exists(module: str) -> types.ModuleType | None:

@@ -4,10 +4,9 @@ import argparse
 import collections
 import json
 import sys
-from importlib import metadata
 from typing import NoReturn
 
-from mlx_lm.plugins.discovery import KINDS, PluginKind
+from mlx_lm.plugins.discovery import list_plugins
 
 __all__ = ["build_parser", "list_command", "main"]
 
@@ -37,12 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def list_command(*, as_json: bool = False) -> int:
     """Print the plug-ins; return 1 if one has an error, else 0."""
-    plugins = [
-        _to_json(kind, entry_point)
-        for kind in KINDS
-        for entry_point in kind.entry_points()
-    ]
-    plugins.sort(key=lambda plugin: plugin["project"])
+    plugins = list_plugins()
 
     if as_json:
         message = json.dumps(plugins, indent=2)
@@ -56,20 +50,6 @@ def list_command(*, as_json: bool = False) -> int:
     if all(plugin["error"] is None for plugin in plugins):
         return 0
     return 1
-
-
-def _to_json(
-    kind: PluginKind, entry_point: metadata.EntryPoint
-) -> dict[str, str | None]:
-    """The JSON record of ``entry_point``, a plug-in of ``kind``."""
-    return {
-        "project": entry_point.dist.name,
-        "version": entry_point.dist.version,
-        "kind": kind.label,
-        "name": entry_point.name,
-        "value": entry_point.value,
-        "error": kind.error(entry_point),
-    }
 
 
 def _render(plugins: list[dict[str, str | None]]) -> str:
