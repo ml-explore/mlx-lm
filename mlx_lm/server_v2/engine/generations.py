@@ -234,6 +234,9 @@ def _read_logprobs(
                 top = mx.argsort(-resp.logprobs)[:num_top]
             arrays[i] = (resp.logprobs[resp.token], top, resp.logprobs[top])
 
+    if not arrays:
+        return [()] * len(responses)
+
     mx.eval(list(arrays.values()))
 
     logprobs = [()] * len(responses)
