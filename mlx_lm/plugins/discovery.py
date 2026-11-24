@@ -6,6 +6,7 @@ import importlib.util
 import types
 from collections.abc import Mapping
 from importlib import metadata
+from typing import Any
 
 from mlx_lm.models import MODEL_REMAPPING, lookup_name
 
@@ -83,7 +84,7 @@ class Registry:
             for entry_point in self._entry_points()
         ]
 
-    def builtin(self, name: str) -> type | types.ModuleType | None:
+    def builtin(self, name: str) -> Any:
         """The built-in for ``name``, or None."""
         module = self.builtin_module(name)
         if module is None or self.attribute is None:
