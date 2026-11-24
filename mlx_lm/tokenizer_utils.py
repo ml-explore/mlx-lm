@@ -318,7 +318,7 @@ def _infer_thinking(tokenizer):
     return (None, None, None, None)
 
 
-def _marker_tokens(tokenizer, marker: str) -> tuple[int, ...]:
+def _marker_tokens(tokenizer: PreTrainedTokenizerBase, marker: str) -> tuple[int, ...]:
     """The tokens of ``marker`` without the whitespace at its ends, which can merge."""
     tokens = tuple(tokenizer.encode(marker.strip(), add_special_tokens=False))
     if not tokens:

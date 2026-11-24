@@ -2,17 +2,15 @@
 
 import dataclasses
 import enum
-import functools
 import importlib
 import importlib.util
 import types
 from collections.abc import Mapping
 from importlib import metadata
-from typing import Any, Self
 
 from mlx_lm.models import MODEL_REMAPPING, lookup_name
 
-__all__ = ["Plugin", "PluginKind", "import_if_exists", "installed_plugins"]
+__all__ = ["PluginKind", "import_if_exists"]
 
 
 # Hashed by identity, since the aliases are a dict.
@@ -46,7 +44,7 @@ class PluginKind(enum.Enum):
         """The package of the built-ins, which is also the entry-point group."""
         return f"mlx_lm.{self.label}"
 
-    def load(self, name: str) -> Any:
+    def load(self, name: str) -> type | types.ModuleType:
         """The built-in for ``name``, else the plug-in; ValueError unless one."""
         # Built-ins come first and never read package metadata.
         found = self.builtin(name)
@@ -56,7 +54,7 @@ class PluginKind(enum.Enum):
         name = self.resolve(name)
         matches = [
             entry_point
-            for entry_point in self.entries()
+            for entry_point in self.entry_points()
             if lookup_name(entry_point.name) == name
         ]
 
@@ -78,7 +76,21 @@ class PluginKind(enum.Enum):
 
         return matches[0].load()
 
-    def builtin(self, name: str) -> Any:
+    def error(self, entry_point: metadata.EntryPoint) -> str | None:
+        """Why ``load`` does not give ``entry_point``, or None. Imports its code."""
+        try:
+            found = self.load(entry_point.name)
+            given = entry_point.load()
+        except Exception as exception:
+            # Plug-in code can raise any error when it is imported.
+            return f"{type(exception).__name__}: {exception}"
+
+        # Only a built-in can win over the one entry that gives a name.
+        if found is not given:
+            return f"shadowed by built-in {self.resolve(entry_point.name)}"
+        return None
+
+    def builtin(self, name: str) -> type | types.ModuleType | None:
         """The built-in for ``name``, or None."""
         module = self.builtin_module(name)
         if module is None or self.attribute is None:
@@ -101,64 +113,9 @@ class PluginKind(enum.Enum):
         name = lookup_name(name)
         return self.aliases.get(name, name)
 
-    def entries(self) -> list[metadata.EntryPoint]:
+    def entry_points(self) -> metadata.EntryPoints:
         """The plug-in entry points."""
-        return list(metadata.entry_points(group=self.package))
-
-
-@dataclasses.dataclass(frozen=True, kw_only=True)
-class Plugin:
-    """A plug-in of an installed project."""
-
-    project: str
-    version: str
-    kind: PluginKind
-    name: str
-    value: str
-
-    @classmethod
-    def from_entry_point(
-        cls, entry_point: metadata.EntryPoint, *, kind: PluginKind
-    ) -> Self:
-        """The plug-in that ``entry_point`` of ``kind`` describes."""
-        return cls(
-            project=entry_point.dist.name,
-            version=entry_point.dist.version,
-            kind=kind,
-            name=entry_point.name,
-            value=entry_point.value,
-        )
-
-    @functools.cached_property
-    def error(self) -> str | None:
-        """Why the lookup does not give this plug-in, or None. Imports its code."""
-        entry_point = metadata.EntryPoint(
-            name=self.name, value=self.value, group=self.kind.package
-        )
-
-        try:
-            found = self.kind.load(self.name)
-            given = entry_point.load()
-        except Exception as exception:
-            # Plug-in code can raise any error when it is imported.
-            return f"{type(exception).__name__}: {exception}"
-
-        # Only a built-in can win over the one entry that gives a name.
-        if found is not given:
-            return f"shadowed by built-in {self.kind.resolve(self.name)}"
-        return None
-
-
-def installed_plugins(kind: PluginKind | None = None) -> list[Plugin]:
-    """The plug-ins of ``kind``, or of all kinds, sorted by project name."""
-    kinds = list(PluginKind) if kind is None else [kind]
-
-    plugins = (
-        Plugin.from_entry_point(entry_point, kind=plugin_kind)
-        for plugin_kind in kinds
-        for entry_point in plugin_kind.entries()
-    )
-    return sorted(plugins, key=lambda plugin: plugin.project)
+        return metadata.entry_points(group=self.package)
 
 
 def import_if_exists(module: str) -> types.ModuleType | None:

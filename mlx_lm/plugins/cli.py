@@ -2,56 +2,25 @@
 
 import argparse
 import collections
-import dataclasses
 import json
 import sys
-from typing import Any
+from importlib import metadata
+from typing import NoReturn
 
-from mlx_lm.plugins.discovery import Plugin, installed_plugins
+from mlx_lm.plugins.discovery import PluginKind
 
 __all__ = ["build_parser", "list_command", "main"]
 
 
-def list_command(*, as_json: bool = False) -> int:
-    """Print the plug-ins; return 1 if one has an error, else 0."""
-    plugins = installed_plugins()
+def main(argv: list[str] | None = None) -> NoReturn:
+    """Run ``mlx_lm plugin`` with ``argv`` (default: the command line)."""
+    args = build_parser().parse_args(argv)
 
-    if as_json:
-        message = json.dumps([_to_json(plugin) for plugin in plugins], indent=2)
-    elif plugins:
-        message = _render(plugins)
+    if args.command == "list":
+        status = list_command(as_json=args.json)
     else:
-        message = "No plug-ins found."
-    print(message)
-
-    # A non-zero exit status lets scripts and CI see the errors.
-    if all(plugin.error is None for plugin in plugins):
-        return 0
-    return 1
-
-
-def _to_json(plugin: Plugin) -> dict[str, Any]:
-    """``plugin`` as JSON, with the kind as its label."""
-    fields = {"kind": plugin.kind.label, "error": plugin.error}
-    return dataclasses.asdict(plugin) | fields
-
-
-def _render(plugins: list[Plugin]) -> str:
-    """``plugins`` as text, under their project and kind."""
-    grouped = collections.defaultdict(lambda: collections.defaultdict(list))
-    for plugin in plugins:
-        grouped[plugin.project, plugin.version][plugin.kind].append(plugin)
-
-    lines = []
-    for (name, version), kinds in grouped.items():
-        lines.append(f"{name} {version}")
-        for kind, kind_plugins in kinds.items():
-            lines.append(f"  {kind.label}")
-            for plugin in kind_plugins:
-                lines.append(f"    {plugin.name} = {plugin.value}")
-                if plugin.error is not None:
-                    lines.append(f"      {plugin.error}")
-    return "\n".join(lines)
+        raise ValueError(f"Unknown command: {args.command}")
+    sys.exit(status)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -66,12 +35,56 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> None:
-    """Run ``mlx_lm plugin`` with ``argv`` (default: the command line)."""
-    args = build_parser().parse_args(argv)
+def list_command(*, as_json: bool = False) -> int:
+    """Print the plug-ins; return 1 if one has an error, else 0."""
+    plugins = [
+        _to_json(kind, entry_point)
+        for kind in PluginKind
+        for entry_point in kind.entry_points()
+    ]
+    plugins.sort(key=lambda plugin: plugin["project"])
 
-    if args.command == "list":
-        status = list_command(as_json=args.json)
+    if as_json:
+        message = json.dumps(plugins, indent=2)
+    elif plugins:
+        message = _render(plugins)
     else:
-        raise ValueError(f"Unknown command: {args.command}")
-    sys.exit(status)
+        message = "No plug-ins found."
+    print(message)
+
+    # A non-zero exit status lets scripts and CI see the errors.
+    if all(plugin["error"] is None for plugin in plugins):
+        return 0
+    return 1
+
+
+def _to_json(
+    kind: PluginKind, entry_point: metadata.EntryPoint
+) -> dict[str, str | None]:
+    """The JSON record of ``entry_point``, a plug-in of ``kind``."""
+    return {
+        "project": entry_point.dist.name,
+        "version": entry_point.dist.version,
+        "kind": kind.label,
+        "name": entry_point.name,
+        "value": entry_point.value,
+        "error": kind.error(entry_point),
+    }
+
+
+def _render(plugins: list[dict[str, str | None]]) -> str:
+    """``plugins`` as text, under their project and kind."""
+    grouped = collections.defaultdict(lambda: collections.defaultdict(list))
+    for plugin in plugins:
+        grouped[plugin["project"], plugin["version"]][plugin["kind"]].append(plugin)
+
+    lines = []
+    for (project, version), kinds in grouped.items():
+        lines.append(f"{project} {version}")
+        for kind, kind_plugins in kinds.items():
+            lines.append(f"  {kind}")
+            for plugin in kind_plugins:
+                lines.append(f"    {plugin['name']} = {plugin['value']}")
+                if plugin["error"] is not None:
+                    lines.append(f"      {plugin['error']}")
+    return "\n".join(lines)
