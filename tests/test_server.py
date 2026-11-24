@@ -1034,5 +1034,69 @@ class TestGenerationThreadDeath(unittest.TestCase):
             rg._await_response(Queue())
 
 
+class TestRequestTimeoutAndHealthProbe(unittest.TestCase):
+    def test_request_timeout_raises_timeout_error(self):
+        provider = SimpleNamespace(
+            cli_args=SimpleNamespace(request_timeout=0.05),
+            model=None,
+            load_default=lambda: (_ for _ in ()).throw(RuntimeError("stop")),
+        )
+        rg = ResponseGenerator(provider, LRUPromptCache())
+        try:
+            with mock.patch.object(rg, "generation_available", return_value=True):
+                with self.assertRaisesRegex(TimeoutError, "timed out after 0.05s"):
+                    rg._await_response(Queue())
+        finally:
+            rg.join()
+
+    def test_health_probe_and_504_timeout_response(self):
+        rg = mock.Mock()
+        rg.is_healthy = True
+        rg.probe_health.return_value = True
+        rg.generate.side_effect = TimeoutError("Inference request timed out after 0.05s")
+        rg.cli_args = SimpleNamespace(
+            allowed_origins=["*"],
+            temp=0.0,
+            top_p=1.0,
+            top_k=0,
+            min_p=0.0,
+            max_tokens=512,
+            num_draft_tokens=3,
+            chat_template_args={},
+            adapter_path=None,
+            draft_model=None,
+            model=None,
+        )
+
+        httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(rg, *args, **kwargs),
+        )
+        port = httpd.server_port
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            resp = requests.get(f"http://localhost:{port}/health?probe=true")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json(), {"status": "ok"})
+            rg.probe_health.assert_called_once()
+
+            rg.probe_health.return_value = False
+            resp = requests.get(f"http://localhost:{port}/health?probe=true")
+            self.assertEqual(resp.status_code, 503)
+            self.assertEqual(resp.json(), {"status": "unavailable"})
+
+            resp = requests.post(
+                f"http://localhost:{port}/v1/completions",
+                json={"model": "default_model", "prompt": "hi", "max_tokens": 5},
+            )
+            self.assertEqual(resp.status_code, 504)
+            self.assertIn("timed out", resp.json()["error"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join()
+
+
 if __name__ == "__main__":
     unittest.main()
