@@ -131,7 +131,7 @@ def list_plugins() -> list[dict[str, str | None]]:
     plugins = []
     for registry in REGISTRIES:
         plugins.extend(registry.plugins())
-    plugins.sort(key=lambda plugin: plugin["project"])
+    plugins.sort(key=lambda plugin: plugin["project"] or "")
     return plugins
 
 
