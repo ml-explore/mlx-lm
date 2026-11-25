@@ -4035,6 +4035,36 @@ class TestModels(unittest.TestCase):
         sanitized = model.sanitize(weights)
         self.assertNotIn("lm_head.weight", sanitized)
 
+    def test_longcat_ngram_padded_history(self):
+        from types import SimpleNamespace
+
+        from mlx_lm.models.cache import ArraysCache
+        from mlx_lm.models.longcat_flash_ngram.layers import NgramEmbedding
+
+        args = SimpleNamespace(
+            vocab_size=64,
+            hidden_size=24,
+            ngram_vocab_size_ratio=2,
+            emb_split_num=2,
+            emb_neighbor_num=4,
+        )
+        embedding = NgramEmbedding(args)
+        cache = ArraysCache(1)
+        cache.prepare(lengths=[2, 5])
+        embedding(mx.array([[4, 0, 0], [5, 6, 7]]), cache)
+        embedding(mx.array([[0, 0], [8, 9]]), cache)
+        self.assertEqual(cache[0].tolist(), [[0, 4, 0], [7, 8, 9]])
+        cache.finalize()
+        batch = embedding(mx.array([[12], [10]]), cache)
+        alone = embedding(mx.array([[4, 0, 12]]))
+        self.assertTrue(mx.allclose(batch[0, 0], alone[0, -1], atol=1e-6))
+
+        # Older caches saved fewer than n - 1 tokens for a short prompt.
+        saved = ArraysCache(1)
+        saved[0] = mx.array([[4]])
+        restored = embedding(mx.array([[0, 12]]), saved)
+        self.assertTrue(mx.allclose(restored[0, -1], alone[0, -1], atol=1e-6))
+
     def test_granitemoehybrid_padded_batch(self):
         from mlx_lm.generate import BatchGenerator, generate_step
         from mlx_lm.models import granitemoehybrid

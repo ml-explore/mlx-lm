@@ -43,12 +43,21 @@ class NgramEmbedding(nn.Module):
 
         input_ids = input_ids.astype(mx.int64)
         if cache is not None:
-            context = cache[0]
-            if context is None:
-                context = input_ids
+            n_keep = self.n - 1
+            history = cache[0]
+            if history is None:
+                history = mx.zeros((input_ids.shape[0], n_keep), dtype=input_ids.dtype)
+            elif history.shape[-1] < n_keep:
+                history = mx.pad(history, [(0, 0), (n_keep - history.shape[-1], 0)])
+            context = mx.concatenate([history, input_ids], axis=-1)
+            if cache.lengths is None:
+                cache[0] = context[:, seq_len:]
             else:
-                context = mx.concatenate([context, input_ids], axis=-1)
-            cache[0] = context[..., max(0, context.shape[-1] - self.n + 1) :]
+                # Skip right padding when saving each row's last real tokens.
+                ends = mx.clip(cache.lengths, 0, seq_len)
+                positions = ends[:, None] + mx.arange(n_keep)
+                cache[0] = mx.take_along_axis(context, positions, axis=1)
+                cache.advance(seq_len)
         else:
             context = input_ids
 
