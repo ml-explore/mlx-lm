@@ -407,6 +407,8 @@ class ModelProvider:
         self._draft_model_map = {}
         self._model_map["default_model"] = self.cli_args.model
         self._adapter_map["default_model"] = self.cli_args.adapter_path
+        if self.cli_args.model is not None:
+            self._adapter_map[self.cli_args.model] = self.cli_args.adapter_path
         self._draft_model_map["default_model"] = self.cli_args.draft_model
 
         # Build the tokenizer config for later use in load
@@ -490,7 +492,9 @@ class ModelProvider:
             self.load("default_model", None, "default_model")
 
     def load(self, model_path, adapter_path=None, draft_model_path=None):
-        adapter_path = self._adapter_map.get(model_path, adapter_path)
+        # Prefer an explicitly requested adapter; fall back to the CLI mapping.
+        if adapter_path is None:
+            adapter_path = self._adapter_map.get(model_path)
         model_path = self._model_map.get(model_path, model_path)
         draft_model_path = self._draft_model_map.get(draft_model_path, draft_model_path)
 
