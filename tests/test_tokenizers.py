@@ -1,19 +1,23 @@
 # Copyright © 2024 Apple Inc.
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from mlx_lm.chat_templates import deepseek_v32
+from mlx_lm.chat_templates.muse_spark import RESPONSE_FORMAT
 from mlx_lm.tokenizer_utils import (
     BPEStreamingDetokenizer,
     NaiveStreamingDetokenizer,
     SPMStreamingDetokenizer,
     TokenizerWrapper,
 )
-from mlx_lm.tool_parsers import pythonic
+from mlx_lm.tool_parsers import muse_spark, pythonic
 from mlx_lm.utils import load_tokenizer
 
 
@@ -226,6 +230,36 @@ class TestTokenizers(unittest.TestCase):
             messages, add_generation_prompt=True, reasoning_effort="low"
         )
         self.assertEqual(out, expected)
+
+    def test_muse_glimmer_tokenizer_defaults(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir)
+            (path / "config.json").write_text(
+                json.dumps({"model_type": "muse_glimmer"})
+            )
+
+            # Response-format-only modules must load when chat_template is absent.
+            make_tokenizer([]).save_pretrained(path)
+            tokenizer = load_tokenizer(path)
+            self.assertFalse(tokenizer.has_chat_template)
+            self.assertEqual(tokenizer.eos_token_ids, {200001, 200008})
+
+            # With a checkpoint chat template, keep it and attach defaults.
+            make_tokenizer(
+                ["<atem:function_calls>", "</atem:function_calls>"],
+                chat_template="{{ messages }}",
+            ).save_pretrained(path)
+            for extra in (None, {"chat_template_type": "muse_spark"}):
+                tokenizer = load_tokenizer(path, tokenizer_config_extra=extra)
+                self.assertTrue(tokenizer.has_chat_template)
+                self.assertEqual(
+                    tokenizer.response_initial_state, RESPONSE_FORMAT["initial_state"]
+                )
+                self.assertEqual(
+                    tokenizer.response_transitions, RESPONSE_FORMAT["transitions"]
+                )
+                self.assertEqual(tokenizer.eos_token_ids, {200001, 200008})
+                self.assertIs(tokenizer.tool_parser, muse_spark.parse_tool_call)
 
 
 if __name__ == "__main__":
