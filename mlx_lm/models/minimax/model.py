@@ -4,9 +4,10 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.nn.layers.distributed import shard_inplace, shard_linear
+from mlx.nn.layers.distributed import shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.minimax import checkpoint
 from mlx_lm.models.minimax.config import ModelArgs
 from mlx_lm.models.minimax.layers import MiniMaxDecoderLayer, ShardedRMSNorm
@@ -117,17 +118,17 @@ class Model(nn.Module):
             layer.self_attn.num_key_value_heads //= N
 
             # Shard the MLP
-            shard_inplace(
+            shard_switch_linear(
                 layer.block_sparse_moe.switch_mlp.gate_proj,
                 "all-to-sharded",
                 group=group,
             )
-            shard_inplace(
+            shard_switch_linear(
                 layer.block_sparse_moe.switch_mlp.down_proj,
                 "sharded-to-all",
                 group=group,
             )
-            shard_inplace(
+            shard_switch_linear(
                 layer.block_sparse_moe.switch_mlp.up_proj,
                 "all-to-sharded",
                 group=group,

@@ -9,6 +9,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.common import ZeroCenteredRMSNorm
 from mlx_lm.layers.distributed import PipelineMixin
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.cache import CacheList, KVCache
 from mlx_lm.models.minimax_m3_vl import checkpoint
 from mlx_lm.models.minimax_m3_vl.config import ModelArgs, TextArgs
@@ -159,10 +160,13 @@ class Model(nn.Module):
             if layer.is_moe:
                 moe = layer.block_sparse_moe
                 # In place, so the block aggregates both experts with one sum.
-                for mlp in (moe.switch_mlp, moe.shared_experts):
-                    shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
-                    shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
-                    shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
+                for mlp, shard_fn in (
+                    (moe.switch_mlp, shard_switch_linear),
+                    (moe.shared_experts, shard_inplace),
+                ):
+                    shard_fn(mlp.gate_proj, "all-to-sharded", group=group)
+                    shard_fn(mlp.up_proj, "all-to-sharded", group=group)
+                    shard_fn(mlp.down_proj, "sharded-to-all", group=group)
                 moe.sharding_group = group
             else:
                 mlp = layer.mlp

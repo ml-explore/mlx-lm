@@ -8,6 +8,7 @@ import mlx.nn as nn
 from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.distributed import PipelineMixin
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.deepseek_v41 import checkpoint
 from mlx_lm.models.deepseek_v41.config import ModelArgs
 from mlx_lm.models.deepseek_v41.layers import (
@@ -328,10 +329,13 @@ class Model(nn.Module):
             attn.sinks = attn.sinks[rank * attn.num_heads : (rank + 1) * attn.num_heads]
 
             layer.mlp.sharding_group = group
-            for mlp in (layer.mlp.experts.switch_mlp, layer.mlp.shared_experts):
-                shard_inplace(mlp.gate_proj, "all-to-sharded", group=group)
-                shard_inplace(mlp.up_proj, "all-to-sharded", group=group)
-                shard_inplace(mlp.down_proj, "sharded-to-all", group=group)
+            for mlp, shard_fn in (
+                (layer.mlp.experts.switch_mlp, shard_switch_linear),
+                (layer.mlp.shared_experts, shard_inplace),
+            ):
+                shard_fn(mlp.gate_proj, "all-to-sharded", group=group)
+                shard_fn(mlp.up_proj, "all-to-sharded", group=group)
+                shard_fn(mlp.down_proj, "sharded-to-all", group=group)
 
     @property
     def layers(self) -> list[DecoderLayer]:

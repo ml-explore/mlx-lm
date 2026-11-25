@@ -9,6 +9,7 @@ from mlx.utils import tree_map
 
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.distributed import PipelineMixin, gather_last_axis
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.layers.recurrent import create_ssm_mask
 from mlx_lm.models.cache import ArraysCache, KVCache
 from mlx_lm.models.qwen3_5 import checkpoint
@@ -288,13 +289,13 @@ class Model(nn.Module):
                 shard_inplace(
                     layer.mlp.shared_expert.up_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 

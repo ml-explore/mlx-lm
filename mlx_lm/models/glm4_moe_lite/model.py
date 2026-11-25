@@ -8,6 +8,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.distributed import PipelineMixin
+from mlx_lm.layers.moe import shard_switch_linear
 from mlx_lm.models.glm4_moe_lite import checkpoint
 from mlx_lm.models.glm4_moe_lite.config import ModelArgs
 from mlx_lm.models.glm4_moe_lite.layers import Glm4MoeLiteDecoderLayer, Glm4MoeLiteMLP
@@ -150,13 +151,13 @@ class Model(nn.Module):
                         "all-to-sharded",
                         group=group,
                     )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.gate_proj, "all-to-sharded", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.down_proj, "sharded-to-all", group=group
                 )
-                shard_inplace(
+                shard_switch_linear(
                     layer.mlp.switch_mlp.up_proj, "all-to-sharded", group=group
                 )
 
