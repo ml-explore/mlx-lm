@@ -3821,9 +3821,7 @@ class TestModels(unittest.TestCase):
                 prefix = k.removesuffix("embed_q.weight")
                 wv = mlx_weights[f"{prefix}unembed_out.weight"]
                 kv_b = mx.concatenate([v.swapaxes(-1, -2), wv], axis=1)
-                hub[f"{prefix}kv_b_proj.weight"] = kv_b.reshape(
-                    -1, mla["kv_lora_rank"]
-                )
+                hub[f"{prefix}kv_b_proj.weight"] = kv_b.reshape(-1, mla["kv_lora_rank"])
                 continue
             if k.endswith("unembed_out.weight"):
                 continue
