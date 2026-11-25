@@ -15,10 +15,11 @@
 #   * "centered" RMSNorm (output = norm(x) * (1 + weight)) on the four
 #     per-block norms; standard RMSNorm on the final norm
 
-from mlx_lm.models.muse_glimmer.config import ModelArgs
+from mlx_lm.models.muse_glimmer.config import TOKENIZER_DEFAULTS, ModelArgs
 from mlx_lm.models.muse_glimmer.model import Model
 
 __all__ = [
     "Model",
     "ModelArgs",
+    "TOKENIZER_DEFAULTS",
 ]

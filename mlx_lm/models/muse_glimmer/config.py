@@ -7,7 +7,15 @@ from mlx_lm.models.base import BaseModelArgs
 
 __all__ = [
     "ModelArgs",
+    "TOKENIZER_DEFAULTS",
 ]
+
+# For checkpoints without them. Stop on <|eot|>, not on <|eom|>.
+TOKENIZER_DEFAULTS = {
+    "chat_template_type": "muse_spark",
+    "tool_parser_type": "muse_spark",
+    "eos_token_ids": [200001, 200008],
+}
 
 
 @dataclass

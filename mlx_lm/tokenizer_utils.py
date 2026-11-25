@@ -752,7 +752,7 @@ def load(
         module = importlib.import_module(f"mlx_lm.chat_templates.{chat_template_type}")
         # A template in the checkpoint replaces only the default template.
         if "chat_template_type" in tokenizer_config or tokenizer.chat_template is None:
-            chat_template = module.apply_chat_template
+            chat_template = getattr(module, "apply_chat_template", None)
         response_format = getattr(module, "RESPONSE_FORMAT", None)
 
     tool_parser_type = tokenizer_config.get(
