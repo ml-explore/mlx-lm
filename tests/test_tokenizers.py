@@ -3,7 +3,8 @@
 import unittest
 
 from tokenizers import Tokenizer
-from tokenizers.models import WordLevel
+from tokenizers.decoders import ByteLevel
+from tokenizers.models import BPE, WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from mlx_lm.chat_templates import deepseek_v32
@@ -125,6 +126,21 @@ class TestTokenizers(unittest.TestCase):
         detokenizer = tokenizer.detokenizer
         detokenizer.add_token(partial)
         self.assertEqual(detokenizer.last_segment, "")
+
+    def test_bpe_detokenizer_preserves_leading_spaces(self):
+        backend = Tokenizer(BPE({"ĠParis": 0, "Ġ": 1}, []))
+        backend.decoder = ByteLevel()
+        tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend)
+        for tokens in ([0], [1], [1, 0]):
+            with self.subTest(tokens=tokens):
+                detokenizer = BPEStreamingDetokenizer(tokenizer)
+                text = ""
+                for token in tokens:
+                    detokenizer.add_token(token)
+                    text += detokenizer.last_segment
+                detokenizer.finalize()
+                text += detokenizer.last_segment
+                self.assertEqual(text, tokenizer.decode(tokens))
 
     def test_special_tokens(self):
         tokenizer_repo = "mlx-community/DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx"
