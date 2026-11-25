@@ -6,8 +6,8 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_lm.layers import attention
 from mlx_lm.models import deepseek_v32 as D
-from mlx_lm.models import dsa
 from mlx_lm.models import glm_moe_dsa as G
 from mlx_lm.models.cache import make_prompt_cache
 
@@ -104,7 +104,7 @@ class _SparsePrefillTests:
         self.assertTrue(bool(mx.all(mx.argmax(dense, -1) == mx.argmax(sparse, -1))))
 
     def test_blocked_topk_matches_indexer(self):
-        from mlx_lm.models.base import create_causal_mask
+        from mlx_lm.layers.attention import create_causal_mask
 
         model = self.module.Model(self._args())
         mx.eval(model.parameters())
@@ -113,7 +113,7 @@ class _SparsePrefillTests:
         qr = mx.random.normal((1, 64, 32))
         mask = create_causal_mask(64)
         stock = indexer(x, qr, mask)
-        blocked = dsa.blocked_topk(indexer, x, qr, mask, None, block=16)
+        blocked = attention.blocked_topk(indexer, x, qr, mask, None, block=16)
         # Rows with fewer than index_topk causal keys also select masked keys.
         rows = slice(indexer.index_topk - 1, None)
         self.assertTrue(
@@ -170,7 +170,7 @@ class _SparsePrefillTests:
             layer.self_attn.sparse_prefill_min_context = 0
         tokens = mx.random.randint(0, 256, (1, 128))
         whole = self._prefill(model, tokens, 64)
-        with patch.object(dsa, "SPARSE_QUERY_BLOCK", 24):
+        with patch.object(attention, "SPARSE_QUERY_BLOCK", 24):
             blocked = self._prefill(model, tokens, 64)
         self.assertTrue(bool(mx.array_equal(whole, blocked)))
 
@@ -208,17 +208,17 @@ class _SparsePrefillTests:
         inputs = [mx.zeros(s, mx.bfloat16) for s in shapes]  # q_pe, kv_latent, k_pe
         model.train()
         self.assertEqual(
-            dsa.min_context(attn, *inputs), attn.sparse_prefill_min_context
+            attention.min_context(attn, *inputs), attn.sparse_prefill_min_context
         )
         model.eval()
-        self.assertEqual(dsa.min_context(attn, *inputs), 0)
+        self.assertEqual(attention.min_context(attn, *inputs), 0)
 
         for layer in model.model.layers:
             layer.self_attn.sparse_prefill_min_context = 0
         tokens = mx.random.randint(0, 256, (1, 64))  # more keys than index_topk
         loss = lambda model: model(tokens).astype(mx.float32).mean()
-        fused = dsa.fused_sparse_attention
-        with patch.object(dsa, "fused_sparse_attention", wraps=fused) as fused:
+        fused = attention.fused_sparse_attention
+        with patch.object(attention, "fused_sparse_attention", wraps=fused) as fused:
             model.train()
             mx.eval(nn.value_and_grad(model, loss)(model))
             fused.assert_not_called()
@@ -248,14 +248,14 @@ class _SparsePrefillTests:
         tokens = mx.random.randint(0, 256, (1, 96))
 
         ran = []
-        fused = dsa.fused_sparse_attention
+        fused = attention.fused_sparse_attention
 
         def record(*args):
             out = fused(*args)
             ran.append(out is not None)
             return out
 
-        with patch.object(dsa, "fused_sparse_attention", record):
+        with patch.object(attention, "fused_sparse_attention", record):
             out = self._prefill(model, tokens, 24)
         for layer in model.model.layers:
             layer.self_attn.sparse_prefill_fused = False
@@ -265,6 +265,33 @@ class _SparsePrefillTests:
         diff = mx.abs(out - ref).astype(mx.float32)
         self.assertLess(float(diff.max()), 0.25)
         self.assertLess(float(diff.mean()), 0.014)
+
+
+class TestHeadSum(unittest.TestCase):
+    def test_matches_ops(self):
+        # Same values as the stock ops: ReLU, times the weight, heads added in order.
+        mx.random.seed(0)
+        device = mx.default_device()
+        try:
+            for d in (mx.cpu, mx.gpu) if mx.metal.is_available() else (mx.cpu,):
+                mx.set_default_device(d)
+                # One compiled graph serves all shapes, so the shapes change too.
+                for b, s, n, dtype in (
+                    (1, 33, 300, mx.bfloat16),
+                    (2, 17, 129, mx.bfloat16),
+                    (1, 33, 300, mx.float16),
+                    (1, 5, 1000, mx.float32),
+                ):
+                    scores = mx.random.normal((b, 8, s, n)).astype(dtype)
+                    weights = mx.random.normal((b, s, 8)).astype(dtype)
+                    weights = weights.swapaxes(-1, -2)[..., None]  # as the indexer's
+                    ref = mx.maximum(scores, 0) * weights
+                    ref = sum(ref[:, h : h + 1] for h in range(ref.shape[1]))
+                    out = attention.head_sum(scores, weights)
+                    self.assertEqual(out.dtype, dtype)
+                    self.assertTrue(bool(mx.array_equal(out, ref)))
+        finally:
+            mx.set_default_device(device)
 
 
 class TestGlmSparsePrefill(_SparsePrefillTests, unittest.TestCase):

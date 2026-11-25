@@ -481,7 +481,7 @@ class ModelProvider:
         self.model_key = (model_path, adapter_path, draft_model_path)
         self.model = model
         self.tokenizer = tokenizer
-        self.processor = load_processor(model, config)
+        self.processor = load_processor(config)
         self.draft_model = draft_model
         self.is_batchable = is_batchable
 
@@ -696,14 +696,15 @@ class ResponseGenerator:
                         add_generation_prompt=True,
                         **{**template_kwargs, "tokenize": False},
                     )
-                    text, pixel_values = processor(
+                    # The prompt cache of this server tracks images only.
+                    text, media_inputs = processor(
                         text, images=[_decode_image(u) for u in urls]
                     )
                     prompt = tokenizer.encode(text, add_special_tokens=False)
                     vision = _make_vision(
                         prompt,
                         urls=urls,
-                        pixel_values=pixel_values,
+                        pixel_values=media_inputs["pixel_values"],
                         token_id=tokenizer.convert_tokens_to_ids(processor.image_token),
                     )
                 else:
