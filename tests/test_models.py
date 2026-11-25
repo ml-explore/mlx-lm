@@ -3749,6 +3749,113 @@ class TestModels(unittest.TestCase):
                 m.load_weights(list(m.sanitize(dict(weights)).items()), strict=True)
                 self.assertTrue(mx.allclose(m(inputs), expected).item())
 
+    def _omoikane_args(self):
+        from mlx_lm.models import omoikane
+
+        return omoikane.ModelArgs(
+            model_type="omoikane",
+            hidden_size=64,
+            num_hidden_layers=4,
+            intermediate_size=128,
+            vocab_size=128,
+            gdn_config={
+                "num_heads": 2,
+                "head_dim_k": 32,
+                "head_dim_v": 32,
+                "short_conv_kernel": 4,
+            },
+            mla_config={
+                "num_heads": 2,
+                "q_lora_rank": 32,
+                "kv_lora_rank": 16,
+                "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+                "rope_theta": 100000.0,
+            },
+            moe_config={
+                "n_routed_experts": 8,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "n_shared_experts": 1,
+                "group_limited_routing": {"n_group": 4, "topk_group": 2},
+            },
+            # Gated DeltaNet, MLA + MoE, Gated DeltaNet + MoE, MLA
+            dense_layer_indices=[0, 3],
+            mla_layer_indices=[1, 3],
+        )
+
+    def test_omoikane(self):
+        from mlx_lm.models import omoikane
+
+        args = self._omoikane_args()
+        model = omoikane.Model(args)
+        self.model_test_runner(
+            model, args.model_type, args.vocab_size, args.num_hidden_layers
+        )
+
+    def test_omoikane_sanitize(self):
+        from mlx_lm.models import omoikane
+
+        args = self._omoikane_args()
+        model = omoikane.Model(args)
+        mlx_weights = dict(tree_flatten(model.parameters()))
+
+        # The training checkpoint's layout: stacked experts with gate and up in
+        # one tensor, kv_b_proj unsplit, [channels, 1, kernel] convolutions, and
+        # the MTP module as the layer after the last.
+        mla = args.mla_config
+        hub = {}
+        for k, v in mlx_weights.items():
+            if "conv1d.weight" in k:
+                v = v.moveaxis(1, 2)
+            if ".switch_mlp." in k:
+                prefix = k.split(".switch_mlp.")[0]
+                if ".gate_proj." in k:
+                    up = mlx_weights[k.replace(".gate_proj.", ".up_proj.")]
+                    hub[f"{prefix}.experts.gate_up_proj"] = mx.concatenate([v, up], 1)
+                elif ".down_proj." in k:
+                    hub[f"{prefix}.experts.down_proj"] = v
+                continue
+            if k.endswith("embed_q.weight") and "unembed" not in k:
+                prefix = k.removesuffix("embed_q.weight")
+                wv = mlx_weights[f"{prefix}unembed_out.weight"]
+                kv_b = mx.concatenate([v.swapaxes(-1, -2), wv], axis=1)
+                hub[f"{prefix}kv_b_proj.weight"] = kv_b.reshape(
+                    -1, mla["kv_lora_rank"]
+                )
+                continue
+            if k.endswith("unembed_out.weight"):
+                continue
+            hub[k] = v
+        mtp = f"model.layers.{args.num_hidden_layers}"
+        hub[f"{mtp}.eh_proj.weight"] = mx.zeros((64, 128))
+        hub[f"{mtp}.self_attn.kv_b_proj.weight"] = mx.zeros((64, 16))
+        hub["lm_head.weight"] = mx.zeros((128, 64))
+
+        sanitized = model.sanitize(dict(hub))
+        self.assertFalse(any(k.startswith(mtp) for k in sanitized))
+        self.assertNotIn("lm_head.weight", sanitized)
+
+        inputs = mx.array([[0, 1, 2, 3, 4]])
+        expected = model(inputs)
+        for name, weights in (("mlx", mlx_weights), ("hub", hub)):
+            with self.subTest(layout=name):
+                m = omoikane.Model(args)
+                m.load_weights(list(m.sanitize(dict(weights)).items()), strict=True)
+                self.assertTrue(mx.allclose(m(inputs), expected).item())
+
+    def test_omoikane_group_routing(self):
+        from mlx_lm.models.omoikane.layers import group_limited_select
+
+        # The correction bias makes every score negative. Experts 0 and 1 form
+        # the best group, so they must win over the excluded group's experts.
+        gates = mx.zeros((1, 4))
+        bias = mx.array([-2.0, -2.1, -3.0, -3.0])
+        inds, weights = group_limited_select(gates, bias, 2, 2, 1, 1.0, True)
+        self.assertEqual(sorted(inds[0].tolist()), [0, 1])
+        self.assertTrue(mx.allclose(weights, mx.array([[0.5, 0.5]])).item())
+
     def test_exaone(self):
         from mlx_lm.models import exaone
 
