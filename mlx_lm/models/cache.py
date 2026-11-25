@@ -1313,7 +1313,9 @@ class BatchRotatingKVCache(_BaseCache):
         rinds = rinds[None]
         mask = linds >= rinds
         mask &= linds < rinds + window_size
-        if (trim_size := self._idx - self.max_size + int(N > 1)) > 0:
+        # A multi-token update first puts a rotated cache in temporal order.
+        idx = self.keys.shape[2] if N > 1 and self.rotated else self._idx
+        if (trim_size := idx - self.max_size + int(N > 1)) > 0:
             left_padding = left_padding - trim_size
 
         rotated = N == 1 and (self.rotated or self._idx >= self.max_size)
