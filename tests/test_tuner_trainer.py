@@ -299,6 +299,34 @@ class TestTunerTrainer(unittest.TestCase):
 
         mx.eval(mx.grad(loss_fn)(embeddings))
 
+    def test_iterate_batches_clamps_offset_to_truncated_length(self):
+        # A prompt longer than max_seq_length must not leave the loss-mask
+        # offset past the truncated length, which would yield an empty mask.
+        data = [([i] * 16, 16) for i in range(4)]
+        for _, lengths in iterate_batches(data, batch_size=4, max_seq_length=8):
+            for offset, length in lengths.tolist():
+                self.assertLessEqual(offset, length)
+
+    def test_default_loss_finite_with_empty_mask(self):
+        from mlx_lm.tuner.trainer import default_loss
+
+        class _TinyModel(nn.Module):
+            def __init__(self, vocab=8):
+                super().__init__()
+                self.embed = nn.Embedding(vocab, 4)
+                self.head = nn.Linear(4, vocab)
+
+            def __call__(self, x):
+                return self.head(self.embed(x))
+
+        model = _TinyModel()
+        batch = mx.array([[1, 2, 3]])
+        lengths = mx.array([[5, 3]])  # offset past length -> empty mask
+        loss, ntoks = default_loss(model, batch, lengths)
+        mx.eval(loss, ntoks)
+        self.assertTrue(mx.isfinite(loss).item())
+        self.assertEqual(ntoks.item(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()
