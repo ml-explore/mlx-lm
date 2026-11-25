@@ -1034,5 +1034,48 @@ class TestGenerationThreadDeath(unittest.TestCase):
             rg._await_response(Queue())
 
 
+
+
+class TestGenerateResponseContent(unittest.TestCase):
+    def _make_handler(self, *, stream: bool):
+        handler = APIHandler.__new__(APIHandler)
+        handler.request_id = "chatcmpl-test"
+        handler.system_fingerprint = "fp-test"
+        handler.object_type = "chat.completion.chunk" if stream else "chat.completion"
+        handler.requested_model = "test-model"
+        handler.created = 0
+        handler.stream = stream
+        return handler
+
+    def test_streaming_final_chunk_includes_null_content_when_empty(self):
+        handler = self._make_handler(stream=True)
+        resp = handler.generate_response("", finish_reason="length")
+        delta = resp["choices"][0]["delta"]
+        self.assertIn("content", delta)
+        self.assertIsNone(delta["content"])
+        self.assertEqual(resp["choices"][0]["finish_reason"], "length")
+
+    def test_streaming_intermediate_reasoning_chunk_omits_empty_content(self):
+        handler = self._make_handler(stream=True)
+        resp = handler.generate_response("", finish_reason=None, reasoning_text="step 1")
+        delta = resp["choices"][0]["delta"]
+        self.assertNotIn("content", delta)
+        self.assertEqual(delta["reasoning"], "step 1")
+
+    def test_streaming_final_chunk_preserves_nonempty_content(self):
+        handler = self._make_handler(stream=True)
+        resp = handler.generate_response("hello", finish_reason="stop")
+        self.assertEqual(resp["choices"][0]["delta"]["content"], "hello")
+
+    def test_non_streaming_empty_content_is_none(self):
+        handler = self._make_handler(stream=False)
+        resp = handler.generate_response(
+            "", finish_reason="length", prompt_token_count=5, completion_token_count=10
+        )
+        msg = resp["choices"][0]["message"]
+        self.assertIn("content", msg)
+        self.assertIsNone(msg["content"])
+
+
 if __name__ == "__main__":
     unittest.main()
