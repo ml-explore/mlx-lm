@@ -35,7 +35,9 @@ def mixed_quant_predicate_builder(
     else:
         raise ValueError(f"Invalid quant recipe {recipe}")
 
-    down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
+    # LFM2 and InternLM2: feed_forward.w2
+    down_names = ("down_proj", "feed_forward.w2")
+    down_keys = [k for k, _ in model.named_modules() if any(n in k for n in down_names)]
     if len(down_keys) == 0:
         raise ValueError("Model does not have expected keys for mixed quant.")
 
@@ -67,7 +69,7 @@ def mixed_quant_predicate_builder(
             "v_proj" in path or "v_a_proj" in path or "v_b_proj" in path
         ) and use_more_bits:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
-        if "down_proj" in path and use_more_bits:
+        if any(n in path for n in down_names) and use_more_bits:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
         if "lm_head" in path:
             return {"group_size": group_size, "bits": high_bits, "mode": mode}
