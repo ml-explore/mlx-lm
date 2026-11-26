@@ -3,6 +3,8 @@
 import http
 import io
 import json
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -14,7 +16,7 @@ import mlx.core as mx
 import requests
 
 from mlx_lm.generate import TextStateMachine
-from mlx_lm.models.cache import KVCache, QuantizedKVCache
+from mlx_lm.models.cache import KVCache, QuantizedKVCache, RotatingKVCache
 from mlx_lm.server import (
     APIHandler,
     GenerationContext,
@@ -31,7 +33,9 @@ from mlx_lm.utils import load
 
 
 class DummyModelProvider:
-    def __init__(self, with_draft=False, kv_bits=None, quantized_kv_start=0):
+    def __init__(
+        self, with_draft=False, kv_bits=None, quantized_kv_start=0, max_kv_size=None
+    ):
         HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
         self.model, self.tokenizer = load(HF_MODEL_PATH)
         self.processor = None
@@ -68,6 +72,7 @@ class DummyModelProvider:
                 "kv_bits": kv_bits,
                 "kv_group_size": 64,
                 "quantized_kv_start": quantized_kv_start,
+                "max_kv_size": max_kv_size,
             },
         )
 
@@ -716,6 +721,99 @@ class TestServerKVCacheQuantization(unittest.TestCase):
             self.assertIsInstance(c, QuantizedKVCache)
             self.assertEqual(c.bits, 4)
             self.assertEqual(c.group_size, 64)
+
+
+class TestServerMaxKVSize(unittest.TestCase):
+    MAX_KV_SIZE = 32
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model_provider = DummyModelProvider(max_kv_size=cls.MAX_KV_SIZE)
+        cls.prompt_cache = LRUPromptCache()
+        cls.response_generator = ResponseGenerator(cls.model_provider, cls.prompt_cache)
+        cls.httpd = http.server.HTTPServer(
+            ("localhost", 0),
+            lambda *args, **kwargs: APIHandler(cls.response_generator, *args, **kwargs),
+        )
+        cls.port = cls.httpd.server_port
+        cls.server_thread = threading.Thread(target=cls.httpd.serve_forever)
+        cls.server_thread.daemon = True
+        cls.server_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        cls.server_thread.join()
+        cls.response_generator.stop_and_join()
+
+    def _complete_and_capture_caches(self, prompt, **body):
+        tokens = self.model_provider.tokenizer.encode(prompt)
+        self.assertGreater(len(tokens), self.MAX_KV_SIZE)
+        url = f"http://localhost:{self.port}/v1/completions"
+        # A full rotating cache cannot be trimmed, so capture it on insert.
+        with mock.patch.object(
+            self.prompt_cache,
+            "insert_cache",
+            wraps=self.prompt_cache.insert_cache,
+        ) as insert_cache:
+            response = requests.post(
+                url,
+                json={
+                    "model": "default_model",
+                    "prompt": prompt,
+                    "max_tokens": 8,
+                    **body,
+                },
+            )
+            # The generation thread stores the cache just after replying.
+            deadline = time.monotonic() + 10
+            while not insert_cache.called and time.monotonic() < deadline:
+                time.sleep(0.05)
+        self.assertIn("choices", json.loads(response.text))
+        caches = [call.args[2] for call in insert_cache.call_args_list]
+        self.assertTrue(caches)
+        return caches
+
+    def _assert_bounded(self, caches):
+        for cache in caches:
+            for c in cache:
+                self.assertIsInstance(c, RotatingKVCache)
+                self.assertEqual(c.max_size, self.MAX_KV_SIZE)
+                self.assertLessEqual(c.keys.shape[2], self.MAX_KV_SIZE)
+
+    def test_max_kv_size_disables_batching(self):
+        args = type("args", (object,), {"seed": None})
+        self.assertFalse(self.response_generator._is_batchable(args))
+
+    def test_completion_uses_a_bounded_cache(self):
+        prompt = "Once upon a time " * 20
+        self._assert_bounded(self._complete_and_capture_caches(prompt))
+
+    def test_seeded_completion_uses_a_bounded_cache(self):
+        prompt = "In a land far away " * 20
+        self._assert_bounded(self._complete_and_capture_caches(prompt, seed=0))
+
+
+class TestServerMaxKVSizeArguments(unittest.TestCase):
+    def _run(self, *args):
+        return subprocess.run(
+            [sys.executable, "-m", "mlx_lm.server", *args],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_rejects_sizes_up_to_4(self):
+        for size in ["0", "4"]:
+            result = self._run("--max-kv-size", size)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("--max-kv-size must be greater than 4", result.stderr)
+
+    def test_rejects_kv_bits(self):
+        result = self._run("--max-kv-size", "128", "--kv-bits", "4")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("cannot be combined with --kv-bits", result.stderr)
 
 
 class TestServerWithoutKVCacheQuantization(unittest.TestCase):

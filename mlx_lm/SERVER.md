@@ -50,6 +50,27 @@ token position at which quantization starts (default `5000`).
 > A quantized KV cache does not support batching. The server processes requests
 > one at a time when you set `--kv-bits`.
 
+### KV Cache Size
+
+Use `--max-kv-size` to cap the number of tokens kept in each request's KV
+cache. Once the cache is full, the oldest tokens are dropped, which bounds
+memory for long conversations at the cost of the model no longer seeing them:
+
+```shell
+mlx_lm.server --model <path_to_model_or_hf_repo> --max-kv-size 4096
+```
+
+The first 4 tokens of each request are always kept, so the size must be
+greater than 4. While a prompt is processed, the cache can briefly hold up to
+`--max-kv-size` plus `--prefill-step-size` tokens.
+
+`--max-kv-size` cannot be combined with `--kv-bits`. It does not apply to
+requests that use a draft model, and models that build their own cache ignore
+it.
+
+> [!NOTE]
+> The server processes requests one at a time when you set `--max-kv-size`.
+
 You can make a request to the model by running:
 
 ```shell
