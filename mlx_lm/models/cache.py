@@ -668,7 +668,7 @@ class ArraysCache(_BaseCache):
 
     def extract(self, idx):
         cache = ArraysCache(len(self.cache))
-        cache.cache = [c[idx : idx + 1] for c in self.cache]
+        cache.cache = [c[idx : idx + 1] if c is not None else None for c in self.cache]
         return cache
 
     def prepare(self, lengths=None, **kwargs):
@@ -706,7 +706,9 @@ class ArraysCache(_BaseCache):
             return cache
 
         for e in range(n_state):
-            c_init = next(iter(c[e] for c in caches if c[e] is not None))
+            c_init = next((c[e] for c in caches if c[e] is not None), None)
+            if c_init is None:
+                continue
             shape = list(c_init.shape)
             shape[0] = B
             cache[e] = mx.zeros(shape, c_init.dtype)
@@ -717,7 +719,7 @@ class ArraysCache(_BaseCache):
         return cache
 
     def empty(self):
-        return self.cache[0] is None
+        return all(c is None for c in self.cache)
 
     @property
     def nbytes(self):
@@ -1046,8 +1048,12 @@ class BatchKVCache(_BaseCache):
 
     def extract(self, idx):
         cache = KVCache()
+        if self.keys is None:
+            return cache
         mx.eval(self.left_padding)
         padding = self.left_padding.tolist()[idx]
+        if padding >= self._idx:
+            return cache
         cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, padding : self._idx])
         cache.values = mx.contiguous(self.values[idx : idx + 1, :, padding : self._idx])
         cache.offset = cache.keys.shape[2]
@@ -1390,10 +1396,14 @@ class BatchRotatingKVCache(_BaseCache):
         self._offset = max(self._offset, other._offset)
 
     def extract(self, idx):
-        mx.eval(self.left_padding, self.offset)
         cache = RotatingKVCache(self.max_size)
+        if self.keys is None:
+            return cache
+        mx.eval(self.left_padding, self.offset)
         padding = max(0, self.left_padding.tolist()[idx])
         offset = self.offset.tolist()[idx]
+        if offset <= 0:
+            return cache
         cache.keys = self.keys[idx : idx + 1]
         cache.values = self.values[idx : idx + 1]
         cache._idx = self._idx

@@ -835,6 +835,47 @@ class TestPromptCache(unittest.TestCase):
         expected = create_causal_mask(1, offset=32, window_size=4)
         self.assertTrue(mx.array_equal(mask, expected))
 
+    def test_extract_and_merge_empty_or_partial_caches(self):
+        # Extracting from merged empty batch caches returns empty single caches
+        arr_batch = ArraysCache.merge([ArraysCache(2), ArraysCache(2)])
+        arr_ex = arr_batch.extract(0)
+        self.assertTrue(arr_ex.empty())
+        self.assertEqual(arr_ex.cache, [None, None])
+
+        kv_batch = BatchKVCache.merge([KVCache(), KVCache()])
+        kv_ex = kv_batch.extract(0)
+        self.assertTrue(kv_ex.empty())
+        self.assertEqual(kv_ex.offset, 0)
+
+        rot_batch = BatchRotatingKVCache.merge([RotatingKVCache(8), RotatingKVCache(8)])
+        rot_ex = rot_batch.extract(0)
+        self.assertTrue(rot_ex.empty())
+        self.assertEqual(rot_ex.offset, 0)
+
+        # Extracting an empty slot from a mixed batch preserves empty()
+        c_full = KVCache()
+        c_full.update_and_fetch(mx.ones((1, 2, 4, 8)), mx.ones((1, 2, 4, 8)))
+        mixed_kv = BatchKVCache.merge([KVCache(), c_full])
+        self.assertTrue(mixed_kv.extract(0).empty())
+        self.assertEqual(mixed_kv.extract(1).offset, 4)
+
+        r_full = RotatingKVCache(8)
+        r_full.update_and_fetch(mx.ones((1, 2, 4, 8)), mx.ones((1, 2, 4, 8)))
+        mixed_rot = BatchRotatingKVCache.merge([RotatingKVCache(8), r_full])
+        self.assertTrue(mixed_rot.extract(0).empty())
+        self.assertEqual(mixed_rot.extract(1).offset, 4)
+
+        # ArraysCache with partial slots preserves populated slots and None slots
+        a1 = ArraysCache(2)
+        a2 = ArraysCache(2)
+        a2[1] = mx.ones((1, 4))
+        self.assertFalse(a2.empty())
+        merged_slot1 = ArraysCache.merge([a1, a2])
+        self.assertIsNone(merged_slot1[0])
+        self.assertEqual(merged_slot1[1].shape, (2, 4))
+        self.assertIsNone(merged_slot1.extract(0)[0])
+        self.assertEqual(merged_slot1.extract(1)[1].shape, (1, 4))
+
 
 if __name__ == "__main__":
     unittest.main()
