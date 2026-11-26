@@ -174,3 +174,8 @@ list contains the following fields:
 
 - `id`: The Hugging Face repo id.
 - `created`: A time-stamp representing the model creation time.
+
+### Experimental Server
+
+`mlx_lm.server_v2` is an experimental OpenAI-compatible server. See
+[SERVER_V2.md](SERVER_V2.md).

@@ -172,6 +172,11 @@ class TestSampleUtils(unittest.TestCase):
             alone = mx.softmax(apply_xtc(mx.log(probs[i : i + 1]), 1, 0.2, []), -1)
             self.assertTrue(mx.allclose(batched[i : i + 1], alone))
 
+        # Test that each row in a batch draws its own probability
+        logits = mx.log(mx.array([[0.5, 0.3, 0.2]] * 64))
+        masked = mx.isinf(apply_xtc(logits, 0.5, 0.1, [])[:, 0])
+        self.assertTrue(0 < masked.sum().item() < 64)
+
     def test_presence_penalty(self):
         # Token appears multiple times - penalty applied once
         tokens = mx.array([0, 0, 0, 1, 1])
