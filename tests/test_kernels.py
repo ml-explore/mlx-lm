@@ -6,9 +6,9 @@ from unittest.mock import patch
 import mlx.core as mx
 import mlx.nn as nn
 
-from mlx_lm.kernels import sparse_mla
+from mlx_lm.kernels import sparse_attention
 from mlx_lm.kernels.expert_routing import expert_routing
-from mlx_lm.kernels.sparse_mla import sparse_mla_attention
+from mlx_lm.kernels.sparse_attention import indexed_attention
 from mlx_lm.models.muse_spark.kernels import (
     norm_add_norm,
     post_expert_norm_combine,
@@ -89,6 +89,24 @@ def _sparse_mla_ref(q, q_pe, kv, k_pe, idx, scale):
     probs = mx.softmax(scores, axis=-1)
     values = kv[rows].astype(mx.float32)  # [L, K, r]
     return (probs[..., None] * values[None]).sum(-2)  # [H, L, r]
+
+
+def _sparse_gqa_ref(q, k, v, idx, scale, q_pe=None, k_pe=None):
+    # Query head h uses kv head h // (H // KVH); entries outside [0, N) are skipped.
+    G = q.shape[0] // k.shape[0]
+    valid = (idx >= 0) & (idx < k.shape[1])
+    rows = mx.where(valid, idx, 0)
+    keys = mx.repeat(k[:, rows], G, axis=0).astype(mx.float32)  # [H, L, K, d]
+    values = mx.repeat(v[:, rows], G, axis=0).astype(mx.float32)
+    scores = (q.astype(mx.float32)[:, :, None] * keys).sum(-1)  # [H, L, K]
+    if q_pe is not None:
+        pe = mx.repeat(k_pe[:, rows], G, axis=0).astype(mx.float32)
+        scores = scores + (q_pe.astype(mx.float32)[:, :, None] * pe).sum(-1)
+    scores = scores * scale
+    scores = mx.where(valid[None], scores, -mx.inf)
+    # A query without keys gives 0.
+    probs = mx.where(valid[None], mx.softmax(scores, axis=-1), 0)
+    return (probs[..., None] * values).sum(-2)  # [H, L, d]
 
 
 @unittest.skipIf(not mx.metal.is_available(), "The kernels need the Metal backend")
@@ -207,11 +225,11 @@ class TestKernels(unittest.TestCase):
             kv = mx.random.normal((N, r)).astype(dtype)
             k_pe = mx.random.normal((N, p)).astype(dtype)
             ref = _sparse_mla_ref(q, q_pe, kv, k_pe, idx, 0.05).astype(dtype)
-            for variant in sparse_mla.VARIANTS:
-                if not sparse_mla.is_available(variant):
+            for variant in sparse_attention.VARIANTS:
+                if not sparse_attention.is_available(variant):
                     continue
-                out = sparse_mla_attention(
-                    q, q_pe, kv, k_pe, idx, 0.05, variant=variant
+                out = indexed_attention(
+                    q, kv, None, idx, 0.05, q_pe=q_pe, k_pe=k_pe, variant=variant
                 )
                 self._assert_close(out, ref, 2e-2)
 
@@ -226,23 +244,113 @@ class TestKernels(unittest.TestCase):
         ]
         for arch, version, expected in cases:
             with (
-                patch.object(sparse_mla, "_gpu_architecture", return_value=arch),
-                patch.object(sparse_mla, "_macos_version", return_value=version),
+                patch.object(sparse_attention, "_gpu_architecture", return_value=arch),
+                patch.object(sparse_attention, "_macos_version", return_value=version),
             ):
-                self.assertEqual(sparse_mla.is_available("tensor_ops"), expected)
+                self.assertEqual(sparse_attention.is_available("tensor_ops"), expected)
 
     def test_sparse_mla_unsupported_shapes(self):
-        def inputs(H=16, r=512, p=16, dtype=mx.bfloat16):
+        def run(H=16, r=512, p=16, dtype=mx.bfloat16, variant=None):
             q, q_pe = mx.zeros((H, 2, r), dtype), mx.zeros((H, 2, p), dtype)
             kv, k_pe = mx.zeros((40, r), dtype), mx.zeros((40, p), dtype)
-            return q, q_pe, kv, k_pe, mx.zeros((2, 4), mx.int32), 1.0
+            idx = mx.zeros((2, 4), mx.int32)
+            kwargs = dict(q_pe=q_pe, k_pe=k_pe, variant=variant)
+            return indexed_attention(q, kv, None, idx, 1.0, **kwargs)
 
         # A latent width the kernel can't split across its simdgroups.
-        self.assertIsNone(sparse_mla_attention(*inputs(r=32)))
-        self.assertIsNone(sparse_mla_attention(*inputs(dtype=mx.float32)))
-        self.assertIsNone(sparse_mla_attention(*inputs(H=8)))
-        self.assertIsNone(sparse_mla_attention(*inputs(p=0)))
-        self.assertIsNone(sparse_mla_attention(*inputs(), variant="unknown"))
+        self.assertIsNone(run(r=32))
+        self.assertIsNone(run(dtype=mx.float32))
+        self.assertIsNone(run(H=8))
+        self.assertIsNone(run(p=0))
+        self.assertIsNone(run(variant="unknown"))
+        # With k [N, r] the heads are in groups of 16; with k [1, N, r] 8 heads are a group.
+        self.assertFalse(sparse_attention.supports(8, 512, mx.bfloat16, rope=16))
+        self.assertEqual(
+            sparse_attention.supports(8, 512, mx.bfloat16, kv_heads=1, rope=16),
+            sparse_attention.supports(16, 512, mx.bfloat16, rope=16),
+        )
+        self.assertFalse(sparse_attention.supports(16, 512, mx.bfloat16, mx.float32))
+
+    def test_sparse_gqa_attention(self):
+        # GQA layouts: QSA sizes (24 heads, 2 kv heads, d 256), each simdgroup count,
+        # 16 heads and groups of 16 heads per kv head, 1 query, a rope part with
+        # several kv heads (with separate values and without them), key counts that
+        # aren't a multiple of the kernel's key block, skipped entries (-1, N or more)
+        # and a query with none.
+        mx.random.seed(0)
+        variants = [
+            v for v in sparse_attention.VARIANTS if sparse_attention.is_available(v)
+        ]
+        cases = [  # H, KVH, d, rope, N, L, K
+            (24, 2, 256, 0, 300, 5, 300),
+            (8, 1, 64, 0, 50, 3, 7),
+            (16, 1, 128, 0, 70, 1, 40),
+            (32, 4, 64, 0, 40, 4, 33),
+            (64, 2, 128, 0, 40, 2, 64),
+            (32, 4, 128, 64, 60, 3, 40),
+        ]
+        for H, KVH, d, p, N, L, K in cases:
+            idx = mx.random.randint(0, N, (L, K)).astype(mx.int32)
+            u = mx.random.uniform(shape=(L, K))
+            idx = mx.where(u < 0.1, -1, mx.where(u > 0.95, N + 7, idx))
+            if L > 1:
+                idx[-1] = -1
+            for dtype in (mx.bfloat16, mx.float16):
+                q = mx.random.normal((H, L, d)).astype(dtype)
+                k = mx.random.normal((KVH, N, d)).astype(dtype)
+                v = mx.random.normal((KVH, N, d)).astype(dtype)
+                q_pe = k_pe = None
+                if p:
+                    q_pe = mx.random.normal((H, L, p)).astype(dtype)
+                    k_pe = mx.random.normal((KVH, N, p)).astype(dtype)
+                for values in (v, None) if p else (v,):
+                    kv = k if values is None else values
+                    ref = _sparse_gqa_ref(q, k, kv, idx, 0.06, q_pe, k_pe).astype(dtype)
+                    for variant in variants:
+                        out = indexed_attention(
+                            q,
+                            k,
+                            values,
+                            idx,
+                            0.06,
+                            q_pe=q_pe,
+                            k_pe=k_pe,
+                            variant=variant,
+                        )
+                        self._assert_close(out, ref, 2e-2)
+        # Separate value rows equal to the key rows give the MLA (values = keys) result.
+        q = mx.random.normal((16, 3, 256)).astype(mx.bfloat16)
+        k = mx.random.normal((64, 256)).astype(mx.bfloat16)
+        idx = mx.random.randint(0, 64, (3, 40)).astype(mx.int32)
+        for variant in variants:
+            a = indexed_attention(q, k, None, idx, 0.05, variant=variant)
+            b = indexed_attention(q, k, k, idx, 0.05, variant=variant)
+            self.assertTrue(mx.array_equal(a, b))
+
+    def test_sparse_gqa_unsupported_shapes(self):
+        def inputs(H=24, KVH=2, d=256, dtype=mx.bfloat16):
+            q, k = mx.zeros((H, 2, d), dtype), mx.zeros((KVH, 40, d), dtype)
+            return q, k, k, mx.zeros((2, 4), mx.int32), 1.0
+
+        self.assertIsNone(indexed_attention(*inputs(d=32)))
+        self.assertIsNone(indexed_attention(*inputs(dtype=mx.float32)))
+        # Heads not a multiple of the kv heads or of 16 groups, fewer heads, no kv heads.
+        self.assertIsNone(indexed_attention(*inputs(H=34, KVH=2)))
+        self.assertIsNone(indexed_attention(*inputs(H=24, KVH=5)))
+        self.assertIsNone(indexed_attention(*inputs(H=1, KVH=2)))
+        self.assertIsNone(indexed_attention(*inputs(KVH=0)))
+        self.assertIsNone(indexed_attention(*inputs(), variant="unknown"))
+        # Values not like the keys, a rope part only for q, indices not one row per query.
+        q, k, v, idx, scale = inputs()
+        self.assertIsNone(indexed_attention(q, k, v[:, :20], idx, scale))
+        self.assertIsNone(indexed_attention(q, k, v, idx, scale, q_pe=q[..., :64]))
+        self.assertIsNone(indexed_attention(q, k, v, idx[:1], scale))
+        device = mx.default_device()
+        try:
+            mx.set_default_device(mx.cpu)
+            self.assertIsNone(indexed_attention(*inputs()))
+        finally:
+            mx.set_default_device(device)
 
 
 if __name__ == "__main__":
