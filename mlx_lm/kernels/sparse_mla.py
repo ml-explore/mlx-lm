@@ -1,6 +1,6 @@
 # Copyright © 2026 Apple Inc.
 
-"""Fused sparse MLA attention for DSA prefill (deepseek_v32, glm_moe_dsa).
+"""Fused sparse MLA attention for DSA prefill (deepseek_v32, glm_moe_dsa, kimi_k31).
 
 ``sparse_mla_attention`` computes, for every query, attention over its own top-k keys in the
 absorbed latent space (keys are latent + rope, values are the latent), as

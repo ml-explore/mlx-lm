@@ -6,7 +6,7 @@ import unittest
 import mlx.core as mx
 
 from mlx_lm.layers.distributed import PipelineMixin
-from mlx_lm.models import muse_spark, qwen2, qwen3_moe, qwen3_next
+from mlx_lm.models import kimi_k31, muse_spark, qwen2, qwen3_moe, qwen3_next
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.utils import model_package, quantize_model
 
@@ -295,6 +295,76 @@ class TestModelParallel(unittest.TestCase):
 
                 expected = run()
                 model.shard()
+                for e, out in zip(expected, run()):
+                    self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
+
+    def test_kimi_k31_decode(self):
+        # Tiny random model: GPU fp32 matmul rounding can be larger than the tolerance.
+        device = mx.default_device()
+        mx.set_default_device(mx.cpu)
+        self.addCleanup(mx.set_default_device, device)
+        # index_topk is 4, so the indexer selects keys in prefill and decode.
+        # Layers 2 and 4 (1-based) use DSA: a two-stage pipeline ends a stage on each.
+        config = {
+            "model_type": "kimi_k31",
+            "text_config": {
+                "vocab_size": 128,
+                "hidden_size": 64,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "intermediate_size": 96,
+                "activation_situ_beta": 4.0,
+                "activation_situ_linear_beta": 25.0,
+                "linear_attn_config": {
+                    "kda_layers": [1, 3],
+                    "full_attn_layers": [2, 4],
+                    "num_heads": 4,
+                    "head_dim": 16,
+                    "short_conv_kernel_size": 4,
+                    "gate_lower_bound": -5.0,
+                    "use_full_rank_gate": True,
+                },
+                "num_experts": 4,
+                "moe_intermediate_size": 32,
+                "q_lora_rank": 32,
+                "kv_lora_rank": 32,
+                "qk_nope_head_dim": 16,
+                "qk_rope_head_dim": 8,
+                "v_head_dim": 16,
+                "mla_use_output_gate": True,
+                "num_experts_per_token": 2,
+                "num_shared_experts": 1,
+                "first_k_dense_replace": 1,
+                "routed_expert_hidden_size": 32,
+                "latent_moe_use_norm": True,
+                "attn_res_block_size": 2,
+                "dsa_config": {
+                    "dsa_layers": [2, 4],
+                    "index_topk": 4,
+                    "index_head_dim": 16,
+                    "index_num_heads": 2,
+                },
+            },
+        }
+        for split in ("shard", "pipeline"):
+            with self.subTest(split=split):
+                mx.random.seed(0)
+                model = kimi_k31.Model(kimi_k31.ModelArgs.from_dict(config))
+                x = mx.random.randint(0, 128, shape=(1, 12))
+
+                def run():
+                    cache = make_prompt_cache(model)
+                    outputs = [model(x[:, :8], cache=cache)]
+                    for i in range(8, 12):
+                        outputs.append(model(x[:, i : i + 1], cache=cache))
+                    return outputs
+
+                expected = run()
+                if split == "shard":
+                    model.shard()
+                else:
+                    model.model.pipeline(mx.distributed.init())
                 for e, out in zip(expected, run()):
                     self.assertTrue(mx.allclose(e, out, rtol=1e-3, atol=1e-3))
 

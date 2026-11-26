@@ -8,7 +8,7 @@ from mlx.nn.layers.distributed import shard_inplace, shard_linear
 
 from mlx_lm.layers.attention import create_attention_mask
 from mlx_lm.layers.recurrent import create_ssm_mask
-from mlx_lm.models.cache import ArraysCache, KVCache
+from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 from mlx_lm.models.kimi_k3 import checkpoint
 from mlx_lm.models.kimi_k3.config import ModelArgs, TextArgs
 from mlx_lm.models.kimi_k3.layers import (
@@ -25,13 +25,20 @@ __all__ = [
 ]
 
 
+def _first_cache(c):
+    # Sparse attention layers keep [latent cache, indexer cache] in a CacheList.
+    return c[0] if isinstance(c, CacheList) else c
+
+
 class KimiK3TextModel(nn.Module):
+    decoder_layer = KimiK3DecoderLayer
+
     def __init__(self, args: TextArgs):
         super().__init__()
         self.args = args
         self.embed_tokens = nn.Embedding(args.vocab_size, args.hidden_size)
         self.layers = [
-            KimiK3DecoderLayer(args, i) for i in range(args.num_hidden_layers)
+            self.decoder_layer(args, i) for i in range(args.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.use_attn_res = args.attn_res_block_size is not None
@@ -67,7 +74,7 @@ class KimiK3TextModel(nn.Module):
         )
         if self.attn_idx is not None:
             attn_mask = create_attention_mask(
-                h, cache[self.attn_idx], return_array=True
+                h, _first_cache(cache[self.attn_idx]), return_array=True
             )
         else:
             attn_mask = None
@@ -105,11 +112,12 @@ class KimiK3TextModel(nn.Module):
                 h = packed[-1]
             else:
                 h = mx.distributed.send(h.astype(boundary_dtype), dst)
-            if cache[-1] is not None:
-                if hasattr(cache[-1], "keys"):
-                    cache[-1].keys = mx.depends(cache[-1].keys, h)
+            last = _first_cache(cache[-1])
+            if last is not None:
+                if hasattr(last, "keys"):
+                    last.keys = mx.depends(last.keys, h)
                 else:
-                    cache[-1][0] = mx.depends(cache[-1][0], h)
+                    last[0] = mx.depends(last[0], h)
         elif blocks is not None:
             if self.training or self._output_res_w_eff is None:
                 self._output_res_w_eff = self.output_attn_res_norm.weight.astype(

@@ -216,8 +216,8 @@ class QuantizedMultiLinear(nn.Module):
         )
 
 
-# Sparse prefill for DeepSeek sparse attention (DSA) models (deepseek_v32, glm_moe_dsa):
-# attention over each query's top-k keys from the indexer.
+# Sparse prefill for DeepSeek sparse attention (DSA) models (deepseek_v32, glm_moe_dsa,
+# kimi_k31): attention over each query's top-k keys from the indexer.
 
 SPARSE_QUERY_BLOCK = 1024
 
@@ -251,7 +251,14 @@ def min_context(attn, q_pe, kv_latent, k_pe):
     return attn.sparse_prefill_min_context
 
 
-def fused_sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L):
+def _out_proj(attn, out, gate):
+    # An optional output gate [B, L, H * v_head_dim] multiplies before o_proj.
+    return attn.o_proj(out if gate is None else out * gate)
+
+
+def fused_sparse_attention(
+    attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L, gate=None
+):
     # sparse_attention in one Metal kernel that reads the selected rows by index,
     # or None when the kernel doesn't support the inputs.
     kv, kp = kv_latent[0, 0], k_pe[0, 0]
@@ -266,13 +273,13 @@ def fused_sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L
     if out is None:
         return None
     out = attn.unembed_out(out[None])  # [1, H, L, v_head_dim]
-    return attn.o_proj(out.transpose(0, 2, 1, 3).reshape(B, L, -1))
+    return _out_proj(attn, out.transpose(0, 2, 1, 3).reshape(B, L, -1), gate)
 
 
-def sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L):
+def sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L, gate=None):
     # Absorbed form: 576-wide keys (512 latent + 64 rope), 512-wide values. B is 1.
     if attn.sparse_prefill_fused and not attn.training:
-        args = (attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L)
+        args = (attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L, gate)
         out = fused_sparse_attention(*args)
         if out is not None:
             return out
@@ -285,7 +292,10 @@ def sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L):
             m = None if mask is None else mask.reshape(L, -1)[s:e]
             q = (q_nope[:, :, s:e], q_pe[:, :, s:e])
             idx = topk[:, :, s:e]
-            outs.append(sparse_attention(attn, *q, kv_latent, k_pe, idx, m, B, e - s))
+            g = None if gate is None else gate[:, s:e]
+            outs.append(
+                sparse_attention(attn, *q, kv_latent, k_pe, idx, m, B, e - s, gate=g)
+            )
         return mx.concatenate(outs, axis=1)
     q_full = mx.concatenate([attn.embed_q(q_nope), q_pe], axis=-1)[0]  # [H, L, 576]
     kv_full = mx.concatenate([kv_latent, k_pe], axis=-1)[0, 0]  # [N, 576]
@@ -302,7 +312,7 @@ def sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L):
     latent_out = latent_out.transpose(1, 0, 2)[None]  # [1, H, L, 512]
     out = attn.unembed_out(latent_out)  # [1, H, L, v_head_dim]
     out = out.transpose(0, 2, 1, 3).reshape(B, L, -1)
-    return attn.o_proj(out)
+    return _out_proj(attn, out, gate)
 
 
 def blocked_topk(indexer, x, qr, mask, cache, block=4096):
