@@ -769,6 +769,8 @@ class ResponseGenerator:
             self.model_provider.is_batchable
             and args.seed is None
             and self.cli_args.kv_bits is None
+            # The batch cache drops the sink tokens of a rotating cache.
+            and self.cli_args.max_kv_size is None
         )
 
     def _generate(self):
@@ -1090,8 +1092,13 @@ class ResponseGenerator:
             ctx.prompt_cache_count = len(prompt) - len(rest)
             rest = prompt[ctx.prompt_cache_count :]
             if cache is None:
-                cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                # Speculative decoding must trim the cache, so do not rotate it.
+                if self.model_provider.draft_model is None:
+                    cache = make_prompt_cache(
+                        self.model_provider.model, self.cli_args.max_kv_size
+                    )
+                else:
+                    cache = make_prompt_cache(self.model_provider.model)
                     cache += make_prompt_cache(self.model_provider.draft_model)
 
             # The images after the cached tokens.
@@ -2061,11 +2068,27 @@ def main():
         f"(default: {DEFAULT_QUANTIZED_KV_START})",
     )
     parser.add_argument(
+        "--max-kv-size",
+        type=int,
+        default=None,
+        help="Maximum number of tokens kept in each request's KV cache. "
+        "Older tokens are dropped once it is full, which bounds memory for "
+        "long conversations. Must be greater than 4. Requests are served one "
+        "at a time when set. Not used with a draft model. Default: None "
+        "(unbounded)",
+    )
+    parser.add_argument(
         "--pipeline",
         action="store_true",
         help="Use pipelining instead of tensor parallelism",
     )
     args = parser.parse_args()
+    if args.max_kv_size is not None:
+        # The rotating cache always keeps its first 4 tokens.
+        if args.max_kv_size <= 4:
+            parser.error("--max-kv-size must be greater than 4")
+        if args.kv_bits is not None:
+            parser.error("--max-kv-size cannot be combined with --kv-bits")
     _ = maybe_set_recommended_wired_limit()
 
     logging.basicConfig(
