@@ -6,6 +6,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from mlx_lm.kernels import sparse_attention
 from mlx_lm.layers.attention import scaled_dot_product_attention
 from mlx_lm.layers.moe import SwitchGLU
 from mlx_lm.layers.recurrent import gated_delta_update, normalize_qk
@@ -30,6 +31,12 @@ _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15
 _M1, _M2 = 0xBF58476D1CE4E5B9, 0x94D049BB133111EB
 _PRIME_1 = 10007
+
+# The prefill top k scores this many key blocks at a time (as blocked_topk in
+# mlx_lm/layers/attention.py), so that only one block of scores is alive.
+_TOPK_KEY_BLOCK = 4096
+# The gather prefill reads the keys of this many queries at a time.
+_QUERY_BLOCK = 128
 
 
 class RMSNorm(nn.Module):
@@ -184,7 +191,40 @@ class QSAIndexer(nn.Module):
             rotary_dim, base=args.rope_theta, scale=self.compress_ratio
         )
 
-    def __call__(self, x: mx.array, cache: Any | None = None) -> mx.array | None:
+    def _update_cache(
+        self, raw_k: mx.array, cache: Any, pad: mx.array | None
+    ) -> mx.array:
+        """Add the raw keys to the cache and return all of them. The values buffer
+        holds the key of each complete block at the block's last row; no other row is
+        read. In token rows, the block keys follow trim, save/load and batching of the
+        cache without other code."""
+        S = raw_k.shape[1]
+        r = self.compress_ratio
+        # The values of the new rows are written below.
+        keys = cache.update_and_fetch(raw_k[:, None], raw_k[:, None])[0][:, 0]
+        n = keys.shape[1]
+        # Each new row gets the mean of the r rows that end at it. Rows before row 0
+        # are zeros: they are in no block.
+        start = n - S - (r - 1)
+        rows = keys[:, max(start, 0) :]
+        if start < 0:
+            rows = mx.pad(rows, [(0, 0), (-start, 0), (0, 0)])
+        # Window i is rows i to i + r - 1 of `rows`, as a strided view.
+        B, m, d = rows.shape
+        windows = mx.as_strided(rows, (B, S, r, d), (m * d, d, d, 1))
+        pooled = windows.astype(mx.float32).mean(axis=2).astype(keys.dtype)
+        # Row t gets RoPE at t - pad - (r - 1): the first token of a block ending at t.
+        offset = start if pad is None else start - pad
+        block_keys = self.rope(self.k_layernorm(pooled), offset=offset)
+        cache.values[..., n - S : n, :] = block_keys[:, None]
+        return keys
+
+    def __call__(
+        self, x: mx.array, cache: Any | None = None
+    ) -> tuple[mx.array, mx.array] | None:
+        """The key positions of each query and their mask, [B, S, (k + 1) * r]: the
+        picked blocks, then the query's own partial block. None when all keys fit in
+        the budget (causal attention)."""
         B, S, _ = x.shape
         r = self.compress_ratio
         qk = self.index_qk_proj(x)
@@ -197,10 +237,7 @@ class QSAIndexer(nn.Module):
         # With left padding, each row's blocks start at its first real token.
         pad = getattr(cache, "left_padding", None)
         if cache is not None:
-            raw_k, _ = cache.update_and_fetch(raw_k[:, None], raw_k[:, None])
-            # Nothing reads the values: reset them, so their graph cannot grow.
-            cache.values = mx.zeros_like(cache.keys)
-            raw_k = raw_k[:, 0]
+            raw_k = self._update_cache(raw_k, cache, pad)
         kv_len = raw_k.shape[1]
 
         # Every visible token fits in the budget: the causal mask is enough.
@@ -208,48 +245,75 @@ class QSAIndexer(nn.Module):
             return None
 
         n_blocks = kv_len // r
-        if pad is None:
-            pad = mx.zeros((B,), dtype=mx.int32)
-            blocks = raw_k[:, : n_blocks * r]
+        if cache is None:
+            blocks = raw_k[:, : n_blocks * r].reshape(B, n_blocks, r, self.head_dim)
+            block_keys = blocks.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
+            block_keys = self.block_rope(self.k_layernorm(block_keys))
+        elif pad is None:
+            block_keys = cache.values[:, 0, r - 1 : n_blocks * r : r]
         else:
             # A block that runs past the buffer is never visible.
-            pos = mx.minimum(pad[:, None] + mx.arange(n_blocks * r), kv_len - 1)
-            blocks = mx.take_along_axis(raw_k, pos[..., None], axis=1)
-        pooled = blocks.reshape(B, n_blocks, r, self.head_dim)
-        pooled = pooled.astype(mx.float32).mean(axis=2).astype(raw_k.dtype)
-        pooled = self.block_rope(self.k_layernorm(pooled))
+            ends = pad[:, None] + mx.arange(r - 1, n_blocks * r, r)
+            ends = mx.minimum(ends, kv_len - 1)[..., None]
+            block_keys = mx.take_along_axis(cache.values[:, 0], ends, axis=1)
 
         q = self.q_layernorm(q).transpose(0, 2, 1, 3)
-        q = self.rope(q, offset=offset)
-
-        # Per block: the sum over heads of relu(q.k).
-        scores = mx.einsum(
-            "bhsd,bnd->bsnh", q.astype(mx.float32), pooled.astype(mx.float32)
-        )
-        scores = mx.maximum(scores, 0).sum(axis=-1) / math.sqrt(self.head_dim)
+        q = self.rope(q, offset=offset).astype(mx.float32)
 
         # Only blocks fully in the query's past; positions exclude the padding.
-        q_pos = mx.array(offset).reshape(-1, 1) + mx.arange(S)
-        n_complete = mx.maximum(q_pos + 1, 0) // r
-        visible = mx.arange(n_blocks) < n_complete[..., None]
-        scores = mx.where(visible, scores, -mx.inf)
+        if isinstance(offset, int):
+            n_complete = (offset + 1 + mx.arange(S)) // r
+            all_visible = offset + 1 >= n_blocks * r
+        else:
+            q_pos = offset.reshape(-1, 1) + mx.arange(S)
+            n_complete = mx.maximum(q_pos + 1, 0) // r
+            all_visible = False
+        n_complete = mx.broadcast_to(n_complete, (B, S))
 
+        # Top k of the sum over heads of relu(q.k). Few queries (decode, speculative
+        # verify) score all key blocks at once.
         k = min(self.block_topk, n_blocks)
-        top = mx.stop_gradient(mx.argpartition(-scores, k - 1, axis=-1)[..., :k])
-        picked = mx.take_along_axis(visible, top, axis=-1)
+        step = n_blocks if S <= 16 else max(_TOPK_KEY_BLOCK, k)
+        best = ids = None
+        for s0 in range(0, n_blocks, step):
+            kb = block_keys[:, s0 : s0 + step]
+            if best is not None:
+                kb = mx.depends(kb, best)
+            scores = q @ kb[:, None].astype(mx.float32).swapaxes(-1, -2)
+            scores = mx.maximum(scores, 0).sum(axis=1) / math.sqrt(self.head_dim)
+            cols = mx.arange(s0, s0 + kb.shape[1])
+            if not all_visible:
+                scores = mx.where(cols < n_complete[..., None], scores, -mx.inf)
+            cols = mx.broadcast_to(cols, scores.shape)
+            if best is not None:
+                scores = mx.concatenate([best, scores], axis=-1)
+                cols = mx.concatenate([ids, cols], axis=-1)
+            top = mx.argpartition(-scores, k - 1, axis=-1)[..., :k]
+            top = mx.stop_gradient(top)
+            best = mx.take_along_axis(scores, top, axis=-1)
+            ids = mx.take_along_axis(cols, top, axis=-1)
 
-        # The tokens of the picked blocks; the others go to a dropped column.
-        tok = pad[:, None, None, None] + top[..., None] * r + mx.arange(r)
-        tok = mx.where(picked[..., None], tok, kv_len).reshape(B, S, -1)
-        keep = mx.zeros((B, S, kv_len + 1), dtype=mx.bool_)
-        keep = mx.put_along_axis(keep, tok, mx.array(True), axis=-1)[..., :kv_len]
+        # The picked blocks, then each query's own partial block (the reference's
+        # `tail`): its positions up to the query.
+        ids = mx.concatenate([ids, n_complete[..., None]], axis=-1)
+        tok = (ids[..., None] * r + mx.arange(r)).reshape(B, S, -1)
+        if pad is not None:
+            tok = tok + pad[:, None, None]
+        picked = mx.concatenate([best > -mx.inf, mx.ones((B, S, 1), mx.bool_)], axis=-1)
+        valid = mx.repeat(picked, r, axis=-1) & (
+            tok <= mx.arange(kv_len - S, kv_len)[:, None]
+        )
+        # The own block can run past the buffer: those positions are masked.
+        return mx.minimum(tok, kv_len - 1), mx.stop_gradient(valid)
 
-        # The reference also keeps each query's own partial block (its `tail`).
-        own_start = n_complete * r + pad[:, None]
-        cols = mx.arange(kv_len)
-        q_cols = mx.arange(kv_len - S, kv_len)[:, None]
-        own = (cols >= own_start[..., None]) & (cols <= q_cols)
-        return (keep | own)[:, None]
+
+def _key_mask(tok: mx.array, valid: mx.array, kv_len: int) -> mx.array:
+    """The selection as a dense mask [B, 1, S, kv_len]."""
+    B, S, _ = tok.shape
+    # The other positions go to a dropped column.
+    tok = mx.where(valid, tok, kv_len)
+    keep = mx.zeros((B, S, kv_len + 1), dtype=mx.bool_)
+    return mx.put_along_axis(keep, tok, mx.array(True), axis=-1)[:, None, :, :kv_len]
 
 
 class Attention(nn.Module):
@@ -271,6 +335,9 @@ class Attention(nn.Module):
             int(args.head_dim * args.partial_rotary_factor), base=args.rope_theta
         )
         self.indexer = QSAIndexer(args)
+        self.sparse_attention = args.sparse_attention
+        self.sparse_prefill_min_context = args.sparse_prefill_min_context
+        self.sparse_prefill_fused = args.sparse_prefill_fused
 
     def __call__(
         self,
@@ -298,16 +365,112 @@ class Attention(nn.Module):
         if kv_cache is not None:
             k, v = kv_cache.update_and_fetch(k, v)
 
-        # The sparse mask is causal and has no padding: it replaces `mask`.
-        sparse = self.indexer(x, idx_cache)
-        if sparse is not None:
-            mask = sparse
-
-        out = scaled_dot_product_attention(
-            q, k, v, cache=kv_cache, scale=self.scale, mask=mask
+        selection = self.indexer(x, idx_cache)
+        # A hand-built quantized cache gives (packed keys, scales, biases) and uses
+        # the masked path (quantized SDPA).
+        quantized = hasattr(kv_cache, "bits")
+        kv_len = (k[0] if quantized else k).shape[2]
+        # Decode always reads only the picked keys. Sparse prefill supports one sequence;
+        # below its minimum context the masked path is faster.
+        sparse = (
+            selection is not None
+            and self.sparse_attention
+            and not self.training
+            and not quantized
+            and (S == 1 or (B == 1 and kv_len >= self._min_context(q, k, v)))
         )
+
+        if sparse:
+            # A slice of the cache buffers is not contiguous: gather from them.
+            keys, values = (
+                (kv_cache.keys, kv_cache.values) if kv_cache is not None else (k, v)
+            )
+            out = self._sparse_attention(q, keys, values, *selection)
+        else:
+            if selection is not None:
+                # The selection is causal and has no padding: it replaces `mask`.
+                mask = _key_mask(*selection, kv_len)
+            elif kv_cache is not None:
+                # Nothing reads the indexer cache: keep its graph from growing.
+                kv_cache.keys = mx.depends(
+                    kv_cache.keys, (idx_cache.keys, idx_cache.values)
+                )
+            out = scaled_dot_product_attention(
+                q, k, v, cache=kv_cache, scale=self.scale, mask=mask
+            )
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)
         return self.o_proj(out * mx.sigmoid(gate))
+
+    def _sparse_attention(
+        self,
+        q: mx.array,
+        keys: mx.array,
+        values: mx.array,
+        tok: mx.array,
+        valid: mx.array,
+    ) -> mx.array:
+        """Attention of each query over its selected key positions only: one Metal
+        kernel at prefill if it supports the inputs, else gather + SDPA."""
+        if q.shape[2] > 1 and self.sparse_prefill_fused and not self.training:
+            idx = mx.where(valid, tok, -1).squeeze(0)  # the kernel skips -1
+            out = sparse_attention.indexed_attention(
+                q.squeeze(0), keys.squeeze(0), values.squeeze(0), idx, self.scale
+            )
+            if out is not None:
+                return out[None]
+        B, H, S, _ = q.shape
+        if S == 1:
+            # Copy whole rows of the flat [B * kv_heads * T, D] buffers: (b, g, t) is
+            # row (b * kv_heads + g) * T + t. Faster than take_along_axis for B > 1.
+            T = keys.shape[2]
+            first = mx.arange(0, B * self.n_kv_heads * T, T).reshape(B, -1, 1)
+            rows = first + tok[:, :1]
+            k = mx.take(keys.reshape(-1, keys.shape[-1]), rows, axis=0)
+            v = mx.take(values.reshape(-1, values.shape[-1]), rows, axis=0)
+            return mx.fast.scaled_dot_product_attention(
+                q, k, v, scale=self.scale, mask=valid[:, None]
+            )
+        # B is 1. One SDPA call per kv head: each query is a batch entry, with the G
+        # heads as its rows. Query blocks run one after the other to keep the gathered
+        # keys small.
+        G = H // self.n_kv_heads
+        outs = []
+        for s0 in range(0, S, _QUERY_BLOCK):
+            s1 = min(S, s0 + _QUERY_BLOCK)
+            idx = tok[0, s0:s1]
+            if outs:
+                idx = mx.depends(idx, outs[-1])
+            mask = valid[0, s0:s1, None, None]
+            out = []
+            for g in range(self.n_kv_heads):
+                k = mx.take(keys[0, g], idx, axis=0)[:, None]
+                v = mx.take(values[0, g], idx, axis=0)[:, None]
+                qg = q[0, g * G : (g + 1) * G, s0:s1].transpose(1, 0, 2)[:, None]
+                out.append(
+                    mx.fast.scaled_dot_product_attention(
+                        qg, k, v, scale=self.scale, mask=mask
+                    )
+                )
+            outs.append(mx.concatenate(out, axis=2)[:, 0])
+        return mx.concatenate(outs, axis=0).transpose(1, 0, 2)[None]
+
+    def _min_context(self, q: mx.array, k: mx.array, v: mx.array) -> int:
+        """Cache length from which prefill reads only the picked keys. With the Metal
+        kernel, that is as soon as the indexer selects."""
+        if (
+            self.sparse_prefill_fused
+            and not self.training
+            and sparse_attention.supports(
+                self.n_heads,
+                self.head_dim,
+                q.dtype,
+                k.dtype,
+                v.dtype,
+                kv_heads=self.n_kv_heads,
+            )
+        ):
+            return 0
+        return self.sparse_prefill_min_context
 
 
 class MLP(nn.Module):

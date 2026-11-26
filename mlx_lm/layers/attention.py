@@ -8,7 +8,7 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_map
 
-from mlx_lm.kernels import sparse_mla
+from mlx_lm.kernels.sparse_attention import indexed_attention, supports
 
 __all__ = [
     "MultiLinear",
@@ -245,7 +245,14 @@ def min_context(attn, q_pe, kv_latent, k_pe):
     if (
         attn.sparse_prefill_fused
         and not attn.training
-        and sparse_mla.supports(q_pe[0], kv_latent[0, 0], k_pe[0, 0])
+        and supports(
+            q_pe.shape[1],
+            kv_latent.shape[-1],
+            q_pe.dtype,
+            kv_latent.dtype,
+            k_pe.dtype,
+            rope=q_pe.shape[-1],
+        )
     ):
         return attn.sparse_prefill_fused_min_context
     return attn.sparse_prefill_min_context
@@ -255,14 +262,12 @@ def fused_sparse_attention(attn, q_nope, q_pe, kv_latent, k_pe, topk, mask, B, L
     # sparse_attention in one Metal kernel that reads the selected rows by index,
     # or None when the kernel doesn't support the inputs.
     kv, kp = kv_latent[0, 0], k_pe[0, 0]
-    if not sparse_mla.supports(q_pe[0], kv, kp):
-        return None
     idx = topk[0, 0].astype(mx.int32)  # [L, K]
     if mask is not None:
         valid = mx.take_along_axis(mask.reshape(L, -1), idx, axis=-1)
         idx = mx.where(valid, idx, -1)  # the kernel skips -1
     q = attn.embed_q(q_nope)[0]  # [H, L, 512]
-    out = sparse_mla.sparse_mla_attention(q, q_pe[0], kv, kp, idx, attn.scale)
+    out = indexed_attention(q, kv, None, idx, attn.scale, q_pe=q_pe[0], k_pe=kp)
     if out is None:
         return None
     out = attn.unembed_out(out[None])  # [1, H, L, v_head_dim]

@@ -1,19 +1,26 @@
 # Copyright © 2026 Apple Inc.
 
-"""Fused sparse MLA attention for DSA prefill (deepseek_v32, glm_moe_dsa).
+"""Fused sparse prefill attention: DSA (deepseek_v32, glm_moe_dsa), QSA (qwen4_exp).
 
-``sparse_mla_attention`` computes, for every query, attention over its own top-k keys in the
-absorbed latent space (keys are latent + rope, values are the latent), as
-``dsa.sparse_attention`` does, without the gathered ``[L, topk, r + rope]`` copy:
+``indexed_attention`` computes, for every query, attention over its own selected key rows,
+without a gathered ``[L, topk, ...]`` copy. Two layouts use it:
 
-- One threadgroup per (query, 16 heads) with WN simdgroups. The 16 heads are the rows of
-  the Q.K^T and P.V tiles, so each selected key row is read once per 16 heads.
+- MLA: the absorbed latent space (keys are latent + rope, values are the latent), as
+  ``layers.attention.sparse_attention`` does. All heads read the same cache rows.
+- GQA: separate key and value rows and no rope part, as the gather path of ``qwen4_exp``
+  does. The heads of a kv head read that kv head's rows.
+
+The kernel:
+
+- One threadgroup per (query, group of at most 16 heads that read one kv head) with WN
+  simdgroups. The heads are the rows of the Q.K^T and P.V tiles, so each selected key row
+  is read once per group.
 - Keys are processed in blocks of 32 * WN selected indices. For Q.K^T each simdgroup scores
-  its own 32 keys over all r + rope dims, reading the rows by index straight from the latent
-  and rope caches. The simdgroups agree on the row max and row sum through threadgroup
-  memory (online softmax, float32) and share P; for P.V each simdgroup accumulates
-  r / WN latent columns over all keys of the block.
-- Only the final ``[heads, L, r]`` latent output is written.
+  its own 32 keys over all d key dims and the rope part (if any), reading the rows by index
+  straight from the key and rope caches. The simdgroups agree on the row max and row sum
+  through threadgroup memory (online softmax, float32) and share P; for P.V each simdgroup
+  accumulates d / WN value columns over all keys of the block.
+- Only the final ``[heads, L, d]`` output is written.
 
 Two variants share this kernel and differ only in their matrix fragments (``SmlaFrag``):
 
@@ -40,8 +47,8 @@ __all__ = [
     "VARIANTS",
     "Variant",
     "default_variant",
+    "indexed_attention",
     "is_available",
-    "sparse_mla_attention",
     "supports",
 ]
 
@@ -67,7 +74,8 @@ METAL_FUNC short2 smla_coord(ushort lane) {
 }
 
 // The lane's part of a 16 x COLS float32 tile (the scores s or the output o) whose rows are
-// the threadgroup's 16 heads. Each lane holds 2 rows and COLS / 4 columns of it:
+// the threadgroup's heads (G used, the others padding). Each lane holds 2 rows and
+// COLS / 4 columns of it:
 // lane row r < 2 is head fm + 8 * r and lane column c < kCols is value c % F::kCols of
 // fragment column c / F::kCols.
 template <typename F, short COLS>
@@ -299,10 +307,12 @@ struct SmlaFrag {
 };
 """
 
-# Inputs: q [H, L, R], q_pe [H, L, RP], kv [N, R], k_pe [N, RP], idx [L, TOPK] (entries
-# outside [0, N) are skipped), scale [1]. Output: out [H, L, R]. The latent part of Q.K^T is
-# unrolled by QK_UNROLL (full unrolling hoists all its loads and spills), the P.V key loop
-# by PV_UNROLL.
+# Inputs: q [H, L, R], q_pe [H, L, RP], kv [KVH * N, R], k_pe [KVH * N, RP], v [KVH * N, R],
+# idx [L, TOPK] (entries outside [0, N) are skipped), scale [1]. Output: out [H, L, R].
+# Each group of G heads (the tile rows; rows G .. 15 are not used) reads one kv head of N
+# rows. The values are the rows of v if SEPV, else the rows of kv (MLA). RP is 0 without a
+# rope part. The latent part of Q.K^T is unrolled by QK_UNROLL (full unrolling hoists all its
+# loads and spills), the P.V key loop by PV_UNROLL.
 _SOURCE = r"""
   using F = SmlaFrag;
   using ScoreTile = SmlaTile<F, 32>;
@@ -316,17 +326,21 @@ _SOURCE = r"""
   const ushort lane = thread_index_in_simdgroup;
   const short g = simdgroup_index_in_threadgroup;
   const int L = q_shape[1];
-  const uint N = uint(kv_shape[0]);
-  const int nhg = q_shape[0] / 16;
+  const uint N = uint(kv_shape[0]) / KVH;
+  const int nhg = q_shape[0] / G;
   const int tgid = threadgroup_position_in_grid.y;
   const int qi = tgid / nhg;
-  const int h0 = (tgid % nhg) * 16;
+  const int h0 = (tgid % nhg) * G;
   const short2 sc = smla_coord<F>(lane);
   const short fn = sc.x, fm = sc.y;
+  // The first row of the group's kv head.
+  const long kvh = long((tgid % nhg) * KVH / nhg) * N;
+  const device T* vh = (SEPV ? v : kv) + kvh * R;
 
   metal::array<const device T*, 2> qrow, prow;
   SMLA_UNROLL for (short i = 0; i < 2; i++) {
-    const long row = (long)(h0 + fm + 8 * i) * L + qi;
+    const short hr = fm + 8 * i;
+    const long row = (long)(h0 + (hr < G ? hr : 0)) * L + qi;
     qrow[i] = q + row * R + F::q_offset(fn);
     prow[i] = q_pe + row * RP + F::q_offset(fn);
   }
@@ -350,7 +364,7 @@ _SOURCE = r"""
     metal::array<const device T*, F::kKeys> kr, kpr;
     SMLA_UNROLL for (short n = 0; n < F::kKeys; n++) {
       const int r = ip[k0 + F::key(n, fn, fm)];
-      const long row = uint(r) < N ? r : 0;
+      const long row = kvh + (uint(r) < N ? r : 0);
       kr[n] = kv + row * R + F::k_offset(fn, fm);
       kpr[n] = k_pe + row * RP + F::k_offset(fn, fm);
     }
@@ -420,7 +434,7 @@ _SOURCE = r"""
       const device T* vr[F::kRows];
       SMLA_UNROLL for (short i = 0; i < F::kRows; i++) {
         const int r = ip[kb + t * F::kSize + fm + 8 * i];
-        vr[i] = kv + (uint(r) < N ? long(r) : 0) * R + g * LATW;
+        vr[i] = vh + (uint(r) < N ? long(r) : 0) * R + g * LATW;
       }
       SMLA_UNROLL for (short c0 = 0; c0 < OutTile::kCols; c0 += 8) {
         typename F::template frag<T> v[8 / F::kCols];
@@ -435,6 +449,9 @@ _SOURCE = r"""
   }
 
   SMLA_UNROLL for (short r = 0; r < 2; r++) {
+    if (fm + 8 * r >= G) {
+      continue;
+    }
     const float inv = l[r] > 0 ? 1.f / l[r] : 0.f;
     device T* orow = out + ((long)(h0 + fm + 8 * r) * L + qi) * R + g * LATW;
     SMLA_UNROLL for (short c = 0; c < OutTile::kCols; c++) {
@@ -463,15 +480,15 @@ VARIANTS = {v.name: v for v in (TENSOR_OPS, SIMDGROUP_MATRIX)}
 
 
 @lru_cache(maxsize=None)
-def _kernel(variant: Variant):
+def _kernel(variant: Variant, separate_values: bool):
     pragma = '_Pragma("clang loop unroll_count({})")'
     source = _SOURCE.replace("QK_UNROLL", pragma.format(variant.qk_unroll)).replace(
         "PV_UNROLL", pragma.format(variant.pv_unroll)
     )
     return mx.fast.metal_kernel(
-        name=f"dsa_sparse_mla_{variant.name}"
+        name=f"{'sparse_gqa' if separate_values else 'dsa_sparse_mla'}_{variant.name}"
         f"_u{variant.qk_unroll}_{variant.pv_unroll}",
-        input_names=["q", "q_pe", "kv", "k_pe", "idx", "scale"],
+        input_names=["q", "q_pe", "kv", "k_pe", "v", "idx", "scale"],
         output_names=["out"],
         header=_HEADER + variant.header,
         source=source,
@@ -509,90 +526,139 @@ def is_available(variant: str) -> bool:
 
 
 def default_variant() -> Optional[str]:
-    """The variant ``sparse_mla_attention`` uses on this device, or ``None``."""
+    """The variant ``indexed_attention`` uses on this device, or ``None``."""
     for variant in (TENSOR_OPS.name, SIMDGROUP_MATRIX.name):
         if is_available(variant):
             return variant
     return None
 
 
-def _simdgroups(latent_dim: int) -> Optional[int]:
-    # Each simdgroup accumulates latent_dim / WN columns, 32 at a time.
+def _simdgroups(dim: int) -> Optional[int]:
+    # Each simdgroup accumulates dim / WN value columns, 32 at a time.
     for wn in (8, 4, 2):
-        if latent_dim % (32 * wn) == 0:
+        if dim % (32 * wn) == 0:
             return wn
     return None
 
 
+def _group(heads: int, kv_heads: Optional[int]) -> Optional[int]:
+    # The heads of one threadgroup (the tile rows), all of one kv head, or None: groups of
+    # 16 (for k [N, d] only these, as in #2027), or for k [kv_heads, N, d] all heads of a
+    # kv head when it has fewer.
+    if kv_heads is None:
+        group, kv_heads = 16, 1
+    elif kv_heads > 0 and heads % kv_heads == 0:
+        group = min(heads // kv_heads, 16)
+    else:
+        return None
+    return group if heads > 0 and heads % (kv_heads * group) == 0 else None
+
+
 def supports(
-    q_pe: mx.array,
-    kv_latent: mx.array,
-    k_pe: mx.array,
+    heads: int,
+    dim: int,
+    *dtypes: mx.Dtype,
+    kv_heads: Optional[int] = None,
+    rope: int = 0,
     variant: Optional[str] = None,
 ) -> bool:
-    """Whether ``sparse_mla_attention`` runs for these shapes, dtypes and this device."""
+    """Whether ``indexed_attention`` runs for these sizes and dtypes on this device.
+
+    ``dtypes`` are the dtypes of the inputs: all bfloat16 or all float16. ``kv_heads`` is
+    ``None`` for ``k`` [N, d], else ``k.shape[0]``; ``rope`` is the width of ``q_pe`` (0
+    without a rope part). ``indexed_attention`` also checks its arrays.
+    """
     variant = variant or default_variant()
     return (
         variant in VARIANTS
-        and kv_latent.ndim == 2
-        and k_pe.ndim == 2
-        and q_pe.ndim == 3
-        and kv_latent.dtype in (mx.bfloat16, mx.float16)
-        and k_pe.dtype == kv_latent.dtype
-        and q_pe.dtype == kv_latent.dtype
-        and q_pe.size > 0
-        and kv_latent.size > 0
-        and q_pe.shape[0] % 16 == 0
-        and q_pe.shape[-1] % VARIANTS[variant].step == 0
-        and k_pe.shape == (kv_latent.shape[0], q_pe.shape[-1])
-        and _simdgroups(kv_latent.shape[-1]) is not None
-        and mx.default_device() == mx.gpu
         and is_available(variant)
+        and set(dtypes) in ({mx.bfloat16}, {mx.float16})
+        and _group(heads, kv_heads) is not None
+        and rope % VARIANTS[variant].step == 0
+        and _simdgroups(dim) is not None
+        and mx.default_device() == mx.gpu
     )
 
 
-def sparse_mla_attention(
+def indexed_attention(
     q: mx.array,
-    q_pe: mx.array,
-    kv_latent: mx.array,
-    k_pe: mx.array,
+    k: mx.array,
+    v: Optional[mx.array],
     indices: mx.array,
     scale: float,
+    *,
+    q_pe: Optional[mx.array] = None,
+    k_pe: Optional[mx.array] = None,
     variant: Optional[str] = None,
 ) -> Optional[mx.array]:
-    """Attention of each query over its selected cache rows, or ``None`` when unsupported.
+    """Attention of each query over its selected key rows, or ``None`` when unsupported.
 
-    ``q`` [heads, L, r] is the absorbed query (``embed_q(q_nope)``), ``q_pe`` [heads, L, rope],
-    ``kv_latent`` [N, r] and ``k_pe`` [N, rope] are the cache, ``indices`` [L, topk] the
-    selected rows per query, where entries outside ``[0, N)`` (for example -1 for masked
-    keys) are skipped. Returns the latent output [heads, L, r] in the input dtype.
-    ``variant`` (``tensor_ops`` or ``simdgroup_matrix``) defaults to ``default_variant()``.
+    ``q`` [heads, L, d]; ``k`` [N, d] or [kv_heads, N, d] (query head h reads kv head
+    h // (heads // kv_heads)); ``v`` like ``k``, or ``None`` when the values are the key rows
+    (MLA latent); ``q_pe`` [heads, L, rope] and ``k_pe`` like ``k`` with width rope, or
+    ``None`` for no rope part; ``indices`` [L, topk] the selected rows per query, where
+    entries outside ``[0, N)`` (for example -1 for masked keys) are skipped. Returns
+    [heads, L, d] in the input dtype. ``variant`` (``tensor_ops`` or ``simdgroup_matrix``)
+    defaults to ``default_variant()``.
     """
     variant = variant or default_variant()
-    if not supports(q_pe, kv_latent, k_pe, variant) or q.dtype != q_pe.dtype:
+    if q.ndim != 3 or k.ndim not in (2, 3) or (q_pe is None) != (k_pe is None):
         return None
-    heads, L, rank = q.shape
-    if q_pe.shape[:2] != (heads, L) or kv_latent.shape[-1] != rank:
+    heads, L, dim = q.shape
+    kv_heads = k.shape[0] if k.ndim == 3 else None
+    rope = 0 if q_pe is None else q_pe.shape[-1]
+    arrays = [q, k] + [x for x in (v, q_pe, k_pe) if x is not None]
+    dtypes = [x.dtype for x in arrays]
+    if not supports(heads, dim, *dtypes, kv_heads=kv_heads, rope=rope, variant=variant):
         return None
-    if indices.ndim != 2 or indices.shape[0] != L or indices.shape[-1] == 0:
+    if (
+        any(x.size == 0 for x in arrays)
+        or k.shape[-1] != dim
+        or (v is not None and v.shape != k.shape)
+        or (q_pe is not None and q_pe.shape != (heads, L, rope))
+        or (k_pe is not None and k_pe.shape != k.shape[:-1] + (rope,))
+        or indices.ndim != 2
+        or indices.shape[0] != L
+        or indices.shape[-1] == 0
+    ):
         return None
-    wn = _simdgroups(rank)
+    group = _group(heads, kv_heads)
+    wn = _simdgroups(dim)
+    # The kernel does not read the unused inputs below. A one-element input becomes a
+    # scalar in the kernel: use 64.
+    unused = mx.zeros((64,), q.dtype)
+    if q_pe is not None:
+        k_pe = k_pe.reshape(-1, rope)
+    else:
+        q_pe = k_pe = unused
+    k = k.reshape(-1, dim)
     indices = indices.astype(mx.int32)
     block = 32 * wn
     if indices.shape[-1] % block:
         pad = block - indices.shape[-1] % block
         indices = mx.concatenate([indices, mx.full((L, pad), -1, mx.int32)], axis=-1)
-    return _kernel(VARIANTS[variant])(
-        inputs=[q, q_pe, kv_latent, k_pe, indices, mx.array([scale], mx.float32)],
+    return _kernel(VARIANTS[variant], v is not None)(
+        inputs=[
+            q,
+            q_pe,
+            k,
+            k_pe,
+            unused if v is None else v.reshape(-1, dim),
+            indices,
+            mx.array([scale], mx.float32),
+        ],
         template=[
             ("T", q.dtype),
-            ("R", rank),
-            ("RP", q_pe.shape[-1]),
+            ("R", dim),
+            ("RP", rope),
             ("TOPK", indices.shape[-1]),
             ("WN", wn),
+            ("G", group),
+            ("KVH", kv_heads or 1),
+            ("SEPV", v is not None),
         ],
-        grid=(32 * wn, L * (heads // 16), 1),
+        grid=(32 * wn, L * (heads // group), 1),
         threadgroup=(32 * wn, 1, 1),
-        output_shapes=[(heads, L, rank)],
+        output_shapes=[(heads, L, dim)],
         output_dtypes=[q.dtype],
     )[0]

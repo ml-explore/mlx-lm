@@ -51,6 +51,12 @@ class TextArgs(BaseModelArgs):
     output_gate_type: str | None = None
     hidden_act: str = "silu"
     tie_word_embeddings: bool = False
+    # QSA reads only the picked keys (False: masked dense attention over all keys).
+    sparse_attention: bool = True
+    # Without the Metal kernel, prefill reads the picked keys from this cache length on.
+    sparse_prefill_min_context: int = 32768
+    # Sparse prefill attention in one Metal kernel.
+    sparse_prefill_fused: bool = True
     rope_theta: float = field(init=False)
     partial_rotary_factor: float = field(init=False)
 
