@@ -6,6 +6,7 @@ from mlx_lm.tool_parsers import (
     function_gemma,
     gemma4,
     glm47,
+    inkling2,
     json_tools,
     kimi_k2,
     kimi_k3,
@@ -68,6 +69,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<atem:invoke name="multiply">\n<atem:parameter name="a">12234585</atem:parameter><atem:parameter name="b">48838483920</atem:parameter>\n</atem:invoke>',
                 muse_spark,
+            ),
+            (
+                '{"name":"multiply","args":{"a":12234585,"b":48838483920}}',
+                inkling2,
             ),
         ]
 
@@ -146,6 +151,10 @@ class TestToolParsing(unittest.TestCase):
             (
                 '<atem:invoke name="get_current_temperature">\n<atem:parameter name="location">London</atem:parameter>\n</atem:invoke>',
                 muse_spark,
+            ),
+            (
+                '{"name":"get_current_temperature","args":{"location":"London"}}',
+                inkling2,
             ),
         ]
         tools = [
@@ -908,6 +917,105 @@ class TestToolParsing(unittest.TestCase):
         )
         tool_call = qwen3_coder.parse_tool_call(test_case, tools)
         self.assertEqual(tool_call["arguments"], {"path": "a>b"})
+
+    def test_inkling2(self):
+        from types import SimpleNamespace
+
+        from mlx_lm.generate import TextStateMachine
+        from mlx_lm.tokenizer_utils import _infer_tool_parser
+
+        # Nested args, lists, booleans, nulls
+        nested = (
+            '{"name":"search","args":{"query":"mlx","filters":{"tags":["a","b"],'
+            '"active":true,"limit":null}}}'
+        )
+        self.assertEqual(
+            inkling2.parse_tool_call(nested, None),
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "mlx",
+                    "filters": {"tags": ["a", "b"], "active": True, "limit": None},
+                },
+            },
+        )
+
+        # Empty args / omitted args / arguments alias
+        self.assertEqual(
+            inkling2.parse_tool_call('{"name":"ping","args":{}}', None),
+            {"name": "ping", "arguments": {}},
+        )
+        self.assertEqual(
+            inkling2.parse_tool_call('{"name":"ping"}', None),
+            {"name": "ping", "arguments": {}},
+        )
+        self.assertEqual(
+            inkling2.parse_tool_call('{"name":"ping","arguments":{"x":1}}', None),
+            {"name": "ping", "arguments": {"x": 1}},
+        )
+
+        # Malformed / invalid payloads
+        for bad in (
+            "",
+            "not json",
+            '["not", "an", "object"]',
+            '{"args":{"x":1}}',
+            '{"name":"","args":{}}',
+            '{"name":"f","args":["list"]}',
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    inkling2.parse_tool_call(bad, None)
+
+        # Auto-inference from chat_template and vocab
+        tok_tpl = SimpleNamespace(
+            chat_template="<|message_model|>fn<|content_invoke_tool_json|>{}<|end_message|>",
+            get_vocab=lambda: {},
+        )
+        self.assertEqual(_infer_tool_parser(tok_tpl), "inkling2")
+
+        tok_vocab = SimpleNamespace(
+            chat_template=None,
+            get_vocab=lambda: {
+                "<|content_invoke_tool_json|>": 200015,
+                "<|end_message|>": 200010,
+            },
+        )
+        self.assertEqual(_infer_tool_parser(tok_vocab), "inkling2")
+
+        # Streaming TextStateMachine with RESPONSE_FORMAT across chunk sizes
+        tok_sm = SimpleNamespace(
+            has_thinking=False,
+            has_tool_calling=True,
+            tool_call_start=inkling2.tool_call_start,
+            tool_call_end=inkling2.tool_call_end,
+            structural_markers=(),
+            response_transitions=inkling2.RESPONSE_FORMAT["transitions"],
+        )
+        sm = TextStateMachine.from_tokenizer(tok_sm)
+        stream = (
+            "<|message_model|><|content_thinking|>Let me check weather and time.<|end_message|>"
+            '<|message_model|>get_weather<|content_invoke_tool_json|>{"name":"get_weather","args":{"city":"Tokyo"}}<|end_message|>'
+            '<|message_model|>get_time<|content_invoke_tool_json|>{"name":"get_time","args":{"tz":"UTC"}}<|end_message|>'
+            "<|message_model|><|content_text|>Calling both tools.<|end_message|>"
+            "<|content_model_end_sampling|>"
+        )
+        for step in (1, 3, 7, len(stream)):
+            with self.subTest(step=step):
+                reader = sm.reader(state=inkling2.RESPONSE_FORMAT["initial_state"])
+                delta = TextStateMachine.Delta()
+                for i in range(0, len(stream), step):
+                    delta += reader.feed(stream[i : i + step])
+                delta += reader.finish()
+                self.assertEqual(delta.reasoning, "Let me check weather and time.")
+                self.assertEqual(delta.content, "Calling both tools.")
+                self.assertEqual(
+                    [inkling2.parse_tool_call(tc, None) for tc in delta.tool_calls],
+                    [
+                        {"name": "get_weather", "arguments": {"city": "Tokyo"}},
+                        {"name": "get_time", "arguments": {"tz": "UTC"}},
+                    ],
+                )
 
 
 if __name__ == "__main__":
