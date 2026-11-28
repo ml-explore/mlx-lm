@@ -32,3 +32,4 @@ MoonshotAI's `Kimi K2.5`, Upstage's `Solar Open`, LG AI Research's `K-Exaone MoE
 Meituan's `LongCat Flash Lite` Helped add support for the following model architectures: 
 Z.ai & THUKEG's `GLM5 (GLM MoE DSA)`
 - Ethan Elasky: Added support for talkie-lm's `Talkie`.
+- Théophile Lafargue: Added support for Alibaba Qwen's `Qwen3.8-Flash-Next`.

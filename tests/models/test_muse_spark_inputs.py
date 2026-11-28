@@ -1,16 +1,21 @@
 # Copyright © 2026 Apple Inc.
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
-from mlx import nn
 
-from mlx_lm.processors import load_processor, muse_spark
+from mlx_lm import utils
+from mlx_lm.models import muse_spark
+from mlx_lm.models.muse_spark.processor import Processor
+from mlx_lm.processors import load_processor
 
 
 class TestMuseSparkProcessor(unittest.TestCase):
     def test_preprocess_image(self):
-        processor = muse_spark.Processor(max_num_image_tokens=16)
+        processor = Processor(max_num_image_tokens=16)
         # (height, width), pixel shape, number of tokens
         test_cases = [
             # A multiple of 28, no resize.
@@ -28,21 +33,23 @@ class TestMuseSparkProcessor(unittest.TestCase):
                 self.assertEqual(n, num_tokens)
 
     def test_call(self):
-        processor = muse_spark.Processor()
+        processor = Processor()
         images = [
             np.zeros((56, 84, 3), dtype=np.uint8),
             np.zeros((10, 10, 3), dtype=np.uint8),
         ]
-        text, pixel_values = processor("A <|patch|> and B <|patch|>.", images=images)
+        text, inputs = processor("A <|patch|> and B <|patch|>.", images=images)
         expected = (
             "A <|image_start|>" + "<|patch|>" * 6 + "<|image_end|>"
             " and B <|image_start|><|patch|><|image_end|>."
         )
         self.assertEqual(text, expected)
-        self.assertEqual([p.shape for p in pixel_values], [(3, 56, 84), (3, 28, 28)])
+        self.assertEqual(list(inputs), ["pixel_values"])
+        shapes = [p.shape for p in inputs["pixel_values"]]
+        self.assertEqual(shapes, [(3, 56, 84), (3, 28, 28)])
 
     def test_call_errors(self):
-        processor = muse_spark.Processor()
+        processor = Processor()
         image = np.zeros((28, 28, 3), dtype=np.uint8)
         with self.assertRaisesRegex(ValueError, "for 1 images"):
             processor("<|patch|> <|patch|>", images=[image])
@@ -50,15 +57,25 @@ class TestMuseSparkProcessor(unittest.TestCase):
             processor("No image", images=[image])
 
     def test_load_processor(self):
-        model = nn.Module()
-        self.assertIsNone(load_processor(model, {"model_type": "muse_spark"}))
-        self.assertIsNone(load_processor(model, {"vision_config": {}}))
+        self.assertIsNone(load_processor({"model_type": "muse_spark"}))
+        self.assertIsNone(load_processor({"vision_config": {}}))
         config = {
             "vision_config": {"patch_size": 16},
             "processor_type": "muse_spark",
         }
-        processor = load_processor(model, config)
+        processor = load_processor(config)
         self.assertEqual(processor.patch_size, 16)
+
+    def test_load_processor_of_the_model_package(self):
+        config = {"model_type": "muse_spark", "vision_config": {"patch_size": 16}}
+        self.assertEqual(load_processor(config).patch_size, 16)
+
+    def test_tokenizer_defaults_of_the_model_package(self):
+        with tempfile.TemporaryDirectory() as path:
+            with open(Path(path) / "config.json", "w") as f:
+                json.dump({"model_type": "muse_spark"}, f)
+            defaults = utils._tokenizer_defaults(Path(path))
+        self.assertEqual(defaults, muse_spark.TOKENIZER_DEFAULTS)
 
 
 if __name__ == "__main__":
