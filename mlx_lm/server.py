@@ -1746,11 +1746,13 @@ class APIHandler(BaseHTTPRequestHandler):
         self.object_type = "chat.completion.chunk" if self.stream else "chat.completion"
         _inline_image_urls(body["messages"])
 
+        tool_choice = body.get("tool_choice")
+
         return CompletionRequest(
             "chat",
             "",
             body["messages"],
-            body.get("tools") or None,
+            None if tool_choice == "none" else body.get("tools") or None,
             body.get("role_mapping"),
         )
 
