@@ -6,7 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
-from mlx_lm.tuner.trainer import iterate_batches
+from mlx_lm.tuner.trainer import default_loss, iterate_batches
 
 
 class MockDistributedGroup:
@@ -302,3 +302,48 @@ class TestTunerTrainer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDefaultLoss(unittest.TestCase):
+    """The loss mask must not include the padding token of each sequence."""
+
+    class DummyModel:
+        def __init__(self, batch_size, seq_len, vocab_size=8):
+            self.batch_size = batch_size
+            self.seq_len = seq_len
+            self.vocab_size = vocab_size
+
+        def __call__(self, inputs):
+            return mx.zeros((inputs.shape[0], inputs.shape[1], self.vocab_size))
+
+    def test_mask_excludes_padding(self):
+        # Two sequences of 3 and 5 real tokens, padded to 8 tokens.
+        batch = mx.array(
+            [
+                [1, 2, 3, 0, 0, 0, 0, 0],
+                [4, 5, 6, 7, 8, 0, 0, 0],
+            ]
+        )
+        lengths = mx.array([[0, 3], [0, 5]])
+        model = self.DummyModel(2, 8)
+
+        _, ntoks = default_loss(model, batch, lengths)
+
+        # Real predictions are the (L - 1) targets of each sequence.
+        self.assertEqual(ntoks.item(), 2 + 4)
+
+    def test_mask_respects_prompt_offsets(self):
+        batch = mx.array(
+            [
+                [1, 2, 3, 0, 0, 0, 0, 0],
+                [4, 5, 6, 7, 8, 0, 0, 0],
+            ]
+        )
+        # First sequence has a 2 token prompt that should not be trained on.
+        lengths = mx.array([[2, 3], [0, 5]])
+        model = self.DummyModel(2, 8)
+
+        _, ntoks = default_loss(model, batch, lengths)
+
+        self.assertEqual(ntoks.item(), 1 + 4)
+
