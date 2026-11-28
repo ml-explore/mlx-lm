@@ -293,6 +293,31 @@ class TestHandleCompletion(unittest.TestCase):
         delta = reader.feed("a #") + reader.feed("# b") + reader.finish()
         self.assertEqual(delta, TextStateMachine.Delta(content="a  b"))
 
+    def test_tool_choice_none_drops_tools(self):
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the current weather",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+        handler = mock.MagicMock(stream=False)
+        handler.body = {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "tools": tools,
+            "tool_choice": "none",
+        }
+
+        request = APIHandler.handle_chat_completions(handler)
+        self.assertIsNone(request.tools)
+
+        del handler.body["tool_choice"]
+        request = APIHandler.handle_chat_completions(handler)
+        self.assertEqual(request.tools, tools)
+
 
 class TestToolCallFormatter(unittest.TestCase):
     def test_formats_parallel_tool_calls(self):
