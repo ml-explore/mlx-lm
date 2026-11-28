@@ -825,6 +825,16 @@ class TestPromptCache(unittest.TestCase):
         self.assertEqual(cache.lengths.item(), 3 - 256)
         self.assertEqual(cache.left_padding.item(), 2 - 256)
 
+    def test_finalize_clears_all_zero_left_padding(self):
+        # An unpadded batch reaches decode with left_padding == [0] * B (set by
+        # merge). finalize() must clear it so make_mask returns None instead of
+        # materializing an all-true mask on every decode step.
+        cache = ArraysCache(2, left_padding=[2, 0])
+        cache.finalize()
+        self.assertIsNone(cache.left_padding)
+        self.assertIsNone(cache.lengths)
+        self.assertIsNone(cache.make_mask(1))
+
     def test_window_mask_with_full_kv_cache(self):
         c = KVCache()
         kv = mx.zeros((1, 1, 32, 128))

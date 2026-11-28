@@ -17,7 +17,7 @@ from mlx_lm.generate import (
     speculative_generate_step,
     stream_generate,
 )
-from mlx_lm.models.cache import KVCache, RotatingKVCache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load
 
@@ -1085,6 +1085,87 @@ class TestGenerate(unittest.TestCase):
             stats.wall_time,
             places=6,
         )
+
+
+class TestBatchDecodeCaches(unittest.TestCase):
+    """Padding metadata left on an ArraysCache is decremented lazily by every
+    decode step and never evaluated, so its graph grows until the backend runs
+    out of resources. Every way a sequence reaches the generation batch has to
+    finalize the caches."""
+
+    def _model(self):
+        from mlx_lm.models import qwen3_next
+
+        mx.random.seed(4)
+        return qwen3_next.Model(
+            qwen3_next.ModelArgs(
+                model_type="qwen3_next",
+                hidden_size=128,
+                num_hidden_layers=4,
+                intermediate_size=128,
+                num_attention_heads=8,
+                num_key_value_heads=4,
+                vocab_size=1000,
+                linear_num_value_heads=4,
+                linear_num_key_heads=4,
+                linear_key_head_dim=32,
+                linear_value_head_dim=32,
+                linear_conv_kernel_dim=3,
+                num_experts=4,
+                num_experts_per_tok=2,
+                decoder_sparse_step=1,
+                shared_expert_intermediate_size=128,
+                mlp_only_layers=[0],
+                moe_intermediate_size=128,
+                rms_norm_eps=1e-5,
+                head_dim=64,
+                rope_theta=1000.0,
+                partial_rotary_factor=0.5,
+                max_position_embeddings=1000,
+            )
+        )
+
+    def test_decode_batch_has_no_arrays_cache_padding(self):
+        model = self._model()
+        long_a = [5, 6, 7, 8, 9, 10, 11, 12]
+        long_b = [15, 16, 17, 18, 19, 20, 21, 22]
+
+        def together(*prompts):
+            return lambda gen: gen.insert(list(prompts))
+
+        def second_after(steps, first, second):
+            def setup(gen):
+                gen.insert([first])
+                for _ in range(steps):
+                    gen.next()
+                gen.insert([second])
+
+            return setup
+
+        scenarios = {
+            "equal length prompts": together(long_a, long_b),
+            "one token prompt": together([5]),
+            # The second prompt joins the prompt batch in the same call that
+            # moves the first one to generation.
+            "prompt arrives during handoff": second_after(1, long_a, long_b),
+            "one token prompt joins decode": second_after(6, long_a, [15]),
+        }
+        for name, setup in scenarios.items():
+            with self.subTest(name):
+                gen = BatchGenerator(model, max_tokens=64)
+                setup(gen)
+                for _ in range(12):
+                    gen.next()
+                caches = [
+                    c
+                    for c in gen._generation_batch.prompt_cache
+                    if isinstance(c, ArraysCache)
+                ]
+                self.assertGreater(len(caches), 0)
+                for c in caches:
+                    self.assertIsNone(c.left_padding)
+                    self.assertIsNone(c.lengths)
+                gen.close()
 
 
 if __name__ == "__main__":
