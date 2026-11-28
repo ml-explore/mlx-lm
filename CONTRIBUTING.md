@@ -62,10 +62,31 @@ To add LoRA support edit
 Finally, add a test for the new modle type to the [model
 tests](https://github.com/ml-explore/mlx-lm/blob/main/tests/test_models.py).
 
-You can run the tests with:
+## Running tests
+
+From the root of your checkout, with a virtual environment active, install MLX LM
+in editable mode:
 
 ```shell
-pip install -e ".[test]"
+python -m pip install -e .
+```
+
+Tests in [`tests/`](tests/) use Python's `unittest`. For example, if you change
+[`mlx_lm/tokenizer_utils.py`](mlx_lm/tokenizer_utils.py), you can run a single
+test from [`tests/test_tokenizers.py`](tests/test_tokenizers.py):
+
+```shell
+python -m unittest discover -s tests -p 'test_tokenizers.py' \
+    -k test_thinking_from_vocab_or_template -v
+```
+
+This test builds its tokenizer in memory and runs without downloading a model.
+Change `-p` to select another test file and `-k` to match a test name.
+
+To run the full suite, install the additional test dependencies:
+
+```shell
+python -m pip install -e ".[test]"
 python -m unittest discover tests/
 ```
 
